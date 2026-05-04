@@ -44,6 +44,13 @@ extern int current_pid(void);
 volatile bool g_trace_highbits = false;
 volatile addr_t g_watch_page_val = 0;
 
+#ifdef ISH_GADGET_PROFILE
+// Gadget call profile: ring buffer of next-gadget pointers, written by `gret`.
+// 64K entries; reader (atexit handler) processes after run.
+__attribute__((aligned(64))) uint64_t g_profile_buf[65536] = {0};
+__attribute__((aligned(64))) uint64_t g_profile_idx = 0;
+#endif
+
 void jit_trace_regs(struct cpu_state *cpu) { (void)cpu; }
 void c_watch_write_hit(addr_t addr, const char *caller) { (void)addr; (void)caller; }
 void jit_watch_write_hit(struct cpu_state *cpu, addr_t store_addr, unsigned long *code_ptr) {

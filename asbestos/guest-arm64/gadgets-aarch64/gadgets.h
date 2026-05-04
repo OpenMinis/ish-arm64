@@ -77,6 +77,19 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
     ldr x8, [_pc, \pop*8]!
     add _pc, _pc, 8
 .endif
+#ifdef ISH_GADGET_PROFILE
+    // Profile: append next-gadget pointer to a ring buffer indexed by g_profile_idx.
+    // Single-threaded JIT path, no atomic needed. Caller must ensure x9-x12 free
+    // (gret runs in callee-saved frame state at gadget boundary).
+    adrp x9, NAME(g_profile_idx)@PAGE
+    ldr  x10, [x9, NAME(g_profile_idx)@PAGEOFF]
+    adrp x11, NAME(g_profile_buf)@PAGE
+    add  x11, x11, NAME(g_profile_buf)@PAGEOFF
+    and  x12, x10, #0xffff           // ring index = idx & 65535
+    str  x8, [x11, x12, lsl #3]
+    add  x10, x10, #1
+    str  x10, [x9, NAME(g_profile_idx)@PAGEOFF]
+#endif
     br x8
 .endm
 

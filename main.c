@@ -117,7 +117,125 @@ void restore_termios(void) {
         tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
 }
 
+#ifdef ISH_GADGET_PROFILE
+extern uint64_t g_profile_buf[65536];
+extern uint64_t g_profile_idx;
+#include <dlfcn.h>
+
+// atexit-installed dumper: bucket the ring-buffer entries by symbol address,
+// look up each via dladdr, print top-20 with name + count + percentage.
+// Also reports the most common consecutive (gadget_a, gadget_b) pairs.
+static const char *resolve_sym(uint64_t addr) {
+    Dl_info info;
+    if (dladdr((void *)addr, &info) && info.dli_sname)
+        return info.dli_sname;
+    return "?";
+}
+
+void dump_gadget_profile(void) {
+    uint64_t total_writes = g_profile_idx;
+    uint64_t samples = total_writes < 65536 ? total_writes : 65536;
+    if (samples == 0) {
+        fprintf(stderr, "[gadget-prof] no samples collected\n");
+        return;
+    }
+
+    typedef struct { uint64_t addr; uint64_t count; } slot_t;
+    enum { MAX_DISTINCT = 4096 };
+    slot_t *slots = calloc(MAX_DISTINCT, sizeof(slot_t));
+    if (!slots) return;
+    uint64_t distinct = 0;
+
+    for (uint64_t i = 0; i < samples; i++) {
+        uint64_t a = g_profile_buf[i];
+        if (a == 0) continue;
+        uint64_t j;
+        for (j = 0; j < distinct; j++)
+            if (slots[j].addr == a) { slots[j].count++; break; }
+        if (j == distinct && distinct < MAX_DISTINCT) {
+            slots[distinct].addr = a;
+            slots[distinct].count = 1;
+            distinct++;
+        }
+    }
+
+    int n_top = distinct < 20 ? (int)distinct : 20;
+    fprintf(stderr, "[gadget-prof] %llu total dispatches, %llu samples, %llu distinct gadgets\n",
+            (unsigned long long)total_writes,
+            (unsigned long long)samples,
+            (unsigned long long)distinct);
+    fprintf(stderr, "[gadget-prof] top %d singles:\n", n_top);
+    for (int rank = 0; rank < n_top; rank++) {
+        uint64_t best_count = 0;
+        uint64_t best_idx = 0;
+        for (uint64_t j = 0; j < distinct; j++) {
+            if (slots[j].count > best_count) {
+                best_count = slots[j].count;
+                best_idx = j;
+            }
+        }
+        if (best_count == 0) break;
+        double pct = 100.0 * (double)best_count / (double)samples;
+        fprintf(stderr, "[gadget-prof]  %2d. %-40s %8llu  %5.2f%%\n",
+                rank + 1, resolve_sym(slots[best_idx].addr),
+                (unsigned long long)best_count, pct);
+        slots[best_idx].count = 0;
+    }
+
+    // Pair statistics: (a,b) consecutive-dispatch counts. Linear-probe hash table.
+    typedef struct { uint64_t a, b, count; } pair_t;
+    enum { PAIR_TBL = 16384 };
+    pair_t *pairs = calloc(PAIR_TBL, sizeof(pair_t));
+    if (!pairs) { free(slots); return; }
+    uint64_t pair_distinct = 0;
+    for (uint64_t i = 0; i + 1 < samples; i++) {
+        uint64_t a = g_profile_buf[i], b = g_profile_buf[i + 1];
+        if (a == 0 || b == 0) continue;
+        uint64_t h = (a * 0x9e3779b97f4a7c15ULL) ^ ((b * 0xbf58476d1ce4e5b9ULL) >> 17);
+        h &= (PAIR_TBL - 1);
+        for (int probe = 0; probe < PAIR_TBL; probe++) {
+            uint64_t k = (h + probe) & (PAIR_TBL - 1);
+            if (pairs[k].count == 0) {
+                pairs[k].a = a; pairs[k].b = b; pairs[k].count = 1;
+                pair_distinct++;
+                break;
+            }
+            if (pairs[k].a == a && pairs[k].b == b) {
+                pairs[k].count++;
+                break;
+            }
+        }
+    }
+    fprintf(stderr, "[gadget-prof] %llu distinct pairs; top 20:\n",
+            (unsigned long long)pair_distinct);
+    for (int rank = 0; rank < 20; rank++) {
+        uint64_t best_count = 0;
+        uint64_t best_idx = 0;
+        for (uint64_t j = 0; j < PAIR_TBL; j++) {
+            if (pairs[j].count > best_count) {
+                best_count = pairs[j].count;
+                best_idx = j;
+            }
+        }
+        if (best_count == 0) break;
+        double pct = 100.0 * (double)best_count / (double)samples;
+        char ab[200];
+        snprintf(ab, sizeof(ab), "%s + %s",
+                 resolve_sym(pairs[best_idx].a),
+                 resolve_sym(pairs[best_idx].b));
+        fprintf(stderr, "[gadget-prof]  P%2d. %-72s %8llu  %5.2f%%\n",
+                rank + 1, ab, (unsigned long long)best_count, pct);
+        pairs[best_idx].count = 0;
+    }
+    free(pairs);
+    free(slots);
+}
+#endif
+
 int main(int argc, char *const argv[]) {
+#ifdef ISH_GADGET_PROFILE
+    atexit(dump_gadget_profile);
+#endif
     // Save host terminal settings so we can restore on exit
     if (isatty(STDIN_FILENO)) {
         if (tcgetattr(STDIN_FILENO, &saved_termios) == 0) {

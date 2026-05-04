@@ -187,6 +187,14 @@ noreturn void do_exit(int status) {
 }
 
 noreturn void do_exit_group(int status) {
+#ifdef ISH_GADGET_PROFILE
+    extern void dump_gadget_profile(void);
+    static int dumped = 0;
+    if (!dumped && current && current->pid == 1) {
+        dumped = 1;
+        dump_gadget_profile();
+    }
+#endif
     // Leaked thread woke up after group already exited — bail silently.
     if (current->exiting) {
         current = NULL;

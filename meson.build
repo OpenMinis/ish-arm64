@@ -31,6 +31,11 @@ endif
 
 add_project_arguments('-Wno-switch', language: 'c')
 
+# ISH_GADGET_PROFILE: enable gadget call ring-buffer + atexit dump.
+# Activate via:  meson setup ... -Dc_args=-DISH_GADGET_PROFILE
+#                or env CFLAGS=-DISH_GADGET_PROFILE meson setup ...
+# Adds ~9 instructions per gret (ring-buffer write); not for production builds.
+
 includes = [include_directories('.')]
 
 threads = dependency('threads')
