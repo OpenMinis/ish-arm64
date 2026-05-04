@@ -115,6 +115,36 @@ extern void gadget_adds_reg_64_nshift(void);
 extern void gadget_subs_reg_64_nshift(void);
 extern void gadget_add_reg_64_nshift(void);
 extern void gadget_sub_reg_64_nshift(void);
+extern void gadget_and_reg_64_nshift(void);
+extern void gadget_orr_reg_64_nshift(void);
+extern void gadget_eor_reg_64_nshift(void);
+extern void gadget_add_reg_32_nshift(void);
+extern void gadget_sub_reg_32_nshift(void);
+extern void gadget_and_reg_32_nshift(void);
+extern void gadget_orr_reg_32_nshift(void);
+extern void gadget_eor_reg_32_nshift(void);
+extern void gadget_lsl_imm_32(void);
+extern void gadget_lsl_imm_64(void);
+extern void gadget_lsr_imm_32(void);
+extern void gadget_lsr_imm_64(void);
+extern void gadget_asr_imm_32(void);
+extern void gadget_asr_imm_64(void);
+extern void gadget_adds_reg_32_nshift(void);
+extern void gadget_subs_reg_32_nshift(void);
+extern void gadget_and_imm_64_simple(void);
+extern void gadget_and_imm_32_simple(void);
+extern void gadget_ands_imm_64(void);
+extern void gadget_ands_imm_32(void);
+extern void gadget_load8_imm_signed_fast(void);
+extern void gadget_load16_imm_signed_fast(void);
+extern void gadget_load32_imm_signed_fast(void);
+extern void gadget_load64_imm_signed_fast(void);
+extern void gadget_store8_imm_signed_fast(void);
+extern void gadget_store16_imm_signed_fast(void);
+extern void gadget_store32_imm_signed_fast(void);
+extern void gadget_store64_imm_signed_fast(void);
+extern void gadget_load64_reg_fast(void);
+extern void gadget_load32_reg_fast(void);
 
 // Per-condition bcond gadgets
 extern void gadget_bcond_eq(void);
@@ -1405,6 +1435,25 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
+        // Fast path: AND immediate, no flag setting (opc=0), rn != 31, rd != 31.
+        // Hot for PyObject tag/flag bit masking. ~30 → ~10 inline insns.
+        if (opc == 0 && rn != 31 && rd != 31) {
+            gen(state, (unsigned long)(sf ? gadget_and_imm_64_simple : gadget_and_imm_32_simple));
+            gen(state, rd | ((uint64_t)rn << 8));
+            gen(state, imm);
+            return 1;
+        }
+
+        // Fast path: ANDS immediate (opc=3, flag-setting), rn != 31.
+        // rd=31 (TST instruction) is allowed and handled inside the gadget.
+        // Common in CPython tag-bit tests: `if (Py_TYPE(o)->tp_flags & Py_TPFLAGS_X)`.
+        if (opc == 3 && rn != 31) {
+            gen(state, (unsigned long)(sf ? gadget_ands_imm_64 : gadget_ands_imm_32));
+            gen(state, rd | ((uint64_t)rn << 8));
+            gen(state, imm);
+            return 1;
+        }
+
         void *gadget;
         switch (opc) {
             case 0: gadget = gadget_and_imm; break;  // AND
@@ -1467,6 +1516,38 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         uint64_t fused_param = immr | (imms << 8) | ((uint64_t)sf << 16)
                               | ((uint64_t)rn << 20) | ((uint64_t)rd << 28);
         bool can_fuse = (rn != 31 && rd != 31 && opc != 1);
+
+        // Recognize LSL/LSR/ASR immediate aliases of UBFM/SBFM and emit a
+        // single-instruction gadget instead of the generic bitfield extractor.
+        // ARM ARM aliases:
+        //   LSL Rd, Rn, #s : UBFM imms = size-1-s, immr = (-s) mod size, imms<immr-1
+        //   LSR Rd, Rn, #s : UBFM imms = size-1, immr = s
+        //   ASR Rd, Rn, #s : SBFM imms = size-1, immr = s
+        if (can_fuse) {
+            uint32_t size = sf ? 64 : 32;
+            uint32_t shift_pkt = ((uint64_t)rd) | ((uint64_t)rn << 8);
+            // LSR / ASR: imms == size-1
+            if (imms == size - 1) {
+                if (opc == 2) {  // UBFM → LSR
+                    gen(state, (unsigned long)(sf ? gadget_lsr_imm_64 : gadget_lsr_imm_32));
+                    gen(state, shift_pkt | ((uint64_t)immr << 16));
+                    return 1;
+                }
+                if (opc == 0) {  // SBFM → ASR
+                    gen(state, (unsigned long)(sf ? gadget_asr_imm_64 : gadget_asr_imm_32));
+                    gen(state, shift_pkt | ((uint64_t)immr << 16));
+                    return 1;
+                }
+            }
+            // LSL #s alias: UBFM with immr = size-s, imms = size-1-s, i.e. immr == imms+1
+            // Excludes shift==0 (which would have immr=0,imms=-1 — never encoded).
+            if (opc == 2 && immr == imms + 1 && immr <= size - 1) {
+                uint32_t shift = size - immr;
+                gen(state, (unsigned long)(sf ? gadget_lsl_imm_64 : gadget_lsl_imm_32));
+                gen(state, shift_pkt | ((uint64_t)shift << 16));
+                return 1;
+            }
+        }
 
         // Handle SBFM (opc=0) and UBFM (opc=2) with fused fast path
         if (opc == 0) {
@@ -2255,6 +2336,19 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
 
         if (use_fused_reg) {
             uint64_t fused_param = rt | ((uint64_t)rn << 8) | ((uint64_t)rm << 16) | ((uint64_t)shift << 24);
+            // Fast path: 32/64-bit non-sign-extending loads, all regs != 31.
+            // Saves ~6 inline branches by skipping XZR/SP checks.
+            bool fast_load = is_load && !sign_extend && rn != 31 && rm != 31 && rt != 31;
+            if (fast_load && size == 3) {
+                gen(state, (unsigned long) gadget_load64_reg_fast);
+                gen(state, fused_param);
+                return 1;
+            }
+            if (fast_load && size == 2) {
+                gen(state, (unsigned long) gadget_load32_reg_fast);
+                gen(state, fused_param);
+                return 1;
+            }
 
             if (is_load) {
                 void *gadget;
@@ -2569,6 +2663,39 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         bool is_pre_indexed = (mode == 3);
         bool is_unscaled = (mode == 0);  // STUR/LDUR - offset applied, no writeback
         bool is_load = (opc == 1) || (opc == 2) || (opc == 3);
+        bool sign_extend_byte_or_half = (opc >= 2) && size < 2;
+
+        // Fast path: unscaled imm form (LDUR/STUR), no writeback, no XZR/SP,
+        // no sign-extend on byte/halfword. Emits a single fused gadget that
+        // computes address + does the load/store + writes the destination,
+        // skipping the dispatch overhead of calc_addr_imm + load/store + store_reg.
+        if (is_unscaled && rn != 31 && rt != 31 && !sign_extend_byte_or_half) {
+            uint64_t param = rt | ((uint64_t)rn << 8) | ((uint64_t)((int64_t)(int32_t)imm9 & 0xffffffffffffULL) << 16);
+            void *g = NULL;
+            if (is_load) {
+                bool sign_extend_word = (opc == 2) && size == 2;
+                if (!sign_extend_word) {
+                    switch (size) {
+                        case 0: g = gadget_load8_imm_signed_fast;  break;
+                        case 1: g = gadget_load16_imm_signed_fast; break;
+                        case 2: g = gadget_load32_imm_signed_fast; break;
+                        case 3: g = gadget_load64_imm_signed_fast; break;
+                    }
+                }
+            } else {
+                switch (size) {
+                    case 0: g = gadget_store8_imm_signed_fast;  break;
+                    case 1: g = gadget_store16_imm_signed_fast; break;
+                    case 2: g = gadget_store32_imm_signed_fast; break;
+                    case 3: g = gadget_store64_imm_signed_fast; break;
+                }
+            }
+            if (g != NULL) {
+                gen(state, (unsigned long) g);
+                gen(state, param);
+                return 1;
+            }
+        }
 
         // Calculate address:
         // - mode=0 (unscaled): address = base + offset (no writeback)
@@ -3194,6 +3321,28 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
             }
         }
 
+        // Fast path: AND/ORR/EOR (no flags, no inversion, no XZR/SP).
+        // Covers the bulk of CPython interpreter bit ops + CRC inner loops.
+        if (N == 0 && opc != 3 && rn != 31 && rm != 31 && rd != 31) {
+            void *fast = NULL;
+            if (sf) {
+                switch (opc) {
+                    case 0: fast = gadget_and_reg_64_nshift; break;
+                    case 1: fast = gadget_orr_reg_64_nshift; break;
+                    case 2: fast = gadget_eor_reg_64_nshift; break;
+                }
+            } else {
+                switch (opc) {
+                    case 0: fast = gadget_and_reg_32_nshift; break;
+                    case 1: fast = gadget_orr_reg_32_nshift; break;
+                    case 2: fast = gadget_eor_reg_32_nshift; break;
+                }
+            }
+            gen(state, (unsigned long) fast);
+            gen(state, rd | ((uint64_t)rn << 8) | ((uint64_t)rm << 16));
+            return 1;
+        }
+
         void *gadget;
         switch (opc) {
             case 0: gadget = N ? gadget_and_reg : gadget_and_reg; break;  // AND/BIC
@@ -3249,6 +3398,23 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         }
         if (can_spec_reg && !S && rd != 31) {
             gen(state, (unsigned long)(op ? gadget_sub_reg_64_nshift : gadget_add_reg_64_nshift));
+            gen(state, rd | (rn << 8) | (rm << 16));
+            return 1;
+        }
+
+        // 32-bit ADD/SUB reg fast path (no shift, no flags, no XZR/SP).
+        // Hot in CRC inner loops, byte-pointer arithmetic, hash mixing.
+        if (!sf && imm6 == 0 && shift == 0 && !S && rn != 31 && rm != 31 && rd != 31) {
+            gen(state, (unsigned long)(op ? gadget_sub_reg_32_nshift : gadget_add_reg_32_nshift));
+            gen(state, rd | (rn << 8) | (rm << 16));
+            return 1;
+        }
+
+        // 32-bit ADDS/SUBS reg fast path (flag-setting, no shift, no XZR/SP).
+        // Hot in Python comparisons, CPython refcount post-decrement.
+        // rd=31 (CMP/CMN) allowed — gadget handles XZR via cmp.
+        if (!sf && imm6 == 0 && shift == 0 && S && rn != 31 && rm != 31) {
+            gen(state, (unsigned long)(op ? gadget_subs_reg_32_nshift : gadget_adds_reg_32_nshift));
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }

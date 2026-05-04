@@ -48,6 +48,211 @@
 
     gret
 
+// Fast path: calculate address from base reg + immediate, no SP, no writeback save.
+// Condition: rn != 31. Used when the consumer load/store does not need the
+// guest address preserved across read_prep (i.e., no pre-indexed LDP/STP).
+// Param: rn<<0 | offset<<8 (signed, 56 bits)
+.gadget calc_addr_imm_fast
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f          // rn (caller guarantees != 31)
+    asr x10, x8, #8            // signed offset
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3] // base
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    gret
+
+// LDR Xt, [Xn, Xm{, LSL #shift}] — fast path: rn != 31, rm != 31, rt != 31.
+// Param: rt | rn<<8 | rm<<16 | shift<<24 (shift in 0..3 bytes; we don't fold size)
+.gadget load64_reg_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #8, #5
+    ubfx x10, x22, #16, #5
+    ubfx x12, x22, #24, #3
+    add x11, _cpu, #CPU_x0
+    ldr x14, [x11, x9, lsl #3]
+    ldr x15, [x11, x10, lsl #3]
+    lsl x15, x15, x12
+    add _addr, x14, x15
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    read_prep 64, load64_reg_fast_1
+    ldr _tmp, [_addr]
+    and x8, x22, #0x1f
+    str _tmp, [x11, x8, lsl #3]
+    gret
+    read_bullshit 64, load64_reg_fast_1
+
+.gadget load32_reg_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #8, #5
+    ubfx x10, x22, #16, #5
+    ubfx x12, x22, #24, #3
+    add x11, _cpu, #CPU_x0
+    ldr x14, [x11, x9, lsl #3]
+    ldr x15, [x11, x10, lsl #3]
+    lsl x15, x15, x12
+    add _addr, x14, x15
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    read_prep 32, load32_reg_fast_1
+    ldr w0, [_addr]
+    and x8, x22, #0x1f
+    str x0, [x11, x8, lsl #3]
+    gret
+    read_bullshit 32, load32_reg_fast_1
+
+// LDUR Wd, [Xn, #imm9] — unscaled, signed 9-bit offset. Fused load 1/2/4/8 bytes.
+// Condition: rn != 31, rt != 31.
+// Param: rt<<0 | rn<<8 | offset<<16 (signed, 48 bits)
+.gadget load8_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16          // signed offset (sign-extended)
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    read_prep 8, load8_imm_signed_fast_1
+    ldrb w0, [_addr]
+    and x8, x22, #0x1f
+    str x0, [x11, x8, lsl #3]
+    gret
+    read_bullshit 8, load8_imm_signed_fast_1
+
+.gadget load16_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    read_prep 16, load16_imm_signed_fast_1
+    ldrh w0, [_addr]
+    and x8, x22, #0x1f
+    str x0, [x11, x8, lsl #3]
+    gret
+    read_bullshit 16, load16_imm_signed_fast_1
+
+.gadget load32_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    read_prep 32, load32_imm_signed_fast_1
+    ldr w0, [_addr]
+    and x8, x22, #0x1f
+    str x0, [x11, x8, lsl #3]
+    gret
+    read_bullshit 32, load32_imm_signed_fast_1
+
+.gadget load64_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    read_prep 64, load64_imm_signed_fast_1
+    ldr _tmp, [_addr]
+    and x8, x22, #0x1f
+    str _tmp, [x11, x8, lsl #3]
+    gret
+    read_bullshit 64, load64_imm_signed_fast_1
+
+// STUR variants
+.gadget store8_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    and x8, x22, #0x1f
+    add x11, _cpu, #CPU_x0
+    ldr x23, [x11, x8, lsl #3]
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    write_prep 8, store8_imm_signed_fast_1
+    strb w23, [_addr]
+    write_done 8, store8_imm_signed_fast_1
+    mov _addr, x24
+    gret
+    write_bullshit 8, store8_imm_signed_fast_1
+
+.gadget store16_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    and x8, x22, #0x1f
+    add x11, _cpu, #CPU_x0
+    ldr x23, [x11, x8, lsl #3]
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    write_prep 16, store16_imm_signed_fast_1
+    strh w23, [_addr]
+    write_done 16, store16_imm_signed_fast_1
+    mov _addr, x24
+    gret
+    write_bullshit 16, store16_imm_signed_fast_1
+
+.gadget store32_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    and x8, x22, #0x1f
+    add x11, _cpu, #CPU_x0
+    ldr x23, [x11, x8, lsl #3]
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    write_prep 32, store32_imm_signed_fast_1
+    str w23, [_addr]
+    write_done 32, store32_imm_signed_fast_1
+    mov _addr, x24
+    gret
+    write_bullshit 32, store32_imm_signed_fast_1
+
+.gadget store64_imm_signed_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    and x8, x22, #0x1f
+    add x11, _cpu, #CPU_x0
+    ldr x23, [x11, x8, lsl #3]
+    ubfx x9, x22, #8, #5
+    asr x10, x22, #16
+    ldr x12, [x11, x9, lsl #3]
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr
+    write_prep 64, store64_imm_signed_fast_1
+    str x23, [_addr]
+    write_done 64, store64_imm_signed_fast_1
+    mov _addr, x24
+    gret
+    write_bullshit 64, store64_imm_signed_fast_1
+
 // Calculate address for PC-relative literal loads
 // Code stream: [gadget addr][64-bit target address]
 // Used for LDR (literal) instructions

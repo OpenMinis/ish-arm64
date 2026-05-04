@@ -14454,6 +14454,303 @@ make_fp2_scalar fabd, fabd, fabd
     str x17, [x14, x9, lsl #3]  // Rd
     gret
 
+// AND (register, 64-bit, no flags, no shift, no inversion, no XZR/SP)
+// Condition: sf=1, S=0, imm6=0, shift=0, N=0, rn!=31, rm!=31, rd!=31
+// Param: rd | rn<<8 | rm<<16
+.gadget and_reg_64_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    and x17, x15, x16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+// ORR (register, 64-bit, no flags, no shift, no inversion, no XZR/SP)
+// Condition: sf=1, S=0, imm6=0, shift=0, N=0, rn!=31, rm!=31, rd!=31
+// Param: rd | rn<<8 | rm<<16
+.gadget orr_reg_64_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    orr x17, x15, x16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+// EOR (register, 64-bit, no flags, no shift, no inversion, no XZR/SP)
+// Condition: sf=1, S=0, imm6=0, shift=0, N=0, rn!=31, rm!=31, rd!=31
+// Param: rd | rn<<8 | rm<<16
+.gadget eor_reg_64_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    eor x17, x15, x16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+// ADD/SUB/AND/ORR/EOR — 32-bit fast paths.
+// Condition: sf=0, S=0, imm6=0, shift=0, N=0, rn!=31, rm!=31, rd!=31.
+// Each gadget zero-extends the result before storing (w-reg ops do this for free).
+
+.gadget add_reg_32_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    add w17, w15, w16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget sub_reg_32_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    sub w17, w15, w16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget and_reg_32_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    and w17, w15, w16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget orr_reg_32_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    orr w17, w15, w16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget eor_reg_32_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    eor w17, w15, w16
+    str x17, [x14, x9, lsl #3]
+    gret
+
+/*
+ * LSL/LSR/ASR immediate — UBFM/SBFM aliases.
+ * gen.c emits these when it can decode the alias from immr/imms.
+ * Param: rd | rn<<8 | shift<<16  (shift in 0..63)
+ */
+.gadget lsl_imm_32
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #6        // shift
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    lsl w17, w15, w11
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget lsl_imm_64
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #6
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    lsl x17, x15, x11
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget lsr_imm_32
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #6
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    lsr w17, w15, w11
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget lsr_imm_64
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #6
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    lsr x17, x15, x11
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget asr_imm_32
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #6
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    asr w17, w15, w11
+    str x17, [x14, x9, lsl #3]
+    gret
+
+.gadget asr_imm_64
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #6
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    asr x17, x15, x11
+    str x17, [x14, x9, lsl #3]
+    gret
+
+// ADDS (register, 32-bit, flag-setting, no shift, no XZR/SP).
+// Condition: sf=0, S=1, imm6=0, shift=0, rn!=31, rm!=31.
+// Param: rd | rn<<8 | rm<<16 (rd=31 allowed for CMN).
+.gadget adds_reg_32_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    adds w3, w15, w16
+    store_flags
+    cmp x9, #31
+    b.eq 1f
+    str x3, [x14, x9, lsl #3]   // w-form already zero-extended
+1:  gret
+
+// SUBS (register, 32-bit, flag-setting, no shift, no XZR/SP).
+// Same conditions as adds_reg_32_nshift.
+.gadget subs_reg_32_nshift
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x10, lsl #3]
+    ldr x16, [x14, x11, lsl #3]
+    subs w3, w15, w16
+    store_flags
+    cmp x9, #31
+    b.eq 1f
+    str x3, [x14, x9, lsl #3]
+1:  gret
+
+// AND (immediate, 64-bit, no flags, no XZR/SP).
+// Condition: sf=1, S=0, rn!=31, rd!=31.
+// Param: rd | rn<<8.  Second slot: imm64.
+.gadget and_imm_64_simple
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    ldr x9, [_pc]               // imm64
+    add _pc, _pc, #8
+    and x10, x8, #0x1f          // rd
+    ubfx x11, x8, #8, #5        // rn
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x11, lsl #3] // Rn
+    and x17, x15, x9
+    str x17, [x14, x10, lsl #3]
+    gret
+
+// AND (immediate, 32-bit, no flags, no XZR/SP).
+// Condition: sf=0, S=0, rn!=31, rd!=31.
+.gadget and_imm_32_simple
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    ldr x9, [_pc]
+    add _pc, _pc, #8
+    and x10, x8, #0x1f
+    ubfx x11, x8, #8, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x11, lsl #3]
+    and w17, w15, w9            // w-form auto zero-extends
+    str x17, [x14, x10, lsl #3]
+    gret
+
+// ANDS immediate, 64-bit, flag-setting; rn != 31 (rd=31 = TST allowed).
+// Used heavily in CPython tag/flag tests like `if (PyObject_TypeCheck(...))`.
+.gadget ands_imm_64
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    ldr x9, [_pc]
+    add _pc, _pc, #8
+    and x10, x8, #0x1f          // rd
+    ubfx x11, x8, #8, #5        // rn (caller guarantees != 31)
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x11, lsl #3]
+    ands x16, x15, x9
+    store_flags
+    cmp x10, #31
+    b.eq 1f
+    str x16, [x14, x10, lsl #3]
+1:  gret
+
+// ANDS immediate, 32-bit, flag-setting; rn != 31.
+.gadget ands_imm_32
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    ldr x9, [_pc]
+    add _pc, _pc, #8
+    and x10, x8, #0x1f
+    ubfx x11, x8, #8, #5
+    add x14, _cpu, #CPU_x0
+    ldr x15, [x14, x11, lsl #3]
+    ands w16, w15, w9
+    store_flags
+    cmp x10, #31
+    b.eq 1f
+    str x16, [x14, x10, lsl #3]   // w-form auto zero-extends
+1:  gret
+
 /*
  * Three-same NEON ops using native instructions (MUL, PMUL, MLA, MLS,
  * SMAX, UMAX, SMIN, UMIN).
