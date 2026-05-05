@@ -388,16 +388,21 @@ COMPAT_TESTS=(
     "Lang|go compile|echo 'package main;func main(){}' > /tmp/_go.go && go tool compile -o /tmp/_go.o /tmp/_go.go 2>/dev/null && rm -f /tmp/_go.go /tmp/_go.o"
     "Lang|clang|clang --version >/dev/null 2>&1"
     # 8. Network Tools (14)
+    # ping/nc/nslookup are now exercised end-to-end (real syscalls), not just
+    # checked for --help/--version, so they actually exercise iSH's socket layer.
     "Network|curl|curl --version >/dev/null 2>&1"
     "Network|wget|wget --version >/dev/null 2>&1"
     "Network|ssh|ssh -V 2>&1 | grep -qi openssh"
     "Network|scp|scp 2>&1 | head -1 >/dev/null; true"
-    "Network|ping|ping -c 1 127.0.0.1 >/dev/null 2>&1"
+    "Network|ping localhost|ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1"
+    "Network|ping 4-pkt|ping -c 4 -W 2 127.0.0.1 >/dev/null 2>&1"
     "Network|netstat|netstat -h 2>&1 | head -1 >/dev/null; true"
     "Network|ss|ss -h 2>&1 | head -1 >/dev/null; true"
-    "Network|nslookup|nslookup localhost 2>&1 | head -1 >/dev/null; true"
+    "Network|nslookup localhost|nslookup -timeout=2 localhost 127.0.0.1 2>&1 | grep -q '127.0.0.1\\|Address'"
+    "Network|nslookup 8.8.8.8|nslookup -timeout=2 8.8.8.8 2>&1 | grep -qi 'name\\|server'"
     "Network|dig|dig -v 2>&1 | head -1 >/dev/null; true"
-    "Network|nc|nc -h 2>&1 | head -1 >/dev/null; true"
+    "Network|nc -l + nc->127.0.0.1|(nc -l -p 19999 -q 1 >/tmp/_nc_in 2>/dev/null & sleep 0.2; echo hello | nc -w 1 127.0.0.1 19999 >/dev/null 2>&1); wait 2>/dev/null; grep -q hello /tmp/_nc_in 2>/dev/null; rm -f /tmp/_nc_in"
+    "Network|nc port-scan|nc -z -w 1 127.0.0.1 1 2>/dev/null; [ \$? -ne 0 ]"
     "Network|socat|socat -V >/dev/null 2>&1"
     "Network|ip|ip link 2>&1 | head -1 >/dev/null; true"
     "Network|ifconfig|ifconfig -a 2>&1 | head -1 >/dev/null; true"
@@ -471,6 +476,26 @@ COMPAT_TESTS=(
     "Signal|kill|sh -c 'sleep 99 & kill \$! 2>/dev/null; wait \$! 2>/dev/null; echo ok'"
     "Signal|wait|sh -c 'true & wait \$!'"
     "Signal|bg job|sh -c 'sleep 0 & wait'"
+    # 19. ClawHub skill dependencies — smoke tests (15)
+    # Tools required by top-starred ClawHub agent skills. Browser (Playwright)
+    # and neural-net-heavy (Whisper, nano-pdf, ComPDFKit) skills are excluded.
+    # Cloud-auth CLIs are smoke-tested via --help; pure-local tools get real
+    # invocations.
+    "Skill|yt-dlp (youtube-watcher 287★)|yt-dlp --version >/dev/null 2>&1"
+    "Skill|ffmpeg (video-frames 115★)|ffmpeg -version >/dev/null 2>&1"
+    "Skill|jq (trello 140★)|echo '{\"a\":1}' | jq .a >/dev/null 2>&1"
+    "Skill|ImageMagick convert (imagemagick)|convert -version >/dev/null 2>&1"
+    "Skill|ImageMagick magick (imagemagick)|magick -version >/dev/null 2>&1"
+    "Skill|ImageMagick smoke (vision/image-resize)|convert -size 16x16 xc:white /tmp/_im.png && rm /tmp/_im.png"
+    "Skill|matplotlib (chart-mpl/python-dataviz)|python3 -c 'import matplotlib; matplotlib.use(\"Agg\"); import matplotlib.pyplot as p; p.plot([1,2,3]); p.savefig(\"/tmp/_mpl.png\"); import os; os.remove(\"/tmp/_mpl.png\")'"
+    "Skill|pandas (pandas-skill)|python3 -c 'import pandas as pd; print(pd.DataFrame({\"a\":[1,2,3]}).sum().a)' >/dev/null 2>&1"
+    "Skill|numpy (numpy)|python3 -c 'import numpy as np; print(np.zeros(5).sum())' >/dev/null 2>&1"
+    "Skill|akshare (akshare-stock 76★)|python3 -c 'import akshare' 2>/dev/null"
+    "Skill|khal (caldav-calendar 216★)|khal --help 2>&1 | head -1 >/dev/null"
+    "Skill|vdirsyncer (caldav-calendar 216★)|vdirsyncer --help 2>&1 | head -1 >/dev/null"
+    "Skill|mcporter (mcporter 184★)|npx -y mcporter --help 2>&1 | head -1 >/dev/null"
+    "Skill|meitu-cli (meitu-skills 119★)|npx -y meitu-cli@latest --help 2>&1 | head -1 >/dev/null"
+    "Skill|node-edge-tts (edge-tts 29★)|npx -y node-edge-tts 2>&1 | head -1 | grep -q Usage"
 )
 
 # Binary name → Alpine package mapping for auto-install
@@ -563,13 +588,18 @@ suite_compat() {
         n=$((n+1))
         IFS='|' read -r cat name cmd <<< "$line"
 
+        # Skill tests that exec `npx -y <pkg>` need a longer budget to spin
+        # up Node + load the package; everything else gets the 15s default.
+        local t=15
+        case "$cmd" in *"npx -y"*) t=60 ;; esac
+
         local xr ar
-        if timeout 15 "$ISH_X86" -f "$FAKEFS_X86" /bin/sh -c "$cmd" >/dev/null 2>&1; then
+        if timeout "$t" "$ISH_X86" -f "$FAKEFS_X86" /bin/sh -c "$cmd" >/dev/null 2>&1; then
             xr="PASS"; x86p=$((x86p+1))
         else
             xr="FAIL"; x86f=$((x86f+1))
         fi
-        if timeout 15 "$ISH_ARM64" -f "$FAKEFS_ARM64" /bin/sh -c "$cmd" >/dev/null 2>&1; then
+        if timeout "$t" "$ISH_ARM64" -f "$FAKEFS_ARM64" /bin/sh -c "$cmd" >/dev/null 2>&1; then
             ar="PASS"; armp=$((armp+1))
         else
             ar="FAIL"; armf=$((armf+1))

@@ -287,6 +287,26 @@ syscall_t syscall_table[] = {
     [289] = (syscall_t) syscall_stub, // pkey_alloc
     [290] = (syscall_t) syscall_stub, // pkey_free
     [291] = (syscall_t) sys_statx,
+
+    // Linux 5.x+ syscalls. Most are stubbed and let glibc/musl/Node fall back
+    // to the older ABI; the few that we actually implement unblock specific
+    // CLIs that hit hard-error paths instead of falling back.
+    [292 ... 423] = (syscall_t) syscall_silent_stub,    // io_pgetevents/rseq/etc.
+    [424] = (syscall_t) syscall_stub, // pidfd_send_signal
+    [425] = (syscall_t) syscall_silent_stub, // io_uring_setup (Node fallback to epoll)
+    [426] = (syscall_t) syscall_silent_stub, // io_uring_enter
+    [427] = (syscall_t) syscall_silent_stub, // io_uring_register
+    [428 ... 433] = (syscall_t) syscall_stub, // open_tree/move_mount/fs* mount API
+    [434] = (syscall_t) syscall_stub, // pidfd_open
+    [435] = (syscall_t) syscall_stub, // clone3 (musl falls back to clone)
+    [436] = (syscall_t) sys_close_range,    // *** unblocks Anthropic claude-cli ***
+    [437] = (syscall_t) syscall_stub, // openat2 (glibc falls back to openat)
+    [438] = (syscall_t) syscall_stub, // pidfd_getfd
+    [439] = (syscall_t) sys_faccessat,      // *** unblocks Google gemini-cli (faccessat2 reuses sys_faccessat) ***
+    [440] = (syscall_t) syscall_silent_stub, // process_madvise
+    [441] = (syscall_t) syscall_silent_stub, // epoll_pwait2 (libuv falls back)
+    [442 ... 448] = (syscall_t) syscall_stub, // mount_setattr/quotactl_fd/landlock/memfd_secret/process_mrelease
+    [449] = (syscall_t) syscall_stub, // futex_waitv
 };
 
 #define NUM_SYSCALLS (sizeof(syscall_table) / sizeof(syscall_table[0]))
