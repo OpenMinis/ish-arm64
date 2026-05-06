@@ -242,6 +242,34 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     db_check_error(fs);
     sqlite3_finalize(statement);
 
+    // N18: Apple-friendly sqlite tuning. The fakefs db is read-mostly
+    // during normal use (writes happen for chmod / chown / mknod / new
+    // files). N17 signpost data showed 78K db_exec calls totaling
+    // 122ms = 8% of npm --version user CPU. Three knobs help on macOS:
+    //
+    //  - PRAGMA mmap_size: lets sqlite read pages directly through
+    //    mmap instead of read() syscalls. The OS's unified buffer
+    //    cache then serves repeated reads at memcpy speed.
+    //  - PRAGMA cache_size (negative => KB of in-process page cache):
+    //    sqlite default is 2 MB; bump to 64 MB so the working set fits.
+    //  - PRAGMA synchronous=NORMAL: WAL with NORMAL is durable across
+    //    process crashes (like FULL) but skips an fsync per commit,
+    //    cheap when fakefs writes are infrequent.
+    //  - PRAGMA temp_store=MEMORY: keeps sort/temp tables off disk.
+    static const char *tuning[] = {
+        "pragma mmap_size=268435456",   // 256 MB
+        "pragma cache_size=-65536",     // 64 MB in-process page cache
+        "pragma synchronous=NORMAL",
+        "pragma temp_store=MEMORY",
+    };
+    for (size_t ti = 0; ti < sizeof(tuning)/sizeof(tuning[0]); ti++) {
+        statement = db_prepare(fs, tuning[ti]);
+        db_check_error(fs);
+        sqlite3_step(statement);
+        db_check_error(fs);
+        sqlite3_finalize(statement);
+    }
+
 #if DEBUG_sql
     sqlite3_trace_v2(mount->db, SQLITE_TRACE_STMT, trace_callback, NULL);
 #endif
