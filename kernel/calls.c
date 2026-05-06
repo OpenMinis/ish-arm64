@@ -6,6 +6,7 @@
 #include "debug.h"
 #include "kernel/calls.h"
 #include "emu/interrupt.h"
+#include "util/signpost.h"
 #include "kernel/memory.h"
 #include "kernel/signal.h"
 #include "kernel/task.h"
@@ -50,6 +51,7 @@ __thread volatile int jit_crash_count = 0;
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
     if (interrupt == INT_SYSCALL) {
+        ISH_SIGNPOST_SCOPE_BEGIN(syscall, "syscall", _sc_spid);
 #if defined(GUEST_X86) || !defined(GUEST_ARM64)
         // x86: syscall number in eax, args in ebx, ecx, edx, esi, edi, ebp
         unsigned syscall_num = cpu->eax;
@@ -166,6 +168,7 @@ void handle_interrupt(int interrupt) {
         if (current->group->doing_group_exit)
             do_exit(current->group->group_exit_code);
 #endif
+        ISH_SIGNPOST_SCOPE_END(syscall, "syscall", _sc_spid);
     } else if (interrupt == INT_GPF) {
         if (ish_exec_trace())
             fprintf(stderr, "INT_GPF pid=%d pc=0x%llx fault=0x%llx write=%d\n",

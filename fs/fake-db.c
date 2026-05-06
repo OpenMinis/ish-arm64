@@ -5,6 +5,7 @@
 #include "debug.h"
 #include "misc.h"
 #include "fs/fake-db.h"
+#include "util/signpost.h"
 
 static void db_check_error(struct fakefs_db *fs) {
     int errcode = sqlite3_errcode(fs->db);
@@ -65,7 +66,10 @@ static sqlite3_stmt *db_prepare(struct fakefs_db *fs, const char *stmt) {
 }
 
 bool db_exec(struct fakefs_db *fs, sqlite3_stmt *stmt) {
-    return db_exec_retry(fs, stmt);
+    ISH_SIGNPOST_SCOPE_BEGIN(fs, "db_exec", _dbe_spid);
+    bool r = db_exec_retry(fs, stmt);
+    ISH_SIGNPOST_SCOPE_END(fs, "db_exec", _dbe_spid);
+    return r;
 }
 void db_reset(struct fakefs_db *fs, sqlite3_stmt *stmt) {
     db_reset_retry(fs, stmt);

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <signal.h>
 #include <execinfo.h>
+#include "util/signpost.h"
 #include <termios.h>
 #include <unistd.h>
 #include <mach/mach.h>
@@ -233,6 +234,7 @@ void dump_gadget_profile(void) {
 #endif
 
 int main(int argc, char *const argv[]) {
+    ish_signpost_init();
 #ifdef ISH_GADGET_PROFILE
     atexit(dump_gadget_profile);
 #endif

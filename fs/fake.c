@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <errno.h>
+#include "util/signpost.h"
 
 #include "debug.h"
 #include "kernel/errno.h"
@@ -463,6 +464,7 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
 }
 
 static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
+    ISH_SIGNPOST_SCOPE_BEGIN(fs, "fakefs_stat", _fs_spid);
     struct fakefs_db *fs = &mount->fakefs;
     db_begin_read(fs);
     struct ish_stat ishstat;
@@ -517,6 +519,7 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     fake_stat->uid = ishstat.uid;
     fake_stat->gid = ishstat.gid;
     fake_stat->rdev = ishstat.rdev;
+    ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
     return 0;
 }
 

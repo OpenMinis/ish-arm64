@@ -1,5 +1,6 @@
 #include "kernel/signal.h"
 #include "task.h"
+#include "util/signpost.h"
 #define _GNU_SOURCE
 #include <unistd.h>
 #include <fcntl.h>
@@ -658,6 +659,8 @@ static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, 
 }
 
 int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
+    ISH_SIGNPOST_SCOPE_BEGIN(exec, "execve", _exec_spid);
+    ISH_SIGNPOST_EVENT(exec, "execve_path", "path=%{public}s", file);
     // New program starts fresh — clear V8 abort-in-progress flag so the
     // fresh process's stderr isn't permanently muted from a prior abort.
     if (current && current->group)
@@ -736,6 +739,7 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         unlock(&pids_lock);
     }
 
+    ISH_SIGNPOST_SCOPE_END(exec, "execve", _exec_spid);
     return 0;
 }
 

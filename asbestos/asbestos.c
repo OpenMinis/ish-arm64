@@ -13,6 +13,7 @@
 #include "emu/tlb.h"
 #include "kernel/memory.h"
 #include "util/list.h"
+#include "util/signpost.h"
 
 // Thread-local recovery state for JIT crash handling.
 // When a host SIGSEGV occurs inside JIT code (due to a stale TLB pointer
@@ -198,6 +199,7 @@ static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr) 
 }
 
 static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
+    ISH_SIGNPOST_SCOPE_BEGIN(jit, "block_compile", _bc_spid);
     struct gen_state state;
     TRACE("%d %08x --- compiling:\n", current_pid(), ip);
     gen_start(ip, &state);
@@ -217,6 +219,7 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     gen_end(&state);
     assert(state.ip - ip <= PAGE_SIZE);
     state.block->used = state.capacity;
+    ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
     return state.block;
 }
 
