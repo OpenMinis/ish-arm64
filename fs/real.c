@@ -96,6 +96,14 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
     struct fd *fd = fd_create(&realfs_fdops);
     fd->real_fd = fd_no;
     fd->dir = NULL;
+
+    /* Bind-mount change tracker: any open that may modify the file fires an
+     * upsert event. The hook is intentionally agnostic about path layout —
+     * we just emit whatever path realfs received. The Swift consumer
+     * decides whether the path is one it cares about. */
+    if (flags & (O_CREAT_ | O_TRUNC_ | O_WRONLY_ | O_RDWR_ | O_APPEND_)) {
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
+    }
     return fd;
 }
 
@@ -445,6 +453,7 @@ int realfs_unlink(struct mount *mount, const char *path) {
     int res = unlinkat(mount->root_fd, fix_path(path), 0);
     if (res < 0)
         return errno_map();
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     return res;
 }
 
@@ -452,6 +461,7 @@ int realfs_rmdir(struct mount *mount, const char *path) {
     int err = unlinkat(mount->root_fd, fix_path(path), AT_REMOVEDIR);
     if (err < 0)
         return errno_map();
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     return 0;
 }
 
@@ -459,6 +469,10 @@ int realfs_rename(struct mount *mount, const char *src, const char *dst) {
     int err = renameat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst));
     if (err < 0)
         return errno_map();
+    /* Source is gone, destination appeared. Emit two events; the Swift
+     * consumer filters paths it doesn't care about. */
+    fakefs_record_change(src, FAKEFS_CHANGE_OP_UNLINK);
+    fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
     return err;
 }
 
@@ -495,6 +509,8 @@ int realfs_truncate(struct mount *mount, const char *path, off_t_ size) {
     if (ftruncate(fd, size) < 0)
         err = errno_map();
     close(fd);
+    if (err == 0)
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_TRUNCATE);
     return err;
 }
 
