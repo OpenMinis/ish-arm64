@@ -10,17 +10,21 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
         return;
     if (tlb->mmu != mmu) {
         // Address space changed (execve); block cache and ret_cache are invalid
-        memset(tlb->block_cache, 0, sizeof(tlb->block_cache));
-        tlb->block_cache_gen = 0;
-        if (tlb->frame != NULL) {
-            free(tlb->frame);
-            tlb->frame = NULL;
-        }
+        tlb_reset_cache(tlb);
     }
     tlb->mmu = mmu;
     tlb->dirty_page = TLB_PAGE_EMPTY;
     tlb->mem_changes = mmu->changes;
     tlb_flush(tlb);
+}
+
+void tlb_reset_cache(struct tlb *tlb) {
+    memset(tlb->block_cache, 0, sizeof(tlb->block_cache));
+    tlb->block_cache_gen = 0;
+    if (tlb->frame != NULL) {
+        free(tlb->frame);
+        tlb->frame = NULL;
+    }
 }
 
 void tlb_flush(struct tlb *tlb) {

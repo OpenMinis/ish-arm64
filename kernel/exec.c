@@ -219,6 +219,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     lock(&current->general_lock);
     mm_release(current->mm);
     task_set_mm(current, mm_new());
+    current->tlb_needs_reset = true;
     unlock(&current->general_lock);
     write_wrlock(&current->mem->lock);
 

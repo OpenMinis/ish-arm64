@@ -46,6 +46,7 @@ struct task {
     // private
     sigset_t_ saved_mask;
     bool has_saved_mask;
+    bool tlb_needs_reset;
 
     // Set when thread is in a blocking syscall (futex_wait, poll_wait, etc.)
     // Used for deadlock detection: if all threads are blocking, it's a hang.

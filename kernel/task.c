@@ -178,6 +178,10 @@ void task_run_current() {
         if (self->mem == NULL) {
             pthread_exit(NULL);
         }
+        if (self->tlb_needs_reset) {
+            tlb_reset_cache(tlb);
+            self->tlb_needs_reset = false;
+        }
         read_wrlock(&self->mem->lock);
         tlb_refresh(tlb, &self->mem->mmu);
         int interrupt = cpu_run_to_interrupt(cpu, tlb);
