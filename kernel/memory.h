@@ -9,6 +9,17 @@
 #include "util/sync.h"
 #include "misc.h"
 
+// Lazy reservation for MAP_NORESERVE regions (JSC heap cage, etc.).
+// Records address range and permissions without allocating page table entries.
+// Pages are materialized on demand when faulted. Used by both x86 and ARM64
+// guests so memory.c can call into the reservation API unconditionally.
+struct mem_reservation {
+    page_t start;
+    pages_t pages;
+    unsigned flags;
+    struct mem_reservation *next;
+};
+
 #ifdef GUEST_ARM64
 // ARM64: 4-level page table for 48-bit address space
 // L0[512] → L1[512] → L2[512] → L3[512 pt_entry]
@@ -23,16 +34,6 @@
 // Page table intermediate node (L0, L1, L2)
 struct pt_node {
     void *children[PT_ENTRIES]; // pt_node* for L0-L2, pt_entry* array for L3
-};
-
-// Lazy reservation for MAP_NORESERVE regions (JSC heap cage, etc.).
-// Records address range and permissions without allocating page table entries.
-// Pages are materialized on demand when faulted.
-struct mem_reservation {
-    page_t start;
-    pages_t pages;
-    unsigned flags;
-    struct mem_reservation *next;
 };
 
 struct mem {
@@ -79,6 +80,9 @@ struct mem {
     struct mmu mmu;
 
     page_t mmap_hint;
+
+    // Lazy MAP_NORESERVE reservations (V8 cage etc.). Shared with ARM64.
+    struct mem_reservation *reservations;
 
     wrlock_t lock;
     lock_t cow_lock;
@@ -139,10 +143,12 @@ struct pt_entry {
 bool pt_is_hole(struct mem *mem, page_t start, pages_t pages);
 page_t pt_find_hole(struct mem *mem, pages_t size);
 
-#ifdef GUEST_ARM64
-int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags);
+// Reservation API is available for both x86 and ARM64 guests.
 struct mem_reservation *mem_find_reservation(struct mem *mem, page_t page);
 void mem_remove_reservations(struct mem *mem, page_t start, pages_t pages);
+
+#ifdef GUEST_ARM64
+int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags);
 // Find a hole for a V8-style large reservation. Prefers addresses
 // above 4GB so heap pointers are non-canonical in low 32 bits.
 page_t pt_find_hole_for_reservation(struct mem *mem, pages_t size);

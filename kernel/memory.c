@@ -43,22 +43,6 @@ void mem_init(struct mem *mem) {
     lock_init(&mem->cow_lock);
 }
 
-struct mem_reservation *mem_find_reservation(struct mem *mem, page_t page) {
-    for (struct mem_reservation *r = mem->reservations; r; r = r->next) {
-        if (page >= r->start && page < r->start + r->pages)
-            return r;
-    }
-    return NULL;
-}
-
-static bool reservations_overlap(struct mem *mem, page_t start, pages_t pages) {
-    for (struct mem_reservation *r = mem->reservations; r; r = r->next) {
-        if (r->start < start + pages && r->start + r->pages > start)
-            return true;
-    }
-    return false;
-}
-
 int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
     struct mem_reservation *res = malloc(sizeof(struct mem_reservation));
     if (res == NULL)
@@ -70,44 +54,6 @@ int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
     mem->reservations = res;
     mem_changed(mem);
     return 0;
-}
-
-void mem_remove_reservations(struct mem *mem, page_t start, pages_t pages) {
-    struct mem_reservation **pp = &mem->reservations;
-    while (*pp) {
-        struct mem_reservation *r = *pp;
-        page_t r_end = r->start + r->pages;
-        page_t u_end = start + pages;
-        if (r->start >= u_end || r_end <= start) {
-            pp = &r->next;
-            continue;
-        }
-        if (r->start >= start && r_end <= u_end) {
-            *pp = r->next;
-            free(r);
-            continue;
-        }
-        if (r->start < start && r_end > u_end) {
-            struct mem_reservation *tail = malloc(sizeof(struct mem_reservation));
-            if (tail) {
-                tail->start = u_end;
-                tail->pages = r_end - u_end;
-                tail->flags = r->flags;
-                tail->next = r->next;
-                r->pages = start - r->start;
-                r->next = tail;
-            }
-            pp = &(tail ? tail : r)->next;
-            continue;
-        }
-        if (r->start < start) {
-            r->pages = start - r->start;
-        } else {
-            r->start = u_end;
-            r->pages = r_end - u_end;
-        }
-        pp = &r->next;
-    }
 }
 
 // Recursively free page table nodes at given level
@@ -425,6 +371,7 @@ void mem_init(struct mem *mem) {
     mem->pgdir = calloc(MEM_PGDIR_SIZE, sizeof(struct pt_entry *));
     mem->pgdir_used = 0;
     mem->mmap_hint = 0;
+    mem->reservations = NULL;
     mem->mmu.ops = &mem_mmu_ops;
     mem->mmu.asbestos = asbestos_new(&mem->mmu);
     mem->mmu.changes = 0;
@@ -436,6 +383,11 @@ void mem_destroy(struct mem *mem) {
     write_wrlock(&mem->lock);
     pt_unmap_always(mem, 0, MEM_PAGES);
     asbestos_free(mem->mmu.asbestos);
+    while (mem->reservations) {
+        struct mem_reservation *r = mem->reservations;
+        mem->reservations = r->next;
+        free(r);
+    }
     for (int i = 0; i < MEM_PGDIR_SIZE; i++) {
         if (mem->pgdir[i] != NULL)
             free(mem->pgdir[i]);
@@ -520,6 +472,68 @@ page_t pt_find_hole(struct mem *mem, pages_t size) {
 }
 
 #endif // GUEST_ARM64
+
+// ============================================================
+// Reservation API — shared by x86 and ARM64.
+// Only the ARM64 path actually creates reservations today (via pt_map_lazy),
+// but the lookup/overlap/remove helpers are called unconditionally from
+// pt_is_hole / pt_unmap / pt_set_flags / pt_copy_on_demand, so they must
+// exist for both architectures.
+// ============================================================
+
+struct mem_reservation *mem_find_reservation(struct mem *mem, page_t page) {
+    for (struct mem_reservation *r = mem->reservations; r; r = r->next) {
+        if (page >= r->start && page < r->start + r->pages)
+            return r;
+    }
+    return NULL;
+}
+
+static bool reservations_overlap(struct mem *mem, page_t start, pages_t pages) {
+    for (struct mem_reservation *r = mem->reservations; r; r = r->next) {
+        if (r->start < start + pages && r->start + r->pages > start)
+            return true;
+    }
+    return false;
+}
+
+void mem_remove_reservations(struct mem *mem, page_t start, pages_t pages) {
+    struct mem_reservation **pp = &mem->reservations;
+    while (*pp) {
+        struct mem_reservation *r = *pp;
+        page_t r_end = r->start + r->pages;
+        page_t u_end = start + pages;
+        if (r->start >= u_end || r_end <= start) {
+            pp = &r->next;
+            continue;
+        }
+        if (r->start >= start && r_end <= u_end) {
+            *pp = r->next;
+            free(r);
+            continue;
+        }
+        if (r->start < start && r_end > u_end) {
+            struct mem_reservation *tail = malloc(sizeof(struct mem_reservation));
+            if (tail) {
+                tail->start = u_end;
+                tail->pages = r_end - u_end;
+                tail->flags = r->flags;
+                tail->next = r->next;
+                r->pages = start - r->start;
+                r->next = tail;
+            }
+            pp = &(tail ? tail : r)->next;
+            continue;
+        }
+        if (r->start < start) {
+            r->pages = start - r->start;
+        } else {
+            r->start = u_end;
+            r->pages = r_end - u_end;
+        }
+        pp = &r->next;
+    }
+}
 
 bool pt_is_hole(struct mem *mem, page_t start, pages_t pages) {
     for (page_t page = start; page < start + pages; page++) {
