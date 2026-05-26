@@ -123,15 +123,93 @@ void fakefs_set_path_reverse_hook(fakefs_path_reverse_hook_t hook) {
     atomic_store_explicit(&g_path_reverse_hook, hook, memory_order_release);
 }
 
+/* Absolute host path of the fakefs `data/` directory, registered by the
+ * host via fakefs_set_rootfs_data_path() at boot. Used to detect
+ * "self-containing" bind mounts in fakefs_bind_mount_resolve_path() —
+ * a mount whose host_path is an ancestor of g_rootfs_data_path would
+ * cause every rootfs-internal fd to be reverse-mapped under that mount,
+ * which is never what the caller wants. Empty string means "no rootfs
+ * path registered" (suppression is disabled). */
+static char g_rootfs_data_path[PATH_MAX] = {0};
+static int g_rootfs_data_path_len = 0;
+
+void fakefs_set_rootfs_data_path(const char *abs_host_path) {
+    if (abs_host_path == NULL || abs_host_path[0] == '\0') {
+        g_rootfs_data_path[0] = '\0';
+        g_rootfs_data_path_len = 0;
+        fprintf(stderr, "fakefs: rootfs_data_path cleared\n");
+        return;
+    }
+    /* Strip any trailing slash so prefix arithmetic below works uniformly:
+     * the ancestor check compares host_path[hlen] against '/' to enforce
+     * a path-component boundary, which fails if g_rootfs_data_path itself
+     * ends in '/' (it generally won't, but be defensive). */
+    size_t n = strlen(abs_host_path);
+    while (n > 1 && abs_host_path[n - 1] == '/') n--;
+    if (n + 1 > sizeof(g_rootfs_data_path)) {
+        fprintf(stderr,
+                "fakefs: rootfs_data_path too long (%zu chars, max %zu) — ignored\n",
+                n, sizeof(g_rootfs_data_path) - 1);
+        return;
+    }
+    memcpy(g_rootfs_data_path, abs_host_path, n);
+    g_rootfs_data_path[n] = '\0';
+    g_rootfs_data_path_len = (int)n;
+    fprintf(stderr, "fakefs: rootfs_data_path registered \"%s\" (len=%d)\n",
+            g_rootfs_data_path, g_rootfs_data_path_len);
+}
+
+/* True if `host_path` is an ancestor of (or equal to) the registered
+ * fakefs data directory. Returns false when no rootfs path is
+ * registered, so the guard is a no-op until the host opts in. */
+static bool fakefs_host_path_contains_rootfs(const char *host_path, int host_path_len) {
+    if (g_rootfs_data_path_len == 0)
+        return false;
+    if (host_path_len > g_rootfs_data_path_len)
+        return false;
+    if (strncmp(host_path, g_rootfs_data_path, host_path_len) != 0)
+        return false;
+    /* Either exact match, or g_rootfs_data_path has a '/' immediately
+     * after the host_path prefix (proper ancestor). Anything else is a
+     * sibling-prefix false positive (e.g. /Users/x vs /Users/xyz). */
+    char next = g_rootfs_data_path[host_path_len];
+    return next == '/' || next == '\0';
+}
+
 /* Translate a resolved host path back to a Linux path for bind mounts.
  * e.g. "/Users/.../MinisChat/minis/<sid>/attachments/file.mp4"
  *   -> "/var/minis/attachments/file.mp4"
- * Returns true and writes to out_path if a match was found. */
+ * Returns true and writes to out_path if a match was found.
+ *
+ * Mounts whose host_path is an ancestor of the registered fakefs
+ * `data/` directory are skipped — a "self-containing" mount would
+ * otherwise reverse-map every rootfs-internal fd to a guest path under
+ * itself, which corrupts execve / fakefs metadata lookups. The
+ * suppression is no-op until fakefs_set_rootfs_data_path() is called by
+ * the host. */
 bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t out_size) {
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
         if (!g_bind_mounts[i].active)
             continue;
         int hlen = g_bind_mounts[i].host_path_len;
+        /* Skip mounts that contain the rootfs — reverse-mapping a
+         * host path inside the fakefs `data/` directory through a
+         * mount whose host_path encloses it yields a bogus guest
+         * path that breaks execve / metadata lookups. */
+        if (fakefs_host_path_contains_rootfs(g_bind_mounts[i].host_path, hlen)) {
+            /* Only log once per process per mount slot — otherwise the hot
+             * path floods the log on every execve. */
+            static bool warned[FAKEFS_MAX_BIND_MOUNTS] = {false};
+            if (!warned[i]) {
+                warned[i] = true;
+                fprintf(stderr,
+                        "fakefs_bind_mount_resolve_path: skipping self-containing mount slot[%d] "
+                        "host=\"%s\" (ancestor of rootfs data \"%s\") — "
+                        "every rootfs fd would otherwise reverse-map into this mount\n",
+                        i, g_bind_mounts[i].host_path, g_rootfs_data_path);
+            }
+            continue;
+        }
         /* Try matching as-is first */
         if (strncmp(resolved, g_bind_mounts[i].host_path, hlen) == 0 &&
             (resolved[hlen] == '/' || resolved[hlen] == '\0')) {

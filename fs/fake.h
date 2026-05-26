@@ -129,4 +129,20 @@ typedef bool (*fakefs_path_reverse_hook_t)(
 
 void fakefs_set_path_reverse_hook(fakefs_path_reverse_hook_t hook);
 
+/* Register the absolute host path of the fakefs `data/` directory (the
+ * host filesystem location backing fakefs `root_fd`). Used by
+ * fakefs_bind_mount_resolve_path() to suppress "self-containing" bind
+ * mounts — e.g. on a desktop OS the user can register a bind mount
+ * whose host path is an ancestor of the rootfs data directory itself
+ * (mounting the user's home directory, when the rootfs lives somewhere
+ * underneath it). Without this guard every rootfs-internal fd would be
+ * reverse-mapped to a guest path under that mount, breaking execve
+ * (EACCES) and fakefs metadata lookups.
+ *
+ * Pass an absolute canonical path (no symlinks, no trailing slash).
+ * Pass NULL or "" to clear. Stored atomically — readers see a value
+ * but not necessarily the very latest write.
+ */
+void fakefs_set_rootfs_data_path(const char *abs_host_path);
+
 #endif
