@@ -146,6 +146,13 @@
 		AAE10013AF96D90D00FFB7A4 /* icon1337.png in Resources */ = {isa = PBXBuildFile; fileRef = BB4A922D24EDA461002F5A96 /* icon1337.png */; };
 		AAE10014AF96D90D00FFB7A4 /* iinhash.png in Resources */ = {isa = PBXBuildFile; fileRef = BBC8298024EDACBB009D042C /* iinhash.png */; };
 		AAE10015AF96D90D00FFB7A4 /* freeiosterminal.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38597B27BCEC78000A1082 /* freeiosterminal.png */; };
+		AAF20040AF96D90D00FFB7A4 /* FileProviderEnumerator.m in Sources */ = {isa = PBXBuildFile; fileRef = BB88F4992154760800A341FD /* FileProviderEnumerator.m */; };
+		AAF20041AF96D90D00FFB7A4 /* NSError+ISHErrno.m in Sources */ = {isa = PBXBuildFile; fileRef = BB13F4DD21C5770000343E17 /* NSError+ISHErrno.m */; };
+		AAF20042AF96D90D00FFB7A4 /* AppGroup.m in Sources */ = {isa = PBXBuildFile; fileRef = BB9C7B84240A240E00F5D4F0 /* AppGroup.m */; };
+		AAF20043AF96D90D00FFB7A4 /* FileProviderExtension.m in Sources */ = {isa = PBXBuildFile; fileRef = BB88F4932154760800A341FD /* FileProviderExtension.m */; };
+		AAF20044AF96D90D00FFB7A4 /* ExceptionExfiltrator.m in Sources */ = {isa = PBXBuildFile; fileRef = 49FF844A2A06249F00850B7A /* ExceptionExfiltrator.m */; };
+		AAF20045AF96D90D00FFB7A4 /* FileProviderItem.m in Sources */ = {isa = PBXBuildFile; fileRef = BB88F4962154760800A341FD /* FileProviderItem.m */; };
+		AAF20050AF96D90D00FFB7A4 /* iSHFileProvider ARM64.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = AAF20030AF96D90D00FFB7A4 /* iSHFileProvider ARM64.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA000100AF96D90D00FFB7A4 /* AboutAppearanceViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 9A28E4E9219A8B670073D200 /* AboutAppearanceViewController.m */; };
 		AA000101AF96D90D00FFB7A4 /* AltIconViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = BB267FA523A48F1500ED7CAF /* AltIconViewController.m */; };
 		AA000102AF96D90D00FFB7A4 /* ThemeViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 491B31E52883BF22008EEFB0 /* ThemeViewController.m */; };
@@ -368,6 +375,13 @@
 			remoteGlobalIDString = BB4A922324ED9402002F5A96;
 			remoteInfo = "iSH pre";
 		};
+		AAF20061AF96D90D00FFB7A4 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = BB792B461F96D8E000FFB7A4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AAF20001AF96D90D00FFB7A4;
+			remoteInfo = "iSHFileProvider-ARM64";
+		};
 		BB10E5C7248DBAA1009C7A74 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = BB10E0C1248DA5B0009C7A74 /* libarchive.xcodeproj */;
@@ -498,6 +512,7 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
+				AAF20050AF96D90D00FFB7A4 /* iSHFileProvider ARM64.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -787,6 +802,8 @@
 		BB82A7FB21B4C2E8006AA5FD /* AboutExternalKeyboardViewController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AboutExternalKeyboardViewController.h; sourceTree = "<group>"; };
 		BB82A7FC21B4C2E8006AA5FD /* AboutExternalKeyboardViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AboutExternalKeyboardViewController.m; sourceTree = "<group>"; };
 		BB88F4902154760800A341FD /* iSHFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = iSHFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		AAF20030AF96D90D00FFB7A4 /* iSHFileProvider ARM64.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = "iSHFileProvider ARM64.appex"; sourceTree = BUILT_PRODUCTS_DIR; };
+		AAF20031AF96D90D00FFB7A4 /* FileProviderARM64.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = FileProviderARM64.xcconfig; sourceTree = "<group>"; };
 		BB88F4922154760800A341FD /* FileProviderExtension.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FileProviderExtension.h; sourceTree = "<group>"; };
 		BB88F4932154760800A341FD /* FileProviderExtension.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = FileProviderExtension.m; sourceTree = "<group>"; };
 		BB88F4952154760800A341FD /* FileProviderItem.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FileProviderItem.h; sourceTree = "<group>"; };
@@ -976,6 +993,7 @@
 				BB0B86CD2586FD8800208600 /* App.xcconfig */,
 				AA000015AF96D90D00FFB7A4 /* AppARM64.xcconfig */,
 				40AEF95FC5D957E4D8F5E6A1 /* AppARM64-ffmpeg.xcconfig */,
+				AAF20031AF96D90D00FFB7A4 /* FileProviderARM64.xcconfig */,
 				BBEF192C26806546001225BD /* AppLib.xcconfig */,
 				493B378F290F5320000C41ED /* CLI.xcconfig */,
 				BB0B86D52587009D00208600 /* iOS.xcconfig */,
@@ -1142,6 +1160,7 @@
 				BB792B501F96D90D00FFB7A4 /* iSH.app */,
 				AA0000021F96D90D00FFB7A4 /* iSH ARM64.app */,
 				BB88F4902154760800A341FD /* iSHFileProvider.appex */,
+				AAF20030AF96D90D00FFB7A4 /* iSHFileProvider ARM64.appex */,
 				BB13F7DC200AD81D003D1C4D /* libish.a */,
 				BBFB2C5B2590257E00545EAB /* libish_emu.a */,
 				BB41591C255EF9E300E0950C /* iSHUITests.xctest */,
@@ -1585,6 +1604,7 @@
 			dependencies = (
 				AA000060AF96D90D00FFB7A4 /* PBXTargetDependency */,
 				AA000062AF96D90D00FFB7A4 /* PBXTargetDependency */,
+				AAF20060AF96D90D00FFB7A4 /* PBXTargetDependency */,
 			);
 			name = "iSH-ARM64";
 			productName = "iSH ARM64";
@@ -1680,6 +1700,24 @@
 			name = iSHFileProvider;
 			productName = iSHFiles;
 			productReference = BB88F4902154760800A341FD /* iSHFileProvider.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		AAF20001AF96D90D00FFB7A4 /* iSHFileProvider-ARM64 */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AAF20002AF96D90D00FFB7A4 /* Build configuration list for PBXNativeTarget "iSHFileProvider-ARM64" */;
+			buildPhases = (
+				AAF20023AF96D90D00FFB7A4 /* Build Meson (ARM64) */,
+				AAF20020AF96D90D00FFB7A4 /* Sources */,
+				AAF20021AF96D90D00FFB7A4 /* Frameworks */,
+				AAF20022AF96D90D00FFB7A4 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "iSHFileProvider-ARM64";
+			productName = iSHFiles;
+			productReference = AAF20030AF96D90D00FFB7A4 /* iSHFileProvider ARM64.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
 		BBBDDF802CE00F6A0071F1F3 /* libiSHLinuxUser */ = {
@@ -1885,6 +1923,7 @@
 				BBECF3A12691314C00DEC937 /* libiSHLinux */,
 				BBBDDF802CE00F6A0071F1F3 /* libiSHLinuxUser */,
 				BB88F48F2154760800A341FD /* iSHFileProvider */,
+				AAF20001AF96D90D00FFB7A4 /* iSHFileProvider-ARM64 */,
 				BB41591B255EF9E300E0950C /* iSHUITests */,
 				BB13F7CA200ACC31003D1C4D /* Meson */,
 				BB13F7D0200ACCA2003D1C4D /* Ninja */,
@@ -1947,6 +1986,33 @@
 				AAE10013AF96D90D00FFB7A4 /* icon1337.png in Resources */,
 				AAE10014AF96D90D00FFB7A4 /* iinhash.png in Resources */,
 				AAE10015AF96D90D00FFB7A4 /* freeiosterminal.png in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AAF20020AF96D90D00FFB7A4 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AAF20040AF96D90D00FFB7A4 /* FileProviderEnumerator.m in Sources */,
+				AAF20041AF96D90D00FFB7A4 /* NSError+ISHErrno.m in Sources */,
+				AAF20042AF96D90D00FFB7A4 /* AppGroup.m in Sources */,
+				AAF20043AF96D90D00FFB7A4 /* FileProviderExtension.m in Sources */,
+				AAF20044AF96D90D00FFB7A4 /* ExceptionExfiltrator.m in Sources */,
+				AAF20045AF96D90D00FFB7A4 /* FileProviderItem.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AAF20021AF96D90D00FFB7A4 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AAF20022AF96D90D00FFB7A4 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -2105,6 +2171,21 @@
 			shellScript = "cd $SRCROOT/deps/libapps && ./hterm/bin/mkdist\n";
 		};
 		AA000300AF96D90D00FFB7A4 /* Build Meson (ARM64) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Build Meson (ARM64)";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/app/xcode-meson.sh\"\ncd \"$MESON_BUILD_DIR\"\n\"$SRCROOT/app/xcode-ninja.sh\" $NINJA_TARGETS\n";
+		};
+		AAF20023AF96D90D00FFB7A4 /* Build Meson (ARM64) */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -2573,6 +2654,11 @@
 		AA000062AF96D90D00FFB7A4 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			targetProxy = BB10E5CA248DBAB7009C7A74 /* PBXContainerItemProxy */;
+		};
+		AAF20060AF96D90D00FFB7A4 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AAF20001AF96D90D00FFB7A4 /* iSHFileProvider-ARM64 */;
+			targetProxy = AAF20061AF96D90D00FFB7A4 /* PBXContainerItemProxy */;
 		};
 		BB10E5CB248DBAB7009C7A74 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
@@ -3043,6 +3129,38 @@
 			};
 			name = "Debug-ApplePleaseFixFB19282108";
 		};
+		AAF20010AF96D90D00FFB7A4 /* Debug-ApplePleaseFixFB19282108 */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = AAF20031AF96D90D00FFB7A4 /* FileProviderARM64.xcconfig */;
+			buildSettings = {
+				DEVELOPMENT_TEAM = K8Q74NT2BG;
+			};
+			name = "Debug-ApplePleaseFixFB19282108";
+		};
+		AAF20011AF96D90D00FFB7A4 /* DebugLinux */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = AAF20031AF96D90D00FFB7A4 /* FileProviderARM64.xcconfig */;
+			buildSettings = {
+				DEVELOPMENT_TEAM = K8Q74NT2BG;
+			};
+			name = DebugLinux;
+		};
+		AAF20012AF96D90D00FFB7A4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = AAF20031AF96D90D00FFB7A4 /* FileProviderARM64.xcconfig */;
+			buildSettings = {
+				DEVELOPMENT_TEAM = K8Q74NT2BG;
+			};
+			name = Release;
+		};
+		AAF20013AF96D90D00FFB7A4 /* ReleaseLinux */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = AAF20031AF96D90D00FFB7A4 /* FileProviderARM64.xcconfig */;
+			buildSettings = {
+				DEVELOPMENT_TEAM = K8Q74NT2BG;
+			};
+			name = ReleaseLinux;
+		};
 		BB88F4A12154760800A341FD /* Release */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB0B86D52587009D00208600 /* iOS.xcconfig */;
@@ -3435,6 +3553,17 @@
 				BB7F62092688EAB5003C0220 /* DebugLinux */,
 				BB88F4A12154760800A341FD /* Release */,
 				BBEF19AF26806D1F001225BD /* ReleaseLinux */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AAF20002AF96D90D00FFB7A4 /* Build configuration list for PBXNativeTarget "iSHFileProvider-ARM64" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AAF20010AF96D90D00FFB7A4 /* Debug-ApplePleaseFixFB19282108 */,
+				AAF20011AF96D90D00FFB7A4 /* DebugLinux */,
+				AAF20012AF96D90D00FFB7A4 /* Release */,
+				AAF20013AF96D90D00FFB7A4 /* ReleaseLinux */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
