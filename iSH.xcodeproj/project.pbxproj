@@ -512,6 +512,16 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AAF20070AF96D90D00FFB7A4 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
 				AAF20050AF96D90D00FFB7A4 /* iSHFileProvider ARM64.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
@@ -1596,7 +1606,7 @@
 				AA000012AF96D90D00FFB7A4 /* Generate APK Repositories File */,
 				AA000013AF96D90D00FFB7A4 /* Compile JavaScript */,
 				AA000010AF96D90D00FFB7A4 /* Resources */,
-				AA000014AF96D90D00FFB7A4 /* Embed Foundation Extensions */,
+				AAF20070AF96D90D00FFB7A4 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 				AA000200AF96D90D00FFB7A4 /* PBXBuildRule */,
