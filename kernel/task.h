@@ -191,6 +191,11 @@ struct tgroup {
     // process-wide hangs where all threads are idle.
     _Atomic uint64_t last_progress_ns;
 
+    // Opaque per-thread-group context for host integrations (e.g. fakefs
+    // path-translate hook). Inherited verbatim on fork via tgroup_copy().
+    // iSH itself never interprets this value; host registers a meaning.
+    uint64_t fs_context;
+
     // for everything in this struct not locked by something else
     lock_t lock;
 };

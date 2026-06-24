@@ -108,15 +108,108 @@ struct fakefs_bind_mount {
 static struct fakefs_bind_mount g_bind_mounts[FAKEFS_MAX_BIND_MOUNTS];
 struct mount *g_fakefs_mount = NULL;
 
+/* Optional host-provided override hooks for guest↔host path translation.
+ * NULL unless host registers via fakefs_set_path_*_hook(). Defined here
+ * (before resolve_path() / bind_mount_translate_path() so both directions
+ * can consult them). */
+static _Atomic(fakefs_path_translate_hook_t) g_path_translate_hook = NULL;
+static _Atomic(fakefs_path_reverse_hook_t) g_path_reverse_hook = NULL;
+
+void fakefs_set_path_translate_hook(fakefs_path_translate_hook_t hook) {
+    atomic_store_explicit(&g_path_translate_hook, hook, memory_order_release);
+}
+
+void fakefs_set_path_reverse_hook(fakefs_path_reverse_hook_t hook) {
+    atomic_store_explicit(&g_path_reverse_hook, hook, memory_order_release);
+}
+
+/* Absolute host path of the fakefs `data/` directory, registered by the
+ * host via fakefs_set_rootfs_data_path() at boot. Used to detect
+ * "self-containing" bind mounts in fakefs_bind_mount_resolve_path() —
+ * a mount whose host_path is an ancestor of g_rootfs_data_path would
+ * cause every rootfs-internal fd to be reverse-mapped under that mount,
+ * which is never what the caller wants. Empty string means "no rootfs
+ * path registered" (suppression is disabled). */
+static char g_rootfs_data_path[PATH_MAX] = {0};
+static int g_rootfs_data_path_len = 0;
+
+void fakefs_set_rootfs_data_path(const char *abs_host_path) {
+    if (abs_host_path == NULL || abs_host_path[0] == '\0') {
+        g_rootfs_data_path[0] = '\0';
+        g_rootfs_data_path_len = 0;
+        fprintf(stderr, "fakefs: rootfs_data_path cleared\n");
+        return;
+    }
+    /* Strip any trailing slash so prefix arithmetic below works uniformly:
+     * the ancestor check compares host_path[hlen] against '/' to enforce
+     * a path-component boundary, which fails if g_rootfs_data_path itself
+     * ends in '/' (it generally won't, but be defensive). */
+    size_t n = strlen(abs_host_path);
+    while (n > 1 && abs_host_path[n - 1] == '/') n--;
+    if (n + 1 > sizeof(g_rootfs_data_path)) {
+        fprintf(stderr,
+                "fakefs: rootfs_data_path too long (%zu chars, max %zu) — ignored\n",
+                n, sizeof(g_rootfs_data_path) - 1);
+        return;
+    }
+    memcpy(g_rootfs_data_path, abs_host_path, n);
+    g_rootfs_data_path[n] = '\0';
+    g_rootfs_data_path_len = (int)n;
+    fprintf(stderr, "fakefs: rootfs_data_path registered \"%s\" (len=%d)\n",
+            g_rootfs_data_path, g_rootfs_data_path_len);
+}
+
+/* True if `host_path` is an ancestor of (or equal to) the registered
+ * fakefs data directory. Returns false when no rootfs path is
+ * registered, so the guard is a no-op until the host opts in. */
+static bool fakefs_host_path_contains_rootfs(const char *host_path, int host_path_len) {
+    if (g_rootfs_data_path_len == 0)
+        return false;
+    if (host_path_len > g_rootfs_data_path_len)
+        return false;
+    if (strncmp(host_path, g_rootfs_data_path, host_path_len) != 0)
+        return false;
+    /* Either exact match, or g_rootfs_data_path has a '/' immediately
+     * after the host_path prefix (proper ancestor). Anything else is a
+     * sibling-prefix false positive (e.g. /Users/x vs /Users/xyz). */
+    char next = g_rootfs_data_path[host_path_len];
+    return next == '/' || next == '\0';
+}
+
 /* Translate a resolved host path back to a Linux path for bind mounts.
  * e.g. "/Users/.../MinisChat/minis/<sid>/attachments/file.mp4"
  *   -> "/var/minis/attachments/file.mp4"
- * Returns true and writes to out_path if a match was found. */
+ * Returns true and writes to out_path if a match was found.
+ *
+ * Mounts whose host_path is an ancestor of the registered fakefs
+ * `data/` directory are skipped — a "self-containing" mount would
+ * otherwise reverse-map every rootfs-internal fd to a guest path under
+ * itself, which corrupts execve / fakefs metadata lookups. The
+ * suppression is no-op until fakefs_set_rootfs_data_path() is called by
+ * the host. */
 bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t out_size) {
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
         if (!g_bind_mounts[i].active)
             continue;
         int hlen = g_bind_mounts[i].host_path_len;
+        /* Skip mounts that contain the rootfs — reverse-mapping a
+         * host path inside the fakefs `data/` directory through a
+         * mount whose host_path encloses it yields a bogus guest
+         * path that breaks execve / metadata lookups. */
+        if (fakefs_host_path_contains_rootfs(g_bind_mounts[i].host_path, hlen)) {
+            /* Only log once per process per mount slot — otherwise the hot
+             * path floods the log on every execve. */
+            static bool warned[FAKEFS_MAX_BIND_MOUNTS] = {false};
+            if (!warned[i]) {
+                warned[i] = true;
+                fprintf(stderr,
+                        "fakefs_bind_mount_resolve_path: skipping self-containing mount slot[%d] "
+                        "host=\"%s\" (ancestor of rootfs data \"%s\") — "
+                        "every rootfs fd would otherwise reverse-map into this mount\n",
+                        i, g_bind_mounts[i].host_path, g_rootfs_data_path);
+            }
+            continue;
+        }
         /* Try matching as-is first */
         if (strncmp(resolved, g_bind_mounts[i].host_path, hlen) == 0 &&
             (resolved[hlen] == '/' || resolved[hlen] == '\0')) {
@@ -138,17 +231,30 @@ bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t
             }
         }
     }
+    /* Static table miss — fall through to the host-provided reverse hook
+     * if one is registered. The hook knows about per-context routes that
+     * are not in g_bind_mounts[]. */
+    fakefs_path_reverse_hook_t reverse =
+        atomic_load_explicit(&g_path_reverse_hook, memory_order_acquire);
+    if (reverse != NULL && reverse(resolved, out_path, out_size))
+        return true;
     return false;
 }
 
 /* Translate a Linux path to a host absolute path if under a bind mount.
- * E.g. "/var/minis/skills/foo" -> "/var/mobile/.../Library/MinisChat/skills/foo"
- * Handles both "/var/minis/..." (with leading /) and "var/minis/..." (without).
+ * Handles both leading-slash and no-leading-slash forms.
  * Returns true and writes to out_path if the path is under a bind mount. */
 /* Public wrapper for native offload handlers. See fake.h. */
 bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t out_size);
 
-static bool bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
+/* Internal variant exposes whether the match came from the per-context
+ * translate hook vs. the static g_bind_mounts[] table. Callers that mutate
+ * meta.db need to know — hook-routed paths must NOT be stored in meta.db,
+ * since the `paths` table is keyed by guest path globally, while the hook
+ * can map the same guest path to different host files per fs_context. */
+static bool bind_mount_translate_path_ex(const char *path, char *out_path,
+                                         size_t out_size, bool *out_via_hook) {
+    if (out_via_hook != NULL) *out_via_hook = false;
     /* Normalize: if path lacks leading /, prepend it for comparison.
      * Bind mount table always stores paths with leading /. */
     char normalized[MAX_PATH];
@@ -156,6 +262,19 @@ static bool bind_mount_translate_path(const char *path, char *out_path, size_t o
     if (path[0] != '/') {
         snprintf(normalized, sizeof(normalized), "/%s", path);
         cmp_path = normalized;
+    }
+    /* Host-provided hook wins over the static table. The hook sees the
+     * normalized (leading-slash) path and the calling task's fs_context. */
+    fakefs_path_translate_hook_t hook =
+        atomic_load_explicit(&g_path_translate_hook, memory_order_acquire);
+    if (hook != NULL) {
+        uint64_t ctx = 0;
+        if (current != NULL && current->group != NULL)
+            ctx = current->group->fs_context;
+        if (hook(cmp_path, ctx, out_path, out_size)) {
+            if (out_via_hook != NULL) *out_via_hook = true;
+            return true;
+        }
     }
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
         if (!g_bind_mounts[i].active)
@@ -169,6 +288,10 @@ static bool bind_mount_translate_path(const char *path, char *out_path, size_t o
         }
     }
     return false;
+}
+
+static bool bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
+    return bind_mount_translate_path_ex(path, out_path, out_size, NULL);
 }
 
 /* Check if a path is at or under a bind mount prefix.
@@ -268,7 +391,9 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
      * instead of relying on symlink traversal (which iOS sandbox may block). */
     char host_abs[PATH_MAX];
     struct fd *fd;
-    if (bind_mount_translate_path(path, host_abs, sizeof(host_abs))) {
+    bool via_hook = false;
+    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    if (via_bind) {
         int real_flags = 0;
         if (flags & O_RDONLY_) real_flags |= O_RDONLY;
         if (flags & O_WRONLY_) real_flags |= O_WRONLY;
@@ -298,6 +423,20 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         fd = realfs.open(mount, path, flags, 0666);
         if (IS_ERR(fd))
             return fd;
+    }
+    /* Hook-routed paths intentionally bypass meta.db: the `paths` table is
+     * keyed globally by guest path, but the hook can map the same guest
+     * path to different host files per fs_context. Storing them would
+     * collide across contexts (one row, N host files). For these paths we
+     * synthesize the fake inode from the host inode so operations within a
+     * single fd still behave consistently. */
+    if (via_hook) {
+        struct stat host_stat;
+        if (fstat(fd->real_fd, &host_stat) == 0)
+            fd->fake_inode = (ino_t)host_stat.st_ino;
+        else
+            fd->fake_inode = 1;  /* non-zero so the ENOENT branch below is skipped */
+        return fd;
     }
     db_begin_write(fs);
     fd->fake_inode = path_get_inode(fs, path);
@@ -356,6 +495,23 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(dst))
         return _EROFS;
+    /* Hook-routed paths can't share meta.db rows, so hard-linking them is
+     * not supported. Perform a host link() directly between translated host
+     * paths when both endpoints are hook-routed. Mixing hook + non-hook
+     * sides returns EXDEV, matching cross-fs link semantics. */
+    char host_src[PATH_MAX], host_dst[PATH_MAX];
+    bool src_hook = false, dst_hook = false;
+    bool src_bind = bind_mount_translate_path_ex(src, host_src, sizeof(host_src), &src_hook);
+    bool dst_bind = bind_mount_translate_path_ex(dst, host_dst, sizeof(host_dst), &dst_hook);
+    if (src_hook != dst_hook)
+        return _EXDEV;
+    if (src_hook) {
+        if (link(host_src, host_dst) < 0)
+            return errno_map();
+        fakefs_record_change(dst, FAKEFS_CHANGE_OP_WRITE);
+        return 0;
+    }
+    (void)src_bind; (void)dst_bind;
     db_begin_write(fs);
     int err = realfs.link(mount, src, dst);
     if (err < 0) {
@@ -371,17 +527,38 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
         return _EROFS;
+    char host_abs[PATH_MAX];
+    bool via_hook = false;
+    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    /* Hook-routed paths bypass meta.db entirely (see fakefs_open). */
+    if (via_hook) {
+        if (unlink(host_abs) < 0)
+            return errno_map();
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
+        return 0;
+    }
     /* Auto-create entry if under bind mount so path_unlink won't die */
     if (is_under_bind_mount(path))
         bind_mount_ensure_inode(fs, mount, path);
     db_begin_write(fs);
-    int err = realfs.unlink(mount, path);
-    if (err < 0) {
-        db_rollback(fs);
-        return err;
+    int err;
+    if (via_bind) {
+        if (unlink(host_abs) < 0) {
+            err = errno_map();
+            db_rollback(fs);
+            return err;
+        }
+    } else {
+        err = realfs.unlink(mount, path);
+        if (err < 0) {
+            db_rollback(fs);
+            return err;
+        }
     }
     ino_t ino = path_unlink(fs, path);
     db_commit(fs);
+    if (via_bind)
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     inode_check_orphaned(mount, ino);
     return 0;
 }
@@ -390,17 +567,36 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
         return _EROFS;
-    /* Auto-create entry if under bind mount so path_unlink won't die */
+    char host_abs[PATH_MAX];
+    bool via_hook = false;
+    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    if (via_hook) {
+        if (rmdir(host_abs) < 0)
+            return errno_map();
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
+        return 0;
+    }
     if (is_under_bind_mount(path))
         bind_mount_ensure_inode(fs, mount, path);
     db_begin_write(fs);
-    int err = realfs.rmdir(mount, path);
-    if (err < 0) {
-        db_rollback(fs);
-        return err;
+    int err;
+    if (via_bind) {
+        if (rmdir(host_abs) < 0) {
+            err = errno_map();
+            db_rollback(fs);
+            return err;
+        }
+    } else {
+        err = realfs.rmdir(mount, path);
+        if (err < 0) {
+            db_rollback(fs);
+            return err;
+        }
     }
     ino_t ino = path_unlink(fs, path);
     db_commit(fs);
+    if (via_bind)
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     inode_check_orphaned(mount, ino);
     return 0;
 }
@@ -409,14 +605,37 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(src) || is_under_readonly_bind_mount(dst))
         return _EROFS;
+    char host_src[PATH_MAX], host_dst[PATH_MAX];
+    bool src_hook = false, dst_hook = false;
+    bool src_bind = bind_mount_translate_path_ex(src, host_src, sizeof(host_src), &src_hook);
+    bool dst_bind = bind_mount_translate_path_ex(dst, host_dst, sizeof(host_dst), &dst_hook);
+    if (src_bind != dst_bind || src_hook != dst_hook)
+        return _EXDEV;
+    if (src_hook) {
+        if (rename(host_src, host_dst) < 0)
+            return errno_map();
+        fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
+        return 0;
+    }
     db_begin_write(fs);
     path_rename(fs, src, dst);
-    int err = realfs.rename(mount, src, dst);
-    if (err < 0) {
-        db_rollback(fs);
-        return err;
+    int err;
+    if (src_bind) {
+        if (rename(host_src, host_dst) < 0) {
+            err = errno_map();
+            db_rollback(fs);
+            return err;
+        }
+    } else {
+        err = realfs.rename(mount, src, dst);
+        if (err < 0) {
+            db_rollback(fs);
+            return err;
+        }
     }
     db_commit(fs);
+    if (src_bind)
+        fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
     return 0;
 }
 
@@ -424,6 +643,15 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(link))
         return _EROFS;
+    /* fakefs's symlink model stores the target in a regular file plus an
+     * S_IFLNK mode bit in meta.db. Hook-routed paths bypass meta.db, so
+     * that representation can't round-trip. Reject the request rather
+     * than creating a regular file that future stat/readlink can't
+     * recognize as a symlink. */
+    char host_chk[PATH_MAX];
+    bool _vh = false;
+    if (bind_mount_translate_path_ex(link, host_chk, sizeof(host_chk), &_vh) && _vh)
+        return _EPERM;
     db_begin_write(fs);
     // create a file containing the target
     int fd = openat(mount->root_fd, fix_path(link), O_WRONLY | O_CREAT | O_EXCL, 0666);
@@ -482,6 +710,34 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
 static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
     ISH_SIGNPOST_SCOPE_BEGIN(fs, "fakefs_stat", _fs_spid);
     struct fakefs_db *fs = &mount->fakefs;
+    /* Hook-routed paths bypass meta.db (see fakefs_open). Stat directly
+     * against the host file; synthesize mode bits from host's. */
+    char host_abs[PATH_MAX];
+    bool via_hook = false;
+    if (bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook) && via_hook) {
+        struct stat host_stat;
+        if (stat(host_abs, &host_stat) < 0) {
+            ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
+            return errno_map();
+        }
+        memset(fake_stat, 0, sizeof(*fake_stat));
+        fake_stat->inode = (ino_t)host_stat.st_ino;
+        /* Pick a sensible mode: keep host's S_IFMT, default to 0644/0755. */
+        mode_t_ type = host_stat.st_mode & S_IFMT;
+        fake_stat->mode = type | (S_ISDIR(host_stat.st_mode) ? 0755 : 0644);
+        fake_stat->uid = 0;
+        fake_stat->gid = 0;
+        fake_stat->size = host_stat.st_size;
+        fake_stat->blocks = host_stat.st_blocks;
+        fake_stat->mtime = host_stat.st_mtimespec.tv_sec;
+        fake_stat->mtime_nsec = host_stat.st_mtimespec.tv_nsec;
+        fake_stat->atime = host_stat.st_atimespec.tv_sec;
+        fake_stat->atime_nsec = host_stat.st_atimespec.tv_nsec;
+        fake_stat->ctime = host_stat.st_ctimespec.tv_sec;
+        fake_stat->ctime_nsec = host_stat.st_ctimespec.tv_nsec;
+        ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
+        return 0;
+    }
     db_begin_read(fs);
     struct ish_stat ishstat;
     ino_t inode;
@@ -548,6 +804,24 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     struct ish_stat ishstat;
     if (!inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat)) {
         db_rollback(fs);
+        /* meta.db row missing. If the fd's path resolves through the
+         * path-translate hook, the missing row is by design (hook-routed
+         * paths bypass meta.db, see fakefs_open). Trust the realfs.fstat
+         * result and synthesize sensible mode bits. Otherwise propagate the
+         * ENOENT so unrelated bugs aren't masked. */
+        char fd_path[MAX_PATH];
+        if (realfs_getpath(fd, fd_path) == 0) {
+            char host_chk[PATH_MAX];
+            bool via_hook = false;
+            if (bind_mount_translate_path_ex(fd_path, host_chk, sizeof(host_chk), &via_hook) && via_hook) {
+                mode_t_ type = fake_stat->mode & S_IFMT;
+                fake_stat->mode = type | (S_ISDIR(fake_stat->mode) ? 0755 : 0644);
+                fake_stat->uid = 0;
+                fake_stat->gid = 0;
+                fake_stat->rdev = 0;
+                return 0;
+            }
+        }
         return _ENOENT;
     }
     db_commit(fs);
@@ -579,6 +853,33 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
         return _EROFS;
+    /* Hook-routed paths bypass meta.db (see fakefs_open). Apply size and
+     * mode/owner changes directly on the host abs path; ignore the meta.db
+     * side. For non-size attrs we use host syscalls so callers get a real
+     * effect (or a real EPERM) rather than silent no-op or a meta.db die. */
+    char host_abs_chk[PATH_MAX];
+    bool _via_hook = false;
+    if (bind_mount_translate_path_ex(path, host_abs_chk, sizeof(host_abs_chk), &_via_hook) && _via_hook) {
+        int err = 0;
+        switch (attr.type) {
+            case attr_size:
+                if (truncate(host_abs_chk, attr.size) < 0)
+                    return errno_map();
+                return 0;
+            case attr_mode:
+                if (chmod(host_abs_chk, attr.mode) < 0)
+                    return errno_map();
+                return 0;
+            case attr_uid:
+            case attr_gid:
+                /* iSH runs as a non-root iOS app; host chown will EPERM.
+                 * Match realfs_setattr's silent-on-EPERM behaviour. */
+                return 0;
+            default:
+                return 0;
+        }
+        (void)err;
+    }
     if (attr.type == attr_size)
         return realfs.setattr(mount, path, attr);
     db_begin_read(fs);
@@ -610,9 +911,27 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
     struct fakefs_db *fs = &fd->mount->fakefs;
     if (attr.type == attr_size)
         return realfs.fsetattr(fd, attr);
-    db_begin_write(fs);
+    /* If this fd was opened on a hook-routed path, its fake_inode is the
+     * host inode and won't be in meta.db. Detect that by probing meta.db;
+     * if absent, apply attr directly to the host fd. */
+    db_begin_read(fs);
     struct ish_stat ishstat;
-    inode_read_stat_or_die(fs, fd->fake_inode, &ishstat);
+    bool in_meta = inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat);
+    db_commit(fs);
+    if (!in_meta) {
+        switch (attr.type) {
+            case attr_mode:
+                if (fchmod(fd->real_fd, attr.mode) < 0)
+                    return errno_map();
+                return 0;
+            case attr_uid:
+            case attr_gid:
+                return 0;  /* host EPERM expected; ignore (matches realfs) */
+            default:
+                return 0;
+        }
+    }
+    db_begin_write(fs);
     fake_stat_setattr(&ishstat, attr);
     inode_write_stat(fs, fd->fake_inode, &ishstat);
     db_commit(fs);
@@ -623,11 +942,29 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
         return _EROFS;
+    char host_abs[PATH_MAX];
+    bool via_hook = false;
+    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    if (via_hook) {
+        if (mkdir(host_abs, 0777) < 0)
+            return errno_map();
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
+        return 0;
+    }
     db_begin_write(fs);
-    int err = realfs.mkdir(mount, path, 0777);
-    if (err < 0) {
-        db_rollback(fs);
-        return err;
+    int err;
+    if (via_bind) {
+        if (mkdir(host_abs, 0777) < 0) {
+            err = errno_map();
+            db_rollback(fs);
+            return err;
+        }
+    } else {
+        err = realfs.mkdir(mount, path, 0777);
+        if (err < 0) {
+            db_rollback(fs);
+            return err;
+        }
     }
     struct ish_stat ishstat;
     ishstat.mode = mode | S_IFDIR;
@@ -636,6 +973,8 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     ishstat.rdev = 0;
     path_create(fs, path, &ishstat);
     db_commit(fs);
+    if (via_bind)
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
     return 0;
 }
 
@@ -694,6 +1033,16 @@ retry:
         // god I don't know what to do if this would overflow
         strcat(entry_path, "/");
         strcat(entry_path, entry->name);
+    }
+
+    /* Hook-routed entries are not in meta.db by design (see fakefs_open).
+     * Keep the inode that realfs_readdir gave us (it came straight from the
+     * host directory, so it's stable for the duration of the open fd). */
+    char host_check[PATH_MAX];
+    bool entry_via_hook = false;
+    bind_mount_translate_path_ex(entry_path, host_check, sizeof(host_check), &entry_via_hook);
+    if (entry_via_hook) {
+        return res;
     }
 
     struct fakefs_db *fs = &fd->mount->fakefs;
@@ -1134,6 +1483,8 @@ void fakefs_record_change(const char *linux_path, int op) {
     strlcpy(slot->linux_path, linux_path, sizeof(slot->linux_path));
     slot->op = op;
     slot->timestamp_ns = (int64_t)mach_absolute_time();
+    slot->fs_context = (current != NULL && current->group != NULL)
+        ? current->group->fs_context : 0;
     atomic_store_explicit(&g_change_head, head + 1, memory_order_release);
     os_unfair_lock_unlock(&g_change_ring_lock);
 

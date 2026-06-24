@@ -56,9 +56,10 @@ bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t o
 #define FAKEFS_CHANGE_OP_TRUNCATE  3
 
 struct fakefs_change_event {
-    char    linux_path[1024];
-    int     op;
-    int64_t timestamp_ns; /* mach_absolute_time() raw ticks */
+    char     linux_path[1024];
+    int      op;
+    int64_t  timestamp_ns; /* mach_absolute_time() raw ticks */
+    uint64_t fs_context;   /* current->group->fs_context at record time; 0 if none */
 };
 
 /* Producer — called from realfs write/unlink/rename/truncate paths.
@@ -84,5 +85,64 @@ void fakefs_install_change_consumer(fakefs_change_handler_t handler);
 
 /* Diagnostic — number of events dropped due to ring overflow since boot. */
 uint64_t fakefs_change_dropped_count(void);
+
+/* ===== Path translate hook =====
+ *
+ * Optional host-provided override for guest→host path translation. When set,
+ * fakefs consults the hook before the global g_bind_mounts[] table for every
+ * path operation (open / stat / readdir / unlink / rename / rmdir / ...).
+ * The hook receives the calling thread group's opaque fs_context value, so
+ * the host can route the same guest path to different host directories per
+ * context. iSH itself assigns no meaning to fs_context.
+ *
+ * Contract:
+ *   - `guest_path` has leading slash, already normalized.
+ *   - `fs_context` is current->group->fs_context, opaque to iSH.
+ *   - Return true and write up to `out_size-1` bytes + NUL into `out_host_path`
+ *     to override translation.
+ *   - Return false to fall through to the global g_bind_mounts[] table.
+ *   - Must be reentrant and non-blocking (called on hot fs path).
+ */
+typedef bool (*fakefs_path_translate_hook_t)(
+    const char *guest_path,
+    uint64_t fs_context,
+    char *out_host_path,
+    size_t out_size);
+
+void fakefs_set_path_translate_hook(fakefs_path_translate_hook_t hook);
+
+/* Optional reverse counterpart to the forward path-translate hook. Called
+ * from realfs_getpath() to map a host APFS path (as returned by F_GETPATH
+ * on a bind-mounted fd) back to its guest path. iSH consults this hook
+ * after the static g_bind_mounts[] table; return true and write the guest
+ * path into `out_guest_path` to override. The hook does not receive an
+ * fs_context — F_GETPATH is per-fd, and the host path itself uniquely
+ * identifies which bind-mount target was resolved.
+ *
+ * Same hot-path contract as the forward hook: must be reentrant and non-
+ * blocking.
+ */
+typedef bool (*fakefs_path_reverse_hook_t)(
+    const char *host_path,
+    char *out_guest_path,
+    size_t out_size);
+
+void fakefs_set_path_reverse_hook(fakefs_path_reverse_hook_t hook);
+
+/* Register the absolute host path of the fakefs `data/` directory (the
+ * host filesystem location backing fakefs `root_fd`). Used by
+ * fakefs_bind_mount_resolve_path() to suppress "self-containing" bind
+ * mounts — e.g. on a desktop OS the user can register a bind mount
+ * whose host path is an ancestor of the rootfs data directory itself
+ * (mounting the user's home directory, when the rootfs lives somewhere
+ * underneath it). Without this guard every rootfs-internal fd would be
+ * reverse-mapped to a guest path under that mount, breaking execve
+ * (EACCES) and fakefs metadata lookups.
+ *
+ * Pass an absolute canonical path (no symlinks, no trailing slash).
+ * Pass NULL or "" to clear. Stored atomically — readers see a value
+ * but not necessarily the very latest write.
+ */
+void fakefs_set_rootfs_data_path(const char *abs_host_path);
 
 #endif

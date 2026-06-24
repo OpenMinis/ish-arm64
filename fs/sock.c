@@ -343,12 +343,25 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
 
     err = bind(sock->real_fd, (void *) &sockaddr, sockaddr_len);
     if (err < 0) {
+        // sockaddr_read_bind() already stashed the freshly-retained inode (and/or
+        // abstract socket) into sock->socket on success. When the real bind() then
+        // fails (e.g. AF_UNIX bind on the sandboxed /tmp returns EPERM), we must
+        // release those references AND clear the pointers — otherwise the socket
+        // fd's destructor releases them a second time on close(), corrupting the
+        // libmalloc freelist ("BUG IN CLIENT OF LIBMALLOC: memory corruption of
+        // free block"). Clearing here makes the cleanup idempotent.
         inode_release_if_exist(sock->socket.unix_name_inode);
-        if (sock->socket.unix_name_abstract != NULL)
+        sock->socket.unix_name_inode = NULL;
+        if (sock->socket.unix_name_abstract != NULL) {
             unix_abstract_release(sock->socket.unix_name_abstract);
+            sock->socket.unix_name_abstract = NULL;
+        }
         return errno_map();
     }
-    sock->socket.unix_name_inode = inode;
+    // On success the inode reference set by sockaddr_read_bind() stays on the fd
+    // and is released by the socket destructor. Do NOT overwrite it with the
+    // always-NULL local `inode` (doing so leaked the reference on every bind).
+    (void) inode;
     return 0;
 }
 
