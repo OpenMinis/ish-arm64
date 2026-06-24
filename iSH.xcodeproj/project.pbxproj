@@ -125,6 +125,27 @@
 		AA000048AF96D90D00FFB7A4 /* term.js in Resources */ = {isa = PBXBuildFile; fileRef = BB4A539C1FAA490C00A72ACE /* term.js */; };
 		AA000049AF96D90D00FFB7A4 /* term.css in Resources */ = {isa = PBXBuildFile; fileRef = BB4A53AF1FAA787900A72ACE /* term.css */; };
 		AA00004AAF96D90D00FFB7A4 /* term.html in Resources */ = {isa = PBXBuildFile; fileRef = BB4A53A91FAA496700A72ACE /* term.html */; };
+		AAE10001AF96D90D00FFB7A4 /* idollarhash.png in Resources */ = {isa = PBXBuildFile; fileRef = BBC8297D24EDAC11009D042C /* idollarhash.png */; };
+		AAE10002AF96D90D00FFB7A4 /* dollarblock2.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38597A27BCEC78000A1082 /* dollarblock2.png */; };
+		AAE10003AF96D90D00FFB7A4 /* uninspired.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0F552F239F8B360032A2A1 /* uninspired.png */; };
+		AAE10004AF96D90D00FFB7A4 /* rgb.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0B88052589661A00208600 /* rgb.png */; };
+		AAE10005AF96D90D00FFB7A4 /* dollarblock1.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38597927BCEC78000A1082 /* dollarblock1.png */; };
+		AAE10006AF96D90D00FFB7A4 /* sprite64.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0B880E2589662200208600 /* sprite64.png */; };
+		AAE10007AF96D90D00FFB7A4 /* ishcolontildehash.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38598227BCEC83000A1082 /* ishcolontildehash.png */; };
+		AAE10008AF96D90D00FFB7A4 /* icon.png in Resources */ = {isa = PBXBuildFile; fileRef = BB1B9A4223A5E96900414052 /* icon.png */; };
+		AAE10009AF96D90D00FFB7A4 /* reworked.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0B88172589662A00208600 /* reworked.png */; };
+		AAE1000AAF96D90D00FFB7A4 /* colontildehash.png in Resources */ = {isa = PBXBuildFile; fileRef = BB4A922F24EDA55C002F5A96 /* colontildehash.png */; };
+		AAE1000BAF96D90D00FFB7A4 /* notsurewhatthisis.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0B88202589734A00208600 /* notsurewhatthisis.png */; };
+		AAE1000CAF96D90D00FFB7A4 /* pydann1.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0F553123A0AB9B0032A2A1 /* pydann1.png */; };
+		AAE1000DAF96D90D00FFB7A4 /* pydann2.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0F553523A0ACFC0032A2A1 /* pydann2.png */; };
+		AAE1000EAF96D90D00FFB7A4 /* 3d.png in Resources */ = {isa = PBXBuildFile; fileRef = BB4A923124EDA560002F5A96 /* 3d.png */; };
+		AAE1000FAF96D90D00FFB7A4 /* ihash1.png in Resources */ = {isa = PBXBuildFile; fileRef = BB0F553323A0AC760032A2A1 /* ihash1.png */; };
+		AAE10010AF96D90D00FFB7A4 /* metal.png in Resources */ = {isa = PBXBuildFile; fileRef = BBC8298624EE5853009D042C /* metal.png */; };
+		AAE10011AF96D90D00FFB7A4 /* is.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38598327BCEC83000A1082 /* is.png */; };
+		AAE10012AF96D90D00FFB7A4 /* circular.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38597627BCEC70000A1082 /* circular.png */; };
+		AAE10013AF96D90D00FFB7A4 /* icon1337.png in Resources */ = {isa = PBXBuildFile; fileRef = BB4A922D24EDA461002F5A96 /* icon1337.png */; };
+		AAE10014AF96D90D00FFB7A4 /* iinhash.png in Resources */ = {isa = PBXBuildFile; fileRef = BBC8298024EDACBB009D042C /* iinhash.png */; };
+		AAE10015AF96D90D00FFB7A4 /* freeiosterminal.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38597B27BCEC78000A1082 /* freeiosterminal.png */; };
 		AA000100AF96D90D00FFB7A4 /* AboutAppearanceViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 9A28E4E9219A8B670073D200 /* AboutAppearanceViewController.m */; };
 		AA000101AF96D90D00FFB7A4 /* AltIconViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = BB267FA523A48F1500ED7CAF /* AltIconViewController.m */; };
 		AA000102AF96D90D00FFB7A4 /* ThemeViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 491B31E52883BF22008EEFB0 /* ThemeViewController.m */; };
@@ -1905,6 +1926,27 @@
 				AA000048AF96D90D00FFB7A4 /* term.js in Resources */,
 				AA000049AF96D90D00FFB7A4 /* term.css in Resources */,
 				AA00004AAF96D90D00FFB7A4 /* term.html in Resources */,
+				AAE10001AF96D90D00FFB7A4 /* idollarhash.png in Resources */,
+				AAE10002AF96D90D00FFB7A4 /* dollarblock2.png in Resources */,
+				AAE10003AF96D90D00FFB7A4 /* uninspired.png in Resources */,
+				AAE10004AF96D90D00FFB7A4 /* rgb.png in Resources */,
+				AAE10005AF96D90D00FFB7A4 /* dollarblock1.png in Resources */,
+				AAE10006AF96D90D00FFB7A4 /* sprite64.png in Resources */,
+				AAE10007AF96D90D00FFB7A4 /* ishcolontildehash.png in Resources */,
+				AAE10008AF96D90D00FFB7A4 /* icon.png in Resources */,
+				AAE10009AF96D90D00FFB7A4 /* reworked.png in Resources */,
+				AAE1000AAF96D90D00FFB7A4 /* colontildehash.png in Resources */,
+				AAE1000BAF96D90D00FFB7A4 /* notsurewhatthisis.png in Resources */,
+				AAE1000CAF96D90D00FFB7A4 /* pydann1.png in Resources */,
+				AAE1000DAF96D90D00FFB7A4 /* pydann2.png in Resources */,
+				AAE1000EAF96D90D00FFB7A4 /* 3d.png in Resources */,
+				AAE1000FAF96D90D00FFB7A4 /* ihash1.png in Resources */,
+				AAE10010AF96D90D00FFB7A4 /* metal.png in Resources */,
+				AAE10011AF96D90D00FFB7A4 /* is.png in Resources */,
+				AAE10012AF96D90D00FFB7A4 /* circular.png in Resources */,
+				AAE10013AF96D90D00FFB7A4 /* icon1337.png in Resources */,
+				AAE10014AF96D90D00FFB7A4 /* iinhash.png in Resources */,
+				AAE10015AF96D90D00FFB7A4 /* freeiosterminal.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
