@@ -1,0 +1,29 @@
+// ARM64 File Provider extension configuration.
+// Mirrors the x86 iSHFileProvider target but links the arm64 guest
+// meson products and inherits the ARM64 app group so it pairs with the
+// iSH-ARM64 host app.
+#include "iOS.xcconfig"
+#include "GuestARM64.xcconfig"
+
+CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements
+INFOPLIST_FILE = app/FileProvider/Info.plist
+PRODUCT_NAME = $(TARGET_NAME)
+SKIP_INSTALL = YES
+
+// Distinguish from the x86 FileProvider and pair with the iSH-ARM64 host.
+PRODUCT_BUNDLE_IDENTIFIER = $(ROOT_BUNDLE_IDENTIFIER).arm64.FileProvider
+PRODUCT_APP_GROUP_IDENTIFIER = group.$(ROOT_BUNDLE_IDENTIFIER).arm64
+
+// Must match the iSH-ARM64 host app version (App Store validation requires it).
+MARKETING_VERSION = 2.0.0
+
+// Header search paths for the FileProvider sources (fs/fake-db.h, kernel/errno.h).
+HEADER_SEARCH_PATHS = $(inherited) $(SRCROOT)
+
+// Ninja targets this extension needs from the arm64 meson build.
+NINJA_TARGETS = libish_emu.a libfakefs.a
+
+// Link the arm64 meson products directly, exactly like AppARM64.xcconfig.
+// These are NOT placed in a Frameworks build phase so Xcode does not
+// auto-discover an implicit dependency on the x86 library targets.
+OTHER_LDFLAGS = $(inherited) $(MESON_BUILD_DIR)/libish_emu.a $(MESON_BUILD_DIR)/libfakefs.a
