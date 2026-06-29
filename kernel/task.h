@@ -226,6 +226,9 @@ void task_run_current(void);
 
 extern void (*exit_hook)(struct task *task, int code);
 
+typedef int (*ish_timer_tick_hook_t)(void);
+void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook);
+
 #define superuser() (current != NULL && current->euid == 0)
 
 // Update the thread name to match the current task, in the format "comm-pid".

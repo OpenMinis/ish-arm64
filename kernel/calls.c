@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "debug.h"
 #include "kernel/calls.h"
 #include "emu/interrupt.h"
@@ -47,6 +48,12 @@ __thread volatile uint64_t jit_last_host_fault = 0;
 __thread volatile uint64_t jit_last_x7 = 0;
 __thread volatile uint64_t jit_last_x10 = 0;
 __thread volatile int jit_crash_count = 0;
+
+static _Atomic(ish_timer_tick_hook_t) g_timer_tick_hook = NULL;
+
+void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook) {
+    atomic_store_explicit(&g_timer_tick_hook, hook, memory_order_release);
+}
 
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
@@ -986,7 +993,9 @@ void handle_interrupt(int interrupt) {
         });
         unlock(&pids_lock);
     } else if (interrupt == INT_TIMER) {
-        // timer handled below
+        ish_timer_tick_hook_t hook =
+            atomic_load_explicit(&g_timer_tick_hook, memory_order_acquire);
+        if (hook) hook();
     } else {
         printk("EXIT[unhandled-int]: pid=%d interrupt=%d\n", current->pid, interrupt);
         sys_exit(interrupt);

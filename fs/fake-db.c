@@ -58,11 +58,76 @@ static void db_reset_retry(struct fakefs_db *fs, sqlite3_stmt *stmt) {
     printk("WARNING: db_reset_retry exhausted %d attempts\n", DB_RETRY_MAX);
 }
 
-static sqlite3_stmt *db_prepare(struct fakefs_db *fs, const char *stmt) {
-    sqlite3_stmt *statement;
-    sqlite3_prepare_v2(fs->db, stmt, strlen(stmt) + 1, &statement, NULL);
-    db_check_error(fs);
-    return statement;
+// [T-fakefs-db-init-no-die] Init-phase variants that DO NOT abort the whole app
+// on a SQLite error. fake_db_init() runs every time a fakefs mount is opened
+// (incl. dynamic bind-mounts while the app is running); on iOS 27 betas these
+// prepare/step calls were hitting SQLITE_BUSY/LOCKED/IOERR and the old
+// db_check_error() → die() path killed the entire process (Abort trap 6 on a
+// node-* thread, symbolicated to fake_db_init.cold.1). Instead: retry transient
+// lock contention, log the full error, and return the SQLite error code so
+// fake_db_init() can fail the mount gracefully (the caller already handles a
+// negative return). Returns SQLITE_OK on success.
+static int db_log_error(struct fakefs_db *fs, const char *what, const char *sql) {
+    int errcode = sqlite3_errcode(fs->db);
+    printk("fakefs db init error: %s%s%s — code=%d ext=%#x msg=%s\n",
+           what, sql ? " sql=" : "", sql ? sql : "",
+           errcode, sqlite3_extended_errcode(fs->db), sqlite3_errmsg(fs->db));
+    return errcode;
+}
+
+// Prepare a statement, retrying transient BUSY/LOCKED. On terminal failure logs
+// and returns the SQLite error code (caller must check); *out is set to the
+// statement (NULL on failure).
+static int db_prepare_checked(struct fakefs_db *fs, const char *sql, sqlite3_stmt **out) {
+    for (int attempt = 0; attempt < DB_RETRY_MAX; attempt++) {
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(fs->db, sql, strlen(sql) + 1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            *out = stmt;
+            return SQLITE_OK;
+        }
+        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+            if (stmt) sqlite3_finalize(stmt);
+            usleep(DB_RETRY_DELAY_US);
+            continue;
+        }
+        if (stmt) sqlite3_finalize(stmt);
+        *out = NULL;
+        return db_log_error(fs, "prepare", sql);
+    }
+    *out = NULL;
+    printk("fakefs db init: prepare exhausted %d retries: %s\n", DB_RETRY_MAX, sql);
+    return SQLITE_BUSY;
+}
+
+// Step a statement to completion, retrying transient BUSY/LOCKED. Returns
+// SQLITE_DONE/SQLITE_ROW on success, or the error code on terminal failure.
+static int db_step_checked(struct fakefs_db *fs, sqlite3_stmt *stmt, const char *sql) {
+    for (int attempt = 0; attempt < DB_RETRY_MAX; attempt++) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE || rc == SQLITE_ROW || rc == SQLITE_OK)
+            return rc;
+        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+            sqlite3_reset(stmt);
+            usleep(DB_RETRY_DELAY_US);
+            continue;
+        }
+        return db_log_error(fs, "step", sql);
+    }
+    printk("fakefs db init: step exhausted %d retries: %s\n", DB_RETRY_MAX, sql);
+    return SQLITE_BUSY;
+}
+
+// Convenience: prepare + step + finalize a one-shot statement (pragmas, etc.),
+// retrying transient lock contention. Returns SQLITE_OK or the error code.
+static int db_exec_oneshot(struct fakefs_db *fs, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = db_prepare_checked(fs, sql, &stmt);
+    if (rc != SQLITE_OK)
+        return rc;
+    rc = db_step_checked(fs, stmt, sql);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE || rc == SQLITE_ROW || rc == SQLITE_OK) ? SQLITE_OK : rc;
 }
 
 bool db_exec(struct fakefs_db *fs, sqlite3_stmt *stmt) {
@@ -227,20 +292,12 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     }
     sqlite3_busy_timeout(fs->db, 5000);
     sqlite3_create_function(fs->db, "change_prefix", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_func_change_prefix, NULL, NULL);
-    db_check_error(fs);
 
-    // let's do WAL mode
-    sqlite3_stmt *statement = db_prepare(fs, "pragma journal_mode=wal");
-    db_check_error(fs);
-    sqlite3_step(statement);
-    db_check_error(fs);
-    sqlite3_finalize(statement);
-
-    statement = db_prepare(fs, "pragma foreign_keys=true");
-    db_check_error(fs);
-    sqlite3_step(statement);
-    db_check_error(fs);
-    sqlite3_finalize(statement);
+    // [T-fakefs-db-init-no-die] Every prepare/step below now fails the mount
+    // (return _EIO) instead of die()-ing the whole app on a SQLite error. The
+    // caller (fakefs mount) already handles a negative return gracefully.
+    if (db_exec_oneshot(fs, "pragma journal_mode=wal") != SQLITE_OK) goto init_fail;
+    if (db_exec_oneshot(fs, "pragma foreign_keys=true") != SQLITE_OK) goto init_fail;
 
     // N18: Apple-friendly sqlite tuning. The fakefs db is read-mostly
     // during normal use (writes happen for chmod / chown / mknod / new
@@ -263,11 +320,10 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
         "pragma temp_store=MEMORY",
     };
     for (size_t ti = 0; ti < sizeof(tuning)/sizeof(tuning[0]); ti++) {
-        statement = db_prepare(fs, tuning[ti]);
-        db_check_error(fs);
-        sqlite3_step(statement);
-        db_check_error(fs);
-        sqlite3_finalize(statement);
+        // Tuning pragmas are best-effort: a failure here only loses a perf knob,
+        // not correctness, so log and continue rather than fail the mount.
+        if (db_exec_oneshot(fs, tuning[ti]) != SQLITE_OK)
+            printk("fakefs db init: tuning pragma failed (continuing): %s\n", tuning[ti]);
     }
 
 #if DEBUG_sql
@@ -285,8 +341,9 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     struct stat statbuf;
     if (stat(db_path, &statbuf) < 0) ERRNO_DIE("stat database");
     ino_t db_inode = statbuf.st_ino;
-    statement = db_prepare(fs, "select db_inode from meta");
-    if (sqlite3_step(statement) == SQLITE_ROW) {
+    sqlite3_stmt *statement = NULL;
+    if (db_prepare_checked(fs, "select db_inode from meta", &statement) != SQLITE_OK) goto init_fail;
+    if (db_step_checked(fs, statement, "select db_inode from meta") == SQLITE_ROW) {
         if ((uint64_t) sqlite3_column_int64(statement, 0) != db_inode) {
             sqlite3_finalize(statement);
             statement = NULL;
@@ -300,38 +357,53 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
         sqlite3_finalize(statement);
 
     // save current inode
-    statement = db_prepare(fs, "update meta set db_inode = ?");
+    if (db_prepare_checked(fs, "update meta set db_inode = ?", &statement) != SQLITE_OK) goto init_fail;
     sqlite3_bind_int64(statement, 1, (int64_t) db_inode);
-    db_check_error(fs);
-    sqlite3_step(statement);
-    db_check_error(fs);
+    int meta_rc = db_step_checked(fs, statement, "update meta set db_inode = ?");
+    if (meta_rc != SQLITE_DONE && meta_rc != SQLITE_ROW && meta_rc != SQLITE_OK) {
+        sqlite3_finalize(statement);
+        goto init_fail;
+    }
     sqlite3_finalize(statement);
 
     // delete orphaned stats
-    statement = db_prepare(fs, "delete from stats where not exists (select 1 from paths where inode = stats.inode)");
-    db_check_error(fs);
-    sqlite3_step(statement);
-    db_check_error(fs);
-    sqlite3_finalize(statement);
+    if (db_exec_oneshot(fs, "delete from stats where not exists (select 1 from paths where inode = stats.inode)") != SQLITE_OK)
+        goto init_fail;
 
     fs->lock = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
-    fs->stmt.begin_deferred = db_prepare(fs, "begin deferred");
-    fs->stmt.begin_immediate = db_prepare(fs, "begin immediate");
-    fs->stmt.commit = db_prepare(fs, "commit");
-    fs->stmt.rollback = db_prepare(fs, "rollback");
-    fs->stmt.path_get_inode = db_prepare(fs, "select inode from paths where path = ?");
-    fs->stmt.path_read_stat = db_prepare(fs, "select inode, stat from stats natural join paths where path = ?");
-    fs->stmt.path_create_stat = db_prepare(fs, "insert into stats (stat) values (?)");
-    fs->stmt.path_create_path = db_prepare(fs, "insert or replace into paths values (?, last_insert_rowid())");
-    fs->stmt.inode_read_stat = db_prepare(fs, "select stat from stats where inode = ?");
-    fs->stmt.inode_write_stat = db_prepare(fs, "update stats set stat = ? where inode = ?");
-    fs->stmt.path_link = db_prepare(fs, "insert or replace into paths (path, inode) values (?, ?)");
-    fs->stmt.path_unlink = db_prepare(fs, "delete from paths where path = ?");
-    fs->stmt.path_rename = db_prepare(fs, "update or replace paths set path = change_prefix(path, ?, ?) "
+    // [T-fakefs-db-init-no-die] Each cached statement must prepare successfully;
+    // a NULL would crash later at runtime. On any failure, fail the mount.
+#define PREPARE_OR_FAIL(field, sql) \
+    if (db_prepare_checked(fs, (sql), &fs->stmt.field) != SQLITE_OK) goto init_fail
+    PREPARE_OR_FAIL(begin_deferred, "begin deferred");
+    PREPARE_OR_FAIL(begin_immediate, "begin immediate");
+    PREPARE_OR_FAIL(commit, "commit");
+    PREPARE_OR_FAIL(rollback, "rollback");
+    PREPARE_OR_FAIL(path_get_inode, "select inode from paths where path = ?");
+    PREPARE_OR_FAIL(path_read_stat, "select inode, stat from stats natural join paths where path = ?");
+    PREPARE_OR_FAIL(path_create_stat, "insert into stats (stat) values (?)");
+    PREPARE_OR_FAIL(path_create_path, "insert or replace into paths values (?, last_insert_rowid())");
+    PREPARE_OR_FAIL(inode_read_stat, "select stat from stats where inode = ?");
+    PREPARE_OR_FAIL(inode_write_stat, "update stats set stat = ? where inode = ?");
+    PREPARE_OR_FAIL(path_link, "insert or replace into paths (path, inode) values (?, ?)");
+    PREPARE_OR_FAIL(path_unlink, "delete from paths where path = ?");
+    PREPARE_OR_FAIL(path_rename, "update or replace paths set path = change_prefix(path, ?, ?) "
             "where (path >= ? and path < ?) or path = ?");
-    fs->stmt.path_from_inode = db_prepare(fs, "select path from paths where inode = ?");
-    fs->stmt.try_cleanup_inode = db_prepare(fs, "delete from stats where inode = ? and not exists (select 1 from paths where inode = stats.inode)");
+    PREPARE_OR_FAIL(path_from_inode, "select path from paths where inode = ?");
+    PREPARE_OR_FAIL(try_cleanup_inode, "delete from stats where inode = ? and not exists (select 1 from paths where inode = stats.inode)");
+#undef PREPARE_OR_FAIL
     return 0;
+
+init_fail:
+    // [T-fakefs-db-init-no-die] A SQLite error during init no longer aborts the
+    // whole app. Close the half-open db and return an error so the fakefs mount
+    // fails gracefully (the caller handles a negative return).
+    printk("fakefs db init: FAILED for %s — mount aborted (app kept alive)\n", db_path);
+    if (fs->db) {
+        sqlite3_close(fs->db);
+        fs->db = NULL;
+    }
+    return _EIO;
 }
 
 int fake_db_deinit(struct fakefs_db *fs) {
