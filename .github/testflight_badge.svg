@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="220" height="60" viewBox="0 0 220 60">
+  <!-- Background -->
+  <rect width="220" height="60" rx="10" fill="#000"/>
+  <!-- Border -->
+  <rect x=".5" y=".5" width="219" height="59" rx="9.5" fill="none" stroke="#a6a6a6" stroke-width="1"/>
+
+  <!-- TestFlight blue rounded square icon -->
+  <rect x="10" y="8" width="44" height="44" rx="10" fill="url(#tfGrad)"/>
+  <defs>
+    <linearGradient id="tfGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5AC8FA"/>
+      <stop offset="100%" stop-color="#007AFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- TestFlight propeller icon (white) -->
+  <g transform="translate(32,30)" fill="white">
+    <!-- Center circle -->
+    <circle cx="0" cy="0" r="3.5"/>
+    <!-- Blade 1 (top) -->
+    <ellipse cx="0" cy="-11" rx="4" ry="8" transform="rotate(0)"/>
+    <!-- Blade 2 (bottom-right) -->
+    <ellipse cx="0" cy="-11" rx="4" ry="8" transform="rotate(120)"/>
+    <!-- Blade 3 (bottom-left) -->
+    <ellipse cx="0" cy="-11" rx="4" ry="8" transform="rotate(240)"/>
+    <!-- Center overlay circle -->
+    <circle cx="0" cy="0" r="4" fill="url(#tfGrad)"/>
+    <circle cx="0" cy="0" r="2.5" fill="white"/>
+  </g>
+
+  <!-- Text -->
+  <text x="66" y="25" fill="#ababab" font-family="Helvetica Neue,Arial,sans-serif" font-size="11" letter-spacing=".3">Download on the</text>
+  <text x="66" y="47" fill="#ffffff" font-family="Helvetica Neue,Arial,sans-serif" font-size="22" font-weight="700" letter-spacing=".2">TestFlight</text>
+</svg>
