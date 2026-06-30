@@ -33,6 +33,12 @@
 >
 > ---
 
+<p align="center">
+<a href="https://testflight.apple.com/join/ZtGfhNkH">
+<img src="https://raw.githubusercontent.com/OpenMinis/ish-arm64/master/.github/testflight_badge.svg" alt="Download on TestFlight" height="60"/>
+</a>
+</p>
+
 [![Build Status](https://github.com/ish-app/ish/actions/workflows/ci.yml/badge.svg)](https://github.com/ish-app/ish/actions)
 [![goto counter](https://img.shields.io/github/search/ish-app/ish/goto.svg)](https://github.com/ish-app/ish/search?q=goto)
 [![fuck counter](https://img.shields.io/github/search/ish-app/ish/fuck.svg)](https://github.com/ish-app/ish/search?q=fuck)
@@ -49,7 +55,7 @@ A project to get a Linux shell running on iOS, using usermode x86 emulation and 
 For the current status of the project, check the issues tab, and the commit logs.
 
 - [App Store page](https://apps.apple.com/us/app/ish-shell/id1436902243)
-- [TestFlight beta](https://testflight.apple.com/join/97i7KM8O)
+- [TestFlight beta (ARM64 fork)](https://testflight.apple.com/join/ZtGfhNkH)
 - [Discord server](https://discord.gg/HFAXj44)
 - [Wiki with help and tutorials](https://github.com/ish-app/ish/wiki)
 - [README中文](https://github.com/ish-app/ish/blob/master/README_ZH.md) (如若未能保持最新，请提交PR以更新)
