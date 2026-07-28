@@ -253,6 +253,14 @@ extern void (*exit_hook)(struct task *task, int code);
 typedef int (*ish_timer_tick_hook_t)(void);
 void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook);
 
+// [fork-guard] Called in sys_clone before a new task is created.
+// Return 0 to allow the fork, or a negative errno (e.g. _EAGAIN) to deny it;
+// the value is returned to the guest verbatim and no task is created.
+// Set with ish_set_fork_guard(); pass NULL to remove. Thread-safe via atomic store.
+// The callback runs on the forking thread and must not allocate or take kernel locks.
+typedef int (*ish_fork_guard_t)(void);
+void ish_set_fork_guard(ish_fork_guard_t guard);
+
 #define superuser() (current != NULL && current->euid == 0)
 
 // Update the thread name to match the current task, in the format "comm-pid".

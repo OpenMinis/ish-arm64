@@ -1,5 +1,6 @@
 #include <time.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include "debug.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -16,6 +17,12 @@
 #define CPU_SP(cpu) ((cpu).esp)
 #define CPU_RETVAL(cpu) ((cpu).eax)
 #endif
+
+static _Atomic(ish_fork_guard_t) g_fork_guard = NULL;
+
+void ish_set_fork_guard(ish_fork_guard_t guard) {
+    atomic_store_explicit(&g_fork_guard, guard, memory_order_release);
+}
 
 #define CSIGNAL_ 0x000000ff
 #define CLONE_VM_ 0x00000100
@@ -170,6 +177,21 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
         return _EINVAL;
     if (flags & CLONE_THREAD_ && !(flags & CLONE_SIGHAND_))
         return _EINVAL;
+
+    // [fork-guard] Let the host layer decide whether to allow this fork. A
+    // negative errno (e.g. _EAGAIN) is returned to the guest verbatim and no
+    // task is created. Threads (CLONE_THREAD_) are exempt: they share the
+    // parent's address space, so they don't add the per-process memory cost
+    // the guard exists to bound, and denying them would break pthread users.
+    if (!(flags & CLONE_THREAD_)) {
+        ish_fork_guard_t guard =
+            atomic_load_explicit(&g_fork_guard, memory_order_acquire);
+        if (guard != NULL) {
+            int err = guard();
+            if (err < 0)
+                return (dword_t) err;
+        }
+    }
 
     struct task *task = task_create_(current);
     if (task == NULL)
