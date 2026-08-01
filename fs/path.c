@@ -117,9 +117,21 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
         return _ENOENT;
 
     if (at_path != NULL && strcmp(at_path, "/") != 0) {
+        // [T-ish-pathnorm-overflow] The base path must leave room for at least
+        // "/x" plus the terminator, or the component loop below writes past
+        // `out`. `n` is signed and every later check is `n == 0`, so a base
+        // that overruns the buffer used to drive `n` NEGATIVE, skipping the
+        // ENAMETOOLONG exit entirely: each iteration then wrote a bare '/'
+        // (line "output a slash" is unconditional) while the name copy was
+        // blocked by `--n > 0`, producing "//" runs that fail
+        // path_is_normalized() — the assert seen in the field — after already
+        // having scribbled past the end of the caller's MAX_PATH buffer.
+        size_t at_len = strlen(at_path);
+        if (at_len + 2 > (size_t) n)
+            return _ENAMETOOLONG;
         strcpy(o, at_path);
-        n -= strlen(at_path);
-        o += strlen(at_path);
+        n -= at_len;
+        o += at_len;
     }
 
     while (*p == '/')
@@ -148,6 +160,13 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
             }
         }
 
+        // [T-ish-pathnorm-overflow] Bail BEFORE writing the separator when
+        // there is no room for it plus at least one name byte and the NUL.
+        // Previously the slash was written unconditionally and only an exact
+        // `n == 0` was caught afterwards, so an already-exhausted buffer both
+        // overflowed and emitted "//".
+        if (n < 2)
+            return _ENAMETOOLONG;
         // output a slash
         *o++ = '/'; n--;
         char *c = o;
@@ -158,7 +177,10 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
         while (*p == '/')
             p++;
 
-        if (n == 0)
+        // `<= 0` rather than `== 0`: the loop above can leave n at 0 having
+        // consumed its last byte, and a defensive lower bound keeps a future
+        // accounting slip from sailing past this exit again.
+        if (n <= 0)
             return _ENAMETOOLONG;
 
         if ((flags & N_SYMLINK_FOLLOW) || *p != '\0') {
