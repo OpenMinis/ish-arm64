@@ -254,7 +254,10 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 #define MAX_PID (1 << 15) // oughta be enough
 
 // TODO document
-void task_start(struct task *task);
+// Starts the task's thread. Returns 0, or a negative guest errno (_EAGAIN when
+// the host is out of thread resources) -- callers must not assume success.
+__attribute__((warn_unused_result))
+int task_start(struct task *task);
 void task_run_current(void);
 
 extern void (*exit_hook)(struct task *task, int code);

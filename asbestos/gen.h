@@ -19,6 +19,11 @@ struct gen_state {
     uint32_t last_insn;
     struct tlb *tlb; // for peephole optimization (peek at next instruction)
     unsigned b_follow_depth; // how many unconditional B's we've followed inline
+    // Set when growing the gadget buffer ran out of memory. gen() cannot report
+    // failure to its ~2000 call sites, so it records it here and emits nothing
+    // further; fiber_block_compile() checks this and fails the compile, which
+    // the run loop turns into a guest INT_GPF. See [T-ish-jit-oom-abort].
+    bool oom;
 };
 
 bool gen_start(addr_t addr, struct gen_state *state);

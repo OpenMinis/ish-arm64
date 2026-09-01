@@ -1020,7 +1020,12 @@ static void handle_guest_exec(jbuf *j, int64_t id, const rpc_request *req) {
     }
 
     pid_t_ guest_pid = task->pid;
-    task_start(task);
+    if (task_start(task) < 0) {
+        current = saved_current;
+        close(pipefd[0]);
+        rpc_error(j, id, -1, "could not start task thread (out of resources)");
+        return;
+    }
     current = saved_current;
 
     // The response will be sent by the reader thread, so set a sentinel

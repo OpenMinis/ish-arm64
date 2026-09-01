@@ -100,6 +100,14 @@ static int proc_refresh_data(struct fd *fd) {
         fd->proc.data.capacity = 4096;
         fd->proc.data.data = malloc(fd->proc.data.capacity); // default size
     }
+    // Not every regular proc entry has a show(): entries that serve their
+    // content through pread/pwrite (e.g. /proc/<pid>/mem) leave it NULL, and
+    // proc_entry_mode() defaults a typeless entry to S_IFREG, so the S_ISDIR
+    // check above lets them through. Calling the NULL pointer jumped to
+    // address 0 and the kernel killed us with CODESIGNING/Invalid Page.
+    if (fd->proc.entry.meta->show == NULL)
+        return _EINVAL;
+
     fd->proc.data.size = 0;
     struct proc_entry *entry = &fd->proc.entry;
     int err = entry->meta->show(entry, &fd->proc.data);
@@ -109,6 +117,29 @@ static int proc_refresh_data(struct fd *fd) {
 }
 
 static off_t_ proc_seek(struct fd *fd, off_t_ off, int whence) {
+    // pread-backed entries have no snapshot to size, and their offset is an
+    // address rather than a position in a buffer — /proc/<pid>/mem is read by
+    // seeking to the guest address and reading. Seek them without an end
+    // bound instead of refreshing (which would have no show() to call).
+    // LSEEK_END is meaningless for an address space, so it stays refused.
+    if (fd->proc.entry.meta->pread != NULL) {
+        if (whence == LSEEK_END)
+            return _EINVAL;
+        // generic_seek checks for a negative result on the CUR and END paths
+        // but not on LSEEK_SET, which stores the offset verbatim. Since
+        // fd->offset is unsigned, a negative would wrap to a huge value and
+        // then be truncated into a guest address by the pread handler, so
+        // reject it up front. Returning before generic_seek also leaves
+        // fd->offset untouched — a failed seek must not move the file.
+        // (Linux returns EINVAL for a negative resulting position too.)
+        if (whence == LSEEK_SET && off < 0)
+            return _EINVAL;
+        int err = generic_seek(fd, off, whence, 0);
+        if (err < 0)
+            return err;
+        return fd->offset;
+    }
+
     int err = proc_refresh_data(fd);
     if (err < 0)
         return err;

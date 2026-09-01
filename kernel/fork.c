@@ -225,7 +225,24 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
         send_signal(current, SIGTRAP_, SIGINFO_NIL);
     }
 
-    task_start(task);
+    // Starting the thread can fail when the host is out of thread resources
+    // (each guest thread costs a host thread plus its stack). Report it to the
+    // guest as clone() failing -- the alternative is a task that exists but
+    // never runs, and a vfork parent that waits on it forever.
+    // [T-ish-jit-oom-abort]
+    int start_err = task_start(task);
+    if (start_err < 0) {
+        if (flags & CLONE_VFORK_) {
+            lock(&task->general_lock);
+            task->vfork = NULL;
+            unlock(&task->general_lock);
+            cond_destroy(&vfork.cond);
+        }
+        lock(&pids_lock);
+        task_destroy(task);
+        unlock(&pids_lock);
+        return start_err;
+    }
 
     if (flags & CLONE_VFORK_) {
         lock(&vfork.lock);

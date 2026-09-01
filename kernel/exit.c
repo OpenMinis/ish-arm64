@@ -560,6 +560,10 @@ int do_wait(int idtype, pid_t_ id, struct siginfo_ *info, struct rusage_ *rusage
     lock(&pids_lock);
     int err;
     bool got_signal = false;
+    // [T-ish-waitpid-backoff] Seconds to wait on the next fruitless expiry.
+    // Local, so each waiter backs off independently.
+    time_t wait_backoff_s = 1;
+    static const time_t WAIT_BACKOFF_MAX_S = 4;
 
 retry:
     ;
@@ -615,11 +619,40 @@ retry:
         goto error;
 
     // no matching zombie found, wait for one.
-    // Use a bounded 1-second timeout to work around macOS condvar issues
+    // Use a bounded timeout to work around macOS condvar issues
     // (pthread_cond_wait can block forever under thread contention).
+    //
+    // [T-ish-waitpid-backoff] The timeout BACKS OFF on consecutive fruitless
+    // expiries: 1s, 2s, then 4s. It is a failsafe for a missed wakeup, not
+    // the delivery path — a child that exits calls notify() on child_exit
+    // (a pthread_cond_broadcast, exit.c), so a normal reap is immediate no
+    // matter what this value is. What the timeout costs is lock traffic: the
+    // wait re-acquires the GLOBAL pids_lock to return, then `goto retry`
+    // rescans the task list under it. A child that hangs without exiting
+    // therefore made its parent grab that lock once a second forever.
+    //
+    // That is what killed the app on 2026-08-23 20:11: a wedged `ssh` idled
+    // 520s, its parent took pids_lock ~520 times, and everything else that
+    // needs it — fork, exit, SIGINT delivery, and the terminal's mount on the
+    // MAIN THREAD — queued behind it until the 10s scene-update watchdog
+    // fired. Backing off cuts those 520 acquisitions to ~132.
+    //
+    // Capped at 4s, deliberately BELOW iOS's 10s watchdog: this timeout is
+    // the only thing that detects a genuinely missed wakeup, and a cap at or
+    // above the watchdog would let one such miss stall a main-thread waiter
+    // long enough to become the very crash this is meant to prevent. Two
+    // ticks still fit inside one watchdog budget.
+    //
+    // Reset to 1s on ANY progress (see below), so a shell reaping a series of
+    // children keeps full responsiveness instead of drifting into a slow
+    // poll. Only CONSECUTIVE empty expiries back off.
+    //
+    // The counter is a local, and child_exit is per-tgroup (task.h), so each
+    // waiter backs off independently — one process's backoff cannot delay
+    // another's reap.
     current->blocking = true;
     {
-        struct timespec waitpid_timeout = {.tv_sec = 1, .tv_nsec = 0};
+        struct timespec waitpid_timeout = {.tv_sec = wait_backoff_s, .tv_nsec = 0};
         // wait_for returns _EINTR (signal), _ETIMEDOUT (deadline expired), or
         // 0 (child_exit was signalled). Only a real signal may set got_signal:
         // treating _ETIMEDOUT as one made every wait for a child that ran
@@ -630,6 +663,16 @@ retry:
         int wait_err = wait_for(&current->group->child_exit, &pids_lock, &waitpid_timeout);
         if (wait_err == _EINTR)
             got_signal = true;
+        if (wait_err == _ETIMEDOUT) {
+            // Nothing happened — this waiter is polling a child that has not
+            // exited. Back off so it stops hammering pids_lock.
+            if (wait_backoff_s < WAIT_BACKOFF_MAX_S)
+                wait_backoff_s *= 2;
+        } else {
+            // child_exit fired (or a signal arrived): something changed, so
+            // the next wait starts responsive again.
+            wait_backoff_s = 1;
+        }
     }
     current->blocking = false;
     {

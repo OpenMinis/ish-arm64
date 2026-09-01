@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <unistd.h>
 #include "debug.h"
 #include "kernel/calls.h"
@@ -11,6 +12,224 @@
 
 #if ANON_MMAP_LIMIT_PAGES > 0
 _Atomic long anon_page_count;
+
+// [T-ish-anon-cap-dynamic] Effective limit, host-tunable at boot. Defaults to
+// the compile-time ceiling so builds that never call the setter keep the old
+// fixed-cap behaviour.
+_Atomic long anon_page_limit = ANON_MMAP_LIMIT_PAGES;
+
+static void anon_count_check(long count);
+
+void ish_set_anon_page_limit(long pages) {
+    if (pages <= 0)
+        return; // host couldn't measure (e.g. unlimited) — keep the default
+    if (pages > ANON_MMAP_LIMIT_PAGES)
+        pages = ANON_MMAP_LIMIT_PAGES;
+    atomic_store(&anon_page_limit, pages);
+}
+
+// [T-ish-footprint-brake] Live memory status. stamp==0 means the host never
+// fed us — legacy ledger mode. See the design note in mm.h.
+static _Atomic int ish_mem_state_v = ISH_MEM_OK;
+static _Atomic uint64_t ish_mem_limit_v;
+static _Atomic uint64_t ish_mem_avail_v;
+static _Atomic uint64_t ish_mem_stamp_ms;
+
+// Feed staleness window. A sampler that stops updating for this long is
+// treated as dead and the brake engages — the governor must fail closed.
+#define ISH_MEM_STALE_MS 2000
+
+static uint64_t ish_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+bool ish_footprint_mode(void) {
+    return atomic_load(&ish_mem_stamp_ms) != 0;
+}
+
+void ish_set_memory_status(uint64_t limit_bytes, uint64_t avail_bytes, bool pressure_critical) {
+    if (limit_bytes == 0)
+        return; // host couldn't measure — don't flip modes on garbage
+    int prev = atomic_load(&ish_mem_state_v);
+    int next;
+    if (pressure_critical) {
+        // The OS itself says memory is critical — believe it over our math.
+        next = ISH_MEM_BRAKE;
+    } else if (avail_bytes * 10 < limit_bytes) {
+        next = ISH_MEM_BRAKE;                       // < 10% headroom
+    } else if (prev == ISH_MEM_BRAKE && avail_bytes * 100 < limit_bytes * 15) {
+        next = ISH_MEM_BRAKE;                       // hysteresis: exit above 15%
+    } else {
+        next = ISH_MEM_OK;
+    }
+    atomic_store(&ish_mem_limit_v, limit_bytes);
+    atomic_store(&ish_mem_avail_v, avail_bytes);
+    atomic_store(&ish_mem_state_v, next);
+    atomic_store(&ish_mem_stamp_ms, ish_monotonic_ms());
+    if (next != prev)
+        printk("mem: brake %s — footprint %lu MB / limit %lu MB (avail %lu MB)%s\n",
+               next == ISH_MEM_BRAKE ? "ENGAGED" : "released",
+               (unsigned long)((limit_bytes - avail_bytes) >> 20),
+               (unsigned long)(limit_bytes >> 20),
+               (unsigned long)(avail_bytes >> 20),
+               pressure_critical ? " [OS pressure critical]" : "");
+}
+
+bool ish_mem_commit_ok(uint64_t bytes) {
+    uint64_t stamp = atomic_load(&ish_mem_stamp_ms);
+    if (stamp == 0)
+        return true;   // legacy mode: the ledger check in anon_pages_reserve decides
+    uint64_t limit = atomic_load(&ish_mem_limit_v);
+    // Sanity gate: one request larger than the entire allowance can never be
+    // dirtied safely — give it a clean upfront ENOMEM (malloc returns NULL)
+    // instead of admitting it and killing the process mid-memset later.
+    if (limit != 0 && bytes > limit)
+        return false;
+    if (ish_monotonic_ms() - stamp > ISH_MEM_STALE_MS)
+        return false;  // dead sampler fails closed
+    return atomic_load(&ish_mem_state_v) == ISH_MEM_OK;
+}
+
+// Check-and-add under the runtime limit. CAS loop rather than fetch_add so a
+// refusal adds nothing — the old blind fetch_add sites both leaked count on
+// the failure path and (worse) let paths that "only account" sail past the
+// limit entirely, which is how the 2026-08-25 jsonnet compile grew a 2GB+
+// footprint with the cap nominally in place.
+//
+// [T-ish-footprint-brake] Two admission regimes share this single choke
+// point. In footprint mode the decision comes from ish_mem_commit_ok()
+// (live jetsam headroom) and the counter is accounting only — a plain add,
+// no limit comparison, because the whole point of the redesign is that
+// COMMITMENT is not what kills the app, dirty footprint is. Legacy mode
+// (host never installed a feed: tests, Linux CLI) keeps the ledger check
+// bit-for-bit as before.
+bool anon_pages_reserve(long pages) {
+    if (ish_footprint_mode()) {
+        if (!ish_mem_commit_ok((uint64_t)pages * PAGE_SIZE))
+            return false;
+        atomic_fetch_add(&anon_page_count, pages);
+        anon_pages_precharged(pages);
+        return true;
+    }
+    long limit = atomic_load(&anon_page_limit);
+    long count = atomic_load(&anon_page_count);
+    anon_count_check(count);
+    do {
+        if (count + pages > limit)
+            return false;
+    } while (!atomic_compare_exchange_weak(&anon_page_count, &count, count + pages));
+    // Tell pt_map_nothing this much is already accounted for, so the pages it
+    // is about to map are not charged a second time.
+    anon_pages_precharged(pages);
+    return true;
+}
+
+void anon_pages_unreserve(long pages) {
+    atomic_fetch_sub(&anon_page_count, pages);
+}
+
+// [T-ish-anon-count-negative] Handoff between "reserved by a caller enforcing
+// the cap" and "charged because pages were actually mapped".
+//
+// pt_map_nothing charges every page it maps. Callers that reserve FIRST (to
+// refuse the allocation before doing any work) would otherwise be counted
+// twice, so they park the reservation here and pt_map_nothing consumes it.
+// Thread-local because the reserve and the map always happen on the same
+// thread, back to back, under mem->lock — a global would let two concurrent
+// mappers steal each other's credit.
+static __thread long anon_precharged_pages;
+
+void anon_pages_precharged(long pages) {
+    anon_precharged_pages = pages;
+}
+
+long anon_pages_precharge_peek(void) {
+    return anon_precharged_pages;
+}
+
+void anon_pages_charge_mapped(long pages) {
+    long credit = anon_precharged_pages;
+    anon_precharged_pages = 0;
+    if (credit >= pages)
+        return;              // fully covered by the caller's reservation
+    atomic_fetch_add(&anon_page_count, pages - credit);
+}
+
+// Fail loudly when the invariant breaks instead of silently granting memory.
+// Called from the cap check, which is the point where a negative count would
+// start handing out free headroom.
+static void anon_count_check(long count) {
+    if (count >= 0)
+        return;
+    static _Atomic bool reported;
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&reported, &expected, true)) {
+        printk("mmap: BUG anon_page_count went NEGATIVE (%ld pages) — "
+               "charge/uncharge asymmetry; the cap is now granting free "
+               "headroom. Clamping to 0.\n", count);
+        assert(count >= 0);
+    }
+    // Release builds (NDEBUG) keep running: clamp so the cap still holds a
+    // line rather than authorising unbounded memory.
+    long expected_count = count;
+    atomic_compare_exchange_strong(&anon_page_count, &expected_count, 0);
+}
+
+// [T-ish-anon-cap-above-jetsam] Announce the moment the cap actually bites.
+//
+// Without this the guest just sees ENOMEM and the app log says nothing, so a
+// runaway allocation is indistinguishable from a bug in the user's script —
+// which is exactly how the 2026-08-24 report was first misread. Rate-limited
+// because a process hitting the ceiling typically retries in a tight loop.
+static void anon_limit_report(const char *where, long requested_pages) {
+    // [T-ish-footprint-brake] In footprint mode the refusal has nothing to do
+    // with the ledger, so the "cap/ceiling" line below would be misinformation
+    // — report the actual reason (brake / stale feed / oversized ask), rate
+    // limited by time since the counter no longer tracks the trigger.
+    if (ish_footprint_mode()) {
+        static _Atomic uint64_t last_ms;
+        uint64_t now = ish_monotonic_ms();
+        uint64_t prev_ms = atomic_load(&last_ms);
+        if (now - prev_ms < 2000)
+            return;
+        atomic_store(&last_ms, now);
+        uint64_t limit = atomic_load(&ish_mem_limit_v);
+        uint64_t avail = atomic_load(&ish_mem_avail_v);
+        bool stale = now - atomic_load(&ish_mem_stamp_ms) > ISH_MEM_STALE_MS;
+        printk("mmap: memory brake refused %s — requested %ld pages, app footprint "
+               "%lu MB / limit %lu MB (avail %lu MB)%s. Failing the guest allocation "
+               "to keep the app below the jetsam line.\n",
+               where, requested_pages,
+               (unsigned long)((limit - avail) >> 20), (unsigned long)(limit >> 20),
+               (unsigned long)(avail >> 20),
+               stale ? " [sampler stale — failing closed]" : "");
+        return;
+    }
+    static _Atomic long last_report_pages;
+    long count = atomic_load(&anon_page_count);
+    long prev = atomic_load(&last_report_pages);
+    // One line per 16MB of movement in the high-water mark, so a retry storm
+    // does not itself become the thing that floods the log.
+    if (count > prev - 4096 && count < prev + 4096)
+        return;
+    atomic_store(&last_report_pages, count);
+    long limit = atomic_load(&anon_page_limit);
+    // [T-ish-anon-cap-page-units] Report HOST megabytes: each counted guest
+    // page occupies a full host page, so `pages / 256` (pages x 4KB) understates
+    // the real footprint by 4x on a 16KB-page device and made the previous log
+    // line agree with a cap that was itself wrong.
+    long kb_per_page = (long)getpagesize() / 1024;
+    printk("mmap: anonymous page cap reached in %s — in use %ld pages (%ld MB host), "
+           "requested %ld pages (%ld MB host), cap %ld pages (%ld MB host, "
+           "ceiling %ld MB host). Failing the guest allocation instead of "
+           "letting the host app be killed by jetsam.\n",
+           where, count, count * kb_per_page / 1024,
+           requested_pages, requested_pages * kb_per_page / 1024,
+           limit, limit * kb_per_page / 1024,
+           (long)ANON_MMAP_LIMIT_PAGES * kb_per_page / 1024);
+}
 #endif
 
 struct mm *mm_new() {
@@ -170,15 +389,15 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
         }
 #endif
 #if ANON_MMAP_LIMIT_PAGES > 0
-        if (!is_prot_none && atomic_load(&anon_page_count) + (long)pages > ANON_MMAP_LIMIT_PAGES)
+        if (!is_prot_none && !anon_pages_reserve((long)pages)) {
+            anon_limit_report("mmap", (long)pages);
             return _ENOMEM;
-        if (!is_prot_none)
-            atomic_fetch_add(&anon_page_count, (long)pages);
+        }
 #endif
         if ((err = pt_map_nothing(current->mem, page, pages, prot)) < 0) {
 #if ANON_MMAP_LIMIT_PAGES > 0
             if (!is_prot_none)
-                atomic_fetch_sub(&anon_page_count, (long)pages);
+                anon_pages_unreserve((long)pages);
 #endif
             return err;
         }
@@ -564,14 +783,15 @@ addr_t sys_brk(addr_t new_brk) {
         if (!pt_is_hole(&mm->mem, start, size))
             goto out;
 #if ANON_MMAP_LIMIT_PAGES > 0
-        if (atomic_load(&anon_page_count) + (long)size > ANON_MMAP_LIMIT_PAGES)
+        if (!anon_pages_reserve((long)size)) {
+            anon_limit_report("brk", (long)size);
             goto out;
-        atomic_fetch_add(&anon_page_count, (long)size);
+        }
 #endif
         int err = pt_map_nothing(&mm->mem, start, size, P_WRITE);
         if (err < 0) {
 #if ANON_MMAP_LIMIT_PAGES > 0
-            atomic_fetch_sub(&anon_page_count, (long)size);
+            anon_pages_unreserve((long)size);
 #endif
             goto out;
         }

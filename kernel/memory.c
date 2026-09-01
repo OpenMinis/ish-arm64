@@ -621,7 +621,13 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
         // Decrement per-page for anonymous mappings. This correctly handles
         // partial unmaps (munmap of subset of original mmap region) where the
         // data object's refcount doesn't reach 0 but the guest page is gone.
-        if (pt->flags & P_ANONYMOUS)
+        //
+        // [T-ish-anon-count-negative] Must mirror pt_map_nothing's charge
+        // condition EXACTLY. It skips PROT_NONE mappings (a reservation costs
+        // no physical memory), so unmapping one must not decrement either —
+        // otherwise every PROT_NONE region the guest maps and frees walks the
+        // counter down, which is the second half of how it reached -1359 MB.
+        if ((pt->flags & P_ANONYMOUS) && anon_page_is_charged(pt->flags))
             atomic_fetch_sub(&anon_page_count, 1);
 #endif
         mem_pt_del(mem, page);
@@ -640,6 +646,13 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
     return 0;
 }
 
+// [T-ish-cluster-hitrate] Every anonymous host allocation, and the guest pages
+// it backs, regardless of which path asked for it. Without this the cluster
+// hit rate is unanchored: a high hit rate means nothing if most memory is
+// actually arriving through mmap/brk instead.
+_Atomic uint64_t st_anon_mmaps;        // host mmap calls for anonymous memory
+_Atomic uint64_t st_anon_pages_mapped; // guest pages they backed
+
 int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
     if (pages == 0) return 0;
     // Use host PROT_NONE for guest PROT_NONE mappings. Go runtime reserves
@@ -652,7 +665,181 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
     void *memory = mmap(NULL, map_size, host_prot, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (memory == MAP_FAILED)
         return _ENOMEM;
-    return pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
+    if (host_prot != PROT_NONE) {
+        // PROT_NONE reservations cost no physical memory, so they would only
+        // dilute the ratio we are trying to measure.
+        atomic_fetch_add_explicit(&st_anon_mmaps, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&st_anon_pages_mapped, (uint64_t)pages,
+                                  memory_order_relaxed);
+    }
+    int err = pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
+#if ANON_MMAP_LIMIT_PAGES > 0
+    // [T-ish-anon-count-negative] Charge HERE, not at the call sites.
+    //
+    // pt_unmap decrements once for EVERY P_ANONYMOUS page it removes, so every
+    // page mapped here must be charged exactly once or the counter drifts
+    // negative — and a negative count silently hands the guest extra headroom
+    // on top of the cap. Observed on device 2026-08-25: `in use -86998 pages
+    // (-1359 MB host)`, i.e. the cap was granting 1.3GB of free credit while
+    // the app climbed to a 3338MB jetsam kill.
+    //
+    // The old design charged at the call sites, and an audit found 9 of 15
+    // sites mapping anonymous pages without charging — including
+    // pt_set_flags' mprotect-commit, which materialises whole 32k-page runs
+    // (the V8/malloc bomb path that produced the number above). Charging in
+    // the one place that creates the mapping makes the asymmetry structurally
+    // impossible rather than a thing every new call site must remember.
+    //
+    // Sites that pre-charge to enforce the cap (sys_mmap, sys_brk, the
+    // reservation lazy-commit) hand their reservation over via
+    // anon_pages_precharged() so this does not double-count them.
+    if (err >= 0 && anon_page_is_charged(flags))
+        anon_pages_charge_mapped(pages);
+    else
+        anon_pages_precharged(0);   // drop any unconsumed reservation credit
+#endif
+    return err;
+}
+
+// [T-ish-cluster-commit] Commit a single faulting guest page as part of a
+// host-page-sized CLUSTER, to stop 4KB guest pages each burning a whole 16KB
+// host page.
+//
+// Every committed page gets its own host mmap, and Darwin on Apple Silicon
+// cannot hand back less than 16KB, so a one-page commit wastes 12KB. Measured
+// on the 2026-08-25 jsonnet compile: 116,836 VM_ALLOCATE regions, every one
+// exactly 16KB, holding 456MB of guest pages while consuming 1826MB of host
+// memory — a 4x amplification.
+//
+// The cluster machinery already exists: pt_map() points N guest pages at one
+// host allocation and refcounts it, and pt_unmap() only munmaps when the last
+// page of that allocation goes away. That IS the per-cluster occupancy map the
+// naive "one mmap per page" callers were bypassing by passing pages=1.
+//
+// Correctness over packing (never fabricate a cluster):
+//   * The cluster is the aligned run of `real_page_size / PAGE_SIZE` guest
+//     pages containing `page` — always contiguous and aligned by construction,
+//     never assembled from scattered requests.
+//   * Every page in it must currently be unmapped. A mapped neighbour means
+//     the region is already backed; silently re-mapping it would strand the
+//     old allocation and corrupt the address space.
+//   * `same_flags` lets the caller require that neighbours belong to the same
+//     logical region (e.g. one reservation) before they are committed early.
+//   * Anything unmet degrades to the plain single-page commit. Wasting 12KB is
+//     always preferable to mapping a page the guest did not ask for.
+//
+// On a 4KB-page host (x86 sim, Linux) cluster_pages == 1 and this is exactly
+// the old behaviour.
+//
+// Caller must hold mem->lock for writing — same as the pt_map_nothing call it
+// replaces. Anonymous-page accounting deliberately stays in GUEST pages: the
+// cap must stay correct in the worst case where every commit degrades to a
+// single page, so it is charged per guest page here just as before.
+// [T-ish-cluster-hitrate] Diagnostic counters. A workload whose real benefit
+// is far below the 4x the design predicts must be measurable, not guessed at:
+// these separate "did the cluster fire" from the specific reason it did not,
+// because a mapped neighbour (the guest is filling a region we already backed
+// — benign, the memory is shared anyway) and a foreign/absent reservation (the
+// cluster is genuinely unavailable) call for completely different responses.
+_Atomic uint64_t st_cluster_full;        // committed the whole host page
+_Atomic uint64_t st_cluster_single;      // degraded to one guest page
+_Atomic uint64_t st_cluster_why_mapped;  // ...because a neighbour was mapped
+_Atomic uint64_t st_cluster_why_flags;   // ...because same_flags refused
+_Atomic uint64_t st_cluster_why_nocluster; // ...host page == guest page
+_Atomic uint64_t st_cluster_why_enomem;  // ...cluster mmap failed, retried
+_Atomic uint64_t st_cluster_pages_committed; // guest pages actually committed
+_Atomic uint64_t st_cluster_calls;       // total calls
+
+int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
+                   bool (*same_flags)(struct mem *mem, page_t page, void *ctx),
+                   void *ctx, pages_t *committed_out) {
+    pages_t cluster_pages = (pages_t)(real_page_size >> PAGE_BITS);
+    if (cluster_pages < 1)
+        cluster_pages = 1;
+
+    atomic_fetch_add_explicit(&st_cluster_calls, 1, memory_order_relaxed);
+
+    page_t base = page & ~(page_t)(cluster_pages - 1);
+    bool whole_cluster = cluster_pages > 1;
+    if (!whole_cluster)
+        atomic_fetch_add_explicit(&st_cluster_why_nocluster, 1, memory_order_relaxed);
+
+    if (whole_cluster) {
+        for (page_t p = base; p < base + cluster_pages; p++) {
+            if (mem_pt(mem, p) != NULL) {
+                atomic_fetch_add_explicit(&st_cluster_why_mapped, 1, memory_order_relaxed);
+                whole_cluster = false; break;
+            }
+            if (same_flags != NULL && !same_flags(mem, p, ctx)) {
+                atomic_fetch_add_explicit(&st_cluster_why_flags, 1, memory_order_relaxed);
+                whole_cluster = false; break;
+            }
+        }
+    }
+
+    page_t start = whole_cluster ? base : page;
+    pages_t count = whole_cluster ? cluster_pages : 1;
+#if ANON_MMAP_LIMIT_PAGES > 0
+    // [T-ish-anon-count-negative] The caller may have parked a precharge for
+    // this commit. pt_map_nothing consumes it, so on the retry below we must
+    // re-park what is still owed — otherwise the failed attempt eats the
+    // credit and the retry charges the same page a second time.
+    long precharge_held = anon_pages_precharge_peek();
+#endif
+    int err = pt_map_nothing(mem, start, count, flags);
+    if (err < 0) {
+        // Retry as a single page: the cluster may have failed only because the
+        // larger host allocation didn't fit.
+        if (whole_cluster) {
+            atomic_fetch_add_explicit(&st_cluster_why_enomem, 1, memory_order_relaxed);
+            whole_cluster = false;
+#if ANON_MMAP_LIMIT_PAGES > 0
+            anon_pages_precharged(precharge_held);
+#endif
+            err = pt_map_nothing(mem, page, 1, flags);
+            count = 1;
+        }
+        if (err < 0) {
+            if (committed_out) *committed_out = 0;
+            return err;
+        }
+    }
+    if (count > 1)
+        atomic_fetch_add_explicit(&st_cluster_full, 1, memory_order_relaxed);
+    else
+        atomic_fetch_add_explicit(&st_cluster_single, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&st_cluster_pages_committed, (uint64_t)count,
+                              memory_order_relaxed);
+    if (committed_out) *committed_out = count;
+    return 0;
+}
+
+// Snapshot the cluster-commit counters for host-side diagnostics.
+void ish_anon_mmap_stats(uint64_t *mmaps, uint64_t *pages) {
+    if (mmaps) *mmaps = atomic_load(&st_anon_mmaps);
+    if (pages) *pages = atomic_load(&st_anon_pages_mapped);
+}
+
+void ish_cluster_stats(uint64_t *calls, uint64_t *full, uint64_t *single,
+                       uint64_t *why_mapped, uint64_t *why_flags,
+                       uint64_t *why_nocluster, uint64_t *why_enomem,
+                       uint64_t *pages_committed) {
+    if (calls) *calls = atomic_load(&st_cluster_calls);
+    if (full) *full = atomic_load(&st_cluster_full);
+    if (single) *single = atomic_load(&st_cluster_single);
+    if (why_mapped) *why_mapped = atomic_load(&st_cluster_why_mapped);
+    if (why_flags) *why_flags = atomic_load(&st_cluster_why_flags);
+    if (why_nocluster) *why_nocluster = atomic_load(&st_cluster_why_nocluster);
+    if (why_enomem) *why_enomem = atomic_load(&st_cluster_why_enomem);
+    if (pages_committed) *pages_committed = atomic_load(&st_cluster_pages_committed);
+}
+
+// Cluster predicate for the reservation lazy-commit path: a neighbour may be
+// pulled in only if it belongs to the SAME reservation. Committing a page from
+// a different reservation (or none) would hand the guest memory it never
+// reserved, with flags taken from the wrong region.
+static bool reservation_cluster_ok(struct mem *mem, page_t page, void *ctx) {
+    return mem_find_reservation(mem, page) == (struct mem_reservation *) ctx;
 }
 
 // W^X stat: stores that hit a P_CODE page and unprotected it (see mem_ptr).
@@ -698,13 +885,64 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
                     page++;
                     run_len++;
                 }
+#if ANON_MMAP_LIMIT_PAGES > 0
+                // [T-ish-footprint-brake] This commit path used to be the ONE
+                // admission bypass: it charged the counter but never checked
+                // any limit, which is how V8's cage commits pushed the count
+                // to 160% of the cap and got every later tiny malloc refused
+                // instead of this one big ask. Route it through the same
+                // reserve gate as mmap/brk. Partial success (earlier runs in
+                // this same mprotect already committed) is acceptable —
+                // POSIX leaves mprotect's partial-failure state unspecified,
+                // and Linux itself can fail an mprotect midway.
+                if (!anon_pages_reserve((long)run_len))
+                    return _ENOMEM;
+                int merr = pt_map_nothing(mem, run_start, run_len, flags | P_ANONYMOUS);
+                if (merr < 0) {
+                    anon_pages_unreserve((long)run_len);
+                    return merr;
+                }
+#else
                 pt_map_nothing(mem, run_start, run_len, flags | P_ANONYMOUS);
+#endif
             }
 #endif
             continue;
         }
         int old_flags = entry->flags;
         entry->flags = flags | (old_flags & P_META_FLAGS);
+#if ANON_MMAP_LIMIT_PAGES > 0
+        // [T-ish-anon-count-mprotect] mprotect can flip the very predicate the
+        // charge/uncharge pair is keyed on, so the count has to follow it.
+        //
+        // pt_map_nothing charges only when anon_page_is_charged(flags), and
+        // pt_unmap decrements only when it still holds at unmap time. Rewriting
+        // flags here without adjusting the count broke that pairing in BOTH
+        // directions: RW -> PROT_NONE was charged at map and then skipped at
+        // unmap (a permanent leak), and PROT_NONE -> RW was never charged yet
+        // decremented at unmap (the counter goes negative). The negative
+        // direction is demonstrated by case [12] in
+        // regress_anon_count_balance.c.
+        //
+        // That second direction is a plausible contributor to the -1359 MB
+        // count [T-ish-anon-count-negative] added its clamp for — an
+        // unaccounted mprotect is one way to reach a negative count — but this
+        // was not traced back to that incident, so treat the connection as a
+        // hypothesis rather than the established cause. Either way the clamp
+        // remains worth keeping as a backstop.
+        //
+        // Only anonymous pages are counted, and only the charged-state
+        // TRANSITION matters: an RW -> RX change moves no memory and must not
+        // move the count. The reservation branch above `continue`s before
+        // reaching here, so pages it commits via pt_map_nothing are charged
+        // exactly once, by pt_map_nothing.
+        if (old_flags & P_ANONYMOUS) {
+            bool was_charged = anon_page_is_charged(old_flags);
+            bool now_charged = anon_page_is_charged(entry->flags);
+            if (was_charged != now_charged)
+                atomic_fetch_add(&anon_page_count, now_charged ? 1 : -1);
+        }
+#endif
 
         // check if protection is increasing
         if ((flags & ~old_flags) & (P_READ|P_WRITE)) {
@@ -741,7 +979,15 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
         // page yet; it re-marks on its own first compile.
         dst_entry->flags = entry->flags & ~P_CODE;
 #if ANON_MMAP_LIMIT_PAGES > 0
-        if (entry->flags & P_ANONYMOUS)
+        // [T-ish-anon-count-cow-predicate] Must mirror pt_unmap's decrement
+        // condition EXACTLY, which is `P_ANONYMOUS && anon_page_is_charged`.
+        // Counting on P_ANONYMOUS alone charged the child for PROT_NONE pages
+        // that pt_unmap then refuses to give back — so every fork of a
+        // PROT_NONE region leaked its full page count, permanently. A single
+        // 128MB V8 cage chunk is 32768 pages, so a handful of forks pinned the
+        // counter above the cap and every later allocation, even 1 page, was
+        // refused while `free -m` showed single-digit MB in use.
+        if ((entry->flags & P_ANONYMOUS) && anon_page_is_charged(entry->flags))
             anon_copied++;
 #endif
     }
@@ -789,6 +1035,18 @@ static void *mem_ptr_nofault(struct mem *mem, addr_t addr, int type) {
 void *mem_ptr(struct mem *mem, addr_t addr, int type) {
 #ifndef NDEBUG
     void *old_ptr = mem_ptr_nofault(mem, addr, type); // just for an assert
+    // Set once we drop mem->lock below. While the lock is released the page
+    // table is fair game for other threads, and the CoW path deliberately
+    // installs a freshly mmap'd page, so `old_ptr` stops being a valid
+    // prediction of the final pointer. Only compare when we never let go.
+    //
+    // Set at each of the three read_wrunlock() sites (growsdown, reservation,
+    // CoW). The later write_wrunlock()/read_wrlock() downgrades are lock-drop
+    // windows too, but every one of them is downstream of one of those three,
+    // so `remapped` is already true by the time they run. If you ever add a
+    // path that reaches a downgrade without passing a read_wrunlock() above,
+    // set the flag there as well or this assert can abort again.
+    bool remapped = false;
 #endif
 
     page_t page = PAGE(addr);
@@ -854,12 +1112,16 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
         // block without our thread needing to return and risk the
         // retry SP compounding.
         read_wrunlock(&mem->lock);
-        // write_wrlock here uses a bounded trylock-spin that falls back to a
-        // blocking acquire (see __write_wrlock in util/sync.h). We released our
-        // own read lock just above, and other threads release theirs on each
-        // JIT block boundary, so a reader-free window normally appears within
-        // the spin budget; if it doesn't, the blocking fallback still
-        // guarantees forward progress (waiting at most about one JIT cycle).
+#ifndef NDEBUG
+        // Lock dropped — see `remapped` at the top of the function.
+        remapped = true;
+#endif
+        // write_wrlock here uses a NON-BLOCKING trylock-spin (see
+        // __write_wrlock in util/sync.h; the blocking fallback was removed in
+        // 26c5d9d5 because it deadlocked JSC's GC). We released our own read
+        // lock just above, and other threads release theirs on each JIT block
+        // boundary, so a reader-free window normally appears quickly — but the
+        // spin is unbounded in time, so nothing read before it still holds.
         //
         // Returning NULL → INT_GPF from this path is catastrophic for
         // growsdown: INT_GPF retry re-enters the JIT block from the
@@ -907,9 +1169,36 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
                 grow_end = grow_start + max_grow; // keep fault page, cap upward
             pages_t grow_count = grow_end - grow_start;
 #if ANON_MMAP_LIMIT_PAGES > 0
-            atomic_fetch_add(&anon_page_count, grow_count);
+            // [T-ish-anon-cap-dynamic] Respect the runtime cap for the
+            // 1MB pre-map window, but NEVER refuse the fault page itself —
+            // the block comment above explains that an unmapped fault page
+            // silently corrupts the frame. When the window doesn't fit,
+            // shrink to just the fault page and count it unconditionally:
+            // a 4KB overrun of the cap is noise, a corrupted stack is not.
+            // [T-ish-anon-count-negative] Reserve only to decide the size;
+            // pt_map_nothing does the charging (consuming this reservation).
+            // The fault page itself is never refused, so when the window does
+            // not fit we shrink to 1 page and let pt_map_nothing charge it
+            // even if that nudges the cap — a 4KB overrun is noise, a
+            // corrupted stack is not.
+            if (!anon_pages_reserve((long)grow_count))
+                grow_count = 1;
 #endif
-            pt_map_nothing(mem, grow_start, grow_count, P_WRITE | P_GROWSDOWN);
+            // [T-ish-cluster-commit] A multi-page window is already one host
+            // allocation shared by refcount, so it needs no clustering. Only
+            // the degraded single-page case (cap-shrunk, or a fault adjacent
+            // to mapped stack) would burn a whole host page for 4KB — route
+            // that one through the cluster helper. No same_flags predicate:
+            // every page here is stack in the same growsdown region, and the
+            // helper still refuses to touch already-mapped neighbours.
+            if (grow_count == 1) {
+                // Charging happens inside pt_map_nothing for whatever the
+                // cluster ends up committing — nothing to do here.
+                pt_map_cluster(mem, grow_start, P_WRITE | P_GROWSDOWN,
+                               NULL, NULL, NULL);
+            } else {
+                pt_map_nothing(mem, grow_start, grow_count, P_WRITE | P_GROWSDOWN);
+            }
         }
         write_wrunlock(&mem->lock);
         read_wrlock(&mem->lock);
@@ -922,16 +1211,70 @@ check_reservation: ;
         if (res == NULL)
             return NULL;
         read_wrunlock(&mem->lock);
-        // BLOCKING: avoid NULL → INT_GPF retry (which re-runs the JIT
-        // block's prologue and can compound sub-sp or other side
-        // effects). See growsdown branch above for the full rationale.
+#ifndef NDEBUG
+        // Lock dropped — see `remapped` at the top of the function.
+        remapped = true;
+#endif
+        // Acquire rather than return NULL → INT_GPF retry (which re-runs the
+        // JIT block's prologue and can compound sub-sp or other side effects).
+        // See growsdown branch above for the full rationale, including why the
+        // acquire spins instead of blocking.
         write_wrlock(&mem->lock);
         entry = mem_pt(mem, page);
         if (entry == NULL) {
+            // [T-ish-anon-cap-dynamic] This lazy commit-on-fault is the path
+            // large NORESERVE reservations actually materialize through, one
+            // page per TLB miss — during the 2026-08-25 jsonnet compile it
+            // committed >116k pages while the old code only ever *counted*
+            // them, so the anon cap never applied and the footprint sailed
+            // past every limit. Enforce here too: on refusal leave the entry
+            // NULL, so mem_ptr returns NULL and the guest takes SIGSEGV —
+            // the same thing Linux does when overcommitted memory can't be
+            // backed. Roll the reservation back if the host mmap itself
+            // fails, so a transient failure doesn't leak count forever.
+            // [T-ish-cluster-commit] Commit the whole host page at once when
+            // the neighbours are free and belong to this same reservation.
+            // This is the path that produced the 116k single-page regions.
+            unsigned commit_flags = res->flags & ~P_GROWSDOWN;
+            pages_t want = (pages_t)(real_page_size >> PAGE_BITS);
+            if (want < 1) want = 1;
 #if ANON_MMAP_LIMIT_PAGES > 0
-            atomic_fetch_add(&anon_page_count, 1);
+            static _Atomic long reservation_denied_reported;
+            // Charge the cluster up front, then refund whatever wasn't
+            // committed. Charging after the fact could let two threads both
+            // pass a nearly-full cap and overshoot it.
+            pages_t charged = want;
+            if (!anon_pages_reserve(charged)) {
+                charged = 1;
+                if (!anon_pages_reserve(charged))
+                    charged = 0;
+            }
+            if (charged == 0) {
+                long prev = atomic_fetch_add(&reservation_denied_reported, 1);
+                if (prev % 4096 == 0)
+                    printk("mem: anon page cap refused lazy commit for pid=%d "
+                           "(page %#x, %ld denials so far) — guest gets SIGSEGV\n",
+                           current != NULL ? current->pid : -1, page, prev + 1);
+            } else {
+                // [T-ish-anon-count-negative] The reservation above is handed
+                // to pt_map_nothing (via the thread-local precharge) and
+                // consumed by whatever it maps; it charges the remainder
+                // itself. Only the UNUSED part of the reservation has to come
+                // back here — when the cluster degrades, or the map fails.
+                pages_t got = 0;
+                int cerr = (charged == want)
+                    ? pt_map_cluster(mem, page, commit_flags,
+                                     reservation_cluster_ok, res, &got)
+                    : pt_map_nothing(mem, page, 1, commit_flags);
+                if (charged != want)
+                    got = (cerr < 0) ? 0 : 1;
+                if (got < charged)
+                    anon_pages_unreserve((long)(charged - got));
+            }
+#else
+            pt_map_cluster(mem, page, commit_flags,
+                           reservation_cluster_ok, res, NULL);
 #endif
-            pt_map_nothing(mem, page, 1, res->flags & ~P_GROWSDOWN);
         }
         write_wrunlock(&mem->lock);
         read_wrlock(&mem->lock);
@@ -981,14 +1324,21 @@ have_entry:
                     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 
             read_wrunlock(&mem->lock);
-            // write_wrlock uses a bounded trylock-spin with a blocking
-            // fallback (util/sync.h). We must get the write lock rather than
-            // return NULL → INT_GPF: retry would re-run the entire JIT block
-            // from the start, and a prologue like `sub sp, sp, #N` before the
-            // faulting store would decrement SP again each retry, corrupting
-            // the frame layout. The spin catches the common case where other
-            // readers release their per-block read locks quickly; the fallback
-            // guarantees we still acquire (bounded ~one JIT cycle).
+#ifndef NDEBUG
+            // Lock dropped — see `remapped` at the top of the function.
+            remapped = true;
+#endif
+            // write_wrlock uses a NON-BLOCKING trylock-spin (util/sync.h): it
+            // retries with a backoff that ramps to a steady 100us sleep and
+            // never queues as a blocking waiter, because blocking here is
+            // writer-preferring on Darwin and deadlocks JSC's GC against JIT
+            // reader threads (26c5d9d5). We must get the write lock rather
+            // than return NULL → INT_GPF: retry would re-run the entire JIT
+            // block from the start, and a prologue like `sub sp, sp, #N`
+            // before the faulting store would decrement SP again each retry,
+            // corrupting the frame layout. Note the spin can last for many
+            // milliseconds while readers stay live, which is precisely why
+            // nothing observed before this call may be assumed afterwards.
             write_wrlock(&mem->lock);
             // Re-fetch entry after lock upgrade — another thread may have
             // already resolved this CoW while we were waiting for the lock.
@@ -1014,7 +1364,10 @@ have_entry:
 
     void *ptr = mem_ptr_nofault(mem, addr, type);
 #ifndef NDEBUG
-    assert(old_ptr == NULL || old_ptr == ptr || type == MEM_WRITE_PTRACE);
+    // `remapped` covers all three paths that drop mem->lock (growsdown,
+    // reservation, CoW); each installs new page-table state on purpose, so a
+    // changed pointer there is correct behavior, not a bug.
+    assert(remapped || old_ptr == NULL || old_ptr == ptr || type == MEM_WRITE_PTRACE);
 #endif
     return ptr;
 }

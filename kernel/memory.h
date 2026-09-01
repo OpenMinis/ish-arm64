@@ -174,6 +174,27 @@ int pt_map_nothing(struct mem *mem, page_t page, pages_t pages, unsigned flags);
 int pt_unmap(struct mem *mem, page_t start, pages_t pages);
 // like pt_unmap but doesn't care if part of the range isn't mapped
 int pt_unmap_always(struct mem *mem, page_t start, pages_t pages);
+
+// [T-ish-cluster-commit] Commit the faulting page as part of an aligned,
+// host-page-sized cluster so a 4KB guest page doesn't consume a whole 16KB
+// host page. Degrades to a single-page commit whenever the cluster's other
+// pages are already mapped or `same_flags` rejects them; on a 4KB-page host
+// it is exactly pt_map_nothing(page, 1). Reports how many pages were actually
+// committed via `committed_out` (NULL if not needed) so callers can keep
+// anonymous-page accounting exact. Caller must hold mem->lock for WRITING.
+int pt_map_cluster(struct mem *mem, page_t page, unsigned flags,
+                   bool (*same_flags)(struct mem *mem, page_t page, void *ctx),
+                   void *ctx, pages_t *committed_out);
+
+// [T-ish-cluster-hitrate] Diagnostics: how often the cluster actually fires,
+// and when it does not, why. Any out-param may be NULL.
+void ish_cluster_stats(uint64_t *calls, uint64_t *full, uint64_t *single,
+                       uint64_t *why_mapped, uint64_t *why_flags,
+                       uint64_t *why_nocluster, uint64_t *why_enomem,
+                       uint64_t *pages_committed);
+// All anonymous host mmaps and the guest pages they backed, across every
+// path — the denominator the cluster hit rate has to be read against.
+void ish_anon_mmap_stats(uint64_t *mmaps, uint64_t *pages);
 // Set the flags on memory
 int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags);
 // Copy pages from src memory to dst memory using copy-on-write

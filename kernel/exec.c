@@ -935,6 +935,16 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
                 "--no-concurrent-recompilation",
                 "--no-lazy-compile-dispatcher",
                 "--predictable",
+                // [T-ish-node-cage-commit] Skip the young generation. The
+                // comment block above always described this flag but the
+                // array never carried it. Measured 2026-08-27 on iPhone 11:
+                // V8 startup commits ~5 x 128MB cage chunks (~640MB); with
+                // --single-generation the commit drops by ~190MB
+                // (164k -> 113k guest pages) because the semi-space chunks
+                // are never created. Pure memory win for iSH's interpreted
+                // workloads; the young-gen GC it disables exists to serve
+                // allocation-heavy JIT throughput we don't have.
+                "--single-generation",
             };
             // Conditionally inject --require for polyfill files that exist in guest fs
             static const char *optional_requires[] = {

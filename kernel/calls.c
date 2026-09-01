@@ -9,6 +9,7 @@
 #include "emu/interrupt.h"
 #include "util/signpost.h"
 #include "kernel/memory.h"
+#include "kernel/mm.h"
 #include "kernel/signal.h"
 #include "kernel/task.h"
 #include "fs/stat.h"
@@ -463,7 +464,26 @@ void handle_interrupt(int interrupt) {
                     unsigned flags = cpu->segfault_was_write
                         ? (P_READ | P_WRITE) : P_READ;
                     if (existing == NULL) {
-                        int err = pt_map_nothing(current->mem, fault_page, 1, flags);
+                        // [T-ish-cluster-commit] Commit the whole host page —
+                        // V8 cage writes walk forward through a region, so the
+                        // neighbours are about to fault too. No same_flags
+                        // predicate: this path is not reservation-scoped, and
+                        // the helper already refuses mapped neighbours.
+                        // Accounting: pt_unmap decrements for EVERY
+                        // P_ANONYMOUS page, so anything mapped here must be
+                        // charged or the counter drifts negative on teardown.
+                        // This path historically under-charged (it mapped one
+                        // page and charged none); charge exactly what is
+                        // committed. Not gated on the cap — refusing a GPF
+                        // recovery would turn a survivable fault into a guest
+                        // crash, and it is bounded by the neighbour check.
+                        pages_t got = 0;
+                        int err = pt_map_cluster(current->mem, fault_page, flags,
+                                                 NULL, NULL, &got);
+#if ANON_MMAP_LIMIT_PAGES > 0
+                        if (err >= 0 && got > 0)
+                            atomic_fetch_add(&anon_page_count, (long)got);
+#endif
                         if (err >= 0) {
                             write_wrunlock(&current->mem->lock);
                             goto gpf_handled;

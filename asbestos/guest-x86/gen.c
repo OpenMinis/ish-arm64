@@ -18,13 +18,19 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
 
 static void gen(struct gen_state *state, unsigned long thing) {
     assert(state->size <= state->capacity);
+    // See the ARM64 gen() for why this reports failure instead of dying: a
+    // single guest process exhausting memory must not take the app with it.
+    if (state->oom)
+        return;
     if (state->size >= state->capacity) {
-        state->capacity *= 2;
+        unsigned new_capacity = state->capacity * 2;
         struct fiber_block *bigger_block = realloc(state->block,
-                sizeof(struct fiber_block) + state->capacity * sizeof(unsigned long));
+                sizeof(struct fiber_block) + new_capacity * sizeof(unsigned long));
         if (bigger_block == NULL) {
-            die("out of memory while carcinizing");
+            state->oom = true;
+            return;
         }
+        state->capacity = new_capacity;
         state->block = bigger_block;
     }
     assert(state->size < state->capacity);
@@ -35,6 +41,7 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     state->capacity = FIBER_BLOCK_INITIAL_CAPACITY;
     state->size = 0;
     state->ip = addr;
+    state->oom = false;
     for (int i = 0; i <= 1; i++) {
         state->jump_ip[i] = 0;
     }

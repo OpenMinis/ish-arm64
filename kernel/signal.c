@@ -1043,10 +1043,27 @@ int_t sys_rt_sigtimedwait(addr_t set_addr, addr_t info_addr, addr_t timeout_addr
     lock(&current->sighand->lock);
     assert(current->waiting == 0);
     current->waiting = set;
-    int wait_err;
-    do {
+    // A signal in `set` is normally BLOCKED by the caller — that is how
+    // sigwait/sigtimedwait are used (bind9's isc_app_run blocks SIGTERM/SIGINT
+    // in every thread and waits for them here). wait_for() classifies a wakeup
+    // as "real" only when (pending & ~blocked) != 0, so a delivery of a blocked
+    // signal — the only kind this syscall exists to consume — always reads as a
+    // spurious wakeup: deliver_signal queues it and notifies waiting_cond, we
+    // wake, wait_for returns 0, and the old `while (wait_err == 0)` loop went
+    // straight back to sleep. Forever. Field case: bind-tools nslookup prints
+    // its answer, isc_app_shutdown raises SIGTERM at the sigwaiting main
+    // thread, the wake is discarded, and the process hangs with
+    // pending=0x4002 blocked=0x4003 (SIGTERM+SIGINT delivered, never consumed);
+    // Ctrl-C dies the same way, and only unblockable SIGKILL gets through.
+    // The loop must therefore check for awaited-signal arrival itself, before
+    // every sleep — which also consumes a signal that was already pending on
+    // entry, as POSIX requires.
+    int wait_err = 0;
+    while (!(current->pending & set)) {
         wait_err = wait_for(&current->pause, &current->sighand->lock, timeout_addr == 0 ? NULL : &timeout);
-    } while (wait_err == 0);
+        if (wait_err != 0)
+            break;
+    }
     current->waiting = 0;
     if (wait_err == _ETIMEDOUT) {
         unlock(&current->sighand->lock);

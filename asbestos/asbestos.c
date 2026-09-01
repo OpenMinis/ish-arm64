@@ -505,6 +505,11 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
         prebuilt_fn spec = native_offload_prebuilt_lookup(ip);
         if (spec != NULL) {
             gen_prebuilt_block(&state, (void *) spec);
+            if (state.oom) {  // see the OOM note at the tail of this function
+                free(state.block);
+                ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
+                return NULL;
+            }
             gen_end(&state);
             state.block->used = state.capacity;
             ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
@@ -515,6 +520,8 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     while (true) {
         if (!gen_step(&state, tlb))
             break;
+        if (state.oom)  // buffer is stuck; decoding the rest of the page is wasted work
+            break;
         // no block should span more than 2 pages
         // guarantee this by limiting total block size to 1 page
         // guarantee that by stopping as soon as there's less space left than
@@ -524,6 +531,19 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
             gen_exit(&state);
             break;
         }
+    }
+    // The gadget buffer could not grow: the emitted stream is truncated and must
+    // never run. Discard it and report failure -- the caller raises INT_GPF,
+    // which kills this guest process only. [T-ish-jit-oom-abort]
+    //
+    // Checked BEFORE gen_end(): that function writes through jump_ip[] and
+    // block_patch_ip, which are offsets recorded on the assumption the buffer
+    // would keep growing. After a failed realloc they can exceed the block's
+    // real capacity, so running gen_end() here would overflow the heap.
+    if (state.oom) {
+        free(state.block);
+        ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
+        return NULL;
     }
     gen_end(&state);
     assert(state.ip - ip <= PAGE_SIZE);

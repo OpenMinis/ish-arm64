@@ -107,6 +107,17 @@ else
     echo
     echo "########## syscall regressions ($ISH $MOUNT_FLAG $ROOTFS) ##########"
     "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_syscall ${FAKEFS_PATH:+"$FAKEFS_PATH"} || status=1
+
+    echo
+    echo "########## FMOV immediate decode ##########"
+    if "$CC_GUEST" -static -O0 -Wall -o "$GUEST_ROOT/tmp/regress_fmov_imm" \
+            tests/regress/regress_fmov_imm.c tests/regress/regress_fmov_imm.S; then
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_fmov_imm || status=1
+        rm -f "$GUEST_ROOT/tmp/regress_fmov_imm"
+    else
+        echo "failed to build regress_fmov_imm" >&2
+        status=1
+    fi
 fi
 
 echo
