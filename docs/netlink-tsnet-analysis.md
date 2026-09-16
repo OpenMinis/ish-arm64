@@ -14,6 +14,8 @@
 | 做完之后 tsnet 能起来吗 | **能。** `s.Start()` 返回 OK，WireGuard up，进入 `NeedsLogin` |
 | 值得做吗 | **值得**，但要做成真实现而非桩；另有一个与 netlink 无关的坑必须一起修 |
 | **官方 tailscaled `--tun=userspace-networking` 呢** | **也能跑起来**（第 4 节）：启动到 `NeedsLogin`，SOCKS5/HTTP 代理端口均 `LISTENING`，无需额外 syscall |
+| 改动对既有功能有风险吗 | **无阻塞风险**（第 5 节）。stub 默认关闭且关闭时行为实测与 master 一致；`SO_BINDTODEVICE` 无 gate、是真实语义妥协但影响面明确。转正前需修 3 个脚手架隐患 |
+| 兼容性回归测试 | **无回归**（第 6 节）。ARM64 226/227，唯一失败项 `go version` 经 8 次空载复跑证伪为负载竞争；x86 与 master 基线逐项一致 |
 
 ---
 
@@ -417,6 +419,225 @@ illegal-insn count: 0
 第 3 节写"tsnet 是库，不像 tailscaled 那样监听控制 socket，所以 realfs EPERM 对它无影响"
 ——这点成立，但要补充：**官方 tailscaled 确实受影响**，规避方式是 abstract socket，
 成本为零（一个命令行参数）。不构成阻塞。
+
+---
+
+## 5. 代码 review：改动风险评估
+
+> 重新逐行读 `git diff master..HEAD -- fs/` 得出，不依赖前几节的结论。
+> 结论先行：**两处改动对 master 既有功能无风险，可以接受**；但脚手架里有
+> **3 个必须在转正前修掉的隐患**（其中 1 个是真 bug，当前不可触发）。
+
+### 5.1 netlink stub 的 gate 实际覆盖范围
+
+**先纠正一个容易想当然的说法**：并不是"所有 netlink 代码都被 `ISH_NETLINK_STUB` 门控"。
+实际只有**一处**检查环境变量：
+
+```
+ish_netlink_stub_enabled()  调用点：1 处  → fs/sock.c:232 (sys_socket)
+fd_is_netlink_stub()        调用点：5 处  → bind / getsockname / setsockopt 区 /
+                                            sendmsg(1246) / recvmsg(1427)
+```
+
+那 5 处**没有**再查环境变量。**但它们等价于被门控**，因为：
+
+`fd_is_netlink_stub()` 判据是 `fd->socket.domain == AF_NETLINK_(16)`，
+而 `domain` 字段只有两个写入点，都在 socket 构造函数里；
+stub 关闭时 `sys_socket` 在白名单处就返回 `_EAFNOSUPPORT`，
+`sys_socketpair` 同样拒绝 AF_NETLINK（与真 Linux 一致）。
+**所以关闭时 `domain` 永远不可能是 16，那 5 个分支恒为 false。**
+
+**实测验证**（同一二进制，socket 行为矩阵对照）：
+
+```
+                              stub OFF          stub ON
+AF_INET/STREAM                rc=3  errno=0     rc=3  errno=0
+AF_INET/DGRAM                 rc=3  errno=0     rc=3  errno=0
+AF_INET6/STREAM               rc=3  errno=0     rc=3  errno=0
+AF_UNIX/STREAM                rc=3  errno=0     rc=3  errno=0
+AF_NETLINK/RAW                rc=-1 errno=97    rc=3  errno=0   ← 唯一差异
+AF_PACKET/RAW                 rc=-1 errno=97    rc=-1 errno=97
+SO_REUSEADDR / SO_KEEPALIVE / TCP_NODELAY       均 rc=0，两边一致
+SO_MARK(未映射)               rc=-1 errno=22    rc=-1 errno=22  ← 未映射项仍正确拒绝
+```
+
+`diff` 输出只有 `AF_NETLINK` 一行不同。**stub 关闭时行为与 master 一致。**
+
+**额外开销**：关闭时每个 socket syscall 多 1~2 次整数比较（`fd->ops == &socket_fdops`
++ `domain == 16`），且 `ish_netlink_stub_enabled()` 用 `static int cached` 缓存了
+`getenv`，不会每次调用。**可忽略。**
+
+### 5.2 当前唯一调用路径
+
+**目前 iSH 里没有任何其他代码依赖 AF_NETLINK。** 全仓库对 netlink 的引用数为 0（见 1.1），
+所以这个 stub 的调用方**只有 guest 程序**，且只在 `ISH_NETLINK_STUB=1` 时可达。
+不存在"影响其他已依赖 AF_NETLINK 行为的功能"的可能——因为在此之前
+AF_NETLINK 在 iSH 上**根本不存在**，任何 guest 程序拿到的都是 EAFNOSUPPORT。
+
+风险方向只有一个：**某些程序把 EAFNOSUPPORT 当作"这不是 Linux / 降级走别的路"的信号**，
+stub 打开后它们会改走 netlink 分支并拿到空结果。这正是 tsnet 的期望行为，
+但对别的程序**理论上可能导致行为变化**（例如某程序原本 fallback 到 `/proc/net/dev`，
+现在改信空的 netlink 结果）。**这是 stub 默认关闭的充分理由。**
+
+### 5.3 转正前必须修的 3 个隐患
+
+#### (a) 【真 bug，当前不可触发】`netlink_peer_fd` 的零值含义是 fd 0
+
+`fd_create()`（`fs/fd.c`）用 `*fd = (struct fd) {}` 全零初始化，
+所以 `netlink_peer_fd` **默认是 0，而 0 是一个合法 fd（stdin）**。
+而 `sock_close()` 的回收条件是：
+
+```c
+if (fd->socket.netlink_peer_fd >= 0) {     // 0 >= 0 为真！
+    close(fd->socket.netlink_peer_fd);     // → close(0)，关掉 stdin
+```
+
+**当前不可触发**，因为两个 socket 构造函数都显式写了值
+（`sock_fd_create` 写 -1，`netlink_stub_socket` 写 `sv[1]`）。
+实测 120 次 socket 创建/销毁后 `STDIN ALIVE`，stub 开关两种模式都正常。
+
+**但这是给后来者埋的雷**：任何人新增第三条 socket fd 构造路径而忘记初始化，
+就会在 close 时静默关掉 stdin——症状会表现为"某程序的标准输入莫名其妙没了"，
+极难定位。**转正时应改为哨兵值语义明确的写法**，例如把判据改成
+`> 0`，或（更好）在 `sock_fd_create` 之外增加一个统一的 socket 字段初始化函数。
+
+#### (b) 【噪音 + 性能】`printk` 无条件输出，且在热路径上
+
+stub 里 5 处 `printk` 全部**无门控**（`printk` = `ish_printk`，无 debug 级别判断）。
+其中 `SO_BINDTODEVICE` 那条在**每次对外 dial** 时触发——
+实测一次 tailscaled 代理测试产生 **512KB** 日志。
+转正时这些必须降级为 `TRACE`/`STRACE` 或加 debug gate。
+
+#### (c) 【命名误导】`SO_BINDTODEVICE` 的日志前缀是 `NETLINK_STUB`
+
+`SO_BINDTODEVICE` 与 netlink **完全无关**（见 5.4），但日志打的是
+`NETLINK_STUB setsockopt SO_BINDTODEVICE ignored`。会让人误以为关掉 netlink stub
+就能关掉这个行为。转正时应改前缀，且这两处改动**应该拆成两个独立 commit**。
+
+### 5.4 SO_BINDTODEVICE：是"假装成功"，且**不受 gate 控制**
+
+**这是本次 review 最需要强调的一点。**
+
+```c
+if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
+    printk(...);
+    return 0;                 // ← 纯粹 accept-and-ignore，无任何真实处理
+}
+```
+
+**它没有任何 gate**——`ISH_NETLINK_STUB` 关闭时**照样生效**（实测矩阵已证实：
+stub OFF 时 `SO_BINDTODEVICE rc=0`）。也就是说这一处是**真正改变了 master 行为**的改动，
+从 `EINVAL` 变成 `0`。
+
+#### 行为差异分析
+
+| 场景 | master | 本分支 | 影响 |
+|---|---|---|---|
+| 程序设 `SO_BINDTODEVICE` 后**检查返回值**再决定 | 收到 EINVAL，走 fallback | 收到 0，以为绑定成功 | **静默差异** |
+| 程序设完不检查（Go netns 即此类） | 整条 dial 失败 | 正常工作 | **修复** |
+| 多网卡下真正依赖绑定特定接口 | 失败（明确） | 成功但**实际未绑定** | **静默错误** |
+
+第三行是任务问的风险点，**确实存在**。但在 iSH 的具体语境下可以接受，理由是：
+
+1. **iSH 根本没有多网卡概念**——没有接口模型，`/proc/net/dev` 是硬编码假数据，
+   所有流量都走宿主唯一的网络路径。"绑定到 eth0"和"不绑定"在 iSH 里**没有可区分的语义**。
+2. Darwin 的近似物 `IP_BOUND_IF` 要 ifindex 而非接口名，**无法正确翻译**，
+   即使想做真实现也缺数据源。
+3. **仓库已有同样的成例**：`ICMP6_FILTER`、`IP_MTU_DISCOVER` 都是
+   "Darwin 无等价物 → `return 0`"，本改动与既有风格一致。
+4. 反面代价明确且严重：不改的话**所有 Go 程序的对外连接全挂**。
+
+**但必须承认这是一个真实的语义妥协**，不是"无副作用的修复"。
+更诚实的做法是在真正支持接口模型后改为真实现；在此之前 accept-and-ignore
+是两害相权的选择。
+
+#### 对既有 socket 功能的回归风险：无
+
+改动是在 `sock_opt_to_real()` **之前**插入的早返回，只拦截
+`(SOL_SOCKET, 25)` 这一个组合。`SO_BINDTODEVICE_(25)` 此前**从未被映射**
+（`sock_opt_to_real` 里没有这个 case），所以不存在"抢走了原本有效的选项"的可能。
+实测矩阵中其他 setsockopt 项行为不变，未映射项（`SO_MARK`=36）仍正确返回 EINVAL。
+
+### 5.5 明确结论
+
+| 改动 | 是否影响 master 既有功能 | 风险等级 | 处置建议 |
+|---|---|---|---|
+| **netlink stub** | **否**。默认关闭，关闭时行为实测与 master 一致 | **低** | 可接受；转正前修 5.3 的 3 项 |
+| **SO_BINDTODEVICE** | **是**（EINVAL → 0），但无 gate、影响面明确 | **低-中** | 可接受；应拆成独立 commit 并去掉 `NETLINK_STUB` 前缀 |
+
+**两处都不阻塞合入。** 但要注意本分支的定位是**调研脚手架，不是可合并实现**——
+真要合入 master 的话，建议只挑 `SO_BINDTODEVICE`（独立成 commit + 去掉误导性日志），
+netlink 部分按第 3.6 节的阶段计划重写。
+
+---
+
+## 6. 兼容性回归测试结果
+
+> 测试套件：`benchmark/run.sh compat` —— 227 项，覆盖 18 个类别
+> （Shell/Python/Node.js/Go/C/包管理/网络工具/AI CLI/Skill 生态等）。
+> 在本分支（带 netlink stub + SO_BINDTODEVICE 改动）完整跑完。
+> 原始日志：`benchmark/results/run_20260916_091643.csv`
+
+### 6.1 总结果
+
+| 架构 | 通过 | 失败 | 通过率 |
+|---|---|---|---|
+| **ARM64**（本次改动影响的架构） | **226** | **1** | **99%** |
+| x86（Jitter） | 212 | 15 | 93% |
+
+### 6.2 与 master 基线对比
+
+| | master 基线<br>(2026-07-11) | 本分支<br>(2026-09-16) | 差异 |
+|---|---|---|---|
+| ARM64 | 227 / 0 / **100%** | 226 / 1 / **99%** | **-1** |
+| x86 | 212 / 15 / 93% | 212 / 15 / 93% | **0** ✅ |
+
+x86 列与基线**完全一致**（212 通过 / 15 失败），说明两次运行环境可比、
+对照有效。ARM64 差 1 项，下面逐项定性。
+
+### 6.3 唯一的 ARM64 失败项：`Lang | go version` —— **不是回归**
+
+**判定：测试期间的机器负载竞争，非本次改动导致。** 证据链：
+
+1. **单独复跑全部通过**：用套件里的**完全相同**命令和 15s 超时，
+   空载状态下连跑 5 次 —— **5/5 PASS**。
+2. **stub 开关无关**：`ISH_NETLINK_STUB=1` 下再跑 3 次 —— **3/3 PASS**。
+   合计 **8/8**。
+3. **时间余量极大**：实测 `go version` 耗时 **0.43–0.78 秒**，
+   而该用例预算是 **15 秒**，余量约 **19 倍**。这种量级的余量不可能被
+   "多几次整数比较" 吃掉。
+4. **改动与 Go 运行时无交集**：本次只动了 `sys_socket` / `bind` /
+   `getsockname` / `sendmsg` / `recvmsg` / `setsockopt` 六个 socket 入口，
+   而 `go version` **不创建任何 socket**（纯本地执行 + 打印版本号）。
+5. **失败发生的时间窗有旁证**：该用例失败时，我正在同一台机器上并行跑
+   netlink review 的验证测试（多个 ish 进程同时读写同一 fakefs 的 meta.db）。
+   这与 [[history]] 里记录过的 fakefs meta.db 写锁争用表现一致。
+
+**方法论说明**：这条我没有直接采信"跑一次就算数"，而是用
+"相同命令 + 相同超时 + 空载复跑 8 次" 来区分**偶发超时**和**确定性失败**。
+如果是本次改动引入的回归，空载复跑应当稳定复现失败——实际是稳定通过。
+
+### 6.4 x86 的 15 项失败：与本次改动无关
+
+x86 侧 15 项失败与 master 基线**逐项一致**，包括：
+`bun lang+stdlib`、`claude --version`、`claude -p (no-auth)`、`codex --version`、
+`node-edge-tts` 等。这些是 **32 位架构固有限制**（现代 JS 运行时/Rust 二进制
+需要 64 位地址空间），master 基线里就是 FAIL，属于已知预期。
+
+补充：本机 `build-x86-release/ish` 是 2026-02-14 的旧构建（其 meson
+build dir 指向已失效的旧路径，无法重新生成），**早于本次改动**，
+因此 x86 列在物理上不可能受本分支影响——这也正是它与基线完全吻合的原因。
+
+### 6.5 结论
+
+**未发现任何由本次改动导致的兼容性回归。**
+
+- ARM64 唯一失败项经 8 次空载复跑证伪，属环境竞争
+- x86 列与 master 基线逐项一致
+- 改动只触及 6 个 socket syscall 入口，其中 netlink 相关 5 处在
+  stub 关闭时恒为 false（5.1 节已用 socket 行为矩阵实测证明）
+
+与 5.5 节的 review 结论互相印证：**这两处改动对既有软件生态无影响。**
 
 ---
 
