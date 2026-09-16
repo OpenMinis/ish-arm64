@@ -13,6 +13,7 @@
 | 内核侧改动量 | **小。** 一个"空 dump"桩 ≈ 250 行，已原型验证 |
 | 做完之后 tsnet 能起来吗 | **能。** `s.Start()` 返回 OK，WireGuard up，进入 `NeedsLogin` |
 | 值得做吗 | **值得**，但要做成真实现而非桩；另有一个与 netlink 无关的坑必须一起修 |
+| **官方 tailscaled `--tun=userspace-networking` 呢** | **也能跑起来**（第 4 节）：启动到 `NeedsLogin`，SOCKS5/HTTP 代理端口均 `LISTENING`，无需额外 syscall |
 
 ---
 
@@ -292,6 +293,130 @@ if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_)
 2. **阶段 2（2-3 天）**：接宿主 `getifaddrs()`，`RTM_GETLINK`/`RTM_GETADDR` 上报真实接口；
    同一数据源顺带补 `/proc/net/route` 和 `/proc/net/dev`（替掉现在的硬编码假数据）。
 3. **阶段 3（可选）**：`PF_ROUTE` 真实路由表。**先在 iOS 上验证 `NET_RT_DUMP` 可用性再投入。**
+
+---
+
+## 4. 官方 tailscaled `--tun=userspace-networking` 实测
+
+> 第二轮实测（同分支）。用**真正的官方二进制**（`tailscale.com/cmd/tailscaled`
+> + `cmd/tailscale`，v1.102.4，`GOOS=linux GOARCH=arm64 CGO_ENABLED=0` 静态编译），
+> 不是自写 demo。
+
+### 4.1 结论：**能跑起来**
+
+| 检查项 | 结果 |
+|---|---|
+| 进程启动（不 panic / 不因缺 syscall 退出） | ✅ 正常启动到 `NeedsLogin` |
+| netlink 是否仍是阻塞点 | ✅ 已解决（stub OFF 时仍复现原报错） |
+| SOCKS5 `127.0.0.1:1055` 监听 | ✅ `LISTENING` |
+| HTTP 代理 `127.0.0.1:1056` 监听 | ✅ `LISTENING` |
+| `tailscale` CLI ↔ daemon 控制通道 | ✅ `tailscale status` → `Logged out.` |
+| 是否需要 netlink 之外的额外 syscall | ✅ 不需要（详见 4.4） |
+
+**架构判断得到证实**：`--tun=userspace-networking` 与 tsnet 库共享同一套
+gVisor netstack 路径，所以第 3 节对 tsnet 的结论直接适用于官方 daemon。
+
+### 4.2 A/B 对照（同一二进制，只差 `ISH_NETLINK_STUB`）
+
+```
+# stub OFF —— 复现原始报错
+$ ./build-arm64-release/ish -r alpine-arm64-321 /tmp/tailscaled \
+      --tun=userspace-networking --socks5-server=127.0.0.1:1055 ...
+netmon.New: route ip+net: netlinkrib: address family not supported by protocol
+
+# stub ON —— 完整启动
+$ ISH_NETLINK_STUB=1 ./build-arm64-release/ish -r alpine-arm64-321 /tmp/tailscaled ...
+wgengine.NewUserspaceEngine(tun "userspace-networking") ...
+link state: interfaces.State{defaultRoute= ifs={} v4=false v6=false}
+magicsock: disco key = d:a91dd7270ac8c0e0
+Creating WireGuard device...
+Bringing WireGuard device up...
+Bringing router up...
+Starting network monitor...
+Engine created.
+got LocalBackend in 27ms
+control: authRoutine / mapRoutine / updateRoutine: awaiting unpause
+health(warnable=wantrunning-false): error: Tailscale is stopped.   ← 未登录时的正确状态
+```
+
+代理监听实测（guest 内 `nc -z`）：
+
+```
+--- tailscale status ---
+Logged out.
+--- SOCKS5 port 1055 ---   SOCKS5 1055 LISTENING
+--- HTTP proxy port 1056 --- HTTPPROXY 1056 LISTENING
+```
+
+daemon 侧同时记录到 `socks5: client connection failed: could not read packet header`
+——正是 `nc -z` 连上又立刻断开的预期表现，**反证 SOCKS5 服务确实在 accept**。
+
+### 4.3 未验证的部分（重要边界）
+
+**没有做带 auth-key 的完整上线验证**，因为手上没有可用的 tailnet 凭据。
+所以以下**未经证实**：
+
+- 登录后能否真正建立 WireGuard 隧道 / 打通 DERP
+- SOCKS5 代理能否真正转发流量到 tailnet 内的节点
+
+已验证的是**到"等待授权"为止的全部启动路径 + 代理端口可 accept**。
+`tailscale up --auth-key=...` 之后的行为需要有凭据时另行验证。
+
+（旁证：上一轮调研中实测过 guest 内到 `controlplane.tailscale.com` /
+`login.tailscale.com` 的 HTTPS 可达，说明控制面网络路径本身通畅。）
+
+### 4.4 是否需要额外 syscall 支持：不需要，但有两个坑
+
+**结论：netlink stub + `SO_BINDTODEVICE` 两项之外，不需要新增 syscall 支持。**
+daemon 模式用到的 unix socket 控制通道、fd 操作、后台进程管理都已可用。
+
+两个需要注意的既有问题（**都不是 netlink 引入的**）：
+
+**(a) 控制 socket 必须用 abstract 地址（realfs 下）**
+
+realfs 下 `--socket=/path/to.sock` 会失败：
+
+```
+safesocket.Listen: listen unix /tmp/tsstate/tailscaled.sock: bind: operation not permitted
+```
+
+根因是 `realfs_mknod`（`fs/real.c`）对 `S_IFSOCK` 直接 `return _EPERM`，
+所以任何 AF_UNIX **文件路径** bind 在 realfs 下都是 EPERM（10 行 C 即可复现，与 netlink 无关）。
+规避：用 abstract socket `--socket=@tsd`（不碰文件系统），实测正常。
+fakefs 下无此问题（`fakefs_mknod` 把真实 mode 存进 meta.db，实测 `UNIXBIND OK`）。
+
+**(b) 后台 daemon + shell 退出会触发 illegal-instruction 风暴（既有 bug，非阻塞）**
+
+测试脚本里把 tailscaled 放后台再退出 shell 时，观测到 **61572 条**
+`illegal instruction at 0x9c128: insn=0x00000000`。
+
+定位过程：
+
+- `0x9c128` 在 **busybox** 里，反汇编实为 `mov x3, x20`（`aa1403e3`），
+  但 iSH 报 `insn=0x0` —— 说明取到的是**空指令流**，不是不支持的编码
+- **全部发生在 `SCRIPT_DONE` 之后**（实测：SCRIPT_DONE 在第 20 行，首条 fault 在第 21 行），
+  即进程退出竞态期间，**所有功能断言都已通过**
+- **与 netlink 无关**：stub ON/OFF 对照，单独跑 busybox `nc`（含 listener 消失场景）
+  各 0 条；单独跑长生命周期后台 Go 进程也是 0 条
+- **前台跑 tailscaled 100 秒：0 条 fault**（见下）
+
+```
+# 前台运行（真实用法），零异常
+$ ISH_NETLINK_STUB=1 timeout 100 ./build-arm64-release/ish -r alpine-arm64-321 \
+      /tmp/tailscaled --tun=userspace-networking ...
+illegal-insn count: 0
+```
+
+**所以这是"后台进程 + shell 退出"时的既有 teardown 竞态**（大概率与
+[[ish-claude-crash-root-cause]] 记录的退出期竞态同源），
+**不影响 tailscaled 的正常前台使用**，也不是本次改动引入的。
+但如果将来要把 tailscaled 做成真正的后台 daemon 常驻，这个需要单独查。
+
+### 4.5 对第 3 节结论的修正
+
+第 3 节写"tsnet 是库，不像 tailscaled 那样监听控制 socket，所以 realfs EPERM 对它无影响"
+——这点成立，但要补充：**官方 tailscaled 确实受影响**，规避方式是 abstract socket，
+成本为零（一个命令行参数）。不构成阻塞。
 
 ---
 
