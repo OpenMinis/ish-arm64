@@ -10,6 +10,10 @@
 #include "fs/inode.h"
 #include "fs/path.h"
 #include "fs/real.h"
+
+// TRACE() in this file routes to the `verbose` channel (debug.h's default),
+// i.e. compiled out unless DEBUG_verbose is set.
+#define DEFAULT_CHANNEL verbose
 #include "fs/sock.h"
 #include "debug.h"
 
@@ -105,7 +109,7 @@ static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
             rtm = ((const struct nlmsghdr_ *) req)->nlmsg_type;
         const char *name = rtm == 18 ? "RTM_GETLINK" : rtm == 22 ? "RTM_GETADDR" :
                            rtm == 26 ? "RTM_GETROUTE" : "other";
-        printk("NETLINK_STUB reply NLMSG_DONE seq=%u pid=%u req_type=%u(%s) (empty dump)\n",
+        TRACE("NETLINK_STUB reply NLMSG_DONE seq=%u pid=%u req_type=%u(%s) (empty dump)\n",
                seq, pid, rtm, name);
     }
     return (int) req_len;
@@ -171,7 +175,7 @@ static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr) {
                                    .nl_pid = 0, .nl_groups = 0 };
         if (user_write(name_addr, &nl, sizeof(nl))) return _EFAULT;
     }
-    printk("NETLINK_STUB recvmsg -> %zd bytes\n", n);
+    TRACE("NETLINK_STUB recvmsg -> %zd bytes\n", n);
     return (int) off;
 }
 
@@ -191,7 +195,7 @@ static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
     fd->socket.type = type & SOCKET_TYPE_MASK;
     fd->socket.protocol = protocol;
     fd->socket.netlink_peer_fd = sv[1];
-    printk("NETLINK_STUB socket(AF_NETLINK, %d, %d) -> stub fd\n", type, protocol);
+    TRACE("NETLINK_STUB socket(AF_NETLINK, %d, %d) -> stub fd\n", type, protocol);
     fd_t f = f_install(fd, type & ~SOCKET_TYPE_MASK);
     if (f < 0) {
         close(sv[0]);
@@ -533,7 +537,7 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     // would record nl_groups to decide which events to multicast; this stub
     // never delivers events, so there is nothing to record.
     if (fd_is_netlink_stub(sock)) {
-        printk("NETLINK_STUB bind() accepted (nl_groups ignored, no events)\n");
+        TRACE("NETLINK_STUB bind() accepted (nl_groups ignored, no events)\n");
         return 0;
     }
     struct sockaddr_max_ sockaddr;
@@ -736,7 +740,7 @@ int_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_ad
             return _EFAULT;
         if (user_put(sockaddr_len_addr, out_len))
             return _EFAULT;
-        printk("NETLINK_STUB getsockname -> nl_pid=0\n");
+        TRACE("NETLINK_STUB getsockname -> nl_pid=0\n");
         return 0;
     }
 
@@ -1088,7 +1092,12 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     // ignore: with a single host network path there is nothing to choose
     // between, so unbound behaviour is what the caller wanted anyway.
     if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
-        printk("NETLINK_STUB setsockopt SO_BINDTODEVICE ignored (no iface model)\n");
+        // Prefix is deliberately NOT "NETLINK_STUB": this has nothing to do
+        // with netlink and is NOT covered by ISH_NETLINK_STUB, so the old
+        // name implied that disabling the stub would disable this too.
+        // TRACE, not printk: Go sets this on EVERY outbound dial, and the
+        // unconditional form produced ~512KB of log in a single proxy test.
+        TRACE("SOCKOPT SO_BINDTODEVICE ignored (no iface model)\n");
         return 0;
     }
     // TCP_CONGESTION also has no equivalent on Darwin
