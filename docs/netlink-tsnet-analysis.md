@@ -16,6 +16,8 @@
 | **官方 tailscaled `--tun=userspace-networking` 呢** | **也能跑起来**（第 4 节）：启动到 `NeedsLogin`，SOCKS5/HTTP 代理端口均 `LISTENING`，无需额外 syscall |
 | 改动对既有功能有风险吗 | **无阻塞风险**（第 5 节）。stub 默认关闭且关闭时行为实测与 master 一致；`SO_BINDTODEVICE` 无 gate、是真实语义妥协但影响面明确。转正前需修 3 个脚手架隐患 |
 | 兼容性回归测试 | **无回归**（第 6 节）。ARM64 226/227，唯一失败项 `go version` 经 8 次空载复跑证伪为负载竞争；x86 与 master 基线逐项一致 |
+| 交互式登录能走通吗 | **能拿到真实授权链接**（第 7 节）：完整 `RegisterReq` 握手 → `https://login.tailscale.com/a/...`。**但有前提**，见下 |
+| ⚠️ **对第 2/3 节的重要修正** | **空 dump 只够启动，不够登录。** 空接口列表使控制客户端被永久 pause（对外 connect 计数为 0），`tailscale up` 永远拿不到链接。**阶段 2 的 `getifaddrs` 真实接口上报是登录必需项，不是可选增强** |
 
 ---
 
@@ -115,6 +117,10 @@ GETLINK=2  GETADDR=0  GETROUTE=0
 因为 `RTM_GETLINK` 返回空接口列表后，上层没有接口可查地址。）
 
 **结论：最小可用集就是能回答一次 `RTM_GETLINK` dump。**
+
+> ⚠️ **【第 7 节修正】"能回答"不等于"可以答空"。** 启动阶段答空即可，
+> 但登录阶段要求 dump 里**至少有一个 up 状态的接口**，否则控制客户端被永久 pause。
+> 见 7.1。
 
 ### 2.3 需要的数据结构
 
@@ -229,8 +235,14 @@ health(warnable=warming-up): ok
 并继续启动。因为 `tsnet` 本来就是纯用户态网络栈（gVisor netstack），
 它查接口只是为了做 endpoint 发现优化，不是硬依赖。
 
-**这意味着不必实现真实的接口枚举**，一个语义正确的空 dump 就能解锁 tsnet。
-真实现（`getifaddrs` → `ifinfomsg`/`ifaddrmsg`）可以作为后续增强，不是前置条件。
+**这意味着不必实现真实的接口枚举**，一个语义正确的空 dump 就能解锁 tsnet **的启动**。
+
+> ⚠️ **【第 7 节修正】"空 dump 就够了"只对启动成立，对登录不成立。**
+> 空接口列表会让 `shouldPauseControlClientLocked()` 恒为 true，
+> 控制客户端被**永久 pause**，`tailscale up` 永远拿不到授权链接
+> （实测对外 connect 计数为 0）。所以真实接口枚举
+> （`getifaddrs` → `ifinfomsg`/`ifaddrmsg`）**不是可选增强，而是登录流程的必需项**。
+> 详见 7.1。
 
 ### 3.3 必须一起修的另一个坑（与 netlink 无关）
 
@@ -292,7 +304,11 @@ if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_)
 
 1. **阶段 1（1-2 天）**：空 dump + `SO_BINDTODEVICE`，按仓库惯例加 build option + env 双 gate。
    目标：tsnet `s.Start()` 通过，加回归测试。
-2. **阶段 2（2-3 天）**：接宿主 `getifaddrs()`，`RTM_GETLINK`/`RTM_GETADDR` 上报真实接口；
+2. **阶段 2（2-3 天）【必需，非可选】**：接宿主 `getifaddrs()`，
+   `RTM_GETLINK`/`RTM_GETADDR` 上报真实接口。
+   **这是登录流程的前置条件**——空接口列表会让控制客户端被永久 pause（见 7.1），
+   只做阶段 1 的话 tsnet/tailscaled 能启动但**永远登录不了**。至少要让
+   `AnyInterfaceUp()` 为 true（上报一个 up 状态的非 loopback 接口）；
    同一数据源顺带补 `/proc/net/route` 和 `/proc/net/dev`（替掉现在的硬编码假数据）。
 3. **阶段 3（可选）**：`PF_ROUTE` 真实路由表。**先在 iOS 上验证 `NET_RT_DUMP` 可用性再投入。**
 
@@ -638,6 +654,126 @@ build dir 指向已失效的旧路径，无法重新生成），**早于本次�
   stub 关闭时恒为 false（5.1 节已用 socket 行为矩阵实测证明）
 
 与 5.5 节的 review 结论互相印证：**这两处改动对既有软件生态无影响。**
+
+---
+
+## 7. 交互式登录流程实测（`tailscale up`，无 authkey）
+
+> 第三轮实测。目标是走一次真实的交互式登录，观察授权链接从哪来、CLI 与 daemon 怎么通信。
+> **结论：拿到了真实授权链接，但同时发现了前几节一个被低估的问题。**
+
+### 7.1 关键发现：空接口列表会让登录流程永久卡死
+
+**默认配置下 `tailscale up` 根本打不出授权链接。** 连跑 5 次，行为一致：
+CLI 挂到超时后输出 `context canceled`，`tailscale status` 始终 `Logged out.`，
+daemon 日志停在：
+
+```
+localapi: [POST] /localapi/v0/login-interactive
+StartLoginInteractiveAs("root"): url=false
+control: client.Login(2)
+control: authRoutine: awaiting unpause     ← 永远等不到 unpause
+```
+
+**根因不是缺凭据，是我们的 stub 返回空接口列表。** 出处：
+
+```go
+// ipn/ipnlocal/local.go  shouldPauseControlClientLocked()
+networkUp := b.interfaceState.AnyInterfaceUp()
+pauseForNetwork := !networkUp && !testenv.InTest() && !envknob.AssumeNetworkUp()
+if pauseForNetwork {
+    return true          // ← 控制客户端被 pause，不发起任何对外连接
+}
+```
+
+`RTM_GETLINK` 返回空 dump → `interfaces.State{ifs={}}` → `AnyInterfaceUp()` 为 false
+→ `shouldPauseControlClientLocked()` 恒为 true → 控制客户端**永久 pause**。
+
+**实测铁证：整个登录过程中 daemon 的对外 connect 计数为 0**
+（`NETDIAG connect` 一条都没有）。它压根没尝试联网，而不是联网失败。
+
+### 7.2 验证：解除这个条件后，真实链接立刻出现
+
+tailscale 自带一个逃生阀 `envknob.AssumeNetworkUp()`
+（环境变量 `TS_ASSUME_NETWORK_UP_FOR_TEST=1`）可以跳过该判断。加上之后：
+
+```
+control: control server key from https://controlplane.tailscale.com: ts2021=[fSeS+], legacy=[nlFWp]
+control: Generating a new nodekey.
+control: RegisterReq: onode= node=[R12T0] fup=false nks=false
+control: RegisterReq: got response; nodeKeyExpired=false, machineAuthorized=false; authURL=true
+control: AuthURL is https://login.tailscale.com/a/161ce8e8012f93
+control: doLogin(regen=false, hasUrl=true)
+popBrowserAuthNow("root"): url=true, key-expired=false
+```
+
+`tailscale status` 同步显示：
+
+```
+Logged out.
+Log in at: https://login.tailscale.com/a/161ce8e8012f93
+```
+
+**这是完整走通的真实控制面握手**：TLS 连上 `controlplane.tailscale.com`、
+取得服务器公钥、生成 nodekey、发送 `RegisterReq`、拿回一次性授权 URL。
+到"等待用户点击链接"为止的每一步都成立。**只差真实账号点链接完成授权。**
+
+这条对照同时**反证了 iSH 侧的网络栈是健全的**：一旦不被 pause 挡住，
+TLS / DNS / HTTP 全链路都能跑通。
+
+### 7.3 授权链接的生成与传递机制
+
+**链接由控制面生成**，不是本地构造：daemon 发 `RegisterReq`，
+`controlplane.tailscale.com` 在响应里返回 `authURL`
+（伴随 `machineAuthorized=false`）。
+
+**CLI ↔ daemon 是 daemon 推送，不是 CLI 轮询**（`cmd/tailscale/cli/up.go`）：
+
+```go
+watcher, err := localClient.WatchIPNBus(watchCtx, 0)                      // :618
+...
+if url := n.BrowseToURL; url != nil {                                     // :762
+    fmt.Fprintf(Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", authURL) // :786
+}
+```
+
+CLI 经 unix socket 上的 localapi 订阅 **IPN bus**（长连接事件流），
+daemon 在 `popBrowserAuthNow()` 时推送一条带 `BrowseToURL` 的通知。
+**CLI 是阻塞等待的**——`watchCtx` 直到授权完成或超时才结束。
+
+### 7.4 【开放疑点，未深挖】CLI 收不到 IPN bus 推送
+
+即使在 7.2 拿到链接的那次运行里，**CLI 端仍然只收到 `context canceled`，
+没有打印链接**。链接是通过 `tailscale status` 查到的，不是 `up` 打印的。
+
+已观察到的现象：
+
+- daemon 侧明确记录了 `popBrowserAuthNow("root"): url=true`，说明**推送已发出**
+- 但 daemon 日志里 `watch-ipn-bus` 的 localapi 调用计数为 **0**
+- CLI 最终以 `watchCtx.Err()` 即 `context canceled` 退出
+
+**怀疑方向**（未验证）：IPN bus 是 unix socket 上的**长连接事件流**，
+可能触及 iSH 的 epoll / 长连接语义——与 [[ish-claude-tui-keyboard-hang]] 记录的
+epoll ONESHOT 问题属于同一类。**本次不深挖，仅记录。**
+
+**影响评估**：不阻塞功能。链接可以通过 `tailscale status` 拿到，
+`--authkey` 路径也完全绕开这个机制。但会影响 `tailscale up` 的交互体验。
+
+### 7.5 与 tsnet demo 的对比：协议层完全一致
+
+| | 官方 tailscaled + CLI | tsnet 库 |
+|---|---|---|
+| 链接来源 | `RegisterReq` → controlplane | **同一个** |
+| 内部机制 | `WatchIPNBus` → `n.BrowseToURL` | `WatchIPNBus`（`tsnet.go:541`） |
+| 额外通道 | 无 | `printAuthURLLoop` **轮询** `st.AuthURL`（`tsnet.go:1144`） |
+| 暴露方式 | CLI 打印到 stderr | `logf` 回调写日志 |
+
+**两者是同一套 controlplane API、同一条 IPN bus**，只是出口不同：
+一个给人看，一个给程序订阅。
+
+**一个有意思的差异**：tsnet 除了订阅事件，还有一个**每几秒轮询 status** 的
+`printAuthURLLoop`。在 iSH 这个环境里**轮询反而更健壮**——
+这正好解释了为什么 tsnet demo 能正常打出状态，而 CLI 的 `up` 拿不到推送（7.4）。
 
 ---
 
