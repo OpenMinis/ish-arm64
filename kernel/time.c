@@ -192,6 +192,78 @@ uint_t sys_alarm(uint_t seconds) {
     return seconds;
 }
 
+
+// [T-ish-nanosleep-uninterruptible] A guest sleep must be interruptible by a
+// guest signal.
+//
+// Both nanosleep paths used to call the HOST's nanosleep() directly. That is a
+// host-level block: iSH's signal machinery cannot reach a thread parked inside
+// it, so a SIGTERM sent to a sleeping task just sat in the pending queue until
+// the host sleep ran to completion on its own. `sleep 8` therefore always slept
+// the full 8 seconds no matter what was sent to it.
+//
+// What that broke, and why it looked like the posix-timer bug: GNU coreutils
+// `timeout` arms its deadline with timer_create (fixed separately in
+// e1d57948), then on expiry signals its child. With the timer fixed, `timeout
+// 3 sleep 8` DOES fire at 3s and does return 124 -- but the child ignored the
+// signal until its own 8s elapsed, so the observable behaviour ("the process is
+// still alive at t=7") did not change at all. Two bugs in series; fixing only
+// the first one shows no improvement, which is exactly what the field reports
+// described.
+//
+// Wait on a private condition with a timeout instead. wait_for() returns
+// _EINTR the moment a signal is pending, which is the behaviour nanosleep(2)
+// is specified to have. `rem` matters: sleep(1) and friends resume with the
+// remainder, so an interrupted sleep that reports a wrong remainder either
+// returns early or loops forever.
+static dword_t nanosleep_interruptible(struct timespec *req, addr_t rem_addr) {
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) < 0)
+        return errno_map();
+
+    // Private cond/lock: nothing ever notifies it, so the wait always ends by
+    // timeout or by signal — which is precisely the semantics wanted here.
+    cond_t sleep_cond = COND_INITIALIZER;
+    lock_t sleep_lock;
+    lock_init(&sleep_lock);
+    cond_init(&sleep_cond);
+
+    lock(&sleep_lock);
+    int err = wait_for(&sleep_cond, &sleep_lock, req);
+    unlock(&sleep_lock);
+    cond_destroy(&sleep_cond);
+
+    if (err == _EINTR) {
+        // Report what is left, clamped at zero: the signal may have arrived
+        // after the deadline had already passed.
+        struct timespec now;
+        struct timespec_ rem_ts = {.sec = 0, .nsec = 0};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+            long long elapsed_ns = (long long)(now.tv_sec - start.tv_sec) * 1000000000LL
+                                 + (long long)(now.tv_nsec - start.tv_nsec);
+            long long req_ns = (long long)req->tv_sec * 1000000000LL + req->tv_nsec;
+            long long left_ns = req_ns - elapsed_ns;
+            if (left_ns > 0) {
+                rem_ts.sec = left_ns / 1000000000LL;
+                rem_ts.nsec = left_ns % 1000000000LL;
+            }
+        }
+        if (rem_addr != 0 && user_put(rem_addr, rem_ts))
+            return _EFAULT;
+        return _EINTR;
+    }
+
+    // _ETIMEDOUT is the normal completion here; 0 would mean a spurious
+    // wakeup, and since nothing notifies this cond there is no remaining time
+    // to report in either case.
+    if (rem_addr != 0) {
+        struct timespec_ rem_ts = {.sec = 0, .nsec = 0};
+        if (user_put(rem_addr, rem_ts))
+            return _EFAULT;
+    }
+    return 0;
+}
+
 dword_t sys_nanosleep(addr_t req_addr, addr_t rem_addr) {
     struct timespec_ req_ts;
     if (user_get(req_addr, req_ts))
@@ -212,17 +284,8 @@ dword_t sys_nanosleep(addr_t req_addr, addr_t rem_addr) {
     struct timespec req;
     req.tv_sec = req_ts.sec;
     req.tv_nsec = req_ts.nsec;
-    struct timespec rem;
-    if (nanosleep(&req, &rem) < 0)
-        return errno_map();
-    if (rem_addr != 0) {
-        struct timespec_ rem_ts;
-        rem_ts.sec = rem.tv_sec;
-        rem_ts.nsec = rem.tv_nsec;
-        if (user_put(rem_addr, rem_ts))
-            return _EFAULT;
-    }
-    return 0;
+    // [T-ish-nanosleep-uninterruptible] interruptible; see the helper above.
+    return nanosleep_interruptible(&req, rem_addr);
 }
 
 dword_t sys_clock_nanosleep(dword_t clock, dword_t flags, addr_t req_addr, addr_t rem_addr) {
@@ -255,17 +318,10 @@ dword_t sys_clock_nanosleep(dword_t clock, dword_t flags, addr_t req_addr, addr_
             return 0; // Already past the target time
     }
 
-    struct timespec rem;
-    if (nanosleep(&req, &rem) < 0)
-        return errno_map();
-    if (rem_addr != 0 && !(flags & TIMER_ABSTIME_)) {
-        struct timespec_ rem_ts;
-        rem_ts.sec = rem.tv_sec;
-        rem_ts.nsec = rem.tv_nsec;
-        if (user_put(rem_addr, rem_ts))
-            return _EFAULT;
-    }
-    return 0;
+    // [T-ish-nanosleep-uninterruptible] interruptible; see the helper above.
+    // POSIX: with TIMER_ABSTIME the remainder is NOT written back (the caller
+    // already knows the absolute deadline), so pass 0 to suppress it.
+    return nanosleep_interruptible(&req, (flags & TIMER_ABSTIME_) ? 0 : rem_addr);
 }
 
 dword_t sys_times(addr_t tbuf) {
