@@ -220,48 +220,71 @@ static dword_t nanosleep_interruptible(struct timespec *req, addr_t rem_addr) {
     struct timespec start;
     if (clock_gettime(CLOCK_MONOTONIC, &start) < 0)
         return errno_map();
+    long long req_ns = (long long) req->tv_sec * 1000000000LL + req->tv_nsec;
 
-    // Private cond/lock: nothing ever notifies it, so the wait always ends by
-    // timeout or by signal — which is precisely the semantics wanted here.
+    // Private cond/lock. Nothing ever notifies it deliberately, so the wait is
+    // meant to end by timeout or by signal.
     cond_t sleep_cond = COND_INITIALIZER;
     lock_t sleep_lock;
     lock_init(&sleep_lock);
     cond_init(&sleep_cond);
 
+    long long left_ns = req_ns;
+    int err = _ETIMEDOUT;
     lock(&sleep_lock);
-    int err = wait_for(&sleep_cond, &sleep_lock, req);
+    // Loop until the deadline is actually reached. wait_for() returns 0 for a
+    // wakeup that is neither a timeout nor a deliverable signal, and that is
+    // reachable here, not just theoretical: deliver_signal() notifies
+    // waiting_cond for EVERY signal, while is_signal_pending() masks out
+    // BLOCKED ones — so a blocked signal (a shell blocking SIGCHLD around a
+    // critical section, say) wakes this cond and reports 0. Returning success
+    // on that would silently truncate the sleep, which is exactly the bug the
+    // caller is relying on us not to have. Every other wait_for() caller in
+    // the kernel loops for the same reason (eventfd.c:32, time.c timerfd,
+    // exit.c) — this one must too.
+    //
+    // The timeout passed to wait_for is RELATIVE
+    // (pthread_cond_timedwait_relative_np on Darwin), so it has to be
+    // recomputed from the remaining time on each pass, never re-passed as the
+    // original `req`.
+    while (left_ns > 0) {
+        struct timespec wait_ts = {
+            .tv_sec = (time_t) (left_ns / 1000000000LL),
+            .tv_nsec = (long) (left_ns % 1000000000LL),
+        };
+        err = wait_for(&sleep_cond, &sleep_lock, &wait_ts);
+
+        // Re-measure BEFORE acting on the result: the _EINTR path reports
+        // `left_ns` as the remainder, so it has to reflect time actually
+        // elapsed. Breaking out first would hand back the full original
+        // duration and make an interrupted sleep restart from scratch.
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+            long long elapsed_ns = (long long) (now.tv_sec - start.tv_sec) * 1000000000LL
+                                 + (long long) (now.tv_nsec - start.tv_nsec);
+            left_ns = req_ns - elapsed_ns;
+        } else if (err != _EINTR) {
+            break;   // cannot measure progress and not interrupted; treat as complete
+        }
+
+        if (err == _EINTR)
+            break;
+        if (err == _ETIMEDOUT)
+            break;   // the deadline is what expired; done regardless of drift
+    }
     unlock(&sleep_lock);
     cond_destroy(&sleep_cond);
 
-    if (err == _EINTR) {
-        // Report what is left, clamped at zero: the signal may have arrived
-        // after the deadline had already passed.
-        struct timespec now;
-        struct timespec_ rem_ts = {.sec = 0, .nsec = 0};
-        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
-            long long elapsed_ns = (long long)(now.tv_sec - start.tv_sec) * 1000000000LL
-                                 + (long long)(now.tv_nsec - start.tv_nsec);
-            long long req_ns = (long long)req->tv_sec * 1000000000LL + req->tv_nsec;
-            long long left_ns = req_ns - elapsed_ns;
-            if (left_ns > 0) {
-                rem_ts.sec = left_ns / 1000000000LL;
-                rem_ts.nsec = left_ns % 1000000000LL;
-            }
-        }
-        if (rem_addr != 0 && user_put(rem_addr, rem_ts))
-            return _EFAULT;
-        return _EINTR;
+    // Only an interrupted sleep reports a remainder; a completed one reports
+    // zero. Clamp: the signal can arrive after the deadline has already passed.
+    struct timespec_ rem_ts = {.sec = 0, .nsec = 0};
+    if (err == _EINTR && left_ns > 0) {
+        rem_ts.sec = left_ns / 1000000000LL;
+        rem_ts.nsec = left_ns % 1000000000LL;
     }
-
-    // _ETIMEDOUT is the normal completion here; 0 would mean a spurious
-    // wakeup, and since nothing notifies this cond there is no remaining time
-    // to report in either case.
-    if (rem_addr != 0) {
-        struct timespec_ rem_ts = {.sec = 0, .nsec = 0};
-        if (user_put(rem_addr, rem_ts))
-            return _EFAULT;
-    }
-    return 0;
+    if (rem_addr != 0 && user_put(rem_addr, rem_ts))
+        return _EFAULT;
+    return err == _EINTR ? _EINTR : 0;
 }
 
 dword_t sys_nanosleep(addr_t req_addr, addr_t rem_addr) {
