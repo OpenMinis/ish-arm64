@@ -86,6 +86,11 @@ struct fd *generic_openat(struct fd *at, const char *path_raw, int flags, int mo
         }
         unlock(&inodes_lock);
     }
+    // [T-ish-exec-fewer-meta-txns] Whatever the fs did with its open-time
+    // stat cache, it must not outlive this open: a later fstat has to see
+    // current metadata. Keep the stat itself for exec.
+    fd->fake_open_stat.valid = false;
+    fd->open_stat = stat;
     fd->type = stat.mode & S_IFMT;
     fd->flags = flags;
 
