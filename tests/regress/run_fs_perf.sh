@@ -30,6 +30,11 @@ else
     echo "skip: no $CC_GUEST for the race test"
 fi
 
+echo "== /proc readers vs exiting processes (25s; crashed iSH in <1s before the fix) =="
+out=$(timeout 180 "$ISH" -f "$R" /bin/sh < tests/regress/regress_proc_exit_race.sh 2>&1 | grep -v '^\[iSH\]\[')
+echo "$out" | tail -1
+echo "$out" | grep -q PROC_RACE_OK || { echo "FAIL: iSH died during the proc/exit race"; fail=1; }
+
 if [ $BENCH = 1 ]; then
     t() { python3 -c 'import time;print(time.time())'; }
     s=$(t); timeout 300 "$ISH" -f "$R" /bin/sh -c 'i=0; while [ $i -lt 1500 ]; do /bin/true; i=$((i+1)); done' >/dev/null 2>&1; e=$(t)

@@ -7,9 +7,15 @@
 // task->mem twice (once for the NULL check, once for the lock) or dereferencing
 // it unguarded races that store — the classic symptom is EXC_BAD_ACCESS at
 // address 0x38 (= offsetof(struct mem, lock)) from read_wrlock(&NULL->lock) or
-// a freed mem. Combined with the A-side fix (the safety valve now leaks the mm
-// instead of freeing it), a non-NULL snapshot here is guaranteed to stay valid
-// for the duration of the copy.
+// a freed mem.
+//
+// [T-ish-exit-mm-general-lock] The snapshot alone is NOT a lifetime guarantee:
+// the target can be mid-do_exit and destroy the mm right after we read the
+// pointer. The contract is that every CROSS-task caller holds
+// task->general_lock for the whole call (procfs does); do_exit and the
+// deferred-release handler unpublish task->mm/task->mem under that lock
+// before destroying, so under it a non-NULL mem stays valid until we return.
+// Same-task callers (user_read/user_write on `current`) need nothing.
 #define USER_MEM_OR_FAULT(task) ({ \
     struct mem *_m = __atomic_load_n(&(task)->mem, __ATOMIC_ACQUIRE); \
     if (_m == NULL) return 1; \

@@ -56,3 +56,15 @@ aarch64-linux-musl-gcc -static -O0 -o <rootfs>/tmp/regress_syscall \
     tests/regress/regress_syscall.c
 <old-ish> -r <rootfs> /tmp/regress_syscall
 ```
+
+## fs hot path / exit race (2026-09-19)
+
+| Fix | What broke before it | Covered by |
+| --- | --- | --- |
+| process-wide path cache (e78c6980) | `__thread` cache was empty for every forked process; fork storms spent 85% CPU re-resolving the same paths through SQLite and host fstatat | `regress_path_cache.sh` |
+| orphan cleanup on demand (43b7c59b) | every last close ran a SQLite write transaction under `inodes_lock`; rename-over-a-closed-file leaked its `stats` row | `regress_inode_orphan.sh` + host-side orphan count |
+| inode ref taken in open() (608530ba) | `generic_openat` held `inodes_lock` across a SQLite read; the naive "fstat outside the lock" reorder reintroduces the d57b6d26 open-vs-unlink race | `regress_open_unlink_race.c` |
+| mm unpublished under general_lock in do_exit | `/proc/<pid>/{cmdline,stat,statm,maps,mem}` readers took `mem->lock` on an mm that `do_exit` was destroying without `general_lock`: `mem_destroy` trapped on `pthread_rwlock_destroy`=EBUSY or the reader hit freed memory. Killed iSH in <1s with a fork storm plus `ps`/`/proc` readers | `regress_proc_exit_race.sh` |
+
+All four run from `tests/regress/run_fs_perf.sh -i build-native/ish -r <fakefs rootfs> [-b]`,
+which works on a COPY of the rootfs so the meta.db orphan check is reproducible.
