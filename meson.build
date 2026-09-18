@@ -1759,6 +1759,7 @@ if get_option('kernel') == 'ish'
         'util/timer.c',
         'util/sync.c',
         'util/fifo.c',
+        'util/verbosetrace.c',
         'util/fchdir.c',
         'util/signpost.c',
 
