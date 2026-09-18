@@ -26,6 +26,9 @@ if command -v "$CC_GUEST" >/dev/null 2>&1; then
     "$CC_GUEST" -static -O0 -o "$T/race" tests/regress/regress_open_unlink_race.c || fail=1
     timeout 300 "$ISH" -f "$R" /bin/sh -c 'cat > /tmp/race && chmod +x /tmp/race && /tmp/race; rc=$?; rm -f /tmp/race; exit $rc' < "$T/race" || fail=1
     o=$(orph); [ "$o" = 0 ] || { echo "FAIL: $o orphan rows after the race"; fail=1; }
+    echo "== sub-ms futex / nanosleep waits (Go idle pattern) =="
+    "$CC_GUEST" -static -O0 -o "$T/subms" tests/regress/regress_subms_wait.c || fail=1
+    timeout 120 "$ISH" -f "$R" /bin/sh -c 'cat > /tmp/subms && chmod +x /tmp/subms && /tmp/subms; rc=$?; rm -f /tmp/subms; exit $rc' < "$T/subms" 2>&1 | grep -v '^\[iSH\]\[' || fail=1
 else
     echo "skip: no $CC_GUEST for the race test"
 fi
