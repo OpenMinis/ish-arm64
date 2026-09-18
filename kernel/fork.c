@@ -24,6 +24,9 @@ void ish_set_fork_guard(ish_fork_guard_t guard) {
     atomic_store_explicit(&g_fork_guard, guard, memory_order_release);
 }
 
+// [T-ish-cpu-top] Successful clone()/fork() count, read by the host [CPUTop] sampler.
+_Atomic uint64_t ish_guest_forks;
+
 #define CSIGNAL_ 0x000000ff
 #define CLONE_VM_ 0x00000100
 #define CLONE_FS_ 0x00000200
@@ -231,6 +234,8 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
     // never runs, and a vfork parent that waits on it forever.
     // [T-ish-jit-oom-abort]
     int start_err = task_start(task);
+    if (start_err >= 0)
+        atomic_fetch_add(&ish_guest_forks, 1);   // [T-ish-cpu-top]
     if (start_err < 0) {
         if (flags & CLONE_VFORK_) {
             lock(&task->general_lock);
