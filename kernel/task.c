@@ -174,7 +174,12 @@ static void task_run_tlb_cleanup(void *arg) {
     struct task *self = current;
     if (self != NULL && self->mm_release_deferred && self->mm != NULL) {
         self->mm_release_deferred = false;
-        mm_release(self->mm);
+        // [T-ish-mm-diag] The other half of the SAFETY-VALVE line: when the
+        // leaked thread finally unwinds and releases, and what refcount it
+        // finds — a value other than 1 here means a second holder.
+        printk("[iSH][DEFERRED-RELEASE] pid=%d mm_release from cleanup handler, mm=%p refcount_before=%u\n",
+               self->pid, (void *) self->mm, (unsigned) self->mm->refcount);
+        mm_release_from(self->mm, "cleanup_handler");
         self->mm = NULL;
         self->mem = NULL;
     }

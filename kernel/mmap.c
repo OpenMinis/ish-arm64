@@ -263,13 +263,23 @@ void mm_retain(struct mm *mm) {
     mm->refcount++;
 }
 
-void mm_release(struct mm *mm) {
-    if (--mm->refcount == 0) {
+// [T-ish-mm-diag] Same as mm_release, but names the release path so the
+// log can tell do_exit / exec / cleanup_handler apart when two of them race
+// on one mm (the mem_destroy brk #1 investigation, analysis §10).
+void mm_release_from(struct mm *mm, const char *caller) {
+    unsigned left = --mm->refcount;
+    if (left == 0) {
+        printk("[iSH][MM-RELEASE] pid=%d mm=%p refcount→0, caller=%s\n",
+               current ? current->pid : -1, (void *) mm, caller);
         if (mm->exefile != NULL)
             fd_close(mm->exefile);
         mem_destroy(&mm->mem);
         free(mm);
     }
+}
+
+void mm_release(struct mm *mm) {
+    mm_release_from(mm, "unknown");
 }
 
 static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd_t fd_no, dword_t offset) {

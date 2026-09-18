@@ -167,5 +167,7 @@ struct mm *mm_copy(struct mm *mm);
 void mm_retain(struct mm *mem);
 // Decrement the refcount, destroy everything in the space if 0
 void mm_release(struct mm *mem);
+// [T-ish-mm-diag] Tagged variant used by the three known release paths.
+void mm_release_from(struct mm *mem, const char *caller);
 
 #endif
