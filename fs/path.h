@@ -30,6 +30,8 @@ bool path_is_normalized(const char *path);
 // namespace mutation that can change what a path resolves to; cheap (one
 // atomic increment), entries are rejected lazily.
 void path_cache_invalidate(void);
+// [T-ish-cpu-top] Cumulative counters: {hits, miss_slot, miss_gen, miss_ttl, miss_flags, invalidations}.
+void path_cache_stats(uint64_t out[6]);
 
 // Helper function for iterating through a normalized path.
 //

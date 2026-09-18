@@ -253,6 +253,9 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 
 #define MAX_PID (1 << 15) // oughta be enough
 
+// [T-ish-cpu-top] Successful fork/clone count (kernel/fork.c), for host diagnostics.
+extern _Atomic uint64_t ish_guest_forks;
+
 // TODO document
 // Starts the task's thread. Returns 0, or a negative guest errno (_EAGAIN when
 // the host is out of thread resources) -- callers must not assume success.

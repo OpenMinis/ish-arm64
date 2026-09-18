@@ -54,8 +54,22 @@ static struct path_cache_entry path_cache[PATH_CACHE_SIZE];
 static lock_t path_cache_lock = LOCK_INITIALIZER;
 static _Atomic uint64_t path_cache_gen = 1;
 
+// [T-ish-cpu-top] Counters for the host's [CPUTop] line. Misses are split by
+// reason so a log line can say WHY the cache is not helping: `slot` = the
+// path was never cached or its slot holds another path (capacity/collision),
+// `gen` = a namespace mutation invalidated it, `ttl` = older than 100 ms,
+// `flags` = cached under the other follow/nofollow mode.
+static _Atomic uint64_t pc_hits, pc_miss_slot, pc_miss_gen, pc_miss_ttl, pc_miss_flags, pc_invals;
+
+void path_cache_stats(uint64_t out[6]) {
+    out[0] = atomic_load(&pc_hits);      out[1] = atomic_load(&pc_miss_slot);
+    out[2] = atomic_load(&pc_miss_gen);  out[3] = atomic_load(&pc_miss_ttl);
+    out[4] = atomic_load(&pc_miss_flags); out[5] = atomic_load(&pc_invals);
+}
+
 void path_cache_invalidate(void) {
     atomic_fetch_add_explicit(&path_cache_gen, 1, memory_order_release);
+    atomic_fetch_add(&pc_invals, 1);
 }
 
 static inline uint64_t path_cache_snapshot(void) {
@@ -86,14 +100,16 @@ static int path_cache_get(const char *full_path, int flags, char *out, uint64_t 
     uint64_t now = get_time_ns();
 
     lock(&path_cache_lock);
-    bool hit = entry->valid
-        && entry->gen == gen
-        && entry->flags == flags
-        && now - entry->timestamp <= PATH_CACHE_TTL_NS
-        && strcmp(entry->input_path, full_path) == 0;
+    _Atomic uint64_t *why = NULL;
+    if (!entry->valid || strcmp(entry->input_path, full_path) != 0) why = &pc_miss_slot;
+    else if (entry->gen != gen)                                    why = &pc_miss_gen;
+    else if (now - entry->timestamp > PATH_CACHE_TTL_NS)          why = &pc_miss_ttl;
+    else if (entry->flags != flags)                                why = &pc_miss_flags;
+    bool hit = (why == NULL);
     if (hit)
         strcpy(out, entry->normalized);
     unlock(&path_cache_lock);
+    atomic_fetch_add(hit ? &pc_hits : why, 1);
     return hit ? 0 : -1;
 }
 
