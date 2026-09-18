@@ -1,4 +1,5 @@
 #include <string.h>
+#include "util/verbosetrace.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -418,12 +419,13 @@ int realfs_getpath(struct fd *fd, char *buf) {
      * Detect and translate back to the Linux path. */
     char linux_path[MAX_PATH];
     if (fakefs_bind_mount_resolve_path(buf, linux_path, sizeof(linux_path))) {
-        if (strstr(buf, "minis") != NULL)
+        /* [T-ios-log-verbose-tier] Per-resolve trace; see util/verbosetrace.h. */
+        if (ish_verbose_trace_enabled && strstr(buf, "minis") != NULL)
             fprintf(stderr, "realfs_getpath: bind_mount_resolve OK: \"%s\" -> \"%s\"\n", buf, linux_path);
         strlcpy(buf, linux_path, MAX_PATH);
         return 0;
     }
-    if (strstr(buf, "minis") != NULL)
+    if (ish_verbose_trace_enabled && strstr(buf, "minis") != NULL)
         fprintf(stderr, "realfs_getpath: bind_mount_resolve MISS: F_GETPATH=\"%s\" source=\"%s\"\n", buf, fd->mount->source);
 
     if (strcmp(fd->mount->source, "/") != 0 || strcmp(buf, "/") == 0) {
