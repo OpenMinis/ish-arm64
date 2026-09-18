@@ -162,6 +162,7 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
         err = _EPERM;
     else
         err = mount->fs->link(mount, src, dst);
+    path_cache_invalidate();
     mount_release(mount);
     mount_release(dst_mount);
     return err;
@@ -180,6 +181,7 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->unlink)
         err = mount->fs->unlink(mount, path);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -205,6 +207,7 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
         err = _EPERM;
     else
         err = mount->fs->rename(mount, src, dst);
+    path_cache_invalidate();
     mount_release(mount);
     mount_release(dst_mount);
     return err;
@@ -219,6 +222,7 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
     err = _EPERM;
     if (mount->fs->symlink)
         err = mount->fs->symlink(mount, target, link);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -237,6 +241,7 @@ int generic_mknodat(struct fd *at, const char *path_raw, mode_t_ mode, dev_t_ de
     err = _EPERM;
     if (mount->fs->mknod)
         err = mount->fs->mknod(mount, path, mode, dev);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -289,6 +294,7 @@ int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
     err = _EPERM;
     if (mount->fs->mkdir)
         err = mount->fs->mkdir(mount, path, mode);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -304,6 +310,7 @@ int generic_rmdirat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->rmdir)
         err = mount->fs->rmdir(mount, path);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
