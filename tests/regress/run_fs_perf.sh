@@ -29,6 +29,12 @@ if command -v "$CC_GUEST" >/dev/null 2>&1; then
     echo "== sub-ms futex / nanosleep waits (Go idle pattern) =="
     "$CC_GUEST" -static -O0 -o "$T/subms" tests/regress/regress_subms_wait.c || fail=1
     timeout 120 "$ISH" -f "$R" /bin/sh -c 'cat > /tmp/subms && chmod +x /tmp/subms && /tmp/subms; rc=$?; rm -f /tmp/subms; exit $rc' < "$T/subms" 2>&1 | grep -v '^\[iSH\]\[' || fail=1
+    echo "== fork-rate governor (40-way storm held at 150/s, light shell bypasses) =="
+    "$CC_GUEST" -static -O2 -o "$T/now_ms" tests/regress/regress_now_ms.c || fail=1
+    "$ISH" -f "$R" /bin/sh -c 'cat > /tmp/now_ms && chmod +x /tmp/now_ms' < "$T/now_ms" || fail=1
+    out=$(ISH_FORK_RATE=150,300 timeout 180 "$ISH" -f "$R" /bin/sh < tests/regress/regress_fork_rate.sh 2>&1 | grep -v '^\[iSH\]\[')
+    echo "$out" | tail -2
+    echo "$out" | grep -q FORK_RATE_OK || { echo "FAIL: fork-rate governor"; fail=1; }
 else
     echo "skip: no $CC_GUEST for the race test"
 fi

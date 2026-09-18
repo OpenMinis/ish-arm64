@@ -118,6 +118,14 @@ struct task {
     // specifically: comm, mm
     lock_t general_lock;
 
+    // [T-ish-fork-rate] How hard THIS task has been forking lately: an
+    // exponentially weighted forks-per-second with a 1 s time constant, only
+    // ever touched by the task itself inside sys_clone. A fresh shell doing a
+    // handful of forks (a tool call) stays "light" and bypasses the global
+    // fork-rate governor; the looping shells of a fork storm do not.
+    uint64_t fork_rate_last_ns;
+    double fork_rate_ewma;
+
     struct task_sockrestart sockrestart;
 
     // Native offload: when is_native_proxy is true, this task is waiting
@@ -255,6 +263,14 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 
 // [T-ish-cpu-top] Successful fork/clone count (kernel/fork.c), for host diagnostics.
 extern _Atomic uint64_t ish_guest_forks;
+
+// [T-ish-fork-rate] Global fork-rate governor: a token bucket that every
+// non-thread clone() draws from. When it is empty, heavy forkers sleep until
+// their token arrives (never denied, only delayed); light forkers (see
+// task->fork_rate_ewma) go through. per_sec == 0 turns it off. The host sets
+// the rate from thermal state; the CLI reads ISH_FORK_RATE=per_sec[,burst].
+void ish_set_fork_rate_limit(unsigned per_sec, unsigned burst);
+void ish_fork_rate_stats(uint64_t *throttled, uint64_t *bypassed, uint64_t *sleep_ns);
 
 // TODO document
 // Starts the task's thread. Returns 0, or a negative guest errno (_EAGAIN when
