@@ -123,6 +123,7 @@ int do_mount(const struct fs_ops *fs, const char *source, const char *point, con
             break;
     }
     list_add_before(&mount->mounts, &new_mount->mounts);
+    path_cache_invalidate();
 
     // Invalidate all mount caches
     global_mount_version++;
@@ -137,6 +138,7 @@ int mount_remove(struct mount *mount) {
     if (mount->fs->umount)
         mount->fs->umount(mount);
     list_remove(&mount->mounts);
+    path_cache_invalidate();
     free((void *) mount->info);
     free((void *) mount->source);
     free((void *) mount->point);

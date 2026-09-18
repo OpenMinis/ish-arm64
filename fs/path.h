@@ -26,6 +26,11 @@
 int path_normalize(struct fd *at, const char *path, char *out, int flags);
 bool path_is_normalized(const char *path);
 
+// [T-ish-pathcache-global] Drop every cached normalization. Call after any
+// namespace mutation that can change what a path resolves to; cheap (one
+// atomic increment), entries are rejected lazily.
+void path_cache_invalidate(void);
+
 // Helper function for iterating through a normalized path.
 //
 // The *path pointer is advanced to point to the next /, and the next path

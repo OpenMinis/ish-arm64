@@ -3,27 +3,64 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include "kernel/calls.h"
+#include "util/sync.h"
 #include "fs/path.h"
 
 // === Path Normalize Cache ===
-// Thread-local cache for frequently normalized paths
-// Reduces redundant path normalization during Python import and file operations
+//
+// [T-ish-pathcache-global] One process-wide cache of path_normalize results.
+//
+// It used to be `__thread`: 64 entries x ~8 KB, memset on first use in every
+// host thread. Every guest process is its own host thread (task_thread), so
+// under fork+exec the cache was born empty for each process, served ~0 hits
+// over a lifetime of a handful of opens, and cost a 525 KB memset per fork
+// on top. A Time Profiler capture of a 40-way fork storm (2026-09-19) put
+// 85% of 261% CPU under path_normalize: every component of every path did a
+// fakefs readlink (SQLite) and, for directories, a stat (SQLite + host
+// fstatat) — for the same dozen paths, millions of times.
+//
+// Now one table shared by all threads. Correctness keeps the old TTL bound
+// and ADDS explicit invalidation: every namespace mutation that can change
+// what a path resolves to (link/unlink/rename/symlink/mknod/mkdir/rmdir,
+// mount/umount) bumps `path_cache_gen`, and an entry stored under an older
+// generation is ignored. The generation is snapshotted BEFORE the
+// normalization whose result is stored, so a mutation racing the walk can
+// only make the entry stale-and-rejected, never stale-and-served. The TTL
+// remains the bound for changes the kernel cannot observe (host-side edits
+// under bind mounts).
+//
+// Only successful normalizations are cached — errors never are — so a
+// cached entry can only ever be wrong about what a *symlink* resolves to.
 
-#define PATH_CACHE_SIZE 64
+#define PATH_CACHE_SIZE 512
 #define PATH_CACHE_TTL_NS 100000000  // 100ms TTL
 
 struct path_cache_entry {
     char input_path[MAX_PATH];     // Original path (with at_path prefix if any)
     char normalized[MAX_PATH];     // Normalized result
     uint64_t timestamp;            // nanosecond timestamp
+    uint64_t gen;                  // path_cache_gen snapshot the result belongs to
     int flags;                     // N_SYMLINK_FOLLOW or N_SYMLINK_NOFOLLOW
     bool valid;
 };
 
-// Thread-local cache (one per thread for lock-free access)
-static __thread struct path_cache_entry path_cache[PATH_CACHE_SIZE];
-static __thread bool path_cache_initialized = false;
+// The critical sections are a strcmp and a strcpy (~100 ns) against a miss
+// path measured in tens of microseconds, so one mutex does not convoy even
+// under a 40-thread storm. The table lives in BSS: nothing is memset per
+// thread any more, and the 4 MB is shared instead of 525 KB per thread.
+static struct path_cache_entry path_cache[PATH_CACHE_SIZE];
+static lock_t path_cache_lock = LOCK_INITIALIZER;
+static _Atomic uint64_t path_cache_gen = 1;
+
+void path_cache_invalidate(void) {
+    atomic_fetch_add_explicit(&path_cache_gen, 1, memory_order_release);
+}
+
+static inline uint64_t path_cache_snapshot(void) {
+    return atomic_load_explicit(&path_cache_gen, memory_order_acquire);
+}
 
 // Simple hash function for path strings
 static inline uint32_t path_hash(const char *str) {
@@ -41,64 +78,41 @@ static inline uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-// Initialize thread-local cache
-static void path_cache_init(void) {
-    if (!path_cache_initialized) {
-        memset(path_cache, 0, sizeof(path_cache));
-        path_cache_initialized = true;
-    }
-}
-
 // Try to get cached normalized path
 // Returns 0 on cache hit, -1 on cache miss
-static int path_cache_get(const char *full_path, int flags, char *out) {
-    path_cache_init();
-
-    uint32_t hash = path_hash(full_path);
-    uint32_t index = hash % PATH_CACHE_SIZE;
+static int path_cache_get(const char *full_path, int flags, char *out, uint64_t gen) {
+    uint32_t index = path_hash(full_path) % PATH_CACHE_SIZE;
     struct path_cache_entry *entry = &path_cache[index];
-
-    // Check cache validity
-    if (!entry->valid)
-        return -1;
-
-    // Check path and flags match
-    if (strcmp(entry->input_path, full_path) != 0)
-        return -1;
-
-    if (entry->flags != flags)
-        return -1;
-
-    // Check TTL (time-to-live)
     uint64_t now = get_time_ns();
-    if (now - entry->timestamp > PATH_CACHE_TTL_NS) {
-        entry->valid = false;  // Expired
-        return -1;
-    }
 
-    // Cache hit! Copy result
-    strcpy(out, entry->normalized);
-    return 0;
+    lock(&path_cache_lock);
+    bool hit = entry->valid
+        && entry->gen == gen
+        && entry->flags == flags
+        && now - entry->timestamp <= PATH_CACHE_TTL_NS
+        && strcmp(entry->input_path, full_path) == 0;
+    if (hit)
+        strcpy(out, entry->normalized);
+    unlock(&path_cache_lock);
+    return hit ? 0 : -1;
 }
 
 // Store normalized path in cache
-static void path_cache_set(const char *full_path, int flags, const char *normalized) {
-    path_cache_init();
-
-    uint32_t hash = path_hash(full_path);
-    uint32_t index = hash % PATH_CACHE_SIZE;
+static void path_cache_set(const char *full_path, int flags, const char *normalized, uint64_t gen) {
+    uint32_t index = path_hash(full_path) % PATH_CACHE_SIZE;
     struct path_cache_entry *entry = &path_cache[index];
+    uint64_t now = get_time_ns();
 
-    // Store in cache
+    lock(&path_cache_lock);
     strncpy(entry->input_path, full_path, MAX_PATH - 1);
     entry->input_path[MAX_PATH - 1] = '\0';
-
     strncpy(entry->normalized, normalized, MAX_PATH - 1);
     entry->normalized[MAX_PATH - 1] = '\0';
-
     entry->flags = flags;
-    entry->timestamp = get_time_ns();
+    entry->timestamp = now;
+    entry->gen = gen;   // the snapshot taken before the walk, not now
     entry->valid = true;
+    unlock(&path_cache_lock);
 }
 
 static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
@@ -268,19 +282,18 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         full_input[MAX_PATH - 1] = '\0';
     }
 
-    // Try cache lookup first
-    if (path_cache_get(full_input, flags, out) == 0) {
-        // Cache hit - fast return
+    // Snapshot the generation BEFORE looking up or walking: a mutation that
+    // lands during the walk bumps past it, so the result we then store is
+    // already stale-tagged and the next lookup rejects it.
+    uint64_t gen = path_cache_snapshot();
+    if (path_cache_get(full_input, flags, out, gen) == 0)
         return 0;
-    }
 
-    // Cache miss - do full normalization
     int result = __path_normalize(at != NULL ? at_path : NULL, path, out, flags, 0);
 
-    // Store result in cache (even on error, we cache the error)
-    if (result == 0) {
-        path_cache_set(full_input, flags, out);
-    }
+    // Only successful results are cached; an error must be re-derived.
+    if (result == 0)
+        path_cache_set(full_input, flags, out, gen);
 
     return result;
 }
