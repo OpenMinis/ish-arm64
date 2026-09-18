@@ -440,7 +440,13 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
             fd->fake_inode = 1;  /* non-zero so the ENOENT branch below is skipped */
         return fd;
     }
-    db_begin_write(fs);
+    // [T-ish-open-read-txn] Only a creating open writes. A deferred (read)
+    // transaction does not take the WAL writer lock, so plain opens stop
+    // serializing against every other meta.db write.
+    if (flags & O_CREAT_)
+        db_begin_write(fs);
+    else
+        db_begin_read(fs);
     fd->fake_inode = path_get_inode(fs, path);
     if (flags & O_CREAT_) {
         struct ish_stat ishstat;
@@ -465,6 +471,20 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         }
     }
     fd->ops = &fakefs_fdops;
+    // [T-ish-openat-inode-early-ref] Take the inode reference NOW, before
+    // generic_openat's fstat. With it held, an unlink racing this open finds
+    // the inode live in inode_check_orphaned and defers the metadata
+    // cleanup to our last close instead of deleting the row from under us —
+    // the invariant that inodes_lock-around-fstat in generic_openat
+    // (d57b6d26) exists for, established without holding that lock across
+    // a SQLite read. generic_openat sees fd->inode set and runs fstat
+    // unlocked. inode_get takes its own mount reference; fd->mount is set
+    // by the caller afterwards, as before.
+    fd->inode = inode_get(mount, fd->fake_inode);
+    if (fd->inode == NULL) {
+        fd_close(fd);
+        return ERR_PTR(_ENOMEM);
+    }
     return fd;
 }
 
