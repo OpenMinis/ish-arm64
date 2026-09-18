@@ -2,6 +2,7 @@
 #define KERNEL_MM_H
 
 #include <stdatomic.h>
+#include <stddef.h>  // offsetof, for MM_OF_MEM
 #include <stdbool.h>
 #include "kernel/memory.h"
 #include "misc.h"
@@ -139,6 +140,15 @@ struct mm {
     atomic_uint refcount;
     struct mem mem;
 
+    // [T-ish-mm-diag] Monotonic identity for the diagnostic log. malloc
+    // recycles `struct mm` addresses aggressively (measured: 802 releases
+    // over 10 distinct addresses, one reused 394 times), so `mm=%p` alone
+    // cannot tell a double-free from a new object at a recycled address —
+    // that ambiguity produced the false positive in analysis §12. Every
+    // allocation gets its own seq, so "the same seq released twice" is the
+    // unambiguous race signal.
+    uint64_t seq;
+
     addr_t vdso; // immutable
     addr_t start_brk; // immutable
     addr_t brk;
@@ -158,6 +168,12 @@ struct mm {
     addr_t exe_bias;
     addr_t exe_entry;
 };
+
+// [T-ish-mm-diag] Recover the owning mm from its embedded mem. In kernel
+// code a `struct mem` only ever exists as `mm->mem` (mm_new / mm_copy are
+// the sole mem_init callers), so this is exact — it lets mem_destroy log the
+// same seq as the MM-RELEASE line that called it.
+#define MM_OF_MEM(memp) ((struct mm *) ((char *) (memp) - offsetof(struct mm, mem)))
 
 // Create a new address space
 struct mm *mm_new(void);
