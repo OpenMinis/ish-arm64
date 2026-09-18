@@ -33,6 +33,7 @@ struct inode_data *inode_get_unlocked(struct mount *mount, ino_t ino) {
         mount_retain(mount);
         inode->mount = mount;
         inode->socket_id = 0;
+        inode->orphan_pending = false;
         cond_init(&inode->posix_unlock);
         list_init(&inode->posix_locks);
         list_init(&inode->chain);
@@ -54,8 +55,14 @@ struct inode_data *inode_get(struct mount *mount, ino_t ino) {
 void inode_check_orphaned(struct mount *mount, ino_t ino) {
     lock(&inodes_lock);
     struct inode_data *inode = inode_get_data(mount, ino);
-    if (inode == NULL)
-        mount->fs->inode_orphaned(mount, ino);
+    if (inode == NULL) {
+        if (mount->fs->inode_orphaned)
+            mount->fs->inode_orphaned(mount, ino);
+    } else {
+        // Still open somewhere: the cleanup belongs to whoever drops the
+        // last reference. Only that close will run fs->inode_orphaned.
+        inode->orphan_pending = true;
+    }
     unlock(&inodes_lock);
 }
 
@@ -69,9 +76,14 @@ void inode_release(struct inode_data *inode) {
     lock(&inodes_lock);
     lock(&inode->lock);
     if (--inode->refcount == 0) {
+        bool pending = inode->orphan_pending;
         unlock(&inode->lock);
         list_remove(&inode->chain);
-        if (inode->mount->fs->inode_orphaned)
+        // Upstream ran fs->inode_orphaned here unconditionally; for the
+        // 99.99% of closes whose file still has a path it deleted zero rows
+        // at the price of a write transaction under this lock. It is only
+        // ever needed when a path removal found us open and deferred.
+        if (pending && inode->mount->fs->inode_orphaned)
             inode->mount->fs->inode_orphaned(inode->mount, inode->number);
         unlock(&inodes_lock);
         mount_release(inode->mount);

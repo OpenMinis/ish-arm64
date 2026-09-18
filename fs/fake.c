@@ -1,4 +1,5 @@
 #include <stdarg.h>
+#include "util/verbosetrace.h"
 #include <stdio.h>
 #include <limits.h>
 #include <string.h>
@@ -619,6 +620,14 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
         return 0;
     }
     db_begin_write(fs);
+    // [T-ish-inode-orphan-pending] `update or replace` overwrites dst's
+    // paths row, so the inode dst pointed at loses its last path. Give it
+    // the treatment unlink gives — cleanup now if closed, at last close if
+    // open — instead of relying on the (now removed) unconditional cleanup
+    // at every close, which only ever caught the open case anyway. A rename
+    // onto a hard link of itself keeps the path and is left alone.
+    inode_t replaced_ino = path_get_inode(fs, dst);
+    inode_t src_ino = path_get_inode(fs, src);
     path_rename(fs, src, dst);
     int err;
     if (src_bind) {
@@ -637,6 +646,8 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
     db_commit(fs);
     if (src_bind)
         fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
+    if (replaced_ino != 0 && replaced_ino != src_ino)
+        inode_check_orphaned(mount, replaced_ino);
     return 0;
 }
 
@@ -1028,8 +1039,13 @@ retry:
     char entry_path[MAX_PATH + 1];
     realfs_getpath(fd, entry_path);
 
-    /* Debug: log readdir for bind-mounted paths */
-    if (strstr(entry_path, "minis") != NULL || strstr(entry_path, "Library/MinisChat") != NULL)
+    /* [T-ios-log-verbose-tier] Per-ENTRY trace, gated on the app's Verbose
+     * level. Unconditional it produced 1.68 M lines / 183 MB in one day from
+     * only 549 distinct paths — one line per directory entry, "." and ".."
+     * included. Still valuable when chasing a bind-mount bug, so it is kept
+     * behind the gate rather than deleted. */
+    if (ish_verbose_trace_enabled &&
+        (strstr(entry_path, "minis") != NULL || strstr(entry_path, "Library/MinisChat") != NULL))
         fprintf(stderr, "fakefs_readdir: getpath=\"%s\" entry=\"%s\"\n", entry_path, entry->name);
 
     if (strcmp(entry->name, "..") == 0) {

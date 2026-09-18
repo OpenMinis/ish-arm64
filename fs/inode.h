@@ -18,6 +18,16 @@ struct inode_data {
 
     uint32_t socket_id;
 
+    // [T-ish-inode-orphan-pending] Set by inode_check_orphaned when a path
+    // was removed while this inode was still open, so inode_release knows a
+    // metadata cleanup was deferred to the last close. Every other last
+    // close skips fs->inode_orphaned entirely: that call is a SQLite write
+    // transaction (begin immediate / delete / commit) and used to run under
+    // inodes_lock on EVERY close, which is the convoy a fork+exec storm
+    // turned into hundreds of threads parked in pthread_mutex_lock (IPS
+    // 2026-09-18). Guarded by inodes_lock.
+    bool orphan_pending;
+
     lock_t lock;
 };
 
