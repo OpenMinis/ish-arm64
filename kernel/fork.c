@@ -1,4 +1,6 @@
 #include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <stdatomic.h>
 #include "debug.h"
@@ -26,6 +28,112 @@ void ish_set_fork_guard(ish_fork_guard_t guard) {
 
 // [T-ish-cpu-top] Successful clone()/fork() count, read by the host [CPUTop] sampler.
 _Atomic uint64_t ish_guest_forks;
+
+// [T-ish-fork-rate] Fork-rate governor.
+//
+// Why: a 40-way `while :; do /bin/true; done` storm forks ~1200 times/s on an
+// iPhone at ~4.2 ms CPU each (JIT recompilation dominates), i.e. it eats every
+// core, drives the device to thermal "serious", and every other guest process
+// (the agent's own shell_execute, tsproxy) crawls behind it. Bounding the
+// aggregate fork rate bounds the storm's CPU; the per-task EWMA keeps a fresh
+// shell that forks a few times (a tool call) out of the queue entirely.
+//
+// Token bucket: `tokens` refills at `rate`/s up to `burst`. A heavy forker
+// that finds the bucket empty reserves its token in the future (tokens goes
+// negative) and sleeps until then, which orders waiters fairly. Sleeps are
+// capped so a misconfigured rate can never wedge fork().
+#include <pthread.h>
+#define FORK_RATE_LIGHT_EWMA 12.0     // decayed recent-fork count below which a task is "light"
+#define FORK_RATE_MAX_SLEEP_NS 500000000LL
+static pthread_mutex_t fork_rate_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned fork_rate_per_sec;   // 0 = governor off
+static _Atomic unsigned fork_rate_burst;
+static double fork_rate_tokens;
+static uint64_t fork_rate_last_ns;
+static _Atomic uint64_t fork_rate_throttled, fork_rate_bypassed, fork_rate_sleep_ns;
+static _Atomic int fork_rate_env_checked;
+
+static uint64_t fork_rate_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+void ish_set_fork_rate_limit(unsigned per_sec, unsigned burst) {
+    if (burst == 0) burst = per_sec;
+    pthread_mutex_lock(&fork_rate_lock);
+    atomic_store(&fork_rate_per_sec, per_sec);
+    atomic_store(&fork_rate_burst, burst);
+    fork_rate_tokens = burst;
+    fork_rate_last_ns = fork_rate_now_ns();
+    pthread_mutex_unlock(&fork_rate_lock);
+    atomic_store(&fork_rate_env_checked, 1);
+    printk("[iSH][ForkRate] limit=%u/s burst=%u\n", per_sec, burst);
+}
+
+void ish_fork_rate_stats(uint64_t *throttled, uint64_t *bypassed, uint64_t *sleep_ns) {
+    if (throttled) *throttled = atomic_load(&fork_rate_throttled);
+    if (bypassed) *bypassed = atomic_load(&fork_rate_bypassed);
+    if (sleep_ns) *sleep_ns = atomic_load(&fork_rate_sleep_ns);
+}
+
+// CLI: ISH_FORK_RATE=per_sec[,burst] in the HOST environment (the app sets
+// the rate through ish_set_fork_rate_limit and never reaches this).
+static void fork_rate_check_env(void) {
+    if (atomic_exchange(&fork_rate_env_checked, 1)) return;
+    const char *env = getenv("ISH_FORK_RATE");
+    if (env == NULL || *env == '\0') return;
+    unsigned per_sec = 0, burst = 0;
+    if (sscanf(env, "%u,%u", &per_sec, &burst) >= 1)
+        ish_set_fork_rate_limit(per_sec, burst);
+}
+
+static void fork_rate_wait(struct task *task) {
+    fork_rate_check_env();
+    unsigned rate = atomic_load(&fork_rate_per_sec);
+    uint64_t now = fork_rate_now_ns();
+
+    // Decayed count of the caller's own recent forks (roughly "forks in the
+    // last second"), decayed by the time since its previous fork at the
+    // task's OWN pace: the sleep the governor imposes below is excluded by
+    // re-stamping fork_rate_last_ns after it, otherwise a throttled storm
+    // worker looks light again as soon as it has been slowed down.
+    double dt = task->fork_rate_last_ns ? (double) (now - task->fork_rate_last_ns) / 1e9 : 10.0;
+    double decay = dt >= 8.0 ? 0.0 : 1.0 / (1.0 + 2.0 * dt);   // cheap stand-in for exp(-dt)
+    task->fork_rate_ewma = task->fork_rate_ewma * decay + 1.0;
+    task->fork_rate_last_ns = now;
+    if (rate == 0)
+        return;
+
+    pthread_mutex_lock(&fork_rate_lock);
+    double burst = atomic_load(&fork_rate_burst);
+    fork_rate_tokens += (double) (now - fork_rate_last_ns) / 1e9 * rate;
+    if (fork_rate_tokens > burst) fork_rate_tokens = burst;
+    fork_rate_last_ns = now;
+    if (fork_rate_tokens >= 1.0) {
+        fork_rate_tokens -= 1.0;
+        pthread_mutex_unlock(&fork_rate_lock);
+        return;
+    }
+    if (task->fork_rate_ewma < FORK_RATE_LIGHT_EWMA) {
+        // Light forker: let it through without charging the bucket, so the
+        // storm's own deficit never delays it.
+        pthread_mutex_unlock(&fork_rate_lock);
+        atomic_fetch_add(&fork_rate_bypassed, 1);
+        return;
+    }
+    fork_rate_tokens -= 1.0;   // reserve; may go negative = queue position
+    int64_t wait_ns = (int64_t) (-fork_rate_tokens / rate * 1e9);   // when our token materialises
+    pthread_mutex_unlock(&fork_rate_lock);
+    if (wait_ns <= 0)
+        return;
+    if (wait_ns > FORK_RATE_MAX_SLEEP_NS) wait_ns = FORK_RATE_MAX_SLEEP_NS;
+    struct timespec ts = { .tv_sec = wait_ns / 1000000000LL, .tv_nsec = wait_ns % 1000000000LL };
+    nanosleep(&ts, NULL);
+    task->fork_rate_last_ns = fork_rate_now_ns();   // governor delay is not the task's pace
+    atomic_fetch_add(&fork_rate_throttled, 1);
+    atomic_fetch_add(&fork_rate_sleep_ns, (uint64_t) wait_ns);
+}
 
 #define CSIGNAL_ 0x000000ff
 #define CLONE_VM_ 0x00000100
@@ -194,6 +302,7 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
             if (err < 0)
                 return (dword_t) err;
         }
+        fork_rate_wait(current);   // [T-ish-fork-rate]
     }
 
     struct task *task = task_create_(current);
