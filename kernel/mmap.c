@@ -232,10 +232,16 @@ static void anon_limit_report(const char *where, long requested_pages) {
 }
 #endif
 
+// [T-ish-mm-diag] Source of `struct mm` identities. Starts at 1 so that 0 is
+// never a live seq — a log line with seq=0 means the object was already
+// released (mm_release_from zeroes it) or never initialised.
+static _Atomic uint64_t g_mm_seq = 1;
+
 struct mm *mm_new() {
     struct mm *mm = malloc(sizeof(struct mm));
     if (mm == NULL)
         return NULL;
+    mm->seq = atomic_fetch_add(&g_mm_seq, 1);
     mem_init(&mm->mem);
     mm->start_brk = mm->brk = 0; // should get overwritten by exec
     mm->exefile = NULL;
@@ -251,6 +257,10 @@ struct mm *mm_copy(struct mm *mm) {
     // Fix wrlock_init failing because it thinks it's reinitializing the same lock
     memset(&new_mm->mem.lock, 0, sizeof(new_mm->mem.lock));
     new_mm->refcount = 1;
+    // [T-ish-mm-diag] A COW clone is its own object: it must NOT inherit the
+    // parent's seq, or a fork would make two live mms share one identity and
+    // the "same seq twice" rule would fire on every fork+exit pair.
+    new_mm->seq = atomic_fetch_add(&g_mm_seq, 1);
     mem_init(&new_mm->mem);
     fd_retain(new_mm->exefile);
     write_wrlock(&mm->mem.lock);
@@ -267,13 +277,27 @@ void mm_retain(struct mm *mm) {
 // log can tell do_exit / exec / cleanup_handler apart when two of them race
 // on one mm (the mem_destroy brk #1 investigation, analysis §10).
 void mm_release_from(struct mm *mm, const char *caller) {
+    // [T-ish-mm-diag] Unconditional entry line, BEFORE the decrement, so a
+    // second release on an already-freed object is visible without waiting
+    // for a crash: it shows up as the same seq twice, the second with
+    // refcount_before=0 (or a wrapped UINT_MAX after the unsigned decrement).
+    uint64_t seq = mm->seq;
+    unsigned before = atomic_load(&mm->refcount);
+    printk("[iSH][MM-RELEASE-ENTER] pid=%d mm=%p seq=%llu refcount_before=%u, caller=%s\n",
+           current ? current->pid : -1, (void *) mm,
+           (unsigned long long) seq, before, caller);
     unsigned left = --mm->refcount;
     if (left == 0) {
-        printk("[iSH][MM-RELEASE] pid=%d mm=%p refcount→0, caller=%s\n",
-               current ? current->pid : -1, (void *) mm, caller);
+        printk("[iSH][MM-RELEASE] pid=%d mm=%p seq=%llu refcount→0, caller=%s\n",
+               current ? current->pid : -1, (void *) mm,
+               (unsigned long long) seq, caller);
         if (mm->exefile != NULL)
             fd_close(mm->exefile);
         mem_destroy(&mm->mem);
+        // Poison the identity before handing the memory back to malloc: if
+        // anything releases this object again, its seq reads 0 rather than a
+        // plausible live value.
+        mm->seq = 0;
         free(mm);
     }
 }
