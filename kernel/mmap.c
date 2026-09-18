@@ -8,6 +8,7 @@
 #include "kernel/task.h"
 #include "fs/fd.h"
 #include "kernel/memory.h"
+#include "util/verbosetrace.h"
 #include "kernel/mm.h"
 
 #if ANON_MMAP_LIMIT_PAGES > 0
@@ -283,11 +284,17 @@ void mm_release_from(struct mm *mm, const char *caller) {
     // refcount_before=0 (or a wrapped UINT_MAX after the unsigned decrement).
     uint64_t seq = mm->seq;
     unsigned before = atomic_load(&mm->refcount);
+    // [T-ios-log-verbose-tier] 3 lines per process exit is too much for the
+    // logger under a fork storm (LoggingManager dropped chunks and ish_vprintk
+    // showed up as a mutex waiter); the rare SAFETY-VALVE/DEFERRED-RELEASE
+    // lines stay unconditional.
+    if (ish_verbose_trace_enabled)
     printk("[iSH][MM-RELEASE-ENTER] pid=%d mm=%p seq=%llu refcount_before=%u, caller=%s\n",
            current ? current->pid : -1, (void *) mm,
            (unsigned long long) seq, before, caller);
     unsigned left = --mm->refcount;
     if (left == 0) {
+        if (ish_verbose_trace_enabled)
         printk("[iSH][MM-RELEASE] pid=%d mm=%p seq=%llu refcount→0, caller=%s\n",
                current ? current->pid : -1, (void *) mm,
                (unsigned long long) seq, caller);
