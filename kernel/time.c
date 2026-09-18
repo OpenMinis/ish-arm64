@@ -293,8 +293,12 @@ dword_t sys_nanosleep(addr_t req_addr, addr_t rem_addr) {
         return _EFAULT;
     STRACE("nanosleep({%lld, %lld}, 0x%x", (long long)req_ts.sec, (long long)req_ts.nsec, rem_addr);
 
-    // Short-circuit for ≤1ms sleeps (common in Go runtime timer management)
-    if (req_ts.sec == 0 && req_ts.nsec <= 1000000) {
+    // Short-circuit only truly tiny sleeps (<=50us: Go's usleep(3..20) inside
+    // scheduler spin loops) into a yield. This used to be <=1ms, which turned
+    // every Go timer / sysmon back-off sleep into a spin — the twin of the
+    // futex sub-ms bug fixed in kernel/futex.c ([T-ish-futex-subms-timeout]).
+    // 50us..1ms now sleep for real through the interruptible helper below.
+    if (req_ts.sec == 0 && req_ts.nsec <= 50000) {
         sched_yield();
         if (rem_addr != 0) {
             struct timespec_ rem_ts = {.sec = 0, .nsec = 0};
