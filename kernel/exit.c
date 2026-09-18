@@ -93,7 +93,7 @@ noreturn void do_exit(int status) {
 
     // release all our resources (may already be NULL if force-released by do_exit_group)
     if (current->mm != NULL) {
-        mm_release(current->mm);
+        mm_release_from(current->mm, "do_exit");
         current->mm = NULL;
         // [T-ish-mm-leak-refcount-handoff] We just released it, so the pthread
         // cleanup handler must NOT release again.
@@ -355,6 +355,11 @@ noreturn void do_exit_group(int status) {
                     // unblocks and re-enters do_exit(), that mm_release()s and
                     // clears the flag, so cleanup won't double-free.
                     task->mm_release_deferred = true;
+                    // [T-ish-mm-diag] Unconditional (not exec-trace gated): one
+                    // line per leaked thread, once — the flag above is set once.
+                    printk("[iSH][SAFETY-VALVE] tid=%d (group pid=%d) marked mm_release_deferred, mm=%p refcount=%u\n",
+                           task->pid, current->pid, (void *) task->mm,
+                           task->mm ? (unsigned) task->mm->refcount : 0u);
                     if (task->files != NULL) {
                         fdtable_release(task->files);
                         task->files = NULL;
@@ -368,8 +373,10 @@ noreturn void do_exit_group(int status) {
             }
             unlock(&group->lock);
             unlock(&pids_lock);
-            if (leaked > 0 && ish_exec_trace())
-                printk("SAFETY-VALVE[exit]: pid=%d leaked %d stuck host threads\n",
+            // [T-ish-mm-diag] Unconditional: do_exit_group runs once per
+            // process, so this is at most one line per exiting process.
+            if (leaked > 0)
+                printk("[iSH][SAFETY-VALVE] pid=%d leaked %d stuck threads, mm_release deferred\n",
                        current->pid, leaked);
         } else {
 

@@ -73,6 +73,10 @@ static void pt_node_free(void *node, int level) {
 }
 
 void mem_destroy(struct mem *mem) {
+    // [T-ish-mm-diag] Entry state of the lock we are about to take, unlock
+    // and destroy; val != 0 here means someone still holds it (see §10).
+    printk("[iSH][MEM-DESTROY] pid=%d mem=%p rwlock_val=%d holder_pid=%d\n",
+           current ? current->pid : -1, (void *) mem, mem->lock.val, mem->lock.pid);
     write_wrlock(&mem->lock);
     pt_unmap_always(mem, 0, MEM_PAGES);
     while (mem->reservations) {
@@ -389,6 +393,9 @@ void mem_init(struct mem *mem) {
 }
 
 void mem_destroy(struct mem *mem) {
+    // [T-ish-mm-diag] See the ARM64 variant above.
+    printk("[iSH][MEM-DESTROY] pid=%d mem=%p rwlock_val=%d holder_pid=%d\n",
+           current ? current->pid : -1, (void *) mem, mem->lock.val, mem->lock.pid);
     write_wrlock(&mem->lock);
     pt_unmap_always(mem, 0, MEM_PAGES);
     // [T-ish-mm-double-destroy-crash] Freed asbestos MUST also be nulled out.
