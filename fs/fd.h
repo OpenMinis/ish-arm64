@@ -111,6 +111,16 @@ struct fd {
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
+    // [T-ish-exec-fewer-meta-txns] fakefs_open reads the stat row inside the
+    // transaction it already holds for the path lookup and parks it here; the
+    // first fstat after open (generic_openat's own) consumes it instead of
+    // opening a second meta.db transaction. One-shot, so any later fstat sees
+    // chmod/chown done by other tasks. Cleared by generic_openat regardless.
+    struct { uint32_t mode, uid, gid, rdev; bool valid; } fake_open_stat;
+    // The stat generic_openat obtained at open time. exec used to fstat the
+    // fd again right after open, which on fakefs is a third meta.db
+    // transaction per exec for a value it already had.
+    struct statbuf open_stat;
     struct statbuf stat; // for adhoc fs
     struct fd_sockrestart sockrestart; // argh
 

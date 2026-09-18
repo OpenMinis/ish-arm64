@@ -674,12 +674,14 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     if (IS_ERR(fd))
         return PTR_ERR(fd);
 
-    struct statbuf stat;
-    int err = fd->mount->fs->fstat(fd, &stat);
-    if (err < 0) {
-        fd_close(fd);
-        return err;
-    }
+    // [T-ish-exec-fewer-meta-txns] generic_open just stat'ed this fd for its
+    // own access check; reuse that instead of a second fstat, which on fakefs
+    // is a further meta.db transaction under the one global fs->lock (the
+    // only queue left in a 40-way fork+exec storm, ~16 of 40 workers parked
+    // on it at any instant in the 2026-09-19 native samples). Same instant
+    // as the open, so setuid/mode decisions are unchanged.
+    struct statbuf stat = fd->open_stat;
+    int err;
 
     // if nobody has permission to execute, it should be safe to not execute
     if (!(stat.mode & 0111)) {

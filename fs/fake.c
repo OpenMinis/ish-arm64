@@ -440,26 +440,45 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
             fd->fake_inode = 1;  /* non-zero so the ENOENT branch below is skipped */
         return fd;
     }
-    // [T-ish-open-read-txn] Only a creating open writes. A deferred (read)
-    // transaction does not take the WAL writer lock, so plain opens stop
-    // serializing against every other meta.db write.
-    if (flags & O_CREAT_)
-        db_begin_write(fs);
-    else
-        db_begin_read(fs);
+    // [T-ish-open-read-txn] A deferred (read) transaction does not take the
+    // WAL writer lock, so plain opens stop serializing against every other
+    // meta.db write.
+    // [T-ish-exec-fewer-meta-txns] Two things happen in that one transaction:
+    //  - O_CREAT opens look the path up here too. Shell redirections
+    //    (`>/dev/null`, `>>log`) overwhelmingly hit existing files, and
+    //    BEGIN IMMEDIATE for them took the writer lock for nothing (14% of
+    //    fs->lock waiters in the 40-way storm). Only an actual create
+    //    upgrades to a write transaction below, re-checking under it.
+    //  - the stat row is read while the lock is held anyway, so the fstat
+    //    generic_openat issues next does not need a transaction of its own.
+    db_begin_read(fs);
     fd->fake_inode = path_get_inode(fs, path);
-    if (flags & O_CREAT_) {
+    if (fd->fake_inode != 0) {
+        struct ish_stat ishstat;
+        if (inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat)) {
+            fd->fake_open_stat.mode = ishstat.mode;
+            fd->fake_open_stat.uid = ishstat.uid;
+            fd->fake_open_stat.gid = ishstat.gid;
+            fd->fake_open_stat.rdev = ishstat.rdev;
+            fd->fake_open_stat.valid = true;
+        }
+    }
+    db_commit(fs);
+    if (fd->fake_inode == 0 && (flags & O_CREAT_)) {
         struct ish_stat ishstat;
         ishstat.mode = mode | S_IFREG;
         ishstat.uid = current->euid;
         ishstat.gid = current->egid;
         ishstat.rdev = 0;
+        db_begin_write(fs);
+        // Another task may have created the row between the two transactions.
+        fd->fake_inode = path_get_inode(fs, path);
         if (fd->fake_inode == 0) {
             path_create(fs, path, &ishstat);
             fd->fake_inode = path_get_inode(fs, path);
         }
+        db_commit(fs);
     }
-    db_commit(fs);
     if (fd->fake_inode == 0) {
         /* Auto-create for bind-mounted paths */
         if (is_under_bind_mount(path)) {
@@ -838,6 +857,17 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     int err = realfs.fstat(fd, fake_stat);
     if (err < 0)
         return err;
+    // [T-ish-exec-fewer-meta-txns] The row fakefs_open read a moment ago,
+    // consumed once (see struct fd).
+    if (fd->fake_open_stat.valid) {
+        fd->fake_open_stat.valid = false;
+        fake_stat->inode = fd->fake_inode;
+        fake_stat->mode = fd->fake_open_stat.mode;
+        fake_stat->uid = fd->fake_open_stat.uid;
+        fake_stat->gid = fd->fake_open_stat.gid;
+        fake_stat->rdev = fd->fake_open_stat.rdev;
+        return 0;
+    }
     db_begin_read(fs);
     struct ish_stat ishstat;
     if (!inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat)) {
