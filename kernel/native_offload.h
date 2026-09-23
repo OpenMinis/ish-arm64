@@ -100,7 +100,17 @@ int native_offload_add(const char *spec);
 
 // Check if a guest binary should be offloaded.
 // Returns native host path, "[builtin]" for handler-only, or NULL.
+// Applies the path policy (native_offload_policy.h) but not the env hatch.
 const char *native_offload_lookup(const char *guest_path);
+
+// [T-ish-offload-path-scope] OpenMinis#288. The exec-time lookup: path policy
+// AND the env escape hatch (`envp` = the packed, double-NUL-terminated exec
+// envp; may be NULL). `*generic_out` (optional) reports whether the matched
+// offload shadows a real program, in which case the caller must also refuse to
+// offload a file that is a #! script — that check needs the filesystem, so it
+// lives at the call site in exec.c.
+const char *native_offload_lookup_exec(const char *guest_path, const char *envp,
+                                       bool *generic_out);
 
 // Execute the offloaded binary (handler or posix_spawn).
 // Takes over the current guest task and calls do_exit(). Does not return

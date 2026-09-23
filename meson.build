@@ -1717,6 +1717,7 @@ if get_option('kernel') == 'ish'
         'kernel/ipc.c',
         'kernel/ptrace.c',
         'kernel/native_offload.c',
+        'kernel/native_offload_policy.c',
 
         'kernel/fs.c',
         'kernel/fs_info.c',
