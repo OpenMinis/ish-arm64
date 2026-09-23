@@ -794,6 +794,22 @@ static ssize_t user_read_string_array(addr_t addr, char *buf, size_t max) {
     return i;
 }
 
+// [T-ish-offload-path-scope] OpenMinis#288. True only when `path` exists, can
+// be read, and starts with "#!". Every failure — missing file, unreadable, a
+// directory, a short file — answers false, which leaves the offload decision
+// exactly where the path policy put it (see the call site for why a missing
+// file must not block the offload). Reads two bytes; only reached for the
+// handful of generic offload names, never on an ordinary exec.
+static bool guest_file_is_shebang_script(const char *path) {
+    struct fd *fd = generic_open(path, O_RDONLY_, 0);
+    if (IS_ERR(fd))
+        return false;
+    char magic[2];
+    ssize_t n = fd->ops->read ? fd->ops->read(fd, magic, sizeof(magic)) : -1;
+    fd_close(fd);
+    return n == 2 && magic[0] == '#' && magic[1] == '!';
+}
+
 dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     char filename[MAX_PATH];
     if (user_read_string(filename_addr, filename, sizeof(filename)))
@@ -1023,8 +1039,23 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     }
 #endif
 
-    // Native offload: check if this binary should run natively on the host
-    const char *native_path = native_offload_lookup(filename);
+    // Native offload: check if this binary should run natively on the host.
+    // [T-ish-offload-path-scope] OpenMinis#288: path policy + env escape hatch
+    // are applied inside the lookup; the #! check below needs the filesystem.
+    bool offload_is_generic = false;
+    const char *native_path = native_offload_lookup_exec(filename, envp, &offload_is_generic);
+    // A generic offload (ffmpeg) must never take over a text script, even at a
+    // system path — a wrapper like `#!/bin/sh ... exec /opt/real/ffmpeg "$@"`
+    // is the user asking for THEIR ffmpeg, and belongs to shebang_exec.
+    //
+    // A file that does not exist is NOT a reason to skip: busybox ash execs
+    // each PATH directory in turn, so the first whitelisted candidate
+    // (/usr/local/bin/ffmpeg) is routinely absent, and offloading it is how a
+    // bare `ffmpeg` reaches the native build at all.
+    if (native_path && offload_is_generic && guest_file_is_shebang_script(filename)) {
+        printk("native_offload: %s is a #! script, running it as one\n", filename);
+        native_path = NULL;
+    }
     if (native_path) {
         // native_offload_exec calls do_exit() on success, which unwinds via
         // pthread_exit() and skips the err_free_{argv,envp} labels below.

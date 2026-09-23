@@ -31,6 +31,7 @@
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/native_offload.h"
+#include "kernel/native_offload_policy.h"
 #include "kernel/fs.h"
 #include "fs/fd.h"
 #include "fs/fake-db.h"
@@ -45,6 +46,11 @@
 #if !__APPLE__
 int native_offload_add(const char *spec) { (void)spec; return -1; }
 const char *native_offload_lookup(const char *guest_path) { (void)guest_path; return NULL; }
+const char *native_offload_lookup_exec(const char *guest_path, const char *envp, bool *generic_out) {
+    (void)guest_path; (void)envp;
+    if (generic_out) *generic_out = false;
+    return NULL;
+}
 int native_offload_exec(const char *native_path, const char *guest_file,
                         size_t argc, const char *argv, const char *envp) {
     (void)native_path; (void)guest_file; (void)argc; (void)argv; (void)envp;
@@ -195,12 +201,35 @@ static struct offload_entry *offload_find(const char *guest_path) {
     return NULL;
 }
 
-const char *native_offload_lookup(const char *guest_path) {
+// [T-ish-offload-path-scope] OpenMinis#288. The basename match above only says
+// "an offload with this NAME exists". Whether THIS exec may be taken over is
+// decided by native_offload_policy: a generic name (ffmpeg) is claimed only at
+// its standard system paths and can be switched off from the environment.
+const char *native_offload_lookup_exec(const char *guest_path, const char *envp,
+                                       bool *generic_out) {
     struct offload_entry *e = offload_find(guest_path);
     if (!e) return NULL;
+    bool generic = native_offload_name_is_generic(e->guest_name);
+    if (generic_out) *generic_out = generic;
+    if (!native_offload_path_allowed(e->guest_name, guest_path)) {
+        fprintf(stderr, "native_offload: %s: not a system path, running the guest's own file\n",
+                guest_path);
+        return NULL;
+    }
+    if (native_offload_env_disabled(e->guest_name, envp)) {
+        fprintf(stderr, "native_offload: %s: disabled by environment, running the guest's own file\n",
+                guest_path);
+        return NULL;
+    }
     // Return non-NULL to signal "offload this". For handler-only entries
     // (no native_path), return a sentinel so the caller proceeds to exec.
     return e->native_path ? e->native_path : "[builtin]";
+}
+
+const char *native_offload_lookup(const char *guest_path) {
+    // Path policy applies here too, so no caller can reintroduce the
+    // name-only hijack by using the older entry point.
+    return native_offload_lookup_exec(guest_path, NULL, NULL);
 }
 
 // --- Shared helpers ---
