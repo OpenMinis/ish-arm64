@@ -38,7 +38,7 @@ const struct fd_ops socket_fdops;
 // implementation must synthesize messages from getifaddrs()/PF_ROUTE -- out of
 // scope here. See docs: this is throwaway experimental scaffolding.
 //
-// Gated at runtime by ISH_NETLINK_STUB=1 so the default build is unchanged.
+// On by default; ISH_NETLINK_STUB=0 disables it at runtime.
 // ---------------------------------------------------------------------------
 
 #define AF_NETLINK_ 16
@@ -69,8 +69,10 @@ struct sockaddr_nl_ {
 bool ish_netlink_stub_enabled(void) {
     static int cached = -1;
     if (cached == -1) {
+        // Built in and on by default (tailscale / tsnet die at startup on
+        // EAFNOSUPPORT otherwise); ISH_NETLINK_STUB=0 turns it off.
         const char *v = getenv("ISH_NETLINK_STUB");
-        cached = (v != NULL && v[0] == '1') ? 1 : 0;
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
     }
     return cached == 1;
 }
@@ -232,7 +234,7 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     STRACE("socket(%d, %d, %d)", domain, type, protocol);
     // [STAGE-0 PROBE] AF_NETLINK has no host equivalent (Darwin uses PF_ROUTE),
     // so it never reaches sock_family_to_real -- it is served entirely by the
-    // stub above. Off unless ISH_NETLINK_STUB=1.
+    // stub above. On unless ISH_NETLINK_STUB=0.
     if (domain == AF_NETLINK_ && ish_netlink_stub_enabled())
         return netlink_stub_socket(type, protocol);
     int real_domain = sock_family_to_real(domain);
