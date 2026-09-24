@@ -111,6 +111,9 @@ struct fd {
     // fs/inode data
     struct mount *mount;
     int real_fd; // seeks on this fd require the lock TODO think about making a special lock just for that
+    // [T-ish-flock-proxy] host fd + 1 of this open file's flock proxy (see
+    // realfs_flock), 0 if it never took a flock
+    _Atomic int flock_proxy;
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
