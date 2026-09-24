@@ -668,6 +668,8 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
     inode_t replaced_ino = path_get_inode(fs, dst);
     inode_t src_ino = path_get_inode(fs, src);
     path_rename(fs, src, dst);
+    if (replaced_ino != 0 && replaced_ino != src_ino)
+        inode_note_orphan(fs, replaced_ino);
     int err;
     if (src_bind) {
         if (rename(host_src, host_dst) < 0) {
@@ -1455,6 +1457,7 @@ static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
     db_begin_write(fs);
     sqlite3_bind_int64(fs->stmt.try_cleanup_inode, 1, inode);
     db_exec_reset(fs, fs->stmt.try_cleanup_inode);
+    inode_clear_orphan(fs, inode);
     db_commit(fs);
 }
 

@@ -234,7 +234,18 @@ inode_t path_unlink(struct fakefs_db *fs, const char *path) {
     // delete from paths where path = ?
     bind_path(fs->stmt.path_unlink, 1, path);
     db_exec_reset(fs, fs->stmt.path_unlink);
+    inode_note_orphan(fs, inode);
     return inode;
+}
+
+void inode_note_orphan(struct fakefs_db *fs, inode_t inode) {
+    sqlite3_bind_int64(fs->stmt.orphan_note, 1, inode);
+    db_exec_reset(fs, fs->stmt.orphan_note);
+}
+
+void inode_clear_orphan(struct fakefs_db *fs, inode_t inode) {
+    sqlite3_bind_int64(fs->stmt.orphan_clear, 1, inode);
+    db_exec_reset(fs, fs->stmt.orphan_clear);
 }
 void path_rename(struct fakefs_db *fs, const char *src, const char *dst) {
     // update or replace paths set path = change_prefix(path, ? [len(src)], ? [dst])
@@ -366,8 +377,15 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     }
     sqlite3_finalize(statement);
 
-    // delete orphaned stats
-    if (db_exec_oneshot(fs, "delete from stats where not exists (select 1 from paths where inode = stats.inode)") != SQLITE_OK)
+    // [T-ish-fakefs-mount-orphans] Delete orphaned stats. Only inodes that lost
+    // a path and whose cleanup never ran (the process died while the file was
+    // still open) can be orphans, and those are listed in `orphans` -- the
+    // full-table `not exists` sweep this replaces cost ~0.3 s per mount on a
+    // 1.5M-row stats table. Migration 4 did one last full sweep.
+    if (db_exec_oneshot(fs, "delete from stats where inode in (select inode from orphans) "
+                            "and not exists (select 1 from paths where inode = stats.inode)") != SQLITE_OK)
+        goto init_fail;
+    if (db_exec_oneshot(fs, "delete from orphans") != SQLITE_OK)
         goto init_fail;
 
     fs->lock = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
@@ -391,6 +409,8 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
             "where (path >= ? and path < ?) or path = ?");
     PREPARE_OR_FAIL(path_from_inode, "select path from paths where inode = ?");
     PREPARE_OR_FAIL(try_cleanup_inode, "delete from stats where inode = ? and not exists (select 1 from paths where inode = stats.inode)");
+    PREPARE_OR_FAIL(orphan_note, "insert or ignore into orphans (inode) values (?)");
+    PREPARE_OR_FAIL(orphan_clear, "delete from orphans where inode = ?");
 #undef PREPARE_OR_FAIL
     return 0;
 
@@ -423,6 +443,8 @@ int fake_db_deinit(struct fakefs_db *fs) {
         sqlite3_finalize(fs->stmt.path_rename);
         sqlite3_finalize(fs->stmt.path_from_inode);
         sqlite3_finalize(fs->stmt.try_cleanup_inode);
+        sqlite3_finalize(fs->stmt.orphan_note);
+        sqlite3_finalize(fs->stmt.orphan_clear);
         return sqlite3_close(fs->db);
     }
     return SQLITE_OK;

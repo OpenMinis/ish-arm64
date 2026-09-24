@@ -32,6 +32,12 @@ static struct migration {
     {
         "drop trigger delete_path"
     },
+    // version 4: inodes that may have lost their last path, so mount only
+    // checks those instead of sweeping the whole stats table; one last sweep
+    {
+        "create table orphans (inode integer primary key);"
+        "delete from stats where not exists (select 1 from paths where inode = stats.inode);"
+    },
 };
 
 int fakefs_migrate(struct fakefs_db *fs, int UNUSED(root_fd)) {
