@@ -388,12 +388,43 @@ void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t e
     lock(&absestos->lock);
     bool did_invalidate = false;
     struct fiber_block *block, *tmp;
+    if (end - start >= FIBER_PAGE_HASH_SIZE) {
+        // Every page of a large range maps onto some bucket, and each bucket
+        // holds the blocks of *all* pages congruent to it: walking page by
+        // page would rescan each bucket (end - start) / FIBER_PAGE_HASH_SIZE
+        // times. Sweep every bucket once and keep the blocks whose page is in
+        // range instead.
+        for (size_t b = 0; b < FIBER_PAGE_HASH_SIZE; b++) {
+            for (int i = 0; i <= 1; i++) {
+                struct list *blocks = &absestos->page_hash[b].blocks[i];
+                if (list_null(blocks))
+                    continue;
+                list_for_each_entry_safe(blocks, block, tmp, page[i]) {
+                    page_t owner = i == 0 ? PAGE(block->addr) : PAGE(block->end_addr);
+                    if (owner < start || owner >= end)
+                        continue;
+                    fiber_block_disconnect(absestos, block);
+                    block->is_jetsam = true;
+                    list_add(&absestos->jetsam, &block->jetsam);
+                    did_invalidate = true;
+                }
+            }
+        }
+        start = end;  // nothing left for the per-page walk
+    }
     for (page_t page = start; page < end; page++) {
         for (int i = 0; i <= 1; i++) {
             struct list *blocks = blocks_list(absestos, page, i);
             if (list_null(blocks))
                 continue;
             list_for_each_entry_safe(blocks, block, tmp, page[i]) {
+                // blocks_list() is a hash bucket shared by every page with the
+                // same page % FIBER_PAGE_HASH_SIZE. Only drop the blocks that
+                // live on this page: invalidating a heap page must not throw
+                // away unrelated code that happens to share its bucket.
+                page_t owner = i == 0 ? PAGE(block->addr) : PAGE(block->end_addr);
+                if (owner != page)
+                    continue;
                 fiber_block_disconnect(absestos, block);
                 block->is_jetsam = true;
                 list_add(&absestos->jetsam, &block->jetsam);
