@@ -7,7 +7,7 @@
 
 #define FIBER_INITIAL_HASH_SIZE (1 << 10)
 #define FIBER_CACHE_SIZE (1 << 12)  // 4096 entries
-#define FIBER_PAGE_HASH_SIZE (1 << 10)
+#define FIBER_PAGE_HASH_SIZE (1 << 14)  // ~4-5 blocks per bucket on big programs; invalidation walks a bucket
 
 struct asbestos {
     // there is one asbestos per address space

@@ -448,6 +448,13 @@ void asbestos_invalidate_all(struct asbestos *asbestos) {
     unlock(&asbestos->lock);
 }
 
+// hash_size is a power of two. ARM64 code addresses are 4-byte aligned, so
+// `addr % hash_size` left 3 of every 4 buckets empty; fold the address so the
+// low bucket bits come from bits 2+ (x86 keeps its byte-granular low bits).
+static inline size_t fiber_hash(addr_t addr, size_t size) {
+    return (size_t) (addr ^ (addr >> 2) ^ (addr >> 19)) & (size - 1);
+}
+
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
     TRACE_(verbose, "%d resizing hash to %lu, using %lu bytes for gadgets\n", current_pid(), new_size, asbestos->mem_used);
     struct list *new_hash = calloc(new_size, sizeof(struct list));
@@ -457,7 +464,7 @@ static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
         struct fiber_block *block, *tmp;
         list_for_each_entry_safe(&asbestos->hash[i], block, tmp, chain) {
             list_remove(&block->chain);
-            list_init_add(&new_hash[block->addr % new_size], &block->chain);
+            list_init_add(&new_hash[fiber_hash(block->addr, new_size)], &block->chain);
         }
     }
     free(asbestos->hash);
@@ -472,14 +479,14 @@ static void fiber_insert(struct asbestos *asbestos, struct fiber_block *block) {
     if (asbestos->num_blocks >= asbestos->hash_size * 2)
         fiber_resize_hash(asbestos, asbestos->hash_size * 2);
 
-    list_init_add(&asbestos->hash[block->addr % asbestos->hash_size], &block->chain);
+    list_init_add(&asbestos->hash[fiber_hash(block->addr, asbestos->hash_size)], &block->chain);
     list_init_add(blocks_list(asbestos, PAGE(block->addr), 0), &block->page[0]);
     if (PAGE(block->addr) != PAGE(block->end_addr))
         list_init_add(blocks_list(asbestos, PAGE(block->end_addr), 1), &block->page[1]);
 }
 
 static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr) {
-    struct list *bucket = &asbestos->hash[addr % asbestos->hash_size];
+    struct list *bucket = &asbestos->hash[fiber_hash(addr, asbestos->hash_size)];
     if (list_null(bucket))
         return NULL;
     struct fiber_block *block;
