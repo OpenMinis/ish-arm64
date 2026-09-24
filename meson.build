@@ -37,6 +37,11 @@ if ish_jit
         error('-Djit=true needs guest_arch=arm64 on an Apple arm64 host')
     endif
     add_project_arguments('-DISH_JIT=1', language: 'c')
+    if not get_option('jit_emit')
+        # Run only AOT images a target links in (asbestos/guest-arm64/aot.h);
+        # never map executable memory (iOS release builds).
+        add_project_arguments('-DISH_JIT_NO_EMIT=1', language: 'c')
+    endif
 endif
 
 add_project_arguments('-Wno-switch', language: 'c')
@@ -1791,7 +1796,13 @@ if get_option('kernel') == 'ish'
         include_directories: includes)
 
     if not meson.is_cross_build()
-        executable('ish', ['main.c'], dependencies: ish)
+        # AOT images are not part of ish: the CLI links them in only when
+        # given (-Dcli_aot=aot_<name>.S from tools/jit_aot/gen.py).
+        cli_aot = get_option('cli_aot')
+        if cli_aot.length() > 0 and not ish_jit
+            error('-Dcli_aot needs -Djit=true (the images register with the JIT runtime)')
+        endif
+        executable('ish', ['main.c'] + files(cli_aot), dependencies: ish)
     endif
 
 elif get_option('kernel') == 'linux'

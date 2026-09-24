@@ -24,3 +24,7 @@ option('offload_test_prebuilt', type: 'boolean', value: false,
 # dual mapping on iOS). Off by default; ISH_JIT=0 disables it at run time.
 option('jit', type: 'boolean', value: false,
        description: 'Build the ARM64 guest with the native JIT.')
+option('jit_emit', type: 'boolean', value: true,
+       description: 'With jit: translate at run time (needs executable memory). false runs only AOT images linked into the target.')
+option('cli_aot', type: 'array', value: [],
+       description: 'AOT images (aot_<name>.S from tools/jit_aot/gen.py) to link into the ish CLI executable only; needs jit.')

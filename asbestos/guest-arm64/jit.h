@@ -26,10 +26,11 @@
 // depends on where the guest module or its blocks live, and a registry reuses
 // a translation for every block with the same key, across processes.
 //
-// Every native segment passes through jit_segment_installed() (jit.c) with
-// its guest units and host code, and every host address the emitter bakes
-// into code goes through one helper (mov_host_ptr). Those two points are
-// where a recording mode can capture translations for offline (AOT) use.
+// AOT: in PIC mode ISH_JIT_RECORD=<file> writes the translations of one module
+// (ISH_JIT_RECORD_MOD, default ld-musl) at exit, and tools/jit_aot turns them
+// into an image that a target links in (aot.h). A build with -Djit_emit=false
+// runs only such images and never maps executable memory; ISH_JIT_AOT_ONLY=1
+// does the same in a JIT build.
 
 #ifdef ISH_JIT
 
