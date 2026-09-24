@@ -139,13 +139,13 @@ fiber_ret:
  * Expected state:
  *   _tmp (x0) = interrupt number to return
  *   _cpu = pointer to cpu_state (already saved if needed)
- *
- * DEBUG: Store a marker value to help debug PC issues
- * We store the _pc value (from control flow gadgets) to LOCAL_value
- * so we can see what _pc was when we returned
  */
 .global fiber_exit
 fiber_exit:
+    // [T-ish-precise-fault-pc] Every exit records where in the code stream
+    // it left. cpu->pc only tracks the current block's start; for an INT_GPF
+    // the run loop maps this back to the faulting instruction.
+    str _pc, [_cpu, #LOCAL_fault_stream]
     // Restore callee-saved registers
     ldr lr, [sp, #0x60]
     ldp x28, x29, [sp, #0x50]

@@ -553,6 +553,54 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
 }
 
 #ifdef GUEST_ARM64
+// [T-ish-precise-fault-pc] cpu->pc only follows block boundaries: a gadget
+// that faults leaves it at the start of the current block. A signal handler
+// then saw the wrong pc (Go could not turn a nil dereference into a panic),
+// and resuming -- after the handler, or after the kernel demand-maps a
+// growsdown stack or heap page -- re-ran every instruction of the block
+// before the fault (`sub sp, sp, #0x1000; str xzr, [sp]` dropped sp twice).
+// fiber_exit records the code-stream pointer; decode the block again (same
+// guest bytes, same gadget stream) to find the unit it points into. Only runs
+// on a fault, so the stream needs no per-instruction pc table.
+static void fiber_fix_fault_pc(struct asbestos *asbestos, struct fiber_frame *frame, struct tlb *tlb) {
+    unsigned long *stream = (unsigned long *) frame->fault_stream;
+    addr_t block_addr = frame->cpu.pc;
+    size_t pos;
+    lock(&asbestos->lock);
+    struct fiber_block *block = fiber_lookup(asbestos, block_addr);
+    bool inside = block != NULL && stream > block->code && stream <= block->code + block->used;
+    pos = inside ? (size_t) (stream - block->code) : 0;
+    unlock(&asbestos->lock);
+    if (!inside)
+        return;
+
+    // The faulting gadget's pointer is at code[pos - 1] or before it (a gadget
+    // may have consumed some of its arguments); its unit spans the first unit
+    // whose end reaches pos.
+    struct gen_state state;
+    if (!gen_start(block_addr, &state))
+        return;
+    addr_t fault_pc = 0;
+    while (true) {
+        size_t before = state.size;
+        addr_t unit_pc = state.ip;
+        bool more = gen_step(&state, tlb);
+        if (state.oom)
+            break;
+        if (state.size > before && state.size >= pos) {
+            // A two-instruction unit (adrp+ldr, cmp+b.cond) restarts at its
+            // first instruction, which is side-effect free.
+            fault_pc = unit_pc;
+            break;
+        }
+        if (!more || state.ip - block_addr >= PAGE_SIZE - 15)
+            break;
+    }
+    free(state.block);
+    frame->cpu.segfault_block_pc = block_addr;
+    frame->cpu.segfault_precise_pc = fault_pc;
+}
+
 // W^X compile wrapper. Guest JITs (bun/JSC) patch their code pages in place
 // (inline caches, repatched branches). Without protection, a block compiled
 // while such a patch is mid-flight caches torn bytes and keeps executing them
@@ -936,6 +984,11 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         in_jit = 1;
         interrupt = fiber_enter(block, frame, tlb);
         in_jit = 0;
+#ifdef GUEST_ARM64
+        frame->cpu.segfault_precise_pc = 0;
+        if (interrupt == INT_GPF)
+            fiber_fix_fault_pc(asbestos, frame, tlb);
+#endif
 
 
         // Check if fiber_enter returned due to a JIT crash (signal handler
