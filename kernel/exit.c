@@ -13,6 +13,9 @@
 #include "kernel/ptrace.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+#endif
 
 static void halt_system(void);
 
@@ -248,6 +251,10 @@ noreturn void do_exit_group(int status) {
     { extern void dump_block_prof(void);
       static int bp_dumped = 0;
       if (!bp_dumped && current && current->pid == 1) { bp_dumped = 1; dump_block_prof(); } }
+#ifdef ISH_JIT
+    { static int jit_reported = 0;
+      if (!jit_reported && current && current->pid == 1) { jit_reported = 1; jit_report(); } }
+#endif
     // Leaked thread woke up after group already exited — bail silently.
     if (current->exiting) {
         current = NULL;

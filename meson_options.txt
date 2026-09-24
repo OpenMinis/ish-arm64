@@ -19,3 +19,8 @@ option('offload_test_symbol', type: 'boolean', value: false,
        description: 'Build symbol-level offload test handlers (mem*/hash/dict).')
 option('offload_test_prebuilt', type: 'boolean', value: false,
        description: 'Build prebuilt-gadget offload test handlers (spec_mix).')
+
+# Native JIT for the ARM64 guest on Apple arm64 hosts (MAP_JIT on macOS, a
+# dual mapping on iOS). Off by default; ISH_JIT=0 disables it at run time.
+option('jit', type: 'boolean', value: false,
+       description: 'Build the ARM64 guest with the native JIT.')

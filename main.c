@@ -47,6 +47,9 @@ extern void jit_crash_trampoline(void);
 // automatically rather than silently corrupting recovery.
 #include <stddef.h>
 #include "asbestos/frame.h"
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+#endif
 #define CRASH_CPU_pc                offsetof(struct cpu_state, pc)
 #define CRASH_CPU_segfault_addr     offsetof(struct cpu_state, segfault_addr)
 #define CRASH_CPU_segfault_was_write offsetof(struct cpu_state, segfault_was_write)
@@ -69,6 +72,10 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     // This avoids the overhead of _setjmp on every block entry.
     if ((sig == SIGSEGV || sig == SIGBUS) && in_jit) {
         ucontext_t *uc = (ucontext_t *)ctx;
+#ifdef ISH_JIT
+        // Pinned guest registers live only in host registers inside native code.
+        jit_crash_sync(uc);
+#endif
 
         // _cpu is in x1 — pointer to cpu_state within fiber_frame
         uint64_t cpu_ptr = uc->uc_mcontext->__ss.__x[1];

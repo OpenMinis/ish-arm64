@@ -29,6 +29,16 @@ if get_option('no_crlf')
     add_project_arguments('-DNO_CRLF', language: 'c')
 endif
 
+# Native JIT for the ARM64 guest (asbestos/guest-arm64/jit.h). Off by default;
+# without it the build is the plain gadget engine.
+ish_jit = get_option('jit')
+if ish_jit
+    if guest_arch != 'arm64' or host_machine.system() != 'darwin' or host_machine.cpu_family() != 'aarch64'
+        error('-Djit=true needs guest_arch=arm64 on an Apple arm64 host')
+    endif
+    add_project_arguments('-DISH_JIT=1', language: 'c')
+endif
+
 add_project_arguments('-Wno-switch', language: 'c')
 
 # ISH_GADGET_PROFILE: enable gadget call ring-buffer + atexit dump.
@@ -115,6 +125,9 @@ elif guest_arch == 'arm64'
         gadgets+'/crypto.S',
         offsets,
     ]
+    if ish_jit
+        emu_src += 'asbestos/guest-arm64/jit.c'
+    endif
 endif
 
 libish_emu = library('ish_emu', emu_src, include_directories: includes)

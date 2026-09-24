@@ -61,7 +61,11 @@ if [[ -n "$ISH_KERNEL" ]]; then
 fi
 kconfig=""
 guest_arch=${GUEST_ARCH:-x86}
-for var in buildtype log b_ndebug b_sanitize log_handler kernel kconfig guest_arch; do
+jit=false
+if [[ $ISH_ENABLE_JIT == YES ]]; then
+    jit=true
+fi
+for var in buildtype log b_ndebug b_sanitize log_handler kernel kconfig guest_arch jit; do
     old_value=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == '$var'); print(str(v).lower() if isinstance(v, bool) else ','.join(v) if isinstance(v, list) else v)" <<< $config)
     new_value=${!var}
     if [[ $old_value != $new_value ]]; then

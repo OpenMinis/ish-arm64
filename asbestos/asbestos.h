@@ -47,6 +47,9 @@ struct asbestos {
 
     lock_t lock;
     wrlock_t jetsam_lock;
+#ifdef ISH_JIT
+    void *jit_ctxs;             // guest-arm64/jit.c: per-module contexts of this address space
+#endif
 };
 
 // this is roughly the average number of instructions in a basic block according to anonymous sources
@@ -74,6 +77,17 @@ struct fiber_block {
     // links for free list
     struct list jetsam;
     bool is_jetsam;
+
+#ifdef ISH_JIT
+    // Native code (guest-arm64/jit.c). native_link[i]: the patchable
+    // instruction in the native exit for jump_ip[i] (nop, or a direct branch
+    // into the chained successor); native_link_orig[i]: what a link replaced.
+    uint32_t *native_link[2];
+    uint32_t native_link_orig[2];
+    uint32_t *native_loop;      // self-loop block: head of the promoted loop body
+    uintptr_t native_entry;     // hot entry of the native code at code[0], 0 if none
+    void *jit_ctx;              // PIC: module context the native code runs with (x29)
+#endif
 
     unsigned long code[];
 };

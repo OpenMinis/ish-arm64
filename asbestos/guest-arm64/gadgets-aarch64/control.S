@@ -132,6 +132,34 @@
 
 /*
  * Branch to register with link (BLR)
+ */
+#ifdef ISH_JIT
+/*
+ * Code stream: [gadget addr][block_self_ptr][return_addr][return_cont][rn]
+ * The first words match BL, so the ret_cache entry has the format RET expects.
+ */
+.gadget branch_link_reg
+    ldr x8, [_pc, #24]      // rn
+    ldr x11, [_pc, #8]      // return address
+
+    and x8, x8, #0x1f
+    add x9, _cpu, #CPU_x0
+    ldr x10, [x9, x8, lsl #3]   // read the target before x30 is overwritten (blr x30)
+
+    // Save return address to X30
+    str x11, [_cpu, #(CPU_x0 + 30*8)]
+#ifndef DISABLE_RET_CACHE
+    ubfx w12, w11, #4, #12
+    add x13, _cpu, #LOCAL_ret_cache
+    str _pc, [x13, x12, lsl #3]
+#endif
+
+    // Mask to 48-bit (see branch_reg for rationale)
+    and x10, x10, #0xffffffffffff
+    str x10, [_cpu, #CPU_pc]
+    b fiber_ret
+#else
+/*
  * Code stream: [gadget addr][rn (64-bit)][return addr (64-bit)]
  */
 .gadget branch_link_reg
@@ -151,6 +179,7 @@
     str x10, [_cpu, #CPU_pc]
     // Indirect branch: always return to main loop
     b fiber_ret
+#endif
 
 /*
  * Return (RET)

@@ -18,5 +18,10 @@ GCC_PREPROCESSOR_DEFINITIONS[config=DebugLinux] = GUEST_ARM64=1 DEBUG=1
 // Meson options for ARM64 guest
 MESON_GUEST_OPTION = -Dguest_arch=arm64
 
+// YES builds libish with the native JIT (meson -Djit=true, see
+// asbestos/guest-arm64/jit.h). It needs executable memory at run time, so it
+// is for development builds only.
+ISH_ENABLE_JIT = NO
+
 // ARM64 rootfs URL (Alpine 3.21 aarch64 minirootfs)
 ROOTFS_URL = dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz
