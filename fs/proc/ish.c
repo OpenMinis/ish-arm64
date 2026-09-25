@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -160,10 +161,32 @@ static int proc_ish_show_version(struct proc_entry *UNUSED(entry), struct proc_d
     return 0;
 }
 
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+// Whether the JIT / AOT images are in use (asbestos/guest-arm64/jit.h).
+static int proc_ish_show_jit(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    size_t size = 16384;
+    char *text = malloc(size);
+    if (text == NULL)
+        return _ENOMEM;
+    jit_describe(text, size);
+    proc_printf(buf, "%s", text);
+    free(text);
+    return 0;
+}
+// pwrite, not update: an unknown command fails the write.
+static ssize_t proc_ish_write_jit(struct proc_entry *UNUSED(entry), struct proc_data *data, off_t UNUSED(off)) {
+    return jit_control(data->data, data->size) == 0 ? (ssize_t) data->size : _EINVAL;
+}
+#endif
+
 struct proc_children proc_ish_children = PROC_CHILDREN({
     {"colors", .show = proc_ish_show_colors},
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
     {"defaults", S_IFDIR, .readdir = proc_ish_defaults_readdir},
     {"documents", .show = proc_ish_show_documents},
+#ifdef ISH_JIT
+    {"jit", .show = proc_ish_show_jit, .pwrite = proc_ish_write_jit},
+#endif
     {"version", .show = proc_ish_show_version},
 });

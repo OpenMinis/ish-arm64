@@ -93,5 +93,11 @@ bool jit_crash_sync(void *ucontext);
 // writes the code region.
 void jit_report(void);
 
+// Human-readable state for /proc/ish/jit (mode, AOT images, hits per module).
+size_t jit_describe(char *buf, size_t size);
+// Writes to /proc/ish/jit: "off" / "on" stop / resume installing AOT images
+// in blocks compiled afterwards (for A/B timing on a device). -1: unknown.
+int jit_control(const char *cmd, size_t len);
+
 #endif
 #endif

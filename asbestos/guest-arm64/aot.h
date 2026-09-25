@@ -38,8 +38,11 @@ struct aot_module {
     uint8_t sha256[32];
     uint32_t ntrans, nidx;        // translations (sorted by off), context indices used
     const struct aot_trans *trans;
-    int32_t prologue_words, entry_off, n_pinned, pad;   // conventions the code was made with
+    int32_t prologue_words, entry_off, n_pinned;   // conventions the code was made with
+    uint32_t abi;                 // jit_abi() of the ish that made it (layouts, code version)
     const uint32_t *text_start, *text_end;
+    uint32_t build_id_len;        // NT_GNU_BUILD_ID of the module, matched before the path
+    uint8_t build_id[20];
 };
 
 // Called by an image's constructor, before main. Needs ish built with -Djit=true.

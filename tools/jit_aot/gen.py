@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import struct
 import subprocess
 import sys
 
@@ -131,6 +132,43 @@ def emit_segment(out, syms, t, s, seg, stats):
     return True
 
 
+def segment_offsets(t):
+    """File offset of the first guest instruction of each segment."""
+    key, offs = t['key'], []
+    for seg in t['segs']:
+        for u in range(key[4]):
+            k = KEY_HDR + KEY_UNIT * u
+            if key[k] == seg['pos']:
+                dpc = key[k + 3] | key[k + 4] << 32
+                offs.append(t['off'] + dpc)
+                break
+    return offs
+
+
+def build_id_of(path):
+    """NT_GNU_BUILD_ID of a 64-bit little-endian ELF file, b'' if none."""
+    with open(path, 'rb') as f:
+        data = f.read(1 << 16)
+        if data[:6] != b'\x7fELF\x02\x01':
+            return b''
+        phoff, = struct.unpack_from('<Q', data, 0x20)
+        phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
+        for i in range(phnum):
+            f.seek(phoff + i * phentsize)
+            ptype, _, noff, _, _, nsize = struct.unpack('<IIQQQQ', f.read(40))
+            if ptype != 4:   # PT_NOTE
+                continue
+            f.seek(noff)
+            notes, p = f.read(nsize), 0
+            while p + 12 <= len(notes):
+                namesz, descsz, ntype = struct.unpack_from('<III', notes, p)
+                name, desc = p + 12, p + 12 + ((namesz + 3) & ~3)
+                if ntype == 3 and notes[name:name + namesz] == b'GNU\0' and 0 < descsz <= 20:
+                    return notes[desc:desc + descsz]
+                p = desc + ((descsz + 3) & ~3)
+    return b''
+
+
 def sha256_of(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -146,9 +184,16 @@ def main():
     ap.add_argument('rootfs')
     ap.add_argument('out')
     ap.add_argument('--name', default='musl')
+    ap.add_argument('--keep', help='only translations with a segment at one of these file offsets '
+                    '(one per line, hex or decimal): the hot code from a profile; the rest runs as gadgets')
+    ap.add_argument('--abi', help='abi of the ish that recorded, for a recording made before the header had it '
+                    '(the "abi" of /proc/ish/jit in that same build)')
     args = ap.parse_args()
 
     header, trans = load_recording(args.recording)
+    abi = header.get('abi') or (int(args.abi, 16) if args.abi else None)
+    if not abi:
+        sys.exit(f"❌ {args.recording}: no abi in the header; re-record, or pass --abi of the ish that made it")
     mods = {t['mod'] for t in trans}
     if len(mods) != 1:
         sys.exit(f"❌ expected one module in the recording, got {sorted(mods)}")
@@ -159,13 +204,19 @@ def main():
     syms = host_symbols(args.ish)
     print(f"📼 {len(trans)} translations of {mod}, prologue {header['prologue_words']} words")
 
+    kept = range(len(trans))
+    if args.keep:
+        hot = {int(x, 0) for x in open(args.keep).read().split()}
+        kept = [i for i, t in enumerate(trans) if hot & set(segment_offsets(t))]
+        print(f"✂️  keeping {len(kept)} of {len(trans)} translations ({len(hot)} hot offsets)")
     # Stable order: by file offset (the loader binary-searches it), then key.
-    order = sorted(range(len(trans)), key=lambda i: (trans[i]['off'], trans[i]['key']))
+    order = sorted(kept, key=lambda i: (trans[i]['off'], trans[i]['key']))
     new_id = {old: new for new, old in enumerate(order)}
     trans = [trans[i] for i in order]
     for t in trans:
         for seg in t['segs']:
-            seg['links'] = [[slot, at, new_id[tt] if tt >= 0 else -1, ts, tw] for slot, at, tt, ts, tw in seg['links']]
+            # a link into a translation left out stays unlinked
+            seg['links'] = [[slot, at, new_id.get(tt, -1), ts, tw] for slot, at, tt, ts, tw in seg['links']]
 
     stats = {'sym': 0, 'exit': 0, 'linked': 0, 'unlinked': 0, 'dropped': 0, 'labels': set()}
     for ti, t in enumerate(trans):
@@ -246,6 +297,7 @@ def main():
         lines.append(f'    .long {len(t["segs"])}, {t["key"][4]}')
         lines.append(f'    .quad {links[0]}, {links[1]}, {f"Ll{ti}" if t["_loop"] else "0"}')
     digest = sha256_of(mod_file)
+    build_id = build_id_of(mod_file)
     lines += ['Lpath:', f'    .asciz "{mod}"', '    .p2align 3',
               f'    .globl _ish_aot_module_{args.name}',
               f'_ish_aot_module_{args.name}:',
@@ -254,8 +306,11 @@ def main():
               '    .byte ' + ', '.join(str(b) for b in digest),
               f'    .long {len(trans)}, {max(t["idx"] for t in trans) + 1}',
               '    .quad Ltrans',
-              f'    .long {header["prologue_words"]}, {header["entry_off"]}, {header["n_pinned"]}, 0',
-              '    .quad Laot_text_start, Laot_text_end', '',
+              f'    .long {header["prologue_words"]}, {header["entry_off"]}, {header["n_pinned"]}, {abi}',
+              '    .quad Laot_text_start, Laot_text_end',
+              f'    .long {len(build_id)}',
+              '    .byte ' + ', '.join(str(b) for b in build_id.ljust(20, b'\0')),
+              '    .p2align 3', '',
               # Register the image when the binary that links it is loaded.
               '    .text',
               '    .p2align 2',

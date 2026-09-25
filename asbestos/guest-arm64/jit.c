@@ -1827,29 +1827,38 @@ static uint64_t reg_hash(const uint32_t *k, unsigned n) {
 
 // ---- module contexts: one per (address space, module, base)
 
+// One per (module mapping, owner): translations made here share one index
+// space, and so does each AOT image -- its indices are baked into its code,
+// so two images of one module (two versions of the file) need two contexts.
 struct ctx_node {
     struct ctx_node *next;
     int mod;
     uint64_t base;
+    const void *owner;      // the AOT image, NULL for this process's own translations
+    size_t bytes;
     struct jit_ctx *ctx;
 };
 static pthread_mutex_t ctx_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static struct jit_ctx *ctx_get(struct asbestos *a, int mod, uint64_t base) {
+static struct jit_ctx *ctx_get(struct asbestos *a, int mod, uint64_t base, const struct aot_module *owner) {
     pthread_mutex_lock(&ctx_lock);
     struct ctx_node *n;
     for (n = a->jit_ctxs; n; n = n->next)
-        if (n->mod == mod && n->base == base)
+        if (n->mod == mod && n->base == base && n->owner == owner)
             break;
     if (!n && (n = malloc(sizeof(*n)))) {
         // Address space only: pages are touched as translations get indices.
-        void *p = mmap(NULL, CTX_BLK + 8 * (size_t) CTX_MAX, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        // An image knows how many it uses.
+        size_t bytes = CTX_BLK + 8 * (size_t) (owner ? owner->nidx : CTX_MAX);
+        void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (p == MAP_FAILED) {
             free(n);
             n = NULL;
         } else {
             n->mod = mod;
             n->base = base;
+            n->owner = owner;
+            n->bytes = bytes;
             n->ctx = p;
             n->ctx->base = base;
             n->next = a->jit_ctxs;
@@ -1867,7 +1876,7 @@ void jit_asbestos_free(struct asbestos *a) {
     pthread_mutex_unlock(&ctx_lock);
     while (n) {
         struct ctx_node *next = n->next;
-        munmap(n->ctx, CTX_BLK + 8 * (size_t) CTX_MAX);
+        munmap(n->ctx, n->bytes);
         free(n);
         n = next;
     }
@@ -1917,6 +1926,7 @@ static bool rec_module(int mod) {
 static unsigned *mod_next_idx;   // per module: indices handed out (reg_lock)
 static const struct aot_module **mod_aot;   // per module: its AOT image, if any (reg_lock)
 static uint8_t *mod_aot_known;
+static uint64_t *mod_blocks, *mod_hits;     // per module: blocks translated or looked up, AOT installs
 static unsigned mod_next_cap;
 
 // ---- AOT images (asbestos/guest-arm64/aot.h)
@@ -1929,6 +1939,9 @@ static unsigned mod_next_cap;
 
 static const struct aot_module **aot_images;
 static unsigned aot_nimages;
+static const struct aot_module *aot_rejected[64];   // registered, made with other conventions or layouts
+static unsigned aot_nrejected;
+static _Atomic bool aot_off;    // /proc/ish/jit "off": blocks compiled from now on skip the images
 
 // Images register themselves from a constructor in their own object (see
 // tools/jit_aot/gen.py), before main: the binary that links an image in is
@@ -1942,20 +1955,55 @@ void ish_aot_register(const struct aot_module *m) {
         aot_registered[aot_nregistered++] = m;
 }
 
+// Bump whenever the code emitted for some guest instruction, stub or exit
+// changes: images made before would still pass every other check.
+#define JIT_CODE_VERSION 1
+
+// Everything the emitted code bakes in besides the gadgets it names: the
+// conventions, the struct layouts it loads from and the TLB / block cache
+// hashing. An image made by an ish that differs in any of these would run
+// with stale offsets, so it is rejected (never 0: images from before this
+// check carry 0 there).
+static uint32_t jit_abi(void) {
+    const uint64_t v[] = {
+        JIT_CODE_VERSION, (uint64_t) prologue_words, entry_off(), (uint64_t) n_pinned, CTX_BLK,
+        FIBER_BLOCK_code, FIBER_BLOCK_addr, offsetof(struct fiber_block, native_entry),
+        offsetof(struct fiber_block, jit_ctx),
+        CPU_pc, CPU_cycle, CPU_poked_ptr, CPU_tls_ptr, offsetof(struct cpu_state, sp),
+        offsetof(struct cpu_state, regs), offsetof(struct cpu_state, nzcv), offsetof(struct cpu_state, fp),
+        LOCAL_last_block, LOCAL_ret_cache,
+        sizeof(struct tlb_entry), offsetof(struct tlb_entry, page), offsetof(struct tlb_entry, page_if_writable),
+        offsetof(struct tlb_entry, gen), offsetof(struct tlb_entry, data_minus_addr), TLB_BITS, PAGE_BITS,
+        offsetof(struct tlb, entries), offsetof(struct tlb, mmu), offsetof(struct tlb, block_cache_gen),
+        offsetof(struct tlb, block_cache), sizeof(((struct tlb *) 0)->block_cache),
+        offsetof(struct mmu, changes), offsetof(struct mmu, asbestos), offsetof(struct asbestos, invalidate_gen),
+        sizeof(struct aot_module), sizeof(struct aot_trans),
+    };
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < sizeof(v); i++)
+        h = (h ^ ((const uint8_t *) v)[i]) * 16777619u;
+    return h ? h : 1;
+}
+
 static void aot_init(void) {
     unsigned n = aot_nregistered;
     aot_images = n ? malloc(n * sizeof(*aot_images)) : NULL;
+    uint32_t abi = jit_abi();
     for (unsigned i = 0; aot_images && i < n; i++) {
         const struct aot_module *m = aot_registered[i];
-        if (m->prologue_words != prologue_words || (uintptr_t) m->entry_off != entry_off() || m->n_pinned != n_pinned) {
-            fprintf(stderr, "⚠️  AOT image of %s was made with other conventions, not used\n", m->path);
+        if (m->abi != abi || m->prologue_words != prologue_words || (uintptr_t) m->entry_off != entry_off() ||
+            m->n_pinned != n_pinned) {
+            fprintf(stderr, "⚠️  AOT image of %s was made by an ish with other conventions or layouts "
+                    "(abi %08x, this ish %08x), not used\n", m->path, m->abi, abi);
+            if (aot_nrejected < 64)
+                aot_rejected[aot_nrejected++] = m;
             continue;
         }
         aot_images[aot_nimages++] = m;
     }
 }
 
-static bool mod_path_is(int mod, const char *path);
+static bool mod_is_image(int mod, const struct aot_module *m);
 
 static bool mod_tables_fit(int mod) {   // reg_lock held
     if ((unsigned) mod < mod_next_cap)
@@ -1968,29 +2016,35 @@ static bool mod_tables_fit(int mod) {   // reg_lock held
     if (img) mod_aot = img;
     uint8_t *known = realloc(mod_aot_known, cap);
     if (known) mod_aot_known = known;
-    if (!idx || !img || !known)
+    uint64_t *blocks = realloc(mod_blocks, cap * sizeof(*blocks));
+    if (blocks) mod_blocks = blocks;
+    uint64_t *hits = realloc(mod_hits, cap * sizeof(*hits));
+    if (hits) mod_hits = hits;
+    if (!idx || !img || !known || !blocks || !hits)
         return false;
     memset(mod_next_idx + mod_next_cap, 0, (cap - mod_next_cap) * sizeof(*idx));
     memset(mod_aot + mod_next_cap, 0, (cap - mod_next_cap) * sizeof(*img));
     memset(mod_aot_known + mod_next_cap, 0, cap - mod_next_cap);
+    memset(mod_blocks + mod_next_cap, 0, (cap - mod_next_cap) * sizeof(*blocks));
+    memset(mod_hits + mod_next_cap, 0, (cap - mod_next_cap) * sizeof(*hits));
     mod_next_cap = cap;
     return true;
 }
 
-// The image for a module (reg_lock held). Attaching one reserves its
-// context indices, so JIT translations of the module never reuse them.
+// The first image of a module (reg_lock held), NULL if none.
 static const struct aot_module *mod_image(int mod) {
     if (!mod_tables_fit(mod))
         return NULL;
     if (!mod_aot_known[mod]) {
         mod_aot_known[mod] = 1;
+        // Several images may fit one module (versions of a file without a
+        // build-id share its path); each block matches at most the one
+        // recorded from its bytes.
         for (unsigned i = 0; i < aot_nimages; i++) {
-            if (!mod_path_is(mod, aot_images[i]->path))
+            if (!mod_is_image(mod, aot_images[i]))
                 continue;
-            mod_aot[mod] = aot_images[i];
-            if (mod_next_idx[mod] < aot_images[i]->nidx)
-                mod_next_idx[mod] = aot_images[i]->nidx;
-            break;
+            if (!mod_aot[mod])
+                mod_aot[mod] = aot_images[i];
         }
     }
     return mod_aot[mod];
@@ -2022,6 +2076,23 @@ static const struct aot_trans *aot_find(const struct aot_module *m, const struct
         }
         if (same)
             return t;
+    }
+    return NULL;
+}
+
+// Look b up in every image of its module.
+static const struct aot_trans *aot_find_any(int mod, const struct fiber_block *b,
+                                            const struct jit_units *U, const uint32_t *key, unsigned nkey,
+                                            const struct aot_module **found) {
+    for (unsigned i = 0; i < aot_nimages; i++) {
+        const struct aot_module *m = aot_images[i];
+        if (!mod_is_image(mod, m))
+            continue;
+        const struct aot_trans *t = aot_find(m, b, U, key, nkey);
+        if (t) {
+            *found = m;
+            return t;
+        }
     }
     return NULL;
 }
@@ -2059,17 +2130,27 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
     struct asbestos *a = cm_tlb ? cm_tlb->mmu->asbestos : NULL;
     if (mod < 0 || !a || !U->n || !one_mapping(U, mod, base))
         return;
-    struct jit_ctx *ctx = ctx_get(a, mod, base);
-    if (!ctx)
+    // This process's own translations need a context with room for CTX_MAX
+    // indices (8MB of address space, per module mapping of every guest
+    // process, all in this one host process): not made when only images run.
+    struct jit_ctx *ctx = NULL;
+    if (!aot_only && !(ctx = ctx_get(a, mod, base, NULL)))
         return;
     unsigned nkey = reg_key(b, U, mod, off, key);
     uint64_t h = reg_hash(key, nkey);
     pthread_mutex_lock(&reg_lock);
     const struct aot_module *img = mod_image(mod);
-    const struct aot_trans *at = img ? aot_find(img, b, U, key, nkey) : NULL;
+    const struct aot_trans *at = img && !aot_off ? aot_find_any(mod, b, U, key, nkey, &img) : NULL;
+    if ((unsigned) mod < mod_next_cap) {
+        mod_blocks[mod]++;
+        mod_hits[mod] += at != NULL;
+    }
     if (at) {
         pthread_mutex_unlock(&reg_lock);
-        aot_install(b, ctx, at, img->entry_off);
+        struct jit_ctx *actx = ctx_get(a, mod, base, img);
+        if (!actx)
+            return;
+        aot_install(b, actx, at, img->entry_off);
         atomic_fetch_add_explicit(&st_aot, 1, memory_order_relaxed);
         return;
     }
@@ -2182,7 +2263,13 @@ bool jit_crash_sync(void *ucontext) {
 // Host PC samples of native code resolve to modules through the S lines; the
 // same identity is what a recorder needs to find the code in another process.
 
-struct cm_module { char path[256]; uint64_t blocks, units, segments, bytes; };
+// A module is one file build: its ELF build-id when it has one (wherever it
+// is installed), else its path.
+struct cm_module {
+    char path[256];              // the first path it was seen at
+    uint8_t id[20], id_len;      // NT_GNU_BUILD_ID, id_len 0 if none
+    uint64_t blocks, units, segments, bytes;
+};
 struct cm_segment { uint64_t code, off, pc; uint32_t words, units, insn; int mod; };
 static bool cm_on;
 static pthread_mutex_t cm_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2190,12 +2277,55 @@ static struct cm_module *cm_mods;
 static unsigned cm_nmods, cm_capmods;
 static struct cm_segment *cm_segs;
 static size_t cm_nsegs, cm_capsegs;
-static __thread struct data *cm_last_data;   // one-entry cache: data -> module
-static __thread int cm_last_mod = -1;
 
-static int cm_module_of_path(const char *path) {
+// NT_GNU_BUILD_ID of the ELF file behind fd (at most 20 bytes); 0 if none.
+static unsigned elf_build_id(struct fd *fd, uint8_t id[20]) {
+    uint8_t eh[64];
+    if (!fd->ops->pread || fd->ops->pread(fd, eh, sizeof(eh), 0) != sizeof(eh))
+        return 0;
+    if (memcmp(eh, "\177ELF\2\1", 6) != 0)   // 64-bit little endian
+        return 0;
+    uint64_t phoff;
+    uint16_t phentsize, phnum;
+    memcpy(&phoff, eh + 0x20, 8);
+    memcpy(&phentsize, eh + 0x36, 2);
+    memcpy(&phnum, eh + 0x38, 2);
+    uint8_t ph[64 * 56];
+    if (phentsize != 56 || phnum == 0 || phnum > 64 ||
+        fd->ops->pread(fd, ph, (size_t) phnum * 56, (off_t) phoff) != (ssize_t) phnum * 56)
+        return 0;
+    for (unsigned i = 0; i < phnum; i++) {
+        uint32_t type;
+        uint64_t noff, nsize;
+        memcpy(&type, ph + 56 * i, 4);
+        memcpy(&noff, ph + 56 * i + 8, 8);
+        memcpy(&nsize, ph + 56 * i + 32, 8);
+        uint8_t n[1024];
+        if (type != 4 /* PT_NOTE */ || nsize > sizeof(n) || fd->ops->pread(fd, n, nsize, (off_t) noff) != (ssize_t) nsize)
+            continue;
+        for (uint64_t p = 0; p + 12 <= nsize;) {
+            uint32_t namesz, descsz, ntype;
+            memcpy(&namesz, n + p, 4);
+            memcpy(&descsz, n + p + 4, 4);
+            memcpy(&ntype, n + p + 8, 4);
+            uint64_t name = p + 12, desc = name + ((namesz + 3u) & ~3u);
+            if (desc + descsz > nsize)
+                break;
+            if (ntype == 3 /* NT_GNU_BUILD_ID */ && namesz == 4 && !memcmp(n + name, "GNU", 4) &&
+                descsz > 0 && descsz <= 20) {
+                memcpy(id, n + desc, descsz);
+                return descsz;
+            }
+            p = desc + ((descsz + 3u) & ~3u);
+        }
+    }
+    return 0;
+}
+
+static int cm_module_of(const char *path, const uint8_t *id, unsigned id_len) {
     for (unsigned i = 0; i < cm_nmods; i++)
-        if (!strcmp(cm_mods[i].path, path))
+        if (id_len ? cm_mods[i].id_len == id_len && !memcmp(cm_mods[i].id, id, id_len)
+                   : !cm_mods[i].id_len && !strcmp(cm_mods[i].path, path))
             return (int) i;
     if (cm_nmods == cm_capmods) {
         unsigned cap = cm_capmods ? 2 * cm_capmods : 64;
@@ -2208,12 +2338,15 @@ static int cm_module_of_path(const char *path) {
     struct cm_module *m = &cm_mods[cm_nmods];
     memset(m, 0, sizeof(*m));
     snprintf(m->path, sizeof(m->path), "%s", path);
+    memcpy(m->id, id, id_len);
+    m->id_len = (uint8_t) id_len;
     return (int) cm_nmods++;
 }
 
-// Module and file offset of guest address pc (cm_lock held). The caller runs
-// guest code, so the address space is read-locked.
-static int cm_locate(addr_t pc, uint64_t *off) {
+// Module and file offset of guest address pc (cm_lock held), and the data
+// mapped there. The caller runs guest code, so the address space is
+// read-locked.
+static int cm_locate(addr_t pc, uint64_t *off, struct data **datap) {
     *off = 0;
     if (!cm_tlb)
         return -1;
@@ -2222,26 +2355,36 @@ static int cm_locate(addr_t pc, uint64_t *off) {
     if (!pt)
         return -1;
     struct data *data = pt->data;
+    if (datap)
+        *datap = data;
     // realfs maps the file from file_offset rounded down to a host page, and
     // pt->offset counts from there.
     if (data->fd)
         *off = data->file_offset - data->file_offset % real_page_size + pt->offset + PGOFFSET(pc);
-    if (data == cm_last_data)
-        return cm_last_mod;
+    // Looked up once per mapping (shared by forked address spaces).
+    if (data->jit_mod)
+        return data->jit_mod - 1;
     char path[MAX_PATH] = "[anon]";
-    if (data->name)
+    uint8_t id[20];
+    unsigned id_len = 0;
+    if (data->name) {
         snprintf(path, sizeof(path), "%s", data->name);
-    else if (data->fd)
-        generic_getpath(data->fd, path);
-    cm_last_data = data;
-    cm_last_mod = cm_module_of_path(path);
-    return cm_last_mod;
+    } else if (data->fd) {
+        if (generic_getpath(data->fd, path) < 0)
+            snprintf(path, sizeof(path), "[unnamed file]");
+        id_len = elf_build_id(data->fd, id);
+    }
+    int mod = cm_module_of(path, id, id_len);
+    if (mod >= 0)
+        data->jit_mod = mod + 1;
+    return mod;
 }
 
 static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base) {
     pthread_mutex_lock(&cm_lock);
-    int mod = cm_locate(pc, off);
-    bool anon = mod >= 0 && !cm_last_data->fd;
+    struct data *data;
+    int mod = cm_locate(pc, off, &data);
+    bool anon = mod >= 0 && !data->fd;
     pthread_mutex_unlock(&cm_lock);
     if (mod < 0)
         return -1;
@@ -2251,9 +2394,16 @@ static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base) {
     return mod;
 }
 
-static bool mod_path_is(int mod, const char *path) {
+// Was image m recorded from this module? By build-id when both have one:
+// the same build anywhere in the file system. Else by path.
+static bool mod_is_image(int mod, const struct aot_module *m) {
     pthread_mutex_lock(&cm_lock);
-    bool eq = mod >= 0 && (unsigned) mod < cm_nmods && !strcmp(cm_mods[mod].path, path);
+    bool eq = false;
+    if (mod >= 0 && (unsigned) mod < cm_nmods) {
+        const struct cm_module *c = &cm_mods[mod];
+        eq = c->id_len && m->build_id_len ? c->id_len == m->build_id_len && !memcmp(c->id, m->build_id, c->id_len)
+                                          : !strcmp(c->path, m->path);
+    }
     pthread_mutex_unlock(&cm_lock);
     return eq;
 }
@@ -2319,8 +2469,8 @@ static void rec_write(const char *path) {
     if (t && w)
         qsort(w, nw, sizeof(*w), rec_where_cmp);
     // The conventions the code was generated with.
-    fprintf(f, "{\"header\": {\"prologue_words\": %d, \"entry_off\": %lu, \"n_pinned\": %d, \"exit_stub\": [",
-            prologue_words, (unsigned long) entry_off(), n_pinned);
+    fprintf(f, "{\"header\": {\"abi\": %u, \"prologue_words\": %d, \"entry_off\": %lu, \"n_pinned\": %d, \"exit_stub\": [",
+            jit_abi(), prologue_words, (unsigned long) entry_off(), n_pinned);
     for (unsigned i = 0; i < exit_stub_words; i++)
         fprintf(f, "%s%u", i ? ", " : "", ((uint32_t *) exit_stub)[i]);
     fprintf(f, "]}}\n");
@@ -2410,7 +2560,7 @@ static void rec_write(const char *path) {
 static void cm_block(struct fiber_block *b) {
     pthread_mutex_lock(&cm_lock);
     uint64_t off;
-    int mod = cm_locate(b->addr, &off);
+    int mod = cm_locate(b->addr, &off, NULL);
     if (mod >= 0)
         cm_mods[mod].blocks++;
     pthread_mutex_unlock(&cm_lock);
@@ -2420,7 +2570,7 @@ static void cm_segment(const struct jit_units *U, unsigned first, unsigned end,
                        const uint8_t *code, unsigned words) {
     pthread_mutex_lock(&cm_lock);
     uint64_t off;
-    int mod = cm_locate(U->u[first].pc, &off);
+    int mod = cm_locate(U->u[first].pc, &off, NULL);
     if (mod >= 0) {
         cm_mods[mod].units += end - first;
         cm_mods[mod].segments++;
@@ -2459,6 +2609,60 @@ static void cm_write(const char *path) {
 }
 
 // ================================================================ entry
+
+int jit_control(const char *cmd, size_t len) {
+    while (len && (cmd[len - 1] == '\n' || cmd[len - 1] == ' '))
+        len--;
+    if (len == 2 && !memcmp(cmd, "on", 2)) {
+        aot_off = false;
+        return 0;
+    }
+    if (len == 3 && !memcmp(cmd, "off", 3)) {
+        aot_off = true;
+        return 0;
+    }
+    return -1;
+}
+
+// /proc/ish/jit: what runs and whether the AOT images are being used.
+size_t jit_describe(char *buf, size_t size) {
+    size_t n = 0;
+#define OUT(...) do { if (n < size) n += (size_t) snprintf(buf + n, size - n, __VA_ARGS__); } while (0)
+    const char *mode = !jit_on ? "off (gadgets only)" :
+                       aot_only ? "AOT images only (no executable memory)" :
+                       pic_on ? "JIT, position-independent" : "JIT";
+    OUT("mode: %s\n", mode);
+    OUT("AOT: %s (echo on|off > /proc/ish/jit; affects blocks compiled afterwards, i.e. new processes)\n",
+        aot_off ? "off" : "on");
+    OUT("blocks translated or looked up: %llu, AOT installs: %llu, reused: %llu\n",
+        (unsigned long long) st_blocks, (unsigned long long) st_aot, (unsigned long long) st_shared);
+    OUT("images: %u in use, %u rejected (abi %08x)\n", aot_nimages, aot_nrejected, jit_abi());
+    for (unsigned i = 0; i < aot_nimages; i++)
+        OUT("  ok        %s (%u translations)\n", aot_images[i]->path, aot_images[i]->ntrans);
+    for (unsigned i = 0; i < aot_nrejected; i++)
+        OUT("  rejected  %s (made by an ish with other conventions or layouts)\n", aot_rejected[i]->path);
+    // Modules that have an image: hits tell whether the module file is the
+    // one the image was recorded from (no hits at all: a different version).
+    pthread_mutex_lock(&reg_lock);
+    OUT("modules with an image (blocks / AOT hits):\n");
+    for (unsigned m = 0; m < mod_next_cap; m++) {
+        if (!mod_aot[m])
+            continue;
+        OUT("  %-40s %8llu / %-8llu %s\n", mod_aot[m]->path, (unsigned long long) mod_blocks[m],
+            (unsigned long long) mod_hits[m],
+            mod_hits[m] ? "" : mod_blocks[m] ? "<- no match: module file differs from the recorded one" : "");
+    }
+    for (unsigned i = 0; i < aot_nimages; i++) {
+        bool seen = false;
+        for (unsigned m = 0; m < mod_next_cap && !seen; m++)
+            seen = mod_aot[m] && !strcmp(mod_aot[m]->path, aot_images[i]->path);
+        if (!seen)
+            OUT("  %-40s not loaded by any process yet\n", aot_images[i]->path);
+    }
+    pthread_mutex_unlock(&reg_lock);
+#undef OUT
+    return n < size ? n : size;
+}
 
 void jit_report(void) {
     // ISH_JIT_DUMP=<file>: [u64 region base][u64 bytes][code], for attributing

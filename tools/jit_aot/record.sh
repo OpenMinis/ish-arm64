@@ -6,9 +6,13 @@
 #             it runs in one ish invocation so every translation shares one registry
 #   module    substring of the module's guest path (default: ld-musl)
 #
-# The image depends on gen.c and the pinned-register conventions of the ish
-# that recorded it, and on the exact module file: record again after changing
-# either (a mismatch is not an error, the loader just finds no matching keys).
+# The image depends on the ish that recorded it (gen.c, the pinned-register
+# conventions and the struct layouts the code loads from, summed up as the
+# "abi" of /proc/ish/jit; an ish with another abi rejects the image) and on the
+# module's bytes: it is matched to the module by ELF build-id, wherever that
+# file is installed (by path for files without one), then block by block by
+# offset and instruction words. Record again after an ish or package upgrade;
+# a changed module is not an error, its blocks just stop matching.
 set -e
 [ $# -ge 4 ] || { sed -n '2,11p' "$0"; exit 1; }
 ish=$1 rootfs=$2 workload=$3 out=$4 module=${5:-ld-musl}
