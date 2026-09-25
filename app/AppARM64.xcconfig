@@ -17,7 +17,13 @@ CURRENT_PROJECT_VERSION = 806
 // Link meson-built libraries directly from the arm64 meson build dir.
 // These are NOT in the Frameworks build phase to prevent Xcode from
 // auto-discovering implicit dependencies on the x86 library targets.
-OTHER_LDFLAGS = $(inherited) $(MESON_BUILD_DIR)/libish.a $(MESON_BUILD_DIR)/libish_emu.a $(MESON_BUILD_DIR)/libfakefs.a
+OTHER_LDFLAGS = $(inherited) $(MESON_BUILD_DIR)/libish.a $(MESON_BUILD_DIR)/libish_emu.a $(MESON_BUILD_DIR)/libfakefs.a $(ISH_AOT_OBJECTS)
+
+// AOT images the app links in as extra objects: aot_<name>.S from
+// tools/jit_aot/gen.py, assembled for iOS, passed as .o paths (for example on
+// the xcodebuild command line). They are not part of ish and need
+// ISH_ENABLE_JIT = YES (see GuestARM64.xcconfig and asbestos/guest-arm64/aot.h).
+ISH_AOT_OBJECTS =
 
 // Header search paths needed for sources compiled directly in this target
 // (previously compiled in libiSHApp, which used AppLib.xcconfig)
