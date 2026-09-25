@@ -174,9 +174,20 @@ static void task_run_tlb_cleanup(void *arg) {
     struct task *self = current;
     if (self != NULL && self->mm_release_deferred && self->mm != NULL) {
         self->mm_release_deferred = false;
-        mm_release(self->mm);
+        // [T-ish-exit-mm-general-lock] Same handoff as do_exit: unpublish the
+        // mm under general_lock so a procfs reader cannot lock it after we
+        // destroy it, then release outside the lock.
+        lock(&self->general_lock);
+        struct mm *mm = self->mm;
         self->mm = NULL;
         self->mem = NULL;
+        unlock(&self->general_lock);
+        // [T-ish-mm-diag] The other half of the SAFETY-VALVE line: when the
+        // leaked thread finally unwinds and releases, and what refcount it
+        // finds — a value other than 1 here means a second holder.
+        printk("[iSH][DEFERRED-RELEASE] pid=%d mm_release from cleanup handler, mm=%p refcount_before=%u\n",
+               self->pid, (void *) mm, (unsigned) mm->refcount);
+        mm_release_from(mm, "cleanup_handler");
     }
 }
 

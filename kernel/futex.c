@@ -206,9 +206,33 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
-                int64_t remain_ms = (deadline_ns - now_ns) / 1000000LL;
-                if (remain_ms <= 0) { err = _ETIMEDOUT; break; }
-                poll_ms = remain_ms > 100 ? 100 : (int)remain_ms;
+                int64_t remain_ns = deadline_ns - now_ns;
+                if (remain_ns <= 0) { err = _ETIMEDOUT; break; }
+                // [T-ish-futex-subms-timeout] This used to be
+                // `remain_ms = remain / 1e6; if (remain_ms <= 0) ETIMEDOUT`:
+                // integer truncation made every sub-millisecond timeout — and
+                // the final <1 ms of every longer one — return ETIMEDOUT
+                // WITHOUT waiting. Go's runtime sleeps on futexes for
+                // "nanoseconds until the next timer", which is usually
+                // sub-ms, so each wait came straight back, the scheduler
+                // re-checked nanotime() and netpoll(0) and slept again: an
+                // idle tsproxy burned ~35% of a core at ~98k syscalls/s
+                // (futex / clock_gettime / epoll_pwait, [CPUTop] 2026-09-19).
+                // Sub-ms remainders now sleep for exactly that long on the
+                // host (a wake in the meantime is picked up by the 0 ms poll
+                // below, so latency is bounded by the remainder itself);
+                // ms-scale remainders poll for the whole milliseconds and
+                // leave the fraction to the sub-ms branch on the next turn,
+                // so a 1.5 ms wait is 1 ms of poll + 0.5 ms of sleep. A futex
+                // may wake late by scheduling slack, never early.
+                if (remain_ns < 1000000LL) {
+                    struct timespec ts = { .tv_sec = 0, .tv_nsec = (long) remain_ns };
+                    nanosleep(&ts, NULL);   // EINTR (signal) just falls through to the checks
+                    poll_ms = 0;
+                } else {
+                    int64_t remain_ms = remain_ns / 1000000LL;   // >= 1 here
+                    poll_ms = remain_ms > 100 ? 100 : (int)remain_ms;
+                }
             } else {
                 poll_ms = 100; // 100ms safety-net timeout for signal/stall checks
             }

@@ -92,9 +92,33 @@ noreturn void do_exit(int status) {
     }
 
     // release all our resources (may already be NULL if force-released by do_exit_group)
+    //
+    // [T-ish-exit-mm-general-lock] general_lock protects task->mm/task->mem
+    // against procfs: /proc/<pid>/{cmdline,environ,stat,statm,maps,mem} take
+    // general_lock, check task->mm, then read through task->mem holding only
+    // mem->lock as a READER. exec already swaps the mm under general_lock for
+    // exactly this reason (exec.c: "otherwise procfs might read the pointer
+    // before it's released and then try to lock it after it's released");
+    // do_exit did not, and never cleared task->mem at all. So a `ps` reading
+    // our entry could take mem->lock the instant mem_destroy unlocked it —
+    // pthread_rwlock_destroy returns EBUSY and wrlock_destroy traps (the
+    // mem_destroy+352 `brk #1` caught on device 2026-09-19) — or touch the
+    // freed mem (EXC_BAD_ACCESS at 0x38 = offsetof(struct mem, lock)). Both
+    // reproduce natively in under a second with a fork storm plus concurrent
+    // /proc readers (tests/regress/regress_proc_exit_race.sh).
+    //
+    // Publish "no memory" under general_lock FIRST, then destroy OUTSIDE it: a
+    // reader that got in before us holds general_lock for its whole read, so
+    // we cannot reach the destroy until it is done; a reader that comes after
+    // sees NULL and returns ESRCH-ish. Never destroy under general_lock —
+    // mem_destroy closes fds and may take other locks.
     if (current->mm != NULL) {
-        mm_release(current->mm);
+        lock(&current->general_lock);
+        struct mm *mm = current->mm;
         current->mm = NULL;
+        current->mem = NULL;
+        unlock(&current->general_lock);
+        mm_release_from(mm, "do_exit");
         // [T-ish-mm-leak-refcount-handoff] We just released it, so the pthread
         // cleanup handler must NOT release again.
         current->mm_release_deferred = false;
@@ -355,6 +379,11 @@ noreturn void do_exit_group(int status) {
                     // unblocks and re-enters do_exit(), that mm_release()s and
                     // clears the flag, so cleanup won't double-free.
                     task->mm_release_deferred = true;
+                    // [T-ish-mm-diag] Unconditional (not exec-trace gated): one
+                    // line per leaked thread, once — the flag above is set once.
+                    printk("[iSH][SAFETY-VALVE] tid=%d (group pid=%d) marked mm_release_deferred, mm=%p refcount=%u\n",
+                           task->pid, current->pid, (void *) task->mm,
+                           task->mm ? (unsigned) task->mm->refcount : 0u);
                     if (task->files != NULL) {
                         fdtable_release(task->files);
                         task->files = NULL;
@@ -368,8 +397,10 @@ noreturn void do_exit_group(int status) {
             }
             unlock(&group->lock);
             unlock(&pids_lock);
-            if (leaked > 0 && ish_exec_trace())
-                printk("SAFETY-VALVE[exit]: pid=%d leaked %d stuck host threads\n",
+            // [T-ish-mm-diag] Unconditional: do_exit_group runs once per
+            // process, so this is at most one line per exiting process.
+            if (leaked > 0)
+                printk("[iSH][SAFETY-VALVE] pid=%d leaked %d stuck threads, mm_release deferred\n",
                        current->pid, leaked);
         } else {
 

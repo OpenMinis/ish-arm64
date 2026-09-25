@@ -1717,6 +1717,7 @@ if get_option('kernel') == 'ish'
         'kernel/ipc.c',
         'kernel/ptrace.c',
         'kernel/native_offload.c',
+        'kernel/native_offload_policy.c',
 
         'kernel/fs.c',
         'kernel/fs_info.c',
@@ -1759,6 +1760,7 @@ if get_option('kernel') == 'ish'
         'util/timer.c',
         'util/sync.c',
         'util/fifo.c',
+        'util/verbosetrace.c',
         'util/fchdir.c',
         'util/signpost.c',
 

@@ -56,20 +56,41 @@ struct fd *generic_openat(struct fd *at, const char *path_raw, int flags, int mo
     }
     fd->mount = mount;
 
-    lock(&inodes_lock); // TODO: don't do this
     struct statbuf stat;
-    err = fd->mount->fs->fstat(fd, &stat);
-    if (err < 0) {
+    if (fd->inode != NULL) {
+        // [T-ish-openat-inode-early-ref] The filesystem already took the
+        // inode reference inside open() (fakefs does), so no concurrent
+        // path removal can orphan the row under us and fstat needs no lock.
+        // This is the hot path of a fork+exec storm: holding inodes_lock
+        // across fakefs_fstat's SQLite read was the convoy that parked 26
+        // threads here and 6 in inode_release (bt all, 2026-09-19) and
+        // 1484 in the 2026-09-18 IPS.
+        err = fd->mount->fs->fstat(fd, &stat);
+        if (err < 0)
+            goto error;
+    } else {
+        // Filesystems that do not pre-acquire keep d57b6d26's guarantee:
+        // "read the stat row" and "take the inode ref" are atomic against
+        // inode_release / inode_check_orphaned under inodes_lock.
+        lock(&inodes_lock); // TODO: don't do this
+        err = fd->mount->fs->fstat(fd, &stat);
+        if (err < 0) {
+            unlock(&inodes_lock);
+            goto error;
+        }
+        fd->inode = inode_get_unlocked(mount, stat.inode);
+        if (fd->inode == NULL) {
+            unlock(&inodes_lock);
+            err = _ENOMEM;
+            goto error;
+        }
         unlock(&inodes_lock);
-        goto error;
     }
-    fd->inode = inode_get_unlocked(mount, stat.inode);
-    if (fd->inode == NULL) {
-        unlock(&inodes_lock);
-        err = _ENOMEM;
-        goto error;
-    }
-    unlock(&inodes_lock);
+    // [T-ish-exec-fewer-meta-txns] Whatever the fs did with its open-time
+    // stat cache, it must not outlive this open: a later fstat has to see
+    // current metadata. Keep the stat itself for exec.
+    fd->fake_open_stat.valid = false;
+    fd->open_stat = stat;
     fd->type = stat.mode & S_IFMT;
     fd->flags = flags;
 
@@ -162,6 +183,7 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
         err = _EPERM;
     else
         err = mount->fs->link(mount, src, dst);
+    path_cache_invalidate();
     mount_release(mount);
     mount_release(dst_mount);
     return err;
@@ -180,6 +202,7 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->unlink)
         err = mount->fs->unlink(mount, path);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -205,6 +228,7 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
         err = _EPERM;
     else
         err = mount->fs->rename(mount, src, dst);
+    path_cache_invalidate();
     mount_release(mount);
     mount_release(dst_mount);
     return err;
@@ -219,6 +243,7 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
     err = _EPERM;
     if (mount->fs->symlink)
         err = mount->fs->symlink(mount, target, link);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -237,6 +262,7 @@ int generic_mknodat(struct fd *at, const char *path_raw, mode_t_ mode, dev_t_ de
     err = _EPERM;
     if (mount->fs->mknod)
         err = mount->fs->mknod(mount, path, mode, dev);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -289,6 +315,7 @@ int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
     err = _EPERM;
     if (mount->fs->mkdir)
         err = mount->fs->mkdir(mount, path, mode);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }
@@ -304,6 +331,7 @@ int generic_rmdirat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->rmdir)
         err = mount->fs->rmdir(mount, path);
+    path_cache_invalidate();
     mount_release(mount);
     return err;
 }

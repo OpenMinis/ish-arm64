@@ -118,6 +118,10 @@ static int proc_pid_statm_show(struct proc_entry *entry, struct proc_data *buf) 
     unsigned long total = 0;   // total program size (VmSize, in pages)
     unsigned long resident = 0; // resident set size (VmRSS, in pages)
     unsigned long shared = 0;   // resident shared pages
+    // [T-ish-exit-mm-general-lock] general_lock is what keeps task->mem alive
+    // while we walk it (do_exit unpublishes the mm under it); cmdline/environ
+    // already did this, statm/maps/mem did not.
+    lock(&task->general_lock);
     struct mem *mem = task->mem;
     if (mem != NULL) {
         read_wrlock(&mem->lock);
@@ -138,6 +142,7 @@ static int proc_pid_statm_show(struct proc_entry *entry, struct proc_data *buf) 
         }
         read_wrunlock(&mem->lock);
     }
+    unlock(&task->general_lock);
 
     proc_printf(buf, "%lu ", total);    // total program size
     proc_printf(buf, "%lu ", resident); // resident set size
@@ -266,7 +271,9 @@ static int proc_pid_maps_show(struct proc_entry *entry, struct proc_data *buf) {
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    lock(&task->general_lock);   // [T-ish-exit-mm-general-lock]
     proc_maps_dump(task, buf);
+    unlock(&task->general_lock);
     proc_put_task(task);
     return 0;
 }
@@ -275,7 +282,9 @@ static ssize_t proc_pid_mem_pread(struct proc_entry *entry, struct proc_data *bu
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    lock(&task->general_lock);   // [T-ish-exit-mm-general-lock]
     int result = user_read_task(task, (addr_t)offset, buf->data, buf->size);
+    unlock(&task->general_lock);
     proc_put_task(task);
     return result ? -1 : buf->size;
 }
@@ -284,7 +293,9 @@ static ssize_t proc_pid_mem_pwrite(struct proc_entry *entry, struct proc_data *b
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    lock(&task->general_lock);   // [T-ish-exit-mm-general-lock]
     int result = user_write_task_ptrace(task, (addr_t)offset, buf->data, buf->size);
+    unlock(&task->general_lock);
     proc_put_task(task);
     return result ? -1 : buf->size;
 }
