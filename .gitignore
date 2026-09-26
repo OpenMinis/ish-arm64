@@ -24,3 +24,7 @@ bench/
 tools/prebuilt_gadget_gen/__pycache__/
 tools/prebuilt_gadget_gen/*.bak
 .cache/
+
+# Recorded AOT images (large, per-build); regenerate them with benchmark/aojit/images/COOKBOOK.md
+benchmark/aojit/images/*
+!benchmark/aojit/images/COOKBOOK.md
