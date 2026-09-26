@@ -2209,7 +2209,8 @@ static const struct aot_module *mod_image(int mod) {
                 mod_same[mod] |= 1ULL << i;
             else
                 mod_family[mod] |= 1ULL << i;
-            if (!mod_aot[mod])
+            // shown in /proc/ish/jit: this build's image if there is one
+            if (!mod_aot[mod] || (match == IMG_SAME && !(mod_same[mod] & ((1ULL << i) - 1))))
                 mod_aot[mod] = aot_images[i];
         }
     }
@@ -3095,7 +3096,7 @@ size_t jit_describe(char *buf, size_t size) {
     for (unsigned i = 0; i < aot_nimages; i++) {
         bool seen = false;
         for (unsigned m = 0; m < mod_next_cap && !seen; m++)
-            seen = mod_aot[m] && !strcmp(mod_aot[m]->path, aot_images[i]->path);
+            seen = mod_aot_known[m] && ((mod_same[m] | mod_family[m]) >> i & 1);
         if (!seen)
             OUT("  %-40s not loaded by any process yet\n", aot_images[i]->path);
     }
