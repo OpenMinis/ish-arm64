@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "AOT images the AOJIT cases are measured against. module: substring of the guest path",
+    "(ISH_JIT_RECORD_MOD); workload: guest script (under /tmp/aojit) recorded in one ish run.",
+    "Recorded on a rootfs with the packages below (apk; pip for python-pptx)."
+  ],
+  "packages": {
+    "apk": ["musl", "busybox", "python3", "py3-pip", "zlib", "nodejs", "bzip2", "openssl", "sqlite-libs",
+            "py3-numpy", "py3-pandas", "py3-matplotlib", "py3-pillow", "py3-reportlab", "py3-lxml",
+            "py3-requests", "py3-httpx", "py3-jwt", "py3-cryptography", "py3-beautifulsoup4"],
+    "pip": ["python-pptx"]
+  },
+  "images": {
+    "musl":    {"module": "ld-musl",               "workload": "shell/record_all.sh"},
+    "busybox": {"module": "/bin/busybox",          "workload": "busybox/bb_all.sh"},
+    "zlib":    {"module": "libz.so",               "workload": "zlib/zlib_train.sh"},
+    "python":  {"module": "libpython3.12",         "workload": "py/all.sh"},
+    "node":    {"module": "/usr/bin/node",         "workload": "node/node_all.sh"},
+    "crypto":  {"module": "libcrypto.so",          "workload": "net/tls_train.sh"},
+    "ssl":     {"module": "libssl.so",             "workload": "net/tls_train.sh"},
+    "sqlite":  {"module": "libsqlite3.so",         "workload": "net/sqlite_train.sh"},
+    "imaging": {"module": "PIL/_imaging.cpython",  "workload": "pil/train.sh"},
+    "webp":    {"module": "libwebp.so",            "workload": "pil/train.sh"},
+    "jpeg":    {"module": "libjpeg.so",            "workload": "pil/train.sh"},
+    "numpy":   {"module": "_multiarray_umath",     "workload": "doc/numpy_train.sh"}
+  }
+}
