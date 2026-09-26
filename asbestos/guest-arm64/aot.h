@@ -32,6 +32,13 @@ struct aot_trans {
     const struct aot_loop *loop;
 };
 
+// Content hash of a translation's key (key_content_hash()) -> its index in
+// trans[], sorted by hash: finds a block whose bytes moved in another version.
+struct aot_hash {
+    uint64_t hash;
+    uint32_t trans, pad;
+};
+
 struct aot_module {
     const char *path;             // guest path of the module
     uint64_t size;
@@ -43,6 +50,10 @@ struct aot_module {
     const uint32_t *text_start, *text_end;
     uint32_t build_id_len;        // NT_GNU_BUILD_ID of the module, matched before the path
     uint8_t build_id[20];
+    const char *family;           // fnmatch() pattern over file names this image may also serve
+                                  // (other versions: blocks are matched by content), or NULL
+    const struct aot_hash *by_hash;
+    uint32_t nhash, pad2;
 };
 
 // Called by an image's constructor, before main. Needs ish built with -Djit=true.

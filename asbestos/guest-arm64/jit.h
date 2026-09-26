@@ -70,6 +70,11 @@ void jit_block(struct fiber_block *block, struct jit_units *units);
 
 // Per-block state, set up by gen_start().
 void jit_block_init(struct fiber_block *block);
+// The block is about to be freed (no thread runs it): its translation's slot
+// is free for another block. A slot has one owner at a time, so a direct link
+// into its translation, made while the owner was the successor, always finds
+// the owner there.
+void jit_block_free(struct fiber_block *block);
 struct asbestos;
 // The address space is going away: release its module contexts.
 void jit_asbestos_free(struct asbestos *asbestos);
@@ -79,8 +84,14 @@ void jit_asbestos_free(struct asbestos *asbestos);
 void jit_link(struct fiber_block *from, int i, struct fiber_block *to);
 void jit_unlink(struct fiber_block *from, int i);
 // May jump_ip[i] of `from` be chained to `to`? PIC code branches directly to
-// the successor it was linked to first, so its slot may only ever hold that.
+// the successor it was linked to first (an AOT image: when it was recorded),
+// so its slot may only ever hold that. A refused successor is marked in the
+// slot instead (jit_chain_refused()): from's native code then enters it the
+// generic way, through the block cache, rather than leaving to the run loop.
 bool jit_chain_ok(struct fiber_block *from, int i, struct fiber_block *to);
+// true: from's native code now enters `to` itself; the caller records the
+// relation so that `to` leaving the cache unlinks it (jit_unlink()).
+bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to);
 
 // Leave the thread's JIT write mode (if a compile or link entered it) before
 // running guest code.

@@ -741,6 +741,9 @@ static void fiber_block_disconnect(struct asbestos *asbestos, struct fiber_block
 
 static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *block) {
     fiber_block_disconnect(asbestos, block);
+#ifdef ISH_JIT
+    jit_block_free(block);
+#endif
     free(block);
 }
 
@@ -748,6 +751,9 @@ static void fiber_free_jetsam(struct asbestos *asbestos) {
     struct fiber_block *block, *tmp;
     list_for_each_entry_safe(&asbestos->jetsam, block, tmp, jetsam) {
         list_remove(&block->jetsam);
+#ifdef ISH_JIT
+        jit_block_free(block);
+#endif
         free(block);
     }
 }
@@ -1005,18 +1011,26 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 // and is thus assumed to have no pointers left
                 if (!last_block->is_jetsam && !block->is_jetsam) {
                     for (int i = 0; i <= 1; i++) {
-                        if (last_block->jump_ip[i] != NULL &&
-                                (*last_block->jump_ip[i] & 0xffffffff) == block->addr
+                        if (last_block->jump_ip[i] == NULL ||
+                                (*last_block->jump_ip[i] & 0xffffffff) != block->addr)
+                            continue;
 #ifdef ISH_JIT
-                                && jit_chain_ok(last_block, i, block)
-#endif
-                                ) {
-                            *last_block->jump_ip[i] = (unsigned long) block->code;
-                            list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
-#ifdef ISH_JIT
-                            jit_link(last_block, i, block);
-#endif
+                        if (!jit_chain_ok(last_block, i, block)) {
+                            // still unchained, but its native code may enter block
+                            // directly; block leaving the cache undoes that
+                            if (jit_chain_refused(last_block, i, block)) {
+                                list_remove_safe(&last_block->jumps_from_links[i]);
+                                list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
+                            }
+                            continue;
                         }
+                        list_remove_safe(&last_block->jumps_from_links[i]);
+#endif
+                        *last_block->jump_ip[i] = (unsigned long) block->code;
+                        list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
+#ifdef ISH_JIT
+                        jit_link(last_block, i, block);
+#endif
                     }
                 }
                 unlock(&asbestos->lock);

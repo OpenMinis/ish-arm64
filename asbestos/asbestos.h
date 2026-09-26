@@ -87,6 +87,7 @@ struct fiber_block {
     uint32_t *native_loop;      // self-loop block: head of the promoted loop body
     uintptr_t native_entry;     // hot entry of the native code at code[0], 0 if none
     void *jit_ctx;              // PIC: module context the native code runs with (x29)
+    unsigned jit_idx;           // PIC: its translation's slot in that context
 #endif
 
     unsigned long code[];

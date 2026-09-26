@@ -25,12 +25,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
 
 from tqdm import tqdm
 
+NO_LINKS = False     # --no-links: every block end takes the generic path (successor native or not)
 KEY_HDR = 7          # key words before the units: mod, off lo/hi, page offset, units, 2 slots
 KEY_UNIT = 9         # words per unit; words 7 and 8 of a unit are its gadget pointer
 LINK_UNSET = 1
@@ -117,7 +119,7 @@ def emit_segment(out, syms, t, s, seg, stats):
             continue
         _, slot, tt, ts, tw = sp
         site = f'{seg_label(t, s)}_l{slot}'
-        if tt >= 0 and (tt, ts) in stats['labels']:
+        if tt >= 0 and (tt, ts) in stats['labels'] and not NO_LINKS:
             dest = f'{seg_label(tt, ts)} + {4 * tw}'
             out.append(f'{site}:')
             out.append(f'    b {dest}')
@@ -169,6 +171,38 @@ def build_id_of(path):
     return b''
 
 
+def insn_norm(w):
+    """insn_norm() of jit.c: a guest word without the pc-relative immediate the translation does not
+    depend on (branch targets come from the block's code stream, adr / adrp targets from dbase)."""
+    if (w & 0x7C000000) == 0x14000000: return w & 0xFC000000            # b, bl
+    if (w & 0xFF000010) == 0x54000000: return w & 0xFF00001F            # b.cond
+    if (w & 0x7E000000) == 0x34000000: return w & 0xFF00001F            # cbz / cbnz
+    if (w & 0x7E000000) == 0x36000000: return w & 0xFFF8001F            # tbz / tbnz
+    if (w & 0x1F000000) == 0x10000000: return w & 0x9F00001F            # adr / adrp
+    return w
+
+
+def content_hash(key):
+    """key_content_hash() of jit.c: FNV-1a over the key words after the module, file offset and page
+    offset (instruction words normalized), skipping the gadget words. Finds a block whose code moved
+    or whose pc-relative immediates changed in another module version."""
+    h = 0xcbf29ce484222325
+    for i in range(4, len(key)):
+        if i >= KEY_HDR and (i - KEY_HDR) % KEY_UNIT >= 7:
+            continue
+        w = insn_norm(key[i]) if i >= KEY_HDR and (i - KEY_HDR) % KEY_UNIT in (5, 6) else key[i]
+        h = ((h ^ w) * 0x100000001b3) & 0xffffffffffffffff
+    return h
+
+
+def default_family(mod):
+    """The file names an image also serves: other versions of a library keep its soname prefix
+    (libz.so.1.3.2 -> libz.so.1*), a program its name."""
+    name = os.path.basename(mod)
+    m = re.match(r'^(.*\.so\.\d+)(\.[\d.]+)?$', name)
+    return m.group(1) + '*' if m else name
+
+
 def sha256_of(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -186,9 +220,16 @@ def main():
     ap.add_argument('--name', default='musl')
     ap.add_argument('--keep', help='only translations with a segment at one of these file offsets '
                     '(one per line, hex or decimal): the hot code from a profile; the rest runs as gadgets')
+    ap.add_argument('--family', help='fnmatch() pattern of the file names this image also serves (other '
+                    'versions of the module, matched block by block); default from the file name, '
+                    '"" for none')
     ap.add_argument('--abi', help='abi of the ish that recorded, for a recording made before the header had it '
                     '(the "abi" of /proc/ish/jit in that same build)')
+    ap.add_argument('--no-links', action='store_true', help='no static links between translations: a block '
+                    'end enters its successor through the generic path, so it chains to any successor')
     args = ap.parse_args()
+    global NO_LINKS
+    NO_LINKS = args.no_links
 
     header, trans = load_recording(args.recording)
     abi = header.get('abi') or (int(args.abi, 16) if args.abi else None)
@@ -298,6 +339,14 @@ def main():
         lines.append(f'    .quad {links[0]}, {links[1]}, {f"Ll{ti}" if t["_loop"] else "0"}')
     digest = sha256_of(mod_file)
     build_id = build_id_of(mod_file)
+    family = default_family(mod) if args.family is None else args.family
+    lines.append('    .p2align 3')
+    lines.append('Lbyhash:')
+    for h, ti in sorted((content_hash(t['key']), ti) for ti, t in enumerate(trans)):
+        lines.append(f'    .quad {h}')
+        lines.append(f'    .long {ti}, 0')
+    if family:
+        lines.append(f'Lfamily:\n    .asciz "{family}"')
     lines += ['Lpath:', f'    .asciz "{mod}"', '    .p2align 3',
               f'    .globl _ish_aot_module_{args.name}',
               f'_ish_aot_module_{args.name}:',
@@ -310,7 +359,10 @@ def main():
               '    .quad Laot_text_start, Laot_text_end',
               f'    .long {len(build_id)}',
               '    .byte ' + ', '.join(str(b) for b in build_id.ljust(20, b'\0')),
-              '    .p2align 3', '',
+              '    .p2align 3',
+              f'    .quad {"Lfamily" if family else "0"}',
+              '    .quad Lbyhash',
+              f'    .long {len(trans)}, 0', '',
               # Register the image when the binary that links it is loaded.
               '    .text',
               '    .p2align 2',
@@ -324,7 +376,8 @@ def main():
     with open(args.out, 'w') as f:
         f.write('\n'.join(lines))
     print(f"✅ {args.out}: {stats['sym']} symbols, {stats['exit']} exits, "
-          f"{stats['linked']} static links ({stats['unlinked']} unlinked), sha256 {digest.hex()[:16]}…")
+          f"{stats['linked']} static links ({stats['unlinked']} unlinked), family {family or '-'}, "
+          f"sha256 {digest.hex()[:16]}…")
 
 
 if __name__ == '__main__':
