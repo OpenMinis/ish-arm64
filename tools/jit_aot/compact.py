@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Rewrite an AOT image (aot_<name>.S from gen.py) into the compact table layout of
+"""Rewrite an AOT image made in the old 64-bit table layout (gen.py before the compact
+layout, abi daf8fcc7) into the compact table layout of
 asbestos/guest-arm64/aot.h: 32-bit self-relative pointers instead of 64-bit absolute ones
 (Ltrans, Lg, Ls), and keys without the words that are always 0 in an image (per unit the
 high dpc word and the two gadget words). The native code is left byte for byte as it is.
@@ -33,11 +34,8 @@ def compact_key(ti, words):
     return [f'    .long ' + ', '.join(str(x) for x in out[i:i + 8]) for i in range(0, len(out), 8)]
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('src'); ap.add_argument('dst'); ap.add_argument('--abi', required=True)
-    args = ap.parse_args()
-    abi = int(args.abi, 16)
+def compact_lines(lines, abi):
+    """The compact image for the lines (no line ends) of one in the 64-bit layout, and stats."""
     out, held, mode, key, ti, trans_line, in_data, after_ltrans_ptr = [], None, None, [], None, 0, False, False
     stats = {'k_in': 0, 'k_out': 0, 'ptr': 0}
 
@@ -49,8 +47,7 @@ def main():
             out.extend(lines)
         key = []
 
-    for line in open(args.src):
-        line = line.rstrip('\n')
+    for line in lines:
         t = line.strip()
         if t.startswith('.section'):
             in_data = '__DATA,__const' in t
@@ -94,6 +91,15 @@ def main():
     flush_key()
     if held is not None:
         out.append(held)
+    return out, stats
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('src'); ap.add_argument('dst'); ap.add_argument('--abi', required=True)
+    args = ap.parse_args()
+    abi = int(args.abi, 16)
+    out, stats = compact_lines((line.rstrip('\n') for line in open(args.src)), abi)
     open(args.dst, 'w').write('\n'.join(out) + '\n')
     print(f'✅ {args.dst}: key words {stats["k_in"]} -> {stats["k_out"]}, {stats["ptr"]} pointers made relative, abi {abi:08x}')
 
