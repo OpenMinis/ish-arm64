@@ -1,10 +1,44 @@
-# AOT image cookbook
+# AOJIT: AOT images, their workloads and tests
 
-Recorded AOT images live here but are not committed (see `.gitignore`: everything under
-`benchmark/aojit/images/` except this file). They are large (the set below is about 2 GB with
-recordings) and tied to one ish build, so regenerate them instead of sharing them.
+AOT images are the ARM64 JIT's translations of one guest module, recorded ahead of time and linked
+into a target (the Mac CLI with `-Dcli_aot`, the app with `ISH_AOT_OBJECTS`). This directory holds
+what makes and checks them; the generic tools are in `tools/jit_aot/`.
 
 ## Layout
+
+```
+tools/jit_aot/             the image pipeline (host, no dependency on this suite)
+├── record.sh              record one module with a JIT build and make its .S (RECORDING= keeps the raw file)
+├── gen.py                 recording -> aot_<name>.S in the compact table layout
+├── compact.py             .S of the older 64-bit table layout -> compact layout (code unchanged)
+└── attrib.py              macOS `sample` + ISH_JIT_MAP -> CPU per guest module
+
+benchmark/aojit/           images, workloads and tests (host scripts at the top)
+├── images.json            the images: module path substring, recording workload, packages
+├── record_images.sh       record the images of images.json (in parallel), IOS=1 also assembles iOS .o
+├── install.sh             copy guest/ into a rootfs as /tmp/aojit and make the inputs (Mac CLI)
+├── phone.sh               the same inside the app, run the cases, send the results back
+├── verify.sh              three-way check: AOT on / AOT off / ISH_JIT=0 must print the same
+├── profile.sh             is a module worth an image: wall on/off/all-native, translations, CPU per module
+├── compat.sh              the ARM64 compatibility suite (benchmark/run.sh) against a given ish
+├── images/                recorded images (not committed, see below)
+└── guest/                 copied to /tmp/aojit in the guest
+    ├── run_cases.py, cases.json, setup.sh   A/B cases (AOT on/off, hits per module), input generation
+    ├── <module>/          per module or area: its recording workload (*_train.sh), the case workloads
+    │                      and the generators of their inputs (gen_*); busybox charts doc net node pil
+    │                      py pyext rg shell ssh zlib
+    ├── verify/            the checks of verify.sh (check.sh, threeway.sh, futex_stress.py)
+    └── measure/           workloads for profile.sh (ssh, curl, py, py_local, py_tls, rg, git, zlib)
+```
+
+Inputs (JSON, logs, images, certificates, the 10 MB scp file) are generated in the guest by
+`guest/setup.sh` and the scripts themselves, never committed.
+
+## Images
+
+Recorded AOT images live in `images/` but are not committed (`.gitignore`). They are large (the set
+below is about 2 GB with recordings) and tied to one ish build, so regenerate them instead of
+sharing them.
 
 ```
 images/
@@ -19,7 +53,7 @@ images/
     └── minis/             the set MinisApp links (its deps/aot), same layout
 ```
 
-`<name>` and what each image covers are in `../images.json` (module substring, recording
+`<name>` and what each image covers are in `images.json` (module substring, recording
 workload, packages).
 
 An image only loads into an ish with the same abi (`jit_abi()`: `JIT_CODE_VERSION` in
@@ -65,8 +99,21 @@ Rootfs used: `latest` = `alpine-arm64-321-latest` (musl, busybox, zlib, python, 
 `/Users/ethan/Src/github.com/ish-arm64/` (untracked). The build 822/823 IPAs link the first 12 `latest/ios/*.o`. ssh and scp came later (2026-09-27, rootfs `alpine-arm64-321-cand` = full + openssh-client). Their workload needs an sshd in a second ish; start it from `guest/ssh/server.sh` on a fakefs rootfs (sshd rejects a realfs `/var/empty`). sftp-mode scp also needs `prctl(PR_SET_DUMPABLE)` support on that server side. The Python extension images (about 6.3 MB of iOS objects) cut local one-liner CPU by about 5%. The rg image (24 MB) makes a directory search 1.21× faster in wall time. rg's worker threads spend most of their CPU in ish's own lock and file-syscall paths, which the image does not change.
 
 The musl, busybox, zlib, python and node images of this set were recorded with the workloads
-before they moved into `../guest/`. Those workloads had the same scripts under `/tmp/p0`, `/tmp/p3`,
+before they moved into `guest/`. Those workloads had the same scripts under `/tmp/p0`, `/tmp/p3`,
 `/tmp/p5`, `/tmp/p6` and `/tmp/pz`, so a new recording differs only in noise.
+
+## Is a module worth an image?
+
+```sh
+benchmark/aojit/profile.sh py_local build-arm64-aot/ish build-arm64-jit/ish -r $R
+```
+
+It prints the workload's wall time with the images on, off and with everything native (the runtime
+JIT build: roughly what images of every module would give), the translations per module and the
+CPU per module. A module is worth recording when the gap between "AOT on" and "all native" is
+large and its own share of the CPU explains it (ssh: 76% of the CPU in ssh itself, 2.1x; curl:
+libcurl about 2%, not worth it). `guest/measure/` holds the workloads; git needs a fakefs rootfs
+(`-f`), since git hangs on the Mac CLI's realfs.
 
 ## Regenerate
 
@@ -145,9 +192,15 @@ xcodebuild -exportArchive -archivePath build-ipa/iSH-ARM64.xcarchive -exportPath
 build-arm64-aot/ish -r $R /bin/cat /proc/ish/jit      # every image "ok", none "rejected"
 build-arm64-aot/ish -r $R /usr/bin/python3 /tmp/aojit/run_cases.py            # quick tier A/B
 build-arm64-aot/ish -r $R /usr/bin/python3 /tmp/aojit/run_cases.py --tier all # everything
+AOJIT_SSH=127.0.0.1:2222 benchmark/aojit/verify.sh build-arm64-aot/ish -r $R   # three-way, exit 1 on a difference
+benchmark/aojit/compat.sh build-arm64-aot/ish                                   # 227 compatibility tests
 ```
 
-On the phone: `sh /tmp/phone.sh <host> <repo dir on host>` (see `../phone.sh`). Add `OLDLIB=<dir>`
+`verify.sh` and the ssh cases need an sshd in a second ish on a fakefs rootfs:
+`build-arm64-jit/ish -f <fakefs> /bin/sh /tmp/aojit/ssh/server.sh 2222 < <client public keys>`
+(`guest/ssh/keys.sh` prints them). Without `AOJIT_SSH` the ssh part is skipped.
+
+On the phone: `sh /tmp/phone.sh <host> <repo dir on host>` (see `phone.sh`). Add `OLDLIB=<dir>`
 for the family cases.
 
 Reference, 822 on the Mac, quick tier:

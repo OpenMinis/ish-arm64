@@ -1,3 +1,4 @@
+# Candidate workload (profile.sh): zlib/gzip/zipfile compression from python.
 import gzip, random, zlib
 random.seed(7)
 words = [''.join(random.choice('abcdefghijklmnop') for _ in range(random.randint(2, 9))).encode() for _ in range(3000)]

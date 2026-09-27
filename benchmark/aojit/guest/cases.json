@@ -25,7 +25,7 @@
     {"id": "bb.grep_r", "group": "busybox", "title": "grep -r", "tier": "quick", "images": ["musl", "busybox"],
      "cmd": "grep -r -c 'def ' /usr/lib/python3.12/email /usr/lib/python3.12/json /usr/lib/python3.12/asyncio"},
     {"id": "bb.all", "volatile": true, "group": "busybox", "title": "busybox 全家桶(录制负载)", "tier": "full", "images": ["musl", "busybox"],
-     "cmd": "sh bb_all.sh"},
+     "cmd": "sh busybox_train.sh"},
 
     {"id": "node.startup_x5", "group": "node", "title": "node 启动 x5", "tier": "quick", "images": ["musl", "node"], "needs": ["bin:node"],
      "cmd": "for i in 1 2 3 4 5; do node -e 'console.log(1)'; done"},

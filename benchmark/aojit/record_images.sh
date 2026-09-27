@@ -8,19 +8,17 @@
 #             (JOBS, default 3). Link them with -Dcli_aot=<.S list> (Mac CLI) or
 #             ISH_AOT_OBJECTS=<.o list> (app); they are not part of the repo.
 set -e
-[ $# -ge 3 ] || { sed -n '2,11p' "$0"; exit 1; }
+[ $# -ge 3 ] || { sed -n '2,9p' "$0"; exit 1; }
 ish=$1 rootfs=$2 out=$3; shift 3
 here=$(cd "$(dirname "$0")" && pwd)
-gen=$here/../../tools/jit_aot/gen.py
+record=$here/../../tools/jit_aot/record.sh
 mkdir -p "$out/rec"
 names=${*:-$(python3 -c "import json; print(' '.join(json.load(open('$here/images.json'))['images']))")}
 rec() {
     name=$1
     set -- $(python3 -c "import json; i = json.load(open('$here/images.json'))['images']['$name']; print(i['module'], i['workload'])")
-    echo "📼 $name: $1 <- /tmp/aojit/$2"
-    ISH_JIT_PIC=1 ISH_JIT_RECORD="$out/rec/$name.jsonl" ISH_JIT_RECORD_MOD="$1" \
-        "$ish" -r "$rootfs" /bin/sh "/tmp/aojit/$2" > /dev/null 2>&1 || echo "⚠️  $name: workload exited $?"
-    python3 "$gen" "$out/rec/$name.jsonl" "$ish" "$rootfs" "$out/aot_$name.S" --name "$name" 2>&1 | grep -E "✅|❌" | cut -c1-160
+    RECORDING="$out/rec/$name.jsonl" sh "$record" "$ish" "$rootfs" "/tmp/aojit/$2" "$out/aot_$name.S" "$1" 2>&1 |
+        grep -E "✅|❌|⚠️" | sed "s/^/[$name] /" | cut -c1-170
     [ "$IOS" = 1 ] || return 0
     xcrun -sdk iphoneos clang -target arm64-apple-ios15.0 -c -o "$out/aot_${name}_ios.o" "$out/aot_$name.S" && echo "📱 $out/aot_${name}_ios.o"
 }
