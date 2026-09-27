@@ -9,8 +9,14 @@
 
 #include <stdint.h>
 
+// Pointers from the tables are 32-bit offsets from the field itself (0: none),
+// so the linker fixes them once and the loader has nothing to rebase.
+static inline const void *aot_rel(const int32_t *field) {
+    return *field ? (const char *) field + *field : (const void *) 0;
+}
+
 struct aot_seg {
-    const uint32_t *code;
+    int32_t code;                 // -> the native code (aot_rel)
     uint32_t pos;                 // code-stream slot it replaces
     uint32_t words;
 };
@@ -21,15 +27,19 @@ struct aot_loop {                 // self-loop block: promoted registers in [lo,
     int8_t g[8], d[8], h[8];      // promoted guest reg, donor guest reg, host reg
 };
 
+// The key as stored: reg_key()'s 7 header words, then per unit 6 of its 9
+// (start, end, n/follow/last, dpc, w0, w1): the high dpc word and the gadget
+// words are always 0 in an image and left out (AOT_KEY_UNIT).
+#define AOT_KEY_UNIT 6
 struct aot_trans {
     uint64_t off;                 // file offset of the block
-    uint32_t idx, nkey;           // module-context index; key length in words
-    const uint32_t *key;          // module word and gadget words zero
-    const void *const *gadget;    // per unit: the gadget at the unit's start, or 0
-    const struct aot_seg *seg;
+    uint32_t idx, nkey;           // module-context index; key length in words as reg_key() builds it
+    int32_t key;                  // -> compact key (above)
+    int32_t gadget;               // -> per unit an int32 (aot_rel) to the gadget at the unit's start, or 0
+    int32_t seg;                  // -> struct aot_seg[nseg]
     uint32_t nseg, nunits;
-    const uint32_t *link[2];      // direct-link branch per jump_ip slot, or 0
-    const struct aot_loop *loop;
+    int32_t link[2];              // -> direct-link branch per jump_ip slot, or 0
+    int32_t loop;                 // -> struct aot_loop, or 0
 };
 
 // Content hash of a translation's key (key_content_hash()) -> its index in

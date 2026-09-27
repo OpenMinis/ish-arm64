@@ -2281,15 +2281,32 @@ static const struct aot_offidx *aot_offidx_get(unsigned img) {
 
 // Key words of a recorded translation against a block's (gadgets excepted:
 // the image has 0 there, the pointers are compared separately).
-static bool aot_key_same(const uint32_t *tk, const uint32_t *k, unsigned nkey) {
+static bool aot_key_same(const struct aot_trans *t, const uint32_t *k, unsigned nkey) {
+    const uint32_t *tk = aot_rel(&t->key);
     for (unsigned i = 1; i < 7 && i < nkey; i++)
         if (tk[i] != k[i])
             return false;
-    for (unsigned u = 7; u < nkey; u += 9)
-        for (unsigned j = 0; j < 9 && u + j < nkey; j++)
-            if (tk[u + j] != (j < 7 ? k[u + j] : 0))
-                return false;
+    for (unsigned u = 7, c = 7; u + 9 <= nkey; u += 9, c += AOT_KEY_UNIT) {
+        const uint32_t *ku = &k[u], *tu = &tk[c];
+        if (ku[0] != tu[0] || ku[1] != tu[1] || ku[2] != tu[2] || ku[3] != tu[3] || ku[4] != 0 ||
+            ku[5] != tu[4] || ku[6] != tu[5])
+            return false;
+    }
     return true;
+}
+
+// Word i of t's key as reg_key() lays it out (the image leaves out words that are 0).
+static uint32_t aot_key_word(const struct aot_trans *t, unsigned i) {
+    static const int8_t at[9] = {0, 1, 2, 3, -1, 4, 5, -1, -1};
+    const uint32_t *tk = aot_rel(&t->key);
+    if (i < 7)
+        return tk[i];
+    int j = at[(i - 7) % 9];
+    return j < 0 ? 0 : tk[7 + AOT_KEY_UNIT * ((i - 7) / 9) + (unsigned) j];
+}
+
+static const void *aot_gadget(const struct aot_trans *t, unsigned u) {
+    return aot_rel(&((const int32_t *) aot_rel(&t->gadget))[u]);
 }
 
 // The recorded translation of b (key as built by reg_key), if image img has it.
@@ -2314,10 +2331,10 @@ static const struct aot_trans *aot_find(unsigned img, const struct fiber_block *
         const struct aot_trans *t = &m->trans[lo];
         if (t->nkey != nkey || t->nunits != U->n)
             continue;
-        bool same = aot_key_same(t->key, key, nkey);
+        bool same = aot_key_same(t, key, nkey);
         for (unsigned u = 0; same && u < U->n; u++) {
             uintptr_t g = U->u[u].start < b->used ? b->code[U->u[u].start] : 0;
-            same = (uintptr_t) t->gadget[u] == g;
+            same = (uintptr_t) aot_gadget(t, u) == g;
         }
         if (same)
             return t;
@@ -2389,12 +2406,12 @@ static bool aot_slot_usable(struct aot_place *p, const struct aot_module *m, con
 // A self-loop translation also keeps its branches.
 static bool aot_fits_moved(const struct aot_trans *t, const uint32_t *k, unsigned nkey, uint64_t off,
                            const struct fiber_block *b, uint64_t *dbase, bool *fixed_out) {
-    bool loop = t->loop != NULL, fixed = false, have = false;
+    bool loop = t->loop != 0, fixed = false, have = false;
     int64_t shift = (int64_t) (off - t->off);   // no adr / adrp: as the code moved
     for (unsigned i = 4; i < nkey; i++) {
         if (key_is_gadget(i))
             continue;
-        uint32_t w = t->key[i];
+        uint32_t w = aot_key_word(t, i);
         if (!key_is_insn(i) || loop) {
             if (w != k[i]) return false;
             continue;
@@ -2403,13 +2420,13 @@ static bool aot_fits_moved(const struct aot_trans *t, const uint32_t *k, unsigne
         fixed |= w != k[i];
     }
     for (unsigned u = 0; u < k[4]; u++) {
-        const uint32_t *ku = &k[7 + 9 * u], *tu = &t->key[7 + 9 * u];
+        const uint32_t *ku = &k[7 + 9 * u];
         uint64_t dpc = ku[3] | (uint64_t) ku[4] << 32;
         for (unsigned j = 0; j < (ku[2] & 0xff) && j < 2; j++) {
             if ((ku[5 + j] & 0x1F000000u) != 0x10000000u)
                 continue;
             int64_t d = (int64_t) (adr_target(ku[5 + j], off + dpc + 4 * j) -
-                                   adr_target(tu[5 + j], t->off + dpc + 4 * j));
+                                   adr_target(aot_key_word(t, 7 + 9 * u + 5 + j), t->off + dpc + 4 * j));
             if (have && d != shift)
                 return false;
             have = true;
@@ -2445,7 +2462,7 @@ static const struct aot_trans *aot_find_moved(const struct aot_module *m, const 
         bool same = true;
         for (unsigned u = 0; same && u < U->n; u++) {
             uintptr_t g = U->u[u].start < b->used ? b->code[U->u[u].start] : 0;
-            same = (uintptr_t) t->gadget[u] == g;
+            same = (uintptr_t) aot_gadget(t, u) == g;
         }
         // The same code is often recorded at several places (short
         // epilogues and the like, one per function): take a copy whose slot
@@ -2510,12 +2527,14 @@ static bool aot_install(struct fiber_block *b, struct jit_ctx *ctx, const struct
     if (!slot_claim(ctx, t->idx, b, b->addr - t->off, dbase))
         return false;
     b->jit_ctx = ctx;
-    b->native_link[0] = (uint32_t *) t->link[0];
-    b->native_link[1] = (uint32_t *) t->link[1];
+    b->native_link[0] = (uint32_t *) aot_rel(&t->link[0]);
+    b->native_link[1] = (uint32_t *) aot_rel(&t->link[1]);
+    const struct aot_seg *seg = aot_rel(&t->seg);
     for (unsigned i = 0; i < t->nseg; i++) {
-        b->code[t->seg[i].pos] = (unsigned long) t->seg[i].code;
-        if (t->seg[i].pos == 0 && n_pinned)
-            __atomic_store_n(&b->native_entry, (uintptr_t) t->seg[i].code + (uintptr_t) entry, __ATOMIC_RELEASE);
+        uintptr_t code = (uintptr_t) aot_rel(&seg[i].code);
+        b->code[seg[i].pos] = (unsigned long) code;
+        if (seg[i].pos == 0 && n_pinned)
+            __atomic_store_n(&b->native_entry, code + (uintptr_t) entry, __ATOMIC_RELEASE);
     }
     return true;
 }
@@ -2730,7 +2749,7 @@ bool jit_crash_sync(void *ucontext) {
         pthread_mutex_unlock(&loopmap_lock);
     } else {
         for (unsigned k = 0; k < img->ntrans; k++) {
-            const struct aot_loop *l = img->trans[k].loop;
+            const struct aot_loop *l = aot_rel(&img->trans[k].loop);
             if (!l || pc < (uintptr_t) l->lo || pc >= (uintptr_t) l->hi)
                 continue;
             lm.n = l->n;
