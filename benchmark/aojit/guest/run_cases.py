@@ -76,6 +76,8 @@ def missing_needs(case):
             return need
         if kind == 'file' and not os.path.exists(what):
             return need
+        if kind == 'env' and not os.environ.get(what):
+            return need
         if kind == 'py' and subprocess.run([sys.executable, '-c', f'import {what}'], capture_output=True).returncode:
             return need
     return None

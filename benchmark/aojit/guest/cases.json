@@ -2,7 +2,8 @@
   "_comment": [
     "AOJIT (AOT on JIT code) cases. cmd runs with sh -c in /tmp/aojit/<group>, output discarded;",
     "wall time is measured with AOT on and off (echo on|off > /proc/ish/jit) in the same ish.",
-    "needs: 'bin:<cmd>' / 'py:<module>' / 'file:<path>' must hold or the case is skipped.",
+    "needs: 'bin:<cmd>' / 'py:<module>' / 'file:<path>' / 'env:<VAR>' must hold or the case is skipped.",
+    "ssh cases: AOJIT_SSH=host:port of the sshd from ssh/server.sh (another ish) and the keys of ssh/keys.sh.",
     "images: the recorded images (images.json) the case is meant to exercise.",
     "family: true = runs an older build of the modules (from /tmp/aojit/oldlib) against images",
     "recorded from the current ones, i.e. the family-matching path.",
@@ -85,6 +86,10 @@
     {"id": "net.node_sqlite", "group": "net", "title": "node:sqlite(未录制)", "tier": "full", "images": ["musl", "node", "sqlite"], "needs": ["bin:node"], "holdout": true,
      "cmd": "node node_sqlite.js"},
 
+    {"id": "ssh.cmd_x8", "group": "ssh", "title": "ssh 远程命令 x8(每次握手)", "tier": "quick", "images": ["musl", "ssh", "crypto"], "needs": ["env:AOJIT_SSH", "bin:ssh"],
+     "cmd": "O='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR'; for i in 1 2 3 4 5 6 7 8; do ssh -p ${AOJIT_SSH#*:} $O root@${AOJIT_SSH%:*} 'head -1 /etc/os-release'; done"},
+    {"id": "ssh.scp_10m", "group": "ssh", "title": "scp 10MB 上传+下载", "tier": "full", "images": ["musl", "ssh", "scp", "crypto"], "needs": ["env:AOJIT_SSH", "bin:scp"],
+     "cmd": "O='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR'; head -c 10485760 /dev/urandom > r10m; scp -q -P ${AOJIT_SSH#*:} $O r10m root@${AOJIT_SSH%:*}:/tmp/u10m && scp -q -P ${AOJIT_SSH#*:} $O root@${AOJIT_SSH%:*}:/tmp/u10m d10m && cmp r10m d10m && echo same"},
     {"id": "family.py_startup", "group": "busybox", "title": "旧版 python 启动 x10", "tier": "quick", "family": true, "images": ["musl", "python"], "needs": ["file:/tmp/aojit/oldlib/libpython3.12.so.1.0"],
      "cmd": "for i in $(seq 1 10); do LD_LIBRARY_PATH=/tmp/aojit/oldlib python3 -c 'import json; print(1)'; done"},
     {"id": "family.zlib", "group": "busybox", "title": "旧版 zlib", "tier": "quick", "family": true, "images": ["zlib", "python"], "needs": ["file:/tmp/aojit/oldlib/libz.so.1"],

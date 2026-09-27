@@ -40,10 +40,11 @@ through family matching, other versions of it (`libz.so.1*`, …).
 | sqlite | libsqlite3.so.0 | sqlite-libs (Alpine 3.21) | ✅ | |
 | imaging, jpeg, webp | PIL `_imaging`, libjpeg.so.8, libwebp.so.7 | py3-pillow, libjpeg-turbo, libwebp | ✅ | |
 | numpy | numpy `_multiarray_umath` | py3-numpy (apk) | ✅ | |
+| ssh, scp | /usr/bin/ssh, /usr/bin/scp | openssh-client-default 9.9_p2-r0 (build-id df164958…, cbc5234e…) | ✅ | |
 
 Rootfs used: `latest` = `alpine-arm64-321-latest` (musl, busybox, zlib, python, node) and
 `alpine-arm64-321-full` (the other seven). `old` = `alpine-arm64-321-old`. All three are in the main checkout,
-`/Users/ethan/Src/github.com/ish-arm64/` (untracked). The build 822 IPA links all 12 `latest/ios/*.o`.
+`/Users/ethan/Src/github.com/ish-arm64/` (untracked). The build 822/823 IPAs link the first 12 `latest/ios/*.o`. ssh and scp came later (2026-09-27, rootfs `alpine-arm64-321-cand` = full + openssh-client). Their workload needs an sshd in a second ish; start it from `guest/ssh/server.sh` on a fakefs rootfs (sshd rejects a realfs `/var/empty`). sftp-mode scp also needs `prctl(PR_SET_DUMPABLE)` support on that server side.
 
 The musl, busybox, zlib, python and node images of this set were recorded with the workloads
 before they moved into `../guest/`. Those workloads had the same scripts under `/tmp/p0`, `/tmp/p3`,

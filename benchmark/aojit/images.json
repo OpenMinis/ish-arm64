@@ -2,12 +2,14 @@
   "_comment": [
     "AOT images the AOJIT cases are measured against. module: substring of the guest path",
     "(ISH_JIT_RECORD_MOD); workload: guest script (under /tmp/aojit) recorded in one ish run.",
-    "Recorded on a rootfs with the packages below (apk; pip for python-pptx)."
+    "Recorded on a rootfs with the packages below (apk; pip for python-pptx).",
+    "ssh, scp: need the sshd of guest/ssh/server.sh running in another ish (AOJIT_SSH=host:port, default 127.0.0.1:2222)."
   ],
   "packages": {
     "apk": ["musl", "busybox", "python3", "py3-pip", "zlib", "nodejs", "bzip2", "openssl", "sqlite-libs",
             "py3-numpy", "py3-pandas", "py3-matplotlib", "py3-pillow", "py3-reportlab", "py3-lxml",
-            "py3-requests", "py3-httpx", "py3-jwt", "py3-cryptography", "py3-beautifulsoup4"],
+            "py3-requests", "py3-httpx", "py3-jwt", "py3-cryptography", "py3-beautifulsoup4",
+            "openssh-client-default"],
     "pip": ["python-pptx"]
   },
   "images": {
@@ -22,6 +24,8 @@
     "imaging": {"module": "PIL/_imaging.cpython",  "workload": "pil/train.sh"},
     "webp":    {"module": "libwebp.so",            "workload": "pil/train.sh"},
     "jpeg":    {"module": "libjpeg.so",            "workload": "pil/train.sh"},
-    "numpy":   {"module": "_multiarray_umath",     "workload": "doc/numpy_train.sh"}
+    "numpy":   {"module": "_multiarray_umath",     "workload": "doc/numpy_train.sh"},
+    "ssh":     {"module": "/usr/bin/ssh",          "workload": "ssh/ssh_train.sh"},
+    "scp":     {"module": "/usr/bin/scp",          "workload": "ssh/ssh_train.sh"}
   }
 }
