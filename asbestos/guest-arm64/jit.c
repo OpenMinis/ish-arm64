@@ -49,11 +49,25 @@ static bool env_off(const char *name) {
 
 // ---------------------------------------------------------------- stats
 
-static _Atomic uint64_t st_blocks, st_segments, st_units, st_bytes, st_ns;
+static _Atomic uint64_t st_blocks, st_segments, st_units, st_bytes, st_ticks;
+
+// Timings summed over every block: jit_ticks() reads the counter without the
+// barrier mach_absolute_time() has, which would wait for the cache misses of the
+// lookup just before it (about as long as the lookup).
+static inline uint64_t jit_ticks(void) {
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+static double jit_ticks_ms(uint64_t ticks) {
+    uint64_t hz;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+    return hz ? (double) ticks * 1e3 / (double) hz : 0;
+}
 static _Atomic uint64_t st_unsupported_insns, st_fail_regs;
 static _Atomic uint64_t st_block_ends, st_block_end_fail, st_links, st_loops;
 static _Atomic uint64_t st_shared, st_aot, st_aot_moved, st_aot_busy, st_aot_fixed;
-static _Atomic uint64_t st_find_ticks;   // mach ticks spent in aot_lookup()
+static _Atomic uint64_t st_find_ticks;   // jit_ticks() spent in aot_lookup()
 
 // ---------------------------------------------------------------- code region
 //
@@ -2221,11 +2235,77 @@ static bool key_is_gadget(unsigned i) {
     return i >= 7 && (i - 7) % 9 >= 7;
 }
 
-// The recorded translation of b (key as built by reg_key), if the image has it.
-static const struct aot_trans *aot_find(const struct aot_module *m, const struct fiber_block *b,
+// Where each image's translations of a file offset start (reg_lock): its
+// trans[] is sorted by offset, and a lookup reads first[] for its bucket of
+// offsets instead of binary-searching the whole table (about 15 steps for
+// libpython, most of them cache misses). Made when the image is first
+// looked up, about one bucket per translation.
+struct aot_offidx {
+    uint32_t *first;            // bucket -> index of its first translation; nb + 1 entries
+    uint64_t lo;                // offset of trans[0]
+    size_t nb;
+    unsigned shift;             // bucket = (off - lo) >> shift
+    bool made;
+};
+static struct aot_offidx *aot_offidx;   // one per aot_images[]
+
+static const struct aot_offidx *aot_offidx_get(unsigned img) {
+    if (!aot_offidx)
+        aot_offidx = calloc(aot_nimages ? aot_nimages : 1, sizeof(*aot_offidx));
+    if (!aot_offidx)
+        return NULL;
+    struct aot_offidx *x = &aot_offidx[img];
+    if (x->made)
+        return x->first ? x : NULL;
+    x->made = true;
+    const struct aot_module *m = aot_images[img];
+    if (!m->ntrans || m->ntrans > UINT32_MAX)
+        return NULL;
+    uint64_t lo = m->trans[0].off, span = m->trans[m->ntrans - 1].off - lo + 1;
+    unsigned shift = 0;
+    while ((span >> shift) > m->ntrans)
+        shift++;
+    size_t nb = ((span - 1) >> shift) + 1;
+    uint32_t *first = malloc((nb + 1) * sizeof(*first));
+    if (!first)
+        return NULL;
+    size_t t = 0;
+    for (size_t bk = 0; bk <= nb; bk++) {
+        while (t < m->ntrans && ((m->trans[t].off - lo) >> shift) < bk)
+            t++;
+        first[bk] = (uint32_t) t;
+    }
+    *x = (struct aot_offidx) {first, lo, nb, shift, true};
+    return x;
+}
+
+// Key words of a recorded translation against a block's (gadgets excepted:
+// the image has 0 there, the pointers are compared separately).
+static bool aot_key_same(const uint32_t *tk, const uint32_t *k, unsigned nkey) {
+    for (unsigned i = 1; i < 7 && i < nkey; i++)
+        if (tk[i] != k[i])
+            return false;
+    for (unsigned u = 7; u < nkey; u += 9)
+        for (unsigned j = 0; j < 9 && u + j < nkey; j++)
+            if (tk[u + j] != (j < 7 ? k[u + j] : 0))
+                return false;
+    return true;
+}
+
+// The recorded translation of b (key as built by reg_key), if image img has it.
+static const struct aot_trans *aot_find(unsigned img, const struct fiber_block *b,
                                         const struct jit_units *U, const uint32_t *key, unsigned nkey) {
+    const struct aot_module *m = aot_images[img];
     uint64_t off = key[1] | (uint64_t) key[2] << 32;
     size_t lo = 0, hi = m->ntrans;
+    const struct aot_offidx *x = aot_offidx_get(img);
+    if (x) {
+        if (off < x->lo || ((off - x->lo) >> x->shift) >= x->nb)
+            return NULL;
+        size_t bk = (off - x->lo) >> x->shift;
+        lo = x->first[bk];
+        hi = x->first[bk + 1];
+    }
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
         if (m->trans[mid].off < off) lo = mid + 1; else hi = mid;
@@ -2234,9 +2314,7 @@ static const struct aot_trans *aot_find(const struct aot_module *m, const struct
         const struct aot_trans *t = &m->trans[lo];
         if (t->nkey != nkey || t->nunits != U->n)
             continue;
-        bool same = true;
-        for (unsigned i = 1; same && i < nkey; i++)
-            same = t->key[i] == (key_is_gadget(i) ? 0 : key[i]);
+        bool same = aot_key_same(t->key, key, nkey);
         for (unsigned u = 0; same && u < U->n; u++) {
             uintptr_t g = U->u[u].start < b->used ? b->code[U->u[u].start] : 0;
             same = (uintptr_t) t->gadget[u] == g;
@@ -2385,7 +2463,7 @@ static const struct aot_trans *aot_find_same(int mod, const struct fiber_block *
     for (unsigned i = 0; images; i++, images >>= 1) {
         if (!(images & 1))
             continue;
-        const struct aot_trans *t = aot_find(aot_images[i], b, U, key, nkey);
+        const struct aot_trans *t = aot_find(i, b, U, key, nkey);
         if (t) {
             *found = aot_images[i];
             return t;
@@ -2409,7 +2487,7 @@ static const struct aot_trans *aot_find_family(int mod, const struct fiber_block
         // down may have left another dbase here)
         *dbase = b->addr - off;
         *fixed = false;
-        const struct aot_trans *t = aot_find(m, b, U, key, nkey);
+        const struct aot_trans *t = aot_find(i, b, U, key, nkey);
         if (!t)
             t = aot_find_moved(m, b, U, key, nkey, place, off, dbase, fixed);
         if (t) {
@@ -2470,14 +2548,14 @@ static _Atomic uint64_t st_memo_hits, st_search_n, st_search_ticks;
 // the one made from this build wins wherever it has the block; then other
 // versions, through the memo.
 static const struct aot_trans *aot_lookup(int mod, const struct fiber_block *b, const struct jit_units *U,
-                                          const uint32_t *key, unsigned nkey, uint64_t h, uint64_t h2,
-                                          struct aot_place *place, uint64_t off,
+                                          const uint32_t *key, unsigned nkey, struct aot_place *place, uint64_t off,
                                           const struct aot_module **found, uint64_t *dbase, bool *fixed) {
     *dbase = b->addr - off;
     *fixed = false;
     const struct aot_trans *t = aot_find_same(mod, b, U, key, nkey, found);
     if (t || !mod_family[mod])
         return t;
+    uint64_t h2, h = reg_hash(key, nkey, &h2);
     if (!aot_memo)
         aot_memo = calloc((size_t) 1 << AOT_MEMO_BITS, sizeof(*aot_memo));
     struct aot_memo *mo = NULL;
@@ -2498,9 +2576,9 @@ static const struct aot_trans *aot_lookup(int mod, const struct fiber_block *b, 
         *fixed = mo->fixed;
         return &(*found)->trans[mo->trans];
     }
-    uint64_t ts = mach_absolute_time();
+    uint64_t ts = jit_ticks();
     t = aot_find_family(mod, b, U, key, nkey, place, off, found, dbase, fixed);
-    atomic_fetch_add_explicit(&st_search_ticks, mach_absolute_time() - ts, memory_order_relaxed);
+    atomic_fetch_add_explicit(&st_search_ticks, jit_ticks() - ts, memory_order_relaxed);
     atomic_fetch_add_explicit(&st_search_n, 1, memory_order_relaxed);
     if (mo) {
         mo->h = h; mo->h2 = h2; mo->valid = 1;
@@ -2535,17 +2613,18 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
     if (!aot_only && !(ctx = ctx_get(a, mod, base, NULL)))
         return;
     unsigned nkey = reg_key(b, U, mod, off, key);
-    uint64_t h2, h = reg_hash(key, nkey, &h2);
+    // for the registry (images are found by offset; aot_lookup() hashes for its memo)
+    uint64_t h2 = 0, h = aot_only ? 0 : reg_hash(key, nkey, &h2);
     pthread_mutex_lock(&reg_lock);
     const struct aot_module *img = mod_image(mod);
     struct aot_place place = {a, mod, base, NULL, NULL};
     uint64_t dbase = base;
     bool fixed = false;
-    uint64_t t0 = mach_absolute_time();
-    const struct aot_trans *at = img && !aot_off ? aot_lookup(mod, b, U, key, nkey, h, h2, &place, off, &img, &dbase, &fixed)
+    uint64_t t0 = jit_ticks();
+    const struct aot_trans *at = img && !aot_off ? aot_lookup(mod, b, U, key, nkey, &place, off, &img, &dbase, &fixed)
                                                  : NULL;
     if (img)
-        atomic_fetch_add_explicit(&st_find_ticks, mach_absolute_time() - t0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&st_find_ticks, jit_ticks() - t0, memory_order_relaxed);
     if ((unsigned) mod < mod_next_cap)
         mod_blocks[mod]++;
     if (at) {
@@ -3066,13 +3145,9 @@ size_t jit_describe(char *buf, size_t size) {
         (unsigned long long) st_aot, (unsigned long long) st_aot_moved, (unsigned long long) st_aot_fixed,
         (unsigned long long) st_aot_busy, (unsigned long long) st_shared);
     OUT("other versions: %s (ISH_AOT_FAMILY=0 turns off)\n", aot_family ? "images serve their family" : "off");
-    {
-        mach_timebase_info_data_t tb;
-        mach_timebase_info(&tb);
-        OUT("image lookups: %.1f ms (%llu answered from the memo; %llu searches of other versions: %.1f ms)\n",
-            (double) st_find_ticks * tb.numer / tb.denom / 1e6, (unsigned long long) st_memo_hits,
-            (unsigned long long) st_search_n, (double) st_search_ticks * tb.numer / tb.denom / 1e6);
-    }
+    OUT("image lookups: %.1f ms (%llu answered from the memo; %llu searches of other versions: %.1f ms)\n",
+        jit_ticks_ms(st_find_ticks), (unsigned long long) st_memo_hits,
+        (unsigned long long) st_search_n, jit_ticks_ms(st_search_ticks));
     OUT("images: %u in use, %u rejected (abi %08x)\n", aot_nimages, aot_nrejected, jit_abi());
     for (unsigned i = 0; i < aot_nimages; i++)
         OUT("  ok        %s (%u translations, family %s)\n", aot_images[i]->path, aot_images[i]->ntrans,
@@ -3132,7 +3207,7 @@ void jit_report(void) {
             "🛠  JIT(%s): blocks %llu, segments %llu, units %llu, code %llu KB, compile %.1f ms | "
             "block ends %llu (not translated %llu), direct links %llu, loop blocks %llu | "
             "unsupported insns %llu, out of regs %llu | shared %llu, AOT %llu (%u images)\n",
-            dual_map ? (pic_on ? "dual-map, PIC" : "dual-map") : (pic_on ? "MAP_JIT, PIC" : "MAP_JIT"), st_blocks, st_segments, st_units, st_bytes / 1024, st_ns / 1e6,
+            dual_map ? (pic_on ? "dual-map, PIC" : "dual-map") : (pic_on ? "MAP_JIT, PIC" : "MAP_JIT"), st_blocks, st_segments, st_units, st_bytes / 1024, jit_ticks_ms(st_ticks),
             st_block_ends, st_block_end_fail, st_links, st_loops, st_unsupported_insns, st_fail_regs, st_shared, st_aot, aot_nimages);
 }
 
@@ -3250,14 +3325,11 @@ void jit_block_init(struct fiber_block *b) {
 void jit_block(struct fiber_block *b, struct jit_units *U) {
     if (!U || U->n > JIT_MAX_UNITS)
         return;
-    uint64_t t0 = mach_absolute_time();
+    uint64_t t0 = jit_ticks();
     if (cm_on)
         cm_block(b);
     jit_translate(b, U, &scratch->em, scratch->key);
-    static mach_timebase_info_data_t tb;
-    if (!tb.denom)
-        mach_timebase_info(&tb);
-    atomic_fetch_add_explicit(&st_ns, (mach_absolute_time() - t0) * tb.numer / tb.denom, memory_order_relaxed);
+    atomic_fetch_add_explicit(&st_ticks, jit_ticks() - t0, memory_order_relaxed);
     atomic_fetch_add_explicit(&st_blocks, 1, memory_order_relaxed);
 }
 
