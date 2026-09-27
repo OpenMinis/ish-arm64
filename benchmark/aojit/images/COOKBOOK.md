@@ -42,11 +42,11 @@ through family matching, other versions of it (`libz.so.1*`, …).
 | numpy | numpy `_multiarray_umath` | py3-numpy (apk) | ✅ | |
 | ssh, scp | /usr/bin/ssh, /usr/bin/scp | openssh-client-default 9.9_p2-r0 (build-id df164958…, cbc5234e…) | ✅ | |
 | py* (11) | lib-dynload `_json` `_hashlib` `_blake2` `_struct` `_datetime` `binascii` `math` `zlib` `_socket` `select` `_ssl` | python3 3.12.14-r0 | ✅ | |
-| rg | /usr/bin/rg | ripgrep 14.1.1-r0 | ✅ (not recommended for the app: no measurable gain, see below) | |
+| rg | /usr/bin/rg | ripgrep 14.1.1-r0 | ✅ | |
 
 Rootfs used: `latest` = `alpine-arm64-321-latest` (musl, busybox, zlib, python, node) and
 `alpine-arm64-321-full` (the other seven). `old` = `alpine-arm64-321-old`. All three are in the main checkout,
-`/Users/ethan/Src/github.com/ish-arm64/` (untracked). The build 822/823 IPAs link the first 12 `latest/ios/*.o`. ssh and scp came later (2026-09-27, rootfs `alpine-arm64-321-cand` = full + openssh-client). Their workload needs an sshd in a second ish; start it from `guest/ssh/server.sh` on a fakefs rootfs (sshd rejects a realfs `/var/empty`). sftp-mode scp also needs `prctl(PR_SET_DUMPABLE)` support on that server side. The Python extension images (about 6.3 MB of iOS objects) cut local one-liner CPU by about 5%. The rg image (24 MB) shows no gain on the Mac: rg's time is ish's own file-syscall and path handling, which is the same with AOT off.
+`/Users/ethan/Src/github.com/ish-arm64/` (untracked). The build 822/823 IPAs link the first 12 `latest/ios/*.o`. ssh and scp came later (2026-09-27, rootfs `alpine-arm64-321-cand` = full + openssh-client). Their workload needs an sshd in a second ish; start it from `guest/ssh/server.sh` on a fakefs rootfs (sshd rejects a realfs `/var/empty`). sftp-mode scp also needs `prctl(PR_SET_DUMPABLE)` support on that server side. The Python extension images (about 6.3 MB of iOS objects) cut local one-liner CPU by about 5%. The rg image (24 MB) makes a directory search 1.21× faster in wall time. rg's worker threads spend most of their CPU in ish's own lock and file-syscall paths, which the image does not change.
 
 The musl, busybox, zlib, python and node images of this set were recorded with the workloads
 before they moved into `../guest/`. Those workloads had the same scripts under `/tmp/p0`, `/tmp/p3`,
