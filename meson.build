@@ -1771,6 +1771,10 @@ if get_option('kernel') == 'ish'
         include_directories: includes)
     ish = declare_dependency(
         link_with: [libish, libish_emu, libfakefs],
+        # cpu-offsets.h is generated, and main.c includes it: every target
+        # using ish waits for it before compiling (else a fresh build dir can
+        # compile main.c before the header exists or while it is written).
+        sources: offsets,
         # link_whole so the offload test handlers' self-registering constructors
         # survive dead-strip (empty unless -Doffload_test_*=true).
         link_whole: offload_test_libs,
