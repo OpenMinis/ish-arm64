@@ -612,6 +612,7 @@ static void apply_exec_semantics(const char *guest_file) {
     update_thread_name();
 
     current->did_exec = true;
+    current->undumpable = false;
     vfork_notify(current);
     fdtable_do_cloexec(current->files);
 

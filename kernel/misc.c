@@ -1,11 +1,24 @@
 #include <string.h>
 #include "kernel/calls.h"
 
+#define PRCTL_GET_DUMPABLE_ 3
+#define PRCTL_SET_DUMPABLE_ 4
 #define PRCTL_SET_KEEPCAPS_ 8
 #define PRCTL_SET_NAME_ 15
 
 int_t sys_prctl(dword_t option, addr_t arg2, addr_t UNUSED(arg3), addr_t UNUSED(arg4), addr_t UNUSED(arg5)) {
     switch (option) {
+        // Nothing dumps core here, but sftp-server, sshd and other hardened
+        // programs set this at startup and exit when it fails.
+        case PRCTL_GET_DUMPABLE_:
+            STRACE("prctl(PR_GET_DUMPABLE)");
+            return current->undumpable ? 0 : 1;
+        case PRCTL_SET_DUMPABLE_:
+            STRACE("prctl(PR_SET_DUMPABLE, %d)", arg2);
+            if (arg2 > 1)
+                return _EINVAL;
+            current->undumpable = arg2 == 0;
+            return 0;
         case PRCTL_SET_KEEPCAPS_:
             // stub
             return 0;

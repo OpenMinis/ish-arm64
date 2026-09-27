@@ -733,6 +733,7 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     unlock(&current->sighand->lock);
 
     current->did_exec = true;
+    current->undumpable = false;
     vfork_notify(current);
 
     if (current->ptrace.traced) {

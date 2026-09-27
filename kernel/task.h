@@ -32,6 +32,7 @@ struct task {
     uid_t_ groups[MAX_GROUPS];
     char comm[16] __strncpy_safe; // locked by general_lock
     bool did_exec; // for that one annoying setsid edge case
+    bool undumpable; // prctl(PR_SET_DUMPABLE, 0); inherited by fork, cleared by exec
 
     struct fdtable *files;
     struct fs_info *fs;
