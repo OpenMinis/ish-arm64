@@ -12,3 +12,6 @@ node /tmp/aojit/shell/node.js
 sh /tmp/aojit/shell/shell_out.sh
 bzip2 -c /tmp/aojit/shell/bz.in | bzip2 -dc | wc -c
 python3 /tmp/aojit/shell/selfmod.py
+# busybox grep/find: the regex and directory-walk paths of musl
+sh /tmp/aojit/busybox/grep_train.sh
+sh /tmp/aojit/busybox/find_train.sh

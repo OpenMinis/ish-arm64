@@ -34,3 +34,6 @@ tar cf t.tar tree; gzip -c t.tar > t.tar.gz; gunzip -c t.tar.gz | tar tf - | wc 
 md5sum log.csv n.txt; sha256sum log.csv | cut -c1-16; cksum n.txt
 date +%s > /dev/null; basename /a/b/c.txt .txt; dirname /a/b/c.txt; expr 7 \* 6; od -c words.txt | head -2
 cd /; rm -rf $W
+# grep/find as agents use them (busybox applets over musl regex): see grep_train.sh, find_train.sh
+sh /tmp/aojit/busybox/grep_train.sh
+sh /tmp/aojit/busybox/find_train.sh

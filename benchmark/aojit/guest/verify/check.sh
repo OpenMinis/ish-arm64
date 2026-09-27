@@ -12,8 +12,11 @@ print(len(s), hashlib.sha256(b).hexdigest(), hashlib.blake2b(b).hexdigest()[:16]
 print(json.loads(s)[12345], struct.pack("<IqHd", 1, -2, 3, 4.5).hex(), binascii.crc32(b), zlib.adler32(zlib.decompress(zlib.compress(b, 9))))
 print(base64.b64encode(b[:48]).decode(), datetime.datetime(2026, 9, 27, 12, 0).isoformat(), round(sum(math.sqrt(i) + math.sin(i) for i in range(50000)), 6))'
 echo "== python ssl/socket/select against a local https server"
+if [ ! -s /tmp/aojit/net/rsa.crt ]; then
+    echo "skipped (no certificates: setup.sh makes them when openssl is installed)"
+else
 cd /tmp/aojit/net && rm -f server_8490.ready; python3 tls_server.py 8490 rsa & spid=$!
-while [ ! -f server_8490.ready ]; do sleep 0.2; done
+n=0; while [ ! -f server_8490.ready ] && [ $n -lt 150 ]; do sleep 0.2; n=$((n + 1)); done
 python3 -c '
 import json, ssl, socket, select, urllib.request
 c = ssl.create_default_context(cafile="/tmp/aojit/net/ca_bundle.pem")
@@ -27,7 +30,9 @@ while True:
     if not x: break
     n += len(x)
 print("blob bytes > 1MB:", n > 1 << 20)'
-kill $spid; wait $spid 2>/dev/null; cd $V
+kill $spid; wait $spid 2>/dev/null
+fi
+cd $V
 echo "== sqlite"
 python3 -c '
 import sqlite3, hashlib
