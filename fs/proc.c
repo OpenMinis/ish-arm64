@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include "kernel/calls.h"
@@ -283,11 +284,27 @@ void proc_buf_append(struct proc_data *buf, const void *data, size_t size) {
 
 void proc_printf(struct proc_data *buf, const char *format, ...) {
     char data[4096];
-    va_list args;
+    va_list args, again;
     va_start(args, format);
-    size_t size = vsnprintf(data, sizeof(data), format, args);
+    va_copy(again, args);
+    int size = vsnprintf(data, sizeof(data), format, args);
     va_end(args);
-    proc_buf_append(buf, data, size);
+    // vsnprintf returns the length the whole text needs: longer ones (e.g.
+    // /proc/ish/jit with many images) are formatted again on the heap instead
+    // of appending past the end of data
+    if (size >= (int) sizeof(data)) {
+        char *big = malloc((size_t) size + 1);
+        if (big) {
+            vsnprintf(big, (size_t) size + 1, format, again);
+            proc_buf_append(buf, big, (size_t) size);
+            free(big);
+        } else {
+            proc_buf_append(buf, data, sizeof(data) - 1);
+        }
+    } else if (size > 0) {
+        proc_buf_append(buf, data, (size_t) size);
+    }
+    va_end(again);
 }
 
 const struct fs_ops procfs = {
