@@ -32,6 +32,13 @@ import sys
 
 from tqdm import tqdm
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compact import compact_lines   # noqa: E402
+
+# Recorders from before the compact table layout: their images need compact.py and the
+# abi of the ish that loads them, not the one in the recording.
+PRE_COMPACT_ABIS = {0xdaf8fcc7}
+
 NO_LINKS = False     # --no-links: every block end takes the generic path (successor native or not)
 KEY_HDR = 7          # key words before the units: mod, off lo/hi, page offset, units, 2 slots
 KEY_UNIT = 9         # words per unit; words 7 and 8 of a unit are its gadget pointer
@@ -235,6 +242,9 @@ def main():
     abi = header.get('abi') or (int(args.abi, 16) if args.abi else None)
     if not abi:
         sys.exit(f"❌ {args.recording}: no abi in the header; re-record, or pass --abi of the ish that made it")
+    if abi in PRE_COMPACT_ABIS:
+        sys.exit(f"❌ {args.recording}: recorded by an ish with the 64-bit table layout (abi {abi:08x}); record "
+                 "with a current ish (an image in the compact layout needs its abi)")
     mods = {t['mod'] for t in trans}
     if len(mods) != 1:
         sys.exit(f"❌ expected one module in the recording, got {sorted(mods)}")
@@ -373,8 +383,10 @@ def main():
               '    .section __DATA,__mod_init_func,mod_init_funcs',
               '    .p2align 3',
               '    .quad Laot_register', '']
+    # The tables go out in the compact layout of aot.h (compact.py; the code is unchanged).
+    out, _ = compact_lines('\n'.join(lines).split('\n'), abi)
     with open(args.out, 'w') as f:
-        f.write('\n'.join(lines))
+        f.write('\n'.join(out) + '\n')
     print(f"✅ {args.out}: {stats['sym']} symbols, {stats['exit']} exits, "
           f"{stats['linked']} static links ({stats['unlinked']} unlinked), family {family or '-'}, "
           f"sha256 {digest.hex()[:16]}…")

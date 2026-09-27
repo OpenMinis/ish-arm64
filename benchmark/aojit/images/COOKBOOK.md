@@ -13,9 +13,10 @@ images/
     │   ├── S/aot_<name>.S     images (tools/jit_aot/gen.py output), for -Dcli_aot
     │   ├── ios/aot_<name>_ios.o   the same, assembled for iOS, for ISH_AOT_OBJECTS
     │   └── rec/<name>.jsonl   raw recordings (ISH_JIT_RECORD); gen.py turns them into .S again
-    └── old/               recorded on older package versions (family-matching A/B)
-        ├── S/ …
-        └── rec/ …
+    ├── old/               recorded on older package versions (family-matching A/B)
+    │   ├── S/ …
+    │   └── rec/ …
+    └── minis/             the set MinisApp links (its deps/aot), same layout
 ```
 
 `<name>` and what each image covers are in `../images.json` (module substring, recording
@@ -27,7 +28,22 @@ An image only loads into an ish with the same abi (`jit_abi()`: `JIT_CODE_VERSIO
 again into a new `<abi>/` directory. Within one abi, an image serves its exact module (build-id) and,
 through family matching, other versions of it (`libz.so.1*`, …).
 
-## Current set: abi `daf8fcc7` (JIT_CODE_VERSION 7, branch feat/aot-family-match, build 822)
+**Table layout.** Since abi `97963b7f` the tables use the compact layout of
+`asbestos/guest-arm64/aot.h`: 32-bit self-relative pointers (the linker resolves them, dyld has
+nothing to rebase) and keys without the words that are always 0. `gen.py` writes it; images made
+before it (abi `daf8fcc7`, the 64-bit layout) are rewritten with `tools/jit_aot/compact.py <in.S>
+<out.S> --abi 97963b7f`, which leaves the native code byte for byte as it is. On the 26 images this
+made the linked app 9% smaller (tables 77.1 -> 53.4 MB, rebases 2.43M -> 7.3K); the IPA stays about
+the same size, since the relative offsets compress less well than the absolute pointers did.
+
+- `daf8fcc7/`: the 64-bit layout, for feat/aot-family-match up to `0e59def6` (build 822/823). Its
+  `rec/` recordings cannot go through the current gen.py (their recorder is gone and gen.py refuses
+  that abi); convert the `.S` with compact.py instead.
+- `97963b7f/`: the compact layout. `latest/` is the 26-image set converted from `daf8fcc7/latest`;
+  `minis/` is MinisApp's 25-image set (musl, busybox and zlib from `old/`, libcrypto, libssl and
+  pcre2 recorded on the app's rootfs), converted the same way.
+
+## Current set: abi `97963b7f` (JIT_CODE_VERSION 7, compact tables; recorded at `daf8fcc7`, converted)
 
 | image | module | recorded on | latest/S | old/S |
 |---|---|---|---|---|
