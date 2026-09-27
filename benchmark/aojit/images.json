@@ -9,7 +9,7 @@
     "apk": ["musl", "busybox", "python3", "py3-pip", "zlib", "nodejs", "bzip2", "openssl", "sqlite-libs",
             "py3-numpy", "py3-pandas", "py3-matplotlib", "py3-pillow", "py3-reportlab", "py3-lxml",
             "py3-requests", "py3-httpx", "py3-jwt", "py3-cryptography", "py3-beautifulsoup4",
-            "openssh-client-default"],
+            "openssh-client-default", "ripgrep"],
     "pip": ["python-pptx"]
   },
   "images": {
@@ -26,6 +26,18 @@
     "jpeg":    {"module": "libjpeg.so",            "workload": "pil/train.sh"},
     "numpy":   {"module": "_multiarray_umath",     "workload": "doc/numpy_train.sh"},
     "ssh":     {"module": "/usr/bin/ssh",          "workload": "ssh/ssh_train.sh"},
-    "scp":     {"module": "/usr/bin/scp",          "workload": "ssh/ssh_train.sh"}
+    "scp":     {"module": "/usr/bin/scp",          "workload": "ssh/ssh_train.sh"},
+    "rg":      {"module": "/usr/bin/rg",           "workload": "rg/rg_train.sh"},
+    "pyjson": {"module": "lib-dynload/_json.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyhashlib": {"module": "lib-dynload/_hashlib.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyblake2": {"module": "lib-dynload/_blake2.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pystruct": {"module": "lib-dynload/_struct.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pydatetime": {"module": "lib-dynload/_datetime.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pybinascii": {"module": "lib-dynload/binascii.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pymath": {"module": "lib-dynload/math.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyzlib": {"module": "lib-dynload/zlib.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pysocket": {"module": "lib-dynload/_socket.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyselect": {"module": "lib-dynload/select.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyssl": {"module": "lib-dynload/_ssl.cpython-312", "workload": "pyext/pyext_train.sh"}
   }
 }
