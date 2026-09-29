@@ -126,10 +126,19 @@ static bool map_jit(void) {
 #endif
 
 static uint8_t *region_alloc(size_t bytes) {
-    size_t off = atomic_fetch_add(&region_used, (bytes + 15) & ~(size_t) 15);
-    if (off + bytes > REGION_SIZE)
+    // Failed reservations must not consume space (or wrap the cursor). Check
+    // before rounding too: SIZE_MAX would otherwise round down to zero.
+    if (!region || !bytes || bytes > REGION_SIZE)
         return NULL;
-    return region + off;
+    size_t aligned = (bytes + 15) & ~(size_t) 15;
+    size_t off = atomic_load_explicit(&region_used, memory_order_relaxed);
+    for (;;) {
+        if (off > REGION_SIZE || aligned > REGION_SIZE - off)
+            return NULL;
+        if (atomic_compare_exchange_weak_explicit(&region_used, &off, off + aligned,
+                                                  memory_order_relaxed, memory_order_relaxed))
+            return region + off;
+    }
 }
 
 // MAP_JIT W^X is per thread and only this thread's fiber runs its native
@@ -2725,16 +2734,17 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
     pthread_mutex_unlock(&reg_lock);
 }
 
-// Host fault inside native code: the pinned guest registers only live in host
-// registers, so copy them from the signal context into cpu_state before the
-// crash-recovery path re-runs the block.
+// Host fault inside native code: copy pinned state from the signal context.
+// AOT-only has no dynamic region but still uses pinned registers. This is state
+// synchronisation only: it does NOT make the caller's block replay a safe retry
+// (exact fault PC/access metadata and partially committed effects are separate).
 bool jit_crash_sync(void *ucontext) {
-    if (!region || n_pinned <= 0)
+    if (n_pinned <= 0)
         return false;
     ucontext_t *uc = ucontext;
     uintptr_t pc = uc->uc_mcontext->__ss.__pc;
     const struct aot_module *img = NULL;
-    bool in_region = pc >= (uintptr_t) region && pc < (uintptr_t) region + REGION_SIZE;
+    bool in_region = region && pc >= (uintptr_t) region && pc < (uintptr_t) region + REGION_SIZE;
     if (!in_region && !in_aot_text(pc, &img))
         return false;
     char *cpu = (char *) uc->uc_mcontext->__ss.__x[1];
@@ -2765,6 +2775,10 @@ bool jit_crash_sync(void *ucontext) {
     }
     for (unsigned k = 0; k < lm.n; k++)
         *(uint64_t *) (cpu + greg_off(lm.g[k])) = uc->uc_mcontext->__ss.__x[lm.h[k]];
+    // Match the normal exit's str w15: only the low 32 bits of cpu->cycle
+    // are updated, even though the backing field is a host long.
+    uint32_t cycle = (uint32_t) uc->uc_mcontext->__ss.__x[H_CYC];
+    memcpy(cpu + CPU_cycle, &cycle, sizeof(cycle));
     return true;
 }
 
@@ -3208,10 +3222,15 @@ void jit_report(void) {
     if (dump) {
         FILE *f = fopen(dump, "wb");
         if (f) {
-            uint64_t base = (uint64_t) (uintptr_t) region, used = region_used;
+            uint64_t base = (uint64_t) (uintptr_t) region;
+            size_t reserved = atomic_load_explicit(&region_used, memory_order_relaxed);
+            // Keep diagnostics bounded even if the reservation cursor is bad.
+            // It is a reservation high-water mark, not a code-publication barrier.
+            uint64_t used = region ? (reserved < REGION_SIZE ? reserved : REGION_SIZE) : 0;
             fwrite(&base, 8, 1, f);
             fwrite(&used, 8, 1, f);
-            fwrite(region, 1, used, f);
+            if (used)
+                fwrite(region, 1, used, f);
             fclose(f);
         }
     }
