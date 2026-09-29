@@ -1,5 +1,10 @@
 # Experimental JIT/AOT bounded safety fixes — 29 September 2026
 
+> Historical report for `083eca69`. The subsequent
+> [precise-restart repair](JIT_PRECISE_RESTART_2026-09-29.md) supersedes the recovery
+> implementation and the restart/loopmap blockers below. Other platform and
+> adoption limits remain.
+
 ## Branch and scope
 
 This is **`fix/jit-aot-safety`**, based on the OpenMinis AOT-family tip

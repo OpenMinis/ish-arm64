@@ -21,6 +21,7 @@
 #include "asbestos/guest-arm64/jit.h"
 #include "asbestos/guest-arm64/aot.h"
 #include "asbestos/asbestos.h"
+#include "asbestos/frame.h"
 #include "emu/cpu.h"
 #include "emu/mmu.h"
 #include "emu/tlb.h"
@@ -257,6 +258,7 @@ struct em {
     struct fiber_block *b; // block being translated
     unsigned idx;          // PIC: the translation's index in its module context
     uint64_t base;         // PIC: guest address the module's constants are relative to
+    uint64_t fault_pc;     // exact guest instruction currently being emitted
     uint32_t buf[8192];
     unsigned n;
     int8_t host[33];
@@ -685,6 +687,48 @@ static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) 
     put(e, 0x8B000000u | (T_A << 16) | (T_E << 5) | T_A);      // add x9, x11, x9
 }
 
+// Emit exactly one faultable host access. All guest state is canonical in the
+// frame BEFORE the instruction: write-through lazy/vector values already are;
+// pinned/promoted values are saved here without replacing live host registers.
+// Only this host instruction's PC is recoverable. ADR survives recording and
+// relocation unchanged, so the same protocol works in read-only AOT images.
+// x1 is the frame's CPU base; ADD-immediate and STR-immediate encodings below
+// require these layout properties. A layout change must fail at build time.
+_Static_assert(offsetof(struct fiber_frame, cpu) == 0, "native checkpoint base");
+_Static_assert(offsetof(struct fiber_frame, native_fault_host_pc) / 4096 < 4096, "checkpoint ADD range");
+_Static_assert(offsetof(struct fiber_frame, native_fault_write) -
+    (offsetof(struct fiber_frame, native_fault_host_pc) & ~4095u) < 32768, "checkpoint STR range");
+_Static_assert(offsetof(struct fiber_frame, native_fault_host_pc) % 8 == 0 &&
+    offsetof(struct fiber_frame, native_fault_guest_pc) % 8 == 0 &&
+    offsetof(struct fiber_frame, native_fault_addr) % 8 == 0 &&
+    offsetof(struct fiber_frame, native_fault_write) % 8 == 0, "checkpoint alignment");
+static void emit_guest_access(struct em *e, uint32_t insn, bool write) {
+    for (int g = 0; g <= G_SP; g++)
+        if (e->pin[g] >= 0)
+            put(e, 0xF9000000u | ((greg_off(g) / 8) << 10) | (1u << 5) | (uint32_t) e->pin[g]);
+    if (n_pinned)
+        put(e, 0xB9000000u | ((CPU_cycle / 4) << 10) | (1u << 5) | H_CYC);
+    // x9 is the translated pointer; x11 still holds data_minus_addr.
+    put(e, 0xCB000000u | (11u << 16) | (9u << 5) | 8u); // sub x8,x9,x11
+    put(e, 0x9240BC00u | (8u << 5) | 8u);              // mask guest address
+    unsigned off = offsetof(struct fiber_frame, native_fault_host_pc);
+    // The checkpoint is beyond ret_cache; use a scratch base for its stores.
+    put(e, 0x91400000u | ((off >> 12) << 10) | (1u << 5) | 12u);
+#define CHECKPOINT_STORE(field, reg) \
+    put(e, 0xF9000000u | (((offsetof(struct fiber_frame, field) - (off & ~4095u)) / 8) << 10) | (12u << 5) | (reg))
+    CHECKPOINT_STORE(native_fault_addr, 8u);
+    mov_guest(e, 8, e->fault_pc, 10);
+    // mov_guest may use scratch x8/x10, but leaves checkpoint base x12 intact.
+    CHECKPOINT_STORE(native_fault_guest_pc, 8u);
+    mov_imm64(e, 8, write);
+    CHECKPOINT_STORE(native_fault_write, 8u);
+    put(e, 0x10000048u); // adr x8, .+8 (the single host access below)
+    CHECKPOINT_STORE(native_fault_host_pc, 8u);
+    put(e, insn);
+    CHECKPOINT_STORE(native_fault_host_pc, 31u); // disarm before result/writeback
+#undef CHECKPOINT_STORE
+}
+
 // Load/store translation. Returns false if the form is unsupported.
 // ---- SIMD & FP: guest V registers live in cpu->fp; an instruction loads the
 // ones it reads into host v16..v23 (caller-saved, unused by the gadgets),
@@ -826,7 +870,7 @@ static bool emit_ldst_fp(struct em *e, uint32_t x, unsigned spos) {
         int hn = ldst_addr(e, gn, imm, idx == 1);
         tlb_lookup(e, 2u << scale, !L, spos);
         if (!L) { vload(e, V_N, rt); vload(e, V_M, rt2); }
-        put(e, (x & 0xC0400000u) | 0x2D000000u | ((uint32_t) V_M << 10) | (T_A << 5) | V_N);   // ldp/stp vN, vM, [x9]
+        emit_guest_access(e, (x & 0xC0400000u) | 0x2D000000u | ((uint32_t) V_M << 10) | (T_A << 5) | V_N, !L);   // ldp/stp vN, vM, [x9]
         if (L) { vstore(e, V_N, rt); vstore(e, V_M, rt2); }
         if (idx == 1 || idx == 3) ldst_wb(e, gn, hn, imm);
         return true;
@@ -853,7 +897,7 @@ static bool emit_ldst_fp(struct em *e, uint32_t x, unsigned spos) {
     int hn = ldst_addr(e, gn, imm, wbmode == 1);
     tlb_lookup(e, 1u << scale, !load, spos);
     if (!load) vload(e, V_N, rt);
-    put(e, (x & 0xC0C00000u) | 0x3D000000u | (T_A << 5) | V_N);              // ldr/str vN, [x9]
+    emit_guest_access(e, (x & 0xC0C00000u) | 0x3D000000u | (T_A << 5) | V_N, !load);              // ldr/str vN, [x9]
     if (load) vstore(e, V_N, rt);   // the host load zeroed the rest of the register
     if (wbmode) ldst_wb(e, gn, hn, imm);
     return true;
@@ -880,7 +924,7 @@ static bool emit_ldst(struct em *e, uint32_t x, unsigned spos) {
         tlb_lookup(e, 2u << scale, !L, spos);
         int ht = rt == 31 ? 31 : hreg(e, rt), ht2 = rt2 == 31 ? 31 : hreg(e, rt2);
         // host pair access, signed-offset form, offset 0
-        put(e, (x & 0xC0400000u) | 0x29000000u | ((uint32_t) ht2 << 10) | (T_A << 5) | (uint32_t) ht);
+        emit_guest_access(e, (x & 0xC0400000u) | 0x29000000u | ((uint32_t) ht2 << 10) | (T_A << 5) | (uint32_t) ht, !L);
         if (L) {
             if (rt != 31) writeback(e, rt);
             if (rt2 != 31) writeback(e, rt2);
@@ -936,7 +980,7 @@ static bool emit_ldst(struct em *e, uint32_t x, unsigned spos) {
     tlb_lookup(e, 1u << size, !load, spos);
     {
         int ht = rt == 31 ? 31 : hreg(e, rt);
-        put(e, (x & 0xC0C00000u) | 0x39000000u | (T_A << 5) | (uint32_t) ht);   // host access: same size/opc, [x9]
+        emit_guest_access(e, (x & 0xC0C00000u) | 0x39000000u | (T_A << 5) | (uint32_t) ht, !load);   // host access: same size/opc, [x9]
         if (load && rt != 31)
             writeback(e, rt);
     }
@@ -952,6 +996,7 @@ writeback_base:
 // Translate one guest instruction. has_mem: set if it may bail out.
 static bool emit_insn(struct em *e, uint32_t x, uint64_t pc, unsigned spos, bool *has_mem) {
     int wrote = -1;
+    e->fault_pc = pc;
     e->locked = 0;
     *has_mem = false;
     if (x == NOP || (x & 0xFFFFF01Fu) == 0xD503201Fu)     // hints
@@ -1053,28 +1098,6 @@ static bool emit_insn(struct em *e, uint32_t x, uint64_t pc, unsigned spos, bool
     return true;
 }
 
-// Loop blocks, for jit_crash_sync(): inside [lo, hi) guest register promo_g[i]
-// lives in host register promo_h[i] and donor_g[i] is in cpu_state.
-struct loopmap { uintptr_t lo, hi; uint8_t n; int8_t g[8], d[8], h[8]; };
-static struct loopmap *loopmaps;
-static unsigned nloopmaps, cap_loopmaps;
-static pthread_mutex_t loopmap_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void loopmap_add(uintptr_t lo, uintptr_t hi, const struct em *e) {
-    pthread_mutex_lock(&loopmap_lock);
-    if (nloopmaps == cap_loopmaps) {
-        unsigned cap = cap_loopmaps ? 2 * cap_loopmaps : 1024;
-        struct loopmap *m = realloc(loopmaps, cap * sizeof(*m));
-        if (!m) { pthread_mutex_unlock(&loopmap_lock); return; }
-        loopmaps = m;
-        cap_loopmaps = cap;
-    }
-    struct loopmap *m = &loopmaps[nloopmaps++];
-    m->lo = lo; m->hi = hi; m->n = e->npromo;
-    memcpy(m->g, e->promo_g, 8); memcpy(m->d, e->donor_g, 8); memcpy(m->h, e->promo_h, 8);
-    pthread_mutex_unlock(&loopmap_lock);
-}
-
 static struct rec_seg *record_segment(const struct em *e) {
     struct rec_seg *r = calloc(1, sizeof(*r));
     if (!r)
@@ -1164,7 +1187,6 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
     install_code(dst, e->buf, e->n);
     if (e->loop) {
         b->native_loop = (uint32_t *) (dst + 4 * e->loop_head);
-        loopmap_add((uintptr_t) b->native_loop, (uintptr_t) dst + 4 * e->body_end, e);
         atomic_fetch_add_explicit(&st_loops, 1, memory_order_relaxed);
     }
     for (int i = 0; i < 2; i++)
@@ -2131,7 +2153,7 @@ void ish_aot_register(const struct aot_module *m) {
 
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
-#define JIT_CODE_VERSION 7
+#define JIT_CODE_VERSION 8
 
 // Everything the emitted code bakes in besides the gadgets it names: the
 // conventions, the struct layouts it loads from and the TLB / block cache
@@ -2146,6 +2168,8 @@ static uint32_t jit_abi(void) {
         CPU_pc, CPU_cycle, CPU_poked_ptr, CPU_tls_ptr, offsetof(struct cpu_state, sp),
         offsetof(struct cpu_state, regs), offsetof(struct cpu_state, nzcv), offsetof(struct cpu_state, fp),
         LOCAL_last_block, LOCAL_ret_cache,
+        offsetof(struct fiber_frame, native_fault_host_pc), offsetof(struct fiber_frame, native_fault_guest_pc),
+        offsetof(struct fiber_frame, native_fault_addr), offsetof(struct fiber_frame, native_fault_write),
         sizeof(struct tlb_entry), offsetof(struct tlb_entry, page), offsetof(struct tlb_entry, page_if_writable),
         offsetof(struct tlb_entry, gen), offsetof(struct tlb_entry, data_minus_addr), TLB_BITS, PAGE_BITS,
         offsetof(struct tlb, entries), offsetof(struct tlb, mmu), offsetof(struct tlb, block_cache_gen),
@@ -2734,52 +2758,28 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
     pthread_mutex_unlock(&reg_lock);
 }
 
-// Host fault inside native code: copy pinned state from the signal context.
-// AOT-only has no dynamic region but still uses pinned registers. This is state
-// synchronisation only: it does NOT make the caller's block replay a safe retry
-// (exact fault PC/access metadata and partially committed effects are separate).
-bool jit_crash_sync(void *ucontext) {
-    if (n_pinned <= 0)
-        return false;
+// Exact emitted-access recovery. The frame is supplied by dispatch, not by a
+// host helper's possibly clobbered x1. No locks, allocation, symbol lookup or
+// register-promotion inference is permitted in this signal path.
+int jit_crash_recover(void *ucontext) {
     ucontext_t *uc = ucontext;
     uintptr_t pc = uc->uc_mcontext->__ss.__pc;
-    const struct aot_module *img = NULL;
-    bool in_region = region && pc >= (uintptr_t) region && pc < (uintptr_t) region + REGION_SIZE;
-    if (!in_region && !in_aot_text(pc, &img))
-        return false;
-    char *cpu = (char *) uc->uc_mcontext->__ss.__x[1];
-    // Faults only happen at guest accesses, which in a loop block are all in
-    // the promoted body. (Blocking lock: this runs in a signal handler, but
-    // only for faults inside native code, never from within loopmap_add.)
-    struct loopmap lm = {0};
-    if (in_region) {
-        pthread_mutex_lock(&loopmap_lock);
-        for (unsigned k = 0; k < nloopmaps; k++)
-            if (pc >= loopmaps[k].lo && pc < loopmaps[k].hi) { lm = loopmaps[k]; break; }
-        pthread_mutex_unlock(&loopmap_lock);
-    } else {
-        for (unsigned k = 0; k < img->ntrans; k++) {
-            const struct aot_loop *l = aot_rel(&img->trans[k].loop);
-            if (!l || pc < (uintptr_t) l->lo || pc >= (uintptr_t) l->hi)
-                continue;
-            lm.n = l->n;
-            memcpy(lm.g, l->g, 8); memcpy(lm.d, l->d, 8); memcpy(lm.h, l->h, 8);
-            break;
-        }
+    struct fiber_frame *frame = jit_active_frame;
+    if (frame && frame->native_fault_host_pc && frame->native_fault_host_pc == pc) {
+        if (uc->uc_mcontext->__ss.__x[1] != (uintptr_t) &frame->cpu)
+            return -1;
+        frame->cpu.pc = frame->native_fault_guest_pc;
+        frame->cpu.segfault_precise_pc = frame->native_fault_guest_pc;
+        frame->cpu.segfault_addr = frame->native_fault_addr;
+        frame->cpu.segfault_was_write = frame->native_fault_write != 0;
+        frame->fault_stream = 0;
+        frame->native_fault_host_pc = 0;
+        return 1;
     }
-    for (int i = 0; i < n_pinned; i++) {
-        bool donor = false;
-        for (unsigned k = 0; k < lm.n; k++) donor |= lm.d[k] == pin_guest[i];
-        if (!donor)
-            *(uint64_t *) (cpu + greg_off(pin_guest[i])) = uc->uc_mcontext->__ss.__x[pin_host[i]];
-    }
-    for (unsigned k = 0; k < lm.n; k++)
-        *(uint64_t *) (cpu + greg_off(lm.g[k])) = uc->uc_mcontext->__ss.__x[lm.h[k]];
-    // Match the normal exit's str w15: only the low 32 bits of cpu->cycle
-    // are updated, even though the backing field is a host long.
-    uint32_t cycle = (uint32_t) uc->uc_mcontext->__ss.__x[H_CYC];
-    memcpy(cpu + CPU_cycle, &cycle, sizeof(cycle));
-    return true;
+    // Never send an unrecognised native prologue/helper/exit through the old
+    // gadget replay path. AOT tables are immutable after pthread_once init.
+    bool native = region && pc >= (uintptr_t) region && pc < (uintptr_t) region + REGION_SIZE;
+    return native || in_aot_text(pc, NULL) ? -1 : 0;
 }
 
 

@@ -9,6 +9,8 @@ static inline uint64_t mach_absolute_time(void) { struct timespec t; clock_getti
 typedef struct { unsigned numer, denom; } mach_timebase_info_data_t;
 static inline void mach_timebase_info(mach_timebase_info_data_t *p) { p->numer=p->denom=1; }
 // Deliberately synthetic Darwin register context: exercises sync logic only.
-typedef struct { struct { uint64_t __x[29], __fp, __lr, __sp, __pc; } __ss; } probe_mcontext;
+typedef struct { struct { uint64_t __x[29], __fp, __lr, __sp, __pc; } __ss;
+    struct { uint64_t __esr; } __es;
+} probe_mcontext;
 typedef struct { probe_mcontext *uc_mcontext; } probe_ucontext;
 #define ucontext_t probe_ucontext

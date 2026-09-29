@@ -16,4 +16,16 @@ struct fiber_frame {
     // can be mapped back to the faulting guest instruction.
     uint64_t fault_stream;
     long ret_cache[FIBER_RETURN_CACHE_SIZE]; // a map of ip to pointer-to-call-gadget-arguments
+#ifdef ISH_JIT
+    // Published just before one emitted guest access and disarmed just after.
+    // Appended to preserve immediate-range assumptions for earlier fields.
+    uintptr_t native_fault_host_pc;
+    addr_t native_fault_guest_pc;
+    addr_t native_fault_addr;
+    uint64_t native_fault_write; // emitted as an aligned 64-bit checkpoint word
+#endif
 };
+#ifdef ISH_JIT
+// Set by dispatch; never infer a frame from arbitrary signal registers.
+extern __thread struct fiber_frame *jit_active_frame;
+#endif
