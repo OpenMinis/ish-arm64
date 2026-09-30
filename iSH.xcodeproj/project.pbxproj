@@ -21,6 +21,7 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+		AABBCCDD1122334455667701 /* netlink.c in Sources */ = {isa = PBXBuildFile; fileRef = AABBCCDD1122334455667702 /* netlink.c */; };
 		0FC2383C2991FBA6004C09EC /* mmx.c in Sources */ = {isa = PBXBuildFile; fileRef = 0FC2383B2991FB82004C09EC /* mmx.c */; };
 		491B31E62883BF22008EEFB0 /* ThemeViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 491B31E52883BF22008EEFB0 /* ThemeViewController.m */; };
 		49302D8E277669D300C9885A /* ish.c in Sources */ = {isa = PBXBuildFile; fileRef = 49302D8D277669D300C9885A /* ish.c */; };
@@ -541,6 +542,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AABBCCDD1122334455667702 /* netlink.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = netlink.c; sourceTree = "<group>"; };
 		0FC2383B2991FB82004C09EC /* mmx.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mmx.c; sourceTree = "<group>"; };
 		408A2639236440F8008A4E81 /* iOSFS.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = iOSFS.m; sourceTree = "<group>"; };
 		408A263B23644102008A4E81 /* iOSFS.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = iOSFS.h; sourceTree = "<group>"; };
@@ -1348,6 +1350,7 @@
 				497F6C04254E5C0E00C82F46 /* real.c */,
 				497F6BF8254E5C0E00C82F46 /* real.h */,
 				497F6BF7254E5C0E00C82F46 /* sock.c */,
+				AABBCCDD1122334455667702 /* netlink.c */,
 				497F6BE1254E5C0D00C82F46 /* sock.h */,
 				497F6BFB254E5C0E00C82F46 /* sockrestart.c */,
 				497F6BFA254E5C0E00C82F46 /* sockrestart.h */,
@@ -2439,6 +2442,7 @@
 				497F6D10254E5EA600C82F46 /* pty.c in Sources */,
 				497F6D11254E5EA600C82F46 /* real.c in Sources */,
 				497F6D12254E5EA600C82F46 /* sock.c in Sources */,
+				AABBCCDD1122334455667701 /* netlink.c in Sources */,
 				497F6D13254E5EA600C82F46 /* sockrestart.c in Sources */,
 				497F6D14254E5EA600C82F46 /* stat.c in Sources */,
 				497F6D15254E5EA600C82F46 /* tmp.c in Sources */,

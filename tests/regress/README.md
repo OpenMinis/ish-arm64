@@ -1,5 +1,10 @@
 # fs/wait syscall regression tests
 
+For the opt-in route-netlink tests (`run_netlink.sh`, `regress_netlink.c`,
+`netlink-snapshot.c` and `netlink_interfaces.go`), see
+[interface snapshots](../../docs/netlink-interface-snapshots.md). The Linux-only
+build adapter is test scaffolding, not an Apple build or device validation.
+
 These pin the observable behaviour of five fixes so a future change that
 reintroduces one of them fails here instead of in a user's shell.
 

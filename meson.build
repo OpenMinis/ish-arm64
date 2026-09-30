@@ -1742,6 +1742,7 @@ if get_option('kernel') == 'ish'
 
         'fs/adhoc.c',
         'fs/sock.c',
+    'fs/netlink.c',
         'fs/pipe.c',
         'fs/sockrestart.c',
         'fs/lock.c',
