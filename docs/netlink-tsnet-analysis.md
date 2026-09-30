@@ -1,5 +1,10 @@
 # 让 tsnet 在 iSH ARM64 上跑起来：netlink 支持调研
 
+> Follow-up: [read-only interface snapshots](netlink-interface-snapshots.md)
+> replaces the empty link/address dumps and records an unmodified official
+> tailscaled control-plane test. The dated investigation below is retained;
+> its empty-stub limitations describe the earlier implementation.
+
 > 分支 `explore/netlink-tsnet`。调研 + 原型验证，**不是可合并的实现**。
 > 所有数字来自本机实测（macOS CLI，`build-arm64-release/ish` + `alpine-arm64-321` realfs）。
 
