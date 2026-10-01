@@ -97,8 +97,10 @@ bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to);
 // running guest code.
 void jit_exec_ready(void);
 
-// Host fault in native code: sync pinned guest registers into cpu_state.
-bool jit_crash_sync(void *ucontext);
+// Host fault: 1 = exact access checkpoint recovered; 0 = not native code;
+// -1 = unrecognised native fault, must NOT fall through to gadget/block replay.
+// Requires dispatch's trusted jit_active_frame. Does not redirect host context.
+int jit_crash_recover(void *ucontext);
 
 // Guest init is exiting: ISH_JIT_STATS=1 prints counters, ISH_JIT_DUMP=<file>
 // writes the code region.

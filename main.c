@@ -72,9 +72,16 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     // This avoids the overhead of _setjmp on every block entry.
     if ((sig == SIGSEGV || sig == SIGBUS) && in_jit) {
         ucontext_t *uc = (ucontext_t *)ctx;
+        int native_recovery = 0;
 #ifdef ISH_JIT
-        // Pinned guest registers live only in host registers inside native code.
-        jit_crash_sync(uc);
+        native_recovery = jit_crash_recover(uc);
+        if (native_recovery < 0) {
+            // This may be a prologue/helper/exit fault with no canonical guest
+            // state. Do not replay it or call non-signal-safe diagnostics.
+            static const char message[] = "unrecoverable native JIT/AOT fault\n";
+            write(STDERR_FILENO, message, sizeof(message) - 1);
+            _exit(139);
+        }
 #endif
 
         // _cpu is in x1 — pointer to cpu_state within fiber_frame
@@ -102,10 +109,13 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         // `bool`, and the previous `*(int *)` store wrote 4 bytes over it and the
         // padding before `trapno`. The generated gadgets use `strb` for the same
         // field, so 1 byte is the correct width on both sides.
-        *(addr_t *)(cpu_ptr + CRASH_CPU_segfault_addr) = guest_addr;
-        *(bool *)(cpu_ptr + CRASH_CPU_segfault_was_write) = (bool)was_write;
-        // Restore guest PC to block start for re-execution
-        *(uint64_t *)(cpu_ptr + CRASH_CPU_pc) = (uint64_t)jit_saved_pc;
+        if (!native_recovery) {
+            *(addr_t *)(cpu_ptr + CRASH_CPU_segfault_addr) = guest_addr;
+            *(bool *)(cpu_ptr + CRASH_CPU_segfault_was_write) = (bool)was_write;
+            *(uint64_t *)(cpu_ptr + CRASH_CPU_pc) = (uint64_t)jit_saved_pc;
+        }
+        // Native recovery already set exact PC/address/direction from the
+        // access checkpoint. Never replace those with gadget register guesses.
 
         // Restore SP to the value saved by fiber_enter, so fiber_exit
         // can correctly pop the callee-saved register frame.
@@ -126,7 +136,7 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     }
 #endif
 
-    // Non-JIT crash: dump state and exit
+    // Non-JIT fault: retain the existing diagnostic path.
     char buf[512];
     int len;
     ucontext_t *uc = (ucontext_t *)ctx;
