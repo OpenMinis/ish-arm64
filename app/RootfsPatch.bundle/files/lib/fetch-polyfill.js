@@ -1,107 +1,149 @@
 "use strict";
-// Lazy fetch polyfill: defer require of http/https/url/zlib until fetch() is
-// actually called. The previous version eager-required these on startup, which
-// alone added ~580ms to `node -e 0` on iSH ARM64 (4 internal modules compiled
-// into V8 bytecode by --no-lazy mode). Profile via Node's --cpu-prof showed
-// 18.5% spent in compileForInternalLoader; this slashes that for scripts that
-// never call fetch (the vast majority).
+// /lib/fetch-polyfill.js: an undici global dispatcher on top of node:http / node:https, for the
+// Node.js that iSH runs (kernel/exec.c injects --require for this file, first).
 //
-// Validated 2026-05-05 on iSH ARM64:
-//   node -e 'process.exit(0)' : 1.18s → 0.60s  (+49%)
-//   npm --version              : 2.40s → 1.70s  (+30%)
+// Under --jitless (the default mode) V8 has no WebAssembly, so undici (Node's own fetch and
+// every copy a package bundles) cannot build its llhttp parser, and the JS llhttp in
+// wasm-polyfill.js is not a working replacement. With ISH_NODE_MODE=hybrid WebAssembly is real,
+// but its generated code runs through the gadgets, so this transport is still ~0.6s faster on
+// the first request. All undici copies share the global dispatcher through
+// Symbol.for('undici.globalDispatcher.1'/'.2') and only create their own Agent when none is set,
+// so installing this one first makes every undici fetch send through node:http, whose parser is
+// Node's native llhttp. fetch keeps its own semantics (Headers, Request, Response, streams,
+// FormData, AbortSignal, redirects, decompression); only the transport changes.
+// Not covered: callers that build their own Agent / Client / ProxyAgent, and WebSocket upgrades.
+// wasm-polyfill.js must stay: Node's internal undici calls WebAssembly.compile() when it loads.
 //
-if (typeof globalThis.WebAssembly === "undefined") {
-  let _impl = null;
-  function _lazy() {
-    if (_impl) return _impl;
-    const http = require("http");
-    const https = require("https");
-    const { URL: U } = require("url");
-    const zlib = require("zlib");
-    class R {
-      constructor(b, s, t, h, u) {
-        this._buf = b; this.status = s; this.statusText = t;
-        this.ok = s >= 200 && s < 300; this.url = u; this._h = h;
-        this.headers = {
-          get: k => h[k.toLowerCase()] || null,
-          has: k => k.toLowerCase() in h,
-          entries: () => Object.entries(h),
-          forEach: fn => Object.entries(h).forEach(([k, v]) => fn(v, k)),
-        };
-      }
-      async text() { return this._buf.toString("utf8"); }
-      async json() { return JSON.parse(this._buf.toString("utf8")); }
-      async arrayBuffer() {
-        return this._buf.buffer.slice(
-          this._buf.byteOffset,
-          this._buf.byteOffset + this._buf.byteLength,
-        );
-      }
-      clone() { return new R(this._buf, this.status, this.statusText, this._h, this.url); }
-    }
-    _impl = function _fetch(input, init) {
-      return new Promise((resolve, reject) => {
-        const url = typeof input === "string" ? new U(input) : new U(input.url || input);
-        const opts = Object.assign({}, init || {});
-        const mod = url.protocol === "https:" ? https : http;
-        const ro = {
-          hostname: url.hostname,
-          port: url.port || (url.protocol === "https:" ? 443 : 80),
-          path: url.pathname + url.search,
-          method: (opts.method || "GET").toUpperCase(),
-          headers: Object.assign({}, opts.headers || {}),
-        };
-        const req = mod.request(ro, res => {
-          if (res.statusCode >= 301 && res.statusCode <= 308 && res.headers.location) {
-            _impl(new U(res.headers.location, url).href, init).then(resolve, reject);
-            return;
-          }
-          const chunks = [];
-          let s = res;
-          const enc = res.headers["content-encoding"];
-          if (enc === "gzip") s = res.pipe(zlib.createGunzip());
-          else if (enc === "deflate") s = res.pipe(zlib.createInflate());
-          else if (enc === "br") s = res.pipe(zlib.createBrotliDecompress());
-          s.on("data", c => chunks.push(c));
-          s.on("end", () => {
-            const body = Buffer.concat(chunks);
-            resolve(new R(body, res.statusCode, res.statusMessage, res.headers, url.href));
-          });
-          s.on("error", reject);
-        });
-        req.on("error", reject);
-        if (opts.body) {
-          req.write(typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body));
-        }
-        req.end();
-      });
+// http/https are required on the first request, so scripts that never fetch pay nothing.
+{
+  const K1 = Symbol.for("undici.globalDispatcher.1");
+  const K2 = Symbol.for("undici.globalDispatcher.2");
+  let mods = null;
+  const lazy = () => mods || (mods = {
+    http: require("http"),
+    https: require("https"),
+    agents: {
+      "http:": new (require("http").Agent)({ keepAlive: true }),
+      "https:": new (require("https").Agent)({ keepAlive: true }),
+    },
+  });
+
+  // undici passes headers as a flat [k, v, ...] array, an array of pairs, an iterable or an object.
+  function toHeaderObject(h) {
+    const out = {};
+    const add = (k, v) => {
+      if (v == null) return;
+      k = String(k);
+      const key = k.toLowerCase();
+      if (key in out) out[key] = [].concat(out[key], String(v));
+      else out[key] = Array.isArray(v) ? v.map(String) : String(v);
     };
-    return _impl;
+    if (!h) return out;
+    if (Array.isArray(h)) {
+      if (h.length && Array.isArray(h[0])) for (const [k, v] of h) add(k, v);
+      else for (let i = 0; i < h.length; i += 2) add(h[i], h[i + 1]);
+    } else if (typeof h[Symbol.iterator] === "function") {
+      for (const [k, v] of h) add(k, v);
+    } else {
+      for (const k of Object.keys(h)) add(k, h[k]);
+    }
+    return out;
   }
-  // Install a getter on globalThis.fetch — first read materialises the impl.
-  // Re-installs on nextTick + setImmediate to defeat Node's bootstrap, which
-  // overwrites globalThis.fetch with the (broken-on-jitless) undici fetch.
-  let _installed = false;
-  const installLazy = () => {
-    if (_installed) return;
-    _installed = true;
-    Object.defineProperty(globalThis, "fetch", {
-      configurable: true,
-      get() {
-        const f = _lazy();
-        Object.defineProperty(globalThis, "fetch", {
-          value: f, writable: true, configurable: true,
+
+  const toBuffers = (raw) => raw.map((s) => Buffer.from(s, "latin1"));
+
+  async function writeBody(req, body) {
+    if (body == null) return req.end();
+    if (typeof body === "string" || body instanceof Uint8Array) return req.end(body);
+    if (body instanceof ArrayBuffer) return req.end(Buffer.from(body));
+    if (typeof body.pipe === "function" && typeof body.on === "function") {
+      body.on("error", (e) => req.destroy(e));
+      return body.pipe(req);
+    }
+    if (typeof body[Symbol.asyncIterator] === "function" || typeof body[Symbol.iterator] === "function") {
+      for await (const chunk of body) {
+        if (req.destroyed) return;
+        if (!req.write(typeof chunk === "string" ? chunk : Buffer.from(chunk.buffer || chunk, chunk.byteOffset || 0, chunk.byteLength))) {
+          await new Promise((r) => req.once("drain", r));
+        }
+      }
+      return req.end();
+    }
+    return req.end(String(body));
+  }
+
+  class HttpDispatcher {
+    constructor() { this.closed = false; }
+
+    dispatch(opts, handler) {
+      const { http, https, agents } = lazy();
+      let done = false;
+      const fail = (err) => {
+        if (done) return;
+        done = true;
+        try { handler.onError(err); } catch {}
+      };
+      try {
+        if (opts.upgrade || opts.method === "CONNECT") {
+          throw Object.assign(new Error("undici-http-dispatcher: upgrade/CONNECT not supported (no WebAssembly under --jitless)"), { code: "UND_ERR_NOT_SUPPORTED" });
+        }
+        const origin = new URL(typeof opts.origin === "string" ? opts.origin : String(opts.origin));
+        const mod = origin.protocol === "https:" ? https : http;
+        const req = mod.request({
+          protocol: origin.protocol,
+          hostname: origin.hostname.replace(/^\[|\]$/g, ""),
+          port: origin.port || undefined,
+          path: opts.path || "/",
+          method: opts.method || "GET",
+          headers: toHeaderObject(opts.headers),
+          agent: agents[origin.protocol],
+          servername: opts.servername || undefined,
         });
-        return f;
-      },
-      set(v) {
-        Object.defineProperty(globalThis, "fetch", {
-          value: v, writable: true, configurable: true,
+        const abort = (err) => { fail(err || new Error("aborted")); req.destroy(err); };
+        if (handler.onConnect) handler.onConnect(abort);
+        if (done) { req.destroy(); return true; }
+
+        req.on("error", fail);
+        req.on("response", (res) => {
+          if (done) return res.destroy();
+          if (handler.onResponseStarted) handler.onResponseStarted();
+          const resume = () => res.resume();
+          const cont = handler.onHeaders(res.statusCode, toBuffers(res.rawHeaders), resume, res.statusMessage || "");
+          if (cont === false) res.pause();
+          res.on("data", (chunk) => {
+            if (done) return;
+            if (handler.onData(chunk) === false) res.pause();
+          });
+          res.on("end", () => {
+            if (done) return;
+            done = true;
+            handler.onComplete(toBuffers(res.rawTrailers || []));
+          });
+          res.on("error", fail);
+          res.on("aborted", () => fail(new Error("response aborted")));
         });
-      },
-    });
-  };
-  installLazy();
-  process.nextTick(installLazy);
-  setImmediate(installLazy);
+        writeBody(req, opts.body).catch((e) => { fail(e); req.destroy(e); });
+      } catch (err) {
+        queueMicrotask(() => fail(err));
+      }
+      return true;
+    }
+
+    close() { this.closed = true; return Promise.resolve(); }
+    destroy() { this.closed = true; return Promise.resolve(); }
+    // Dispatcher is an EventEmitter in undici; nothing here emits.
+    on() { return this; }
+    once() { return this; }
+    off() { return this; }
+    removeListener() { return this; }
+    emit() { return false; }
+  }
+
+  if (globalThis[K1] === undefined) {
+    const d = new HttpDispatcher();
+    // Same attributes as undici's setGlobalDispatcher, so a later setGlobalDispatcher still works.
+    for (const k of [K1, K2]) {
+      Object.defineProperty(globalThis, k, { value: d, writable: true, enumerable: false, configurable: false });
+    }
+  }
 }

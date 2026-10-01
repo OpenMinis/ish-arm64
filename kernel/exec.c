@@ -925,7 +925,9 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         }
     }
 
-    // Inject V8 flags for Node.js to work around scope corruption in emulation.
+    // Inject V8 flags for Node.js: the hybrid set by default, the jitless set as an explicit
+    // fallback (both below). The notes that follow are about the jitless set, which was added
+    // to work around scope corruption in emulation.
     // --jitless: disable JIT (avoids V8 code generation incompatible with our JIT)
     // --predictable: disable concurrent GC/compilation (avoids race conditions)
     // --no-lazy: eager compilation (avoids Zone reuse patterns that corrupt scopes)
@@ -940,7 +942,8 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         const char *base = strrchr(filename, '/');
         base = base ? base + 1 : filename;
         if (strcmp(base, "node") == 0) {
-            static const char *inject_args_base[] = {
+            // Fallback (jitless) mode, see the mode choice below.
+            static const char *inject_args_jitless[] = {
                 "--jitless",
                 "--no-lazy",
                 "--max-old-space-size=512",
@@ -965,16 +968,57 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
                 // allocation-heavy JIT throughput we don't have.
                 "--single-generation",
             };
-            // Conditionally inject --require for polyfill files that exist in guest fs
+            // Default (hybrid) mode: V8 keeps JIT support, which gives it real WebAssembly (and
+            // with it undici's own fetch and every package that loads wasm), but its JS tiers and
+            // native regexp code are off. Code V8 generates at run time runs through the gadgets,
+            // while its interpreter and builtins are part of the node binary, which an AOT image
+            // runs natively; so JS stays in the interpreter. --no-lazy is left out: eager
+            // compilation made large CLIs start ~25% slower and the Zone problem it was added for
+            // did not show up. Measured 2026-10-01 on the Mac CLI (pure AOT build, node image
+            // recorded in this mode): 9 agent workloads 15.6s -> 14.0s, 13 MCP servers start
+            // 10-27% faster (mcp-remote only starts in this mode).
+            static const char *inject_args_hybrid[] = {
+                "--no-sparkplug",
+                "--no-maglev",
+                "--no-opt",
+                "--regexp-interpret-all",
+                "--max-old-space-size=512",
+                "--no-concurrent-marking",
+                "--no-concurrent-recompilation",
+                "--no-lazy-compile-dispatcher",
+                "--single-generation",
+            };
+            // The jitless fallback is explicit: ISH_NODE_MODE=jitless in the new program's
+            // environment (so it also reaches the node that npx or a shebang starts), or a
+            // caller that passes --jitless / --no-expose-wasm itself. Both of those flags take
+            // WebAssembly away, and Node's own undici calls WebAssembly.compile() when it loads,
+            // so they need the jitless set with wasm-polyfill.js.
+            bool jitless = false;
+            for (const char *e = envp; *e != '\0'; e += strlen(e) + 1) {
+                if (strcmp(e, "ISH_NODE_MODE=jitless") == 0)
+                    jitless = true;
+            }
+            for (const char *a = argv + strlen(argv) + 1; *a != '\0'; a += strlen(a) + 1) {
+                if (strcmp(a, "--jitless") == 0 || strcmp(a, "--no-expose-wasm") == 0)
+                    jitless = true;
+            }
+            bool hybrid = !jitless;
+            // Conditionally inject --require for polyfill files that exist in guest fs.
+            // With real WebAssembly (hybrid) only the fetch transport is needed.
             static const char *optional_requires[] = {
                 "--require=/lib/wasm-polyfill.js",    // WebAssembly shim (must load first)
-                "--require=/lib/fetch-polyfill.js",   // fetch() via native http/https
+                "--require=/lib/fetch-polyfill.js",   // undici dispatcher on native http/https
             };
             const char *inject_args[16]; // base args + optional requires
             size_t inject_count = 0;
-            for (size_t i = 0; i < sizeof(inject_args_base)/sizeof(inject_args_base[0]); i++)
-                inject_args[inject_count++] = inject_args_base[i];
-            for (size_t i = 0; i < sizeof(optional_requires)/sizeof(optional_requires[0]); i++) {
+            if (hybrid) {
+                for (size_t i = 0; i < sizeof(inject_args_hybrid)/sizeof(inject_args_hybrid[0]); i++)
+                    inject_args[inject_count++] = inject_args_hybrid[i];
+            } else {
+                for (size_t i = 0; i < sizeof(inject_args_jitless)/sizeof(inject_args_jitless[0]); i++)
+                    inject_args[inject_count++] = inject_args_jitless[i];
+            }
+            for (size_t i = hybrid ? 1 : 0; i < sizeof(optional_requires)/sizeof(optional_requires[0]); i++) {
                 // Extract path after "--require="
                 const char *path = optional_requires[i] + 10; // strlen("--require=")
                 struct fd *fd = generic_open(path, O_RDONLY_, 0);
