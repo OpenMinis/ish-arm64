@@ -2,7 +2,12 @@
   "_comment": [
     "AOT images the AOJIT cases are measured against. module: substring of the guest path",
     "(ISH_JIT_RECORD_MOD); workload: guest script (under /tmp/aojit) recorded in one ish run.",
-    "Recorded on a rootfs with the packages below (apk; pip for python-pptx).",
+    "Recorded on a rootfs with the packages below (apk; pip for python-pptx; npm, installed with npm i -g,",
+    "for what the node workload runs: cf and MCP servers). Held out of the node workload, for measuring with",
+    "guest/node/mcp_probe.py: @modelcontextprotocol/server-sequential-thinking @wonderwhy-er/desktop-commander",
+    "@notionhq/notion-mcp-server @playwright/mcp.",
+    "node is recorded in the mode kernel/exec.c gives it by default (hybrid; ISH_NODE_MODE=jitless is the",
+    "fallback); an image fits the mode it was recorded in.",
     "ssh, scp: need the sshd of guest/ssh/server.sh running in another ish (AOJIT_SSH=host:port, default 127.0.0.1:2222)."
   ],
   "packages": {
@@ -10,7 +15,10 @@
             "py3-numpy", "py3-pandas", "py3-matplotlib", "py3-pillow", "py3-reportlab", "py3-lxml",
             "py3-requests", "py3-httpx", "py3-jwt", "py3-cryptography", "py3-beautifulsoup4",
             "openssh-client-default", "ripgrep"],
-    "pip": ["python-pptx"]
+    "pip": ["python-pptx"],
+    "npm": ["cf@1.0.0-beta.6", "@modelcontextprotocol/server-filesystem", "@modelcontextprotocol/server-memory",
+            "@modelcontextprotocol/server-everything", "@upstash/context7-mcp", "mcp-remote", "firecrawl-mcp",
+            "@modelcontextprotocol/server-github"]
   },
   "images": {
     "musl":    {"module": "ld-musl",               "workload": "shell/musl_train.sh"},

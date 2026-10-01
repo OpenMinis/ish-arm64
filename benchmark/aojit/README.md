@@ -138,8 +138,20 @@ of the images.
 ```sh
 build-arm64-jit/ish -r $R /sbin/apk add -u $(python3 -c "import json; print(' '.join(json.load(open('benchmark/aojit/images.json'))['packages']['apk']))")
 build-arm64-jit/ish -r $R /usr/bin/pip install --break-system-packages python-pptx
+build-arm64-jit/ish -r $R /bin/sh -c "npm i -g --no-audit --no-fund $(python3 -c "import json; print(' '.join(json.load(open('benchmark/aojit/images.json'))['packages']['npm']))")"
 benchmark/aojit/install.sh build-arm64-jit/ish $R [old rootfs]   # suite -> $R/tmp/aojit, inputs
 ```
+
+The npm packages are cf and the MCP servers the node workload starts. Without them
+`node/node_train.sh` skips those parts, and the node image covers less.
+
+**Node mode.** `kernel/exec.c` adds V8 flags to every exec of a program named `node`. The default is
+the hybrid set: V8 keeps JIT support, so WebAssembly and undici's own fetch work, but its JS tiers
+and native regexp are off, so JS runs in the interpreter, which the node image covers.
+`ISH_NODE_MODE=jitless` in the environment, or `--jitless` / `--no-expose-wasm` on the command
+line, selects the old jitless set with `/lib/wasm-polyfill.js`. The two modes execute different
+parts of the node binary, so record node in the mode the app runs. The images under `minis-hybrid/`
+are hybrid; the node image of the older sets is jitless.
 
 ### 3. Record: `.S`, plus iOS objects with `IOS=1`
 
