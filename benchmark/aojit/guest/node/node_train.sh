@@ -1,8 +1,8 @@
 # Node.js agent workload (recording): every task once, startup a few times, then what agents
 # run through node: npm, fetch, cf and MCP servers over stdio (start, handshake, tools/list, a
 # few calls; also through npx, the way Minis starts them). Node runs in the mode kernel/exec.c
-# picks (hybrid by default). The npm and MCP parts need the npm packages of images.json; without
-# them they are skipped with a warning.
+# picks (the default mode unless ISH_NODE_MODE=jitless). The npm and MCP parts need the npm
+# packages of images.json; without them they are skipped with a warning.
 cd /tmp/aojit/node
 for i in 1 2 3 4 5; do node -e 'console.log(JSON.stringify({ok: true, n: process.argv.length}))'; done
 for t in json_task fs_task exec_task text_task agent_task; do node $t.js; done

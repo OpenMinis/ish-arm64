@@ -4,7 +4,7 @@
 //
 // In the jitless fallback (ISH_NODE_MODE=jitless) V8 has no WebAssembly, so undici (Node's own
 // fetch and every copy a package bundles) cannot build its llhttp parser, and the JS llhttp in
-// wasm-polyfill.js is not a working replacement. In the default hybrid mode WebAssembly is real,
+// wasm-polyfill.js is not a working replacement. In the default mode WebAssembly is real,
 // but its generated code runs through the gadgets, so this transport is still ~0.6s faster on
 // the first request. All undici copies share the global dispatcher through
 // Symbol.for('undici.globalDispatcher.1'/'.2') and only create their own Agent when none is set,
