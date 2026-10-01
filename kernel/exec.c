@@ -998,7 +998,10 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
                 if (strcmp(e, "ISH_NODE_MODE=jitless") == 0)
                     jitless = true;
             }
+            // node's own options come before the script; what follows it belongs to the script
             for (const char *a = argv + strlen(argv) + 1; *a != '\0'; a += strlen(a) + 1) {
+                if (a[0] != '-' || strcmp(a, "--") == 0)
+                    break;
                 if (strcmp(a, "--jitless") == 0 || strcmp(a, "--no-expose-wasm") == 0)
                     jitless = true;
             }

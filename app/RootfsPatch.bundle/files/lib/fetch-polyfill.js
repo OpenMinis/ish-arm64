@@ -2,17 +2,18 @@
 // /lib/fetch-polyfill.js: an undici global dispatcher on top of node:http / node:https, for the
 // Node.js that iSH runs (kernel/exec.c injects --require for this file, first).
 //
-// Under --jitless (the default mode) V8 has no WebAssembly, so undici (Node's own fetch and
-// every copy a package bundles) cannot build its llhttp parser, and the JS llhttp in
-// wasm-polyfill.js is not a working replacement. With ISH_NODE_MODE=hybrid WebAssembly is real,
+// In the jitless fallback (ISH_NODE_MODE=jitless) V8 has no WebAssembly, so undici (Node's own
+// fetch and every copy a package bundles) cannot build its llhttp parser, and the JS llhttp in
+// wasm-polyfill.js is not a working replacement. In the default hybrid mode WebAssembly is real,
 // but its generated code runs through the gadgets, so this transport is still ~0.6s faster on
 // the first request. All undici copies share the global dispatcher through
 // Symbol.for('undici.globalDispatcher.1'/'.2') and only create their own Agent when none is set,
-// so installing this one first makes every undici fetch send through node:http, whose parser is
-// Node's native llhttp. fetch keeps its own semantics (Headers, Request, Response, streams,
-// FormData, AbortSignal, redirects, decompression); only the transport changes.
-// Not covered: callers that build their own Agent / Client / ProxyAgent, and WebSocket upgrades.
-// wasm-polyfill.js must stay: Node's internal undici calls WebAssembly.compile() when it loads.
+// so installing this one first makes every undici fetch (and WebSocket) send through node:http,
+// whose parser is Node's native llhttp. fetch keeps its own semantics (Headers, Request,
+// Response, streams, FormData, AbortSignal, redirects, decompression); only the transport
+// changes. Not covered: callers that build their own Agent / Client / ProxyAgent, and CONNECT.
+// wasm-polyfill.js must stay for the jitless mode: Node's internal undici calls
+// WebAssembly.compile() when it loads.
 //
 // http/https are required on the first request, so scripts that never fetch pay nothing.
 {
@@ -84,18 +85,24 @@
         try { handler.onError(err); } catch {}
       };
       try {
-        if (opts.upgrade || opts.method === "CONNECT") {
-          throw Object.assign(new Error("undici-http-dispatcher: upgrade/CONNECT not supported (no WebAssembly under --jitless)"), { code: "UND_ERR_NOT_SUPPORTED" });
+        if (opts.method === "CONNECT") {
+          throw Object.assign(new Error("undici-http-dispatcher: CONNECT is not supported"), { code: "UND_ERR_NOT_SUPPORTED" });
         }
         const origin = new URL(typeof opts.origin === "string" ? opts.origin : String(opts.origin));
         const mod = origin.protocol === "https:" ? https : http;
+        const headers = toHeaderObject(opts.headers);
+        if (opts.upgrade) {
+          // undici's h1 client writes these itself for an upgrade (WebSocket) request
+          headers.connection = "upgrade";
+          headers.upgrade = opts.upgrade;
+        }
         const req = mod.request({
           protocol: origin.protocol,
           hostname: origin.hostname.replace(/^\[|\]$/g, ""),
           port: origin.port || undefined,
           path: opts.path || "/",
           method: opts.method || "GET",
-          headers: toHeaderObject(opts.headers),
+          headers,
           agent: agents[origin.protocol],
           servername: opts.servername || undefined,
         });
@@ -103,9 +110,30 @@
         if (handler.onConnect) handler.onConnect(abort);
         if (done) { req.destroy(); return true; }
 
+        // undici's defaults: headersTimeout and bodyTimeout of 300 s without data
+        req.setTimeout(opts.headersTimeout || 300e3, () => req.destroy(Object.assign(
+          new Error("undici-http-dispatcher: no data for " + (opts.headersTimeout || 300e3) / 1e3 + " s"),
+          { code: "UND_ERR_HEADERS_TIMEOUT" })));
         req.on("error", fail);
+        req.on("upgrade", (res, socket, head) => {
+          if (done) return socket.destroy();
+          done = true;
+          socket.setTimeout(0);
+          if (head && head.length) socket.unshift(head);
+          if (handler.onUpgrade) {
+            handler.onUpgrade(res.statusCode, toBuffers(res.rawHeaders), socket);
+          } else if (handler.onRequestUpgrade) {
+            handler.onRequestUpgrade({ abort: (e) => socket.destroy(e) }, res.statusCode, res.headers, socket);
+          } else {
+            socket.destroy();
+          }
+        });
         req.on("response", (res) => {
           if (done) return res.destroy();
+          if (opts.upgrade) {
+            res.resume();
+            return fail(Object.assign(new Error("undici-http-dispatcher: upgrade refused, status " + res.statusCode), { code: "UND_ERR_SOCKET" }));
+          }
           if (handler.onResponseStarted) handler.onResponseStarted();
           const resume = () => res.resume();
           const cont = handler.onHeaders(res.statusCode, toBuffers(res.rawHeaders), resume, res.statusMessage || "");
