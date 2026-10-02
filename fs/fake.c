@@ -581,16 +581,19 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
     /* Auto-create entry if under bind mount so path_unlink won't die */
     if (is_under_bind_mount(path))
         bind_mount_ensure_inode(fs, mount, path);
+    /* [T-ish-bind-host-op-unlocked] On a bind mount the host call goes first,
+     * OUTSIDE fs->lock. A bind mount can be an iCloud / File Provider folder,
+     * where unlink / rename / mkdir can block for minutes (the provider waits
+     * on a sync). Holding the global meta.db lock across that froze every
+     * other guest file operation, so nothing could even exec `ps`, and the
+     * blocked task could not be killed. The metadata update follows in its
+     * own short transaction; bind-mount rows are re-created on demand
+     * (bind_mount_ensure_inode), so the brief gap between the two is benign. */
+    if (via_bind && unlink(host_abs) < 0)
+        return errno_map();
     db_begin_write(fs);
-    int err;
-    if (via_bind) {
-        if (unlink(host_abs) < 0) {
-            err = errno_map();
-            db_rollback(fs);
-            return err;
-        }
-    } else {
-        err = realfs.unlink(mount, path);
+    if (!via_bind) {
+        int err = realfs.unlink(mount, path);
         if (err < 0) {
             db_rollback(fs);
             return err;
@@ -619,16 +622,12 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
     }
     if (is_under_bind_mount(path))
         bind_mount_ensure_inode(fs, mount, path);
+    /* [T-ish-bind-host-op-unlocked] Host call first, outside fs->lock. */
+    if (via_bind && rmdir(host_abs) < 0)
+        return errno_map();
     db_begin_write(fs);
-    int err;
-    if (via_bind) {
-        if (rmdir(host_abs) < 0) {
-            err = errno_map();
-            db_rollback(fs);
-            return err;
-        }
-    } else {
-        err = realfs.rmdir(mount, path);
+    if (!via_bind) {
+        int err = realfs.rmdir(mount, path);
         if (err < 0) {
             db_rollback(fs);
             return err;
@@ -658,6 +657,9 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
         fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
         return 0;
     }
+    /* [T-ish-bind-host-op-unlocked] Host call first, outside fs->lock. */
+    if (src_bind && rename(host_src, host_dst) < 0)
+        return errno_map();
     db_begin_write(fs);
     // [T-ish-inode-orphan-pending] `update or replace` overwrites dst's
     // paths row, so the inode dst pointed at loses its last path. Give it
@@ -670,15 +672,8 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
     path_rename(fs, src, dst);
     if (replaced_ino != 0 && replaced_ino != src_ino)
         inode_note_orphan(fs, replaced_ino);
-    int err;
-    if (src_bind) {
-        if (rename(host_src, host_dst) < 0) {
-            err = errno_map();
-            db_rollback(fs);
-            return err;
-        }
-    } else {
-        err = realfs.rename(mount, src, dst);
+    if (!src_bind) {
+        int err = realfs.rename(mount, src, dst);
         if (err < 0) {
             db_rollback(fs);
             return err;
@@ -826,12 +821,13 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     char host_stat_path[PATH_MAX];
     if (bind_mount_translate_path(path, host_stat_path, sizeof(host_stat_path))) {
         /* For bind-mounted paths, stat the host path directly to avoid
-         * AT_SYMLINK_NOFOLLOW returning symlink stats instead of dir stats. */
+         * AT_SYMLINK_NOFOLLOW returning symlink stats instead of dir stats.
+         * [T-ish-bind-host-op-unlocked] The meta.db row is already read;
+         * release fs->lock before touching the host (File Provider paths). */
+        db_commit(fs);
         struct stat real_stat;
-        if (stat(host_stat_path, &real_stat) < 0) {
-            db_commit(fs);
+        if (stat(host_stat_path, &real_stat) < 0)
             return errno_map();
-        }
         /* Copy basic fields from real stat */
         fake_stat->size = real_stat.st_size;
         fake_stat->nlink = real_stat.st_nlink;
@@ -841,8 +837,8 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         err = 0;
     } else {
         err = realfs.stat(mount, path, fake_stat);
+        db_commit(fs);
     }
-    db_commit(fs);
     if (err < 0)
         return err;
     fake_stat->inode = inode;
@@ -1021,16 +1017,12 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
         fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
         return 0;
     }
+    /* [T-ish-bind-host-op-unlocked] Host call first, outside fs->lock. */
+    if (via_bind && mkdir(host_abs, 0777) < 0)
+        return errno_map();
     db_begin_write(fs);
-    int err;
-    if (via_bind) {
-        if (mkdir(host_abs, 0777) < 0) {
-            err = errno_map();
-            db_rollback(fs);
-            return err;
-        }
-    } else {
-        err = realfs.mkdir(mount, path, 0777);
+    if (!via_bind) {
+        int err = realfs.mkdir(mount, path, 0777);
         if (err < 0) {
             db_rollback(fs);
             return err;
