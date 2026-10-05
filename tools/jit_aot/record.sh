@@ -17,7 +17,8 @@
 set -e
 [ $# -ge 4 ] || { sed -n '2,8p' "$0"; exit 1; }
 ish=$1 rootfs=$2 workload=$3 out=$4 module=${5:-ld-musl}
-name=$(basename "$out" .S | sed 's/^aot_//')
+# the image's symbol is _ish_aot_module_<name>: versioned names (aot_musl_1.2.5-r8.S) need . and - mapped
+name=$(basename "$out" .S | sed 's/^aot_//' | tr '.-' '__')
 if [ -n "$RECORDING" ]; then
     rec=$RECORDING
 else
