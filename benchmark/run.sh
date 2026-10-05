@@ -417,6 +417,14 @@ COMPAT_TESTS=(
     "VCS|hg|hg --version >/dev/null 2>&1"
     "VCS|svn|svn --version >/dev/null 2>&1"
     "VCS|git config|git config --global user.name 2>&1 >/dev/null; true"
+    # gh (Go, static). Every gh runs as a child of sh (pipe or &&): a
+    # multi-threaded program that is the CLI's pid 1 can leave ish running
+    # after it exits. GH_CONFIG_DIR keeps the rootfs's own gh config untouched.
+    "VCS|gh --version|gh --version 2>&1 | grep -q 'gh version'"
+    "VCS|gh help|gh help 2>&1 | grep -q 'gh <command> <subcommand>'"
+    "VCS|gh completion|gh completion -s bash 2>/dev/null | grep -q '__gh_debug'"
+    "VCS|gh config|rm -rf /tmp/_ghc && GH_CONFIG_DIR=/tmp/_ghc gh config set editor vi && GH_CONFIG_DIR=/tmp/_ghc gh config get editor | grep -qx vi; r=\$?; rm -rf /tmp/_ghc; exit \$r"
+    "VCS|gh api (no-auth)|rm -rf /tmp/_gha; GH_CONFIG_DIR=/tmp/_gha gh api user 2>&1 | grep -q 'gh auth login'; r=\$?; rm -rf /tmp/_gha; exit \$r"
     # 10. Editors (6)
     "Editor|vi|vi --version 2>&1 | head -1 >/dev/null; true"
     "Editor|vim|vim --version 2>&1 | head -1 >/dev/null; true"
@@ -526,7 +534,7 @@ _pkg_for() {
         bison) echo bison;; flex) echo flex;; clang) echo clang;;
         python3) echo python3;; pip3|pip) echo py3-pip;;
         node) echo nodejs;; npm) echo nodejs npm;;
-        go) echo go;;
+        go) echo go;; gh) echo github-cli;;
         perl) echo perl;; ruby) echo ruby;; php) echo php83;; lua5.4) echo lua5.4;;
         bash) echo bash;;
         git) echo git;; hg) echo mercurial;; svn) echo subversion;;
@@ -552,7 +560,7 @@ _ensure_packages() {
 
     # Collect unique binary names that need packages
     local missing_pkgs="" checked=""
-    local all_bins="file xz zstd rsync fmt numfmt column jq bc gcc g++ make cmake m4 ld as ar nm objdump strip readelf pkg-config autoconf automake bison flex clang python3 pip3 node npm go perl ruby php lua5.4 bash git hg svn curl wget ssh socat dig nano vim ed sqlite3 openssl ffmpeg convert gm sox gpg strace gdb lsof valgrind ltrace screen tmux"
+    local all_bins="file xz zstd rsync fmt numfmt column jq bc gcc g++ make cmake m4 ld as ar nm objdump strip readelf pkg-config autoconf automake bison flex clang python3 pip3 node npm go gh perl ruby php lua5.4 bash git hg svn curl wget ssh socat dig nano vim ed sqlite3 openssl ffmpeg convert gm sox gpg strace gdb lsof valgrind ltrace screen tmux"
 
     for bin in $all_bins; do
         local pkg
