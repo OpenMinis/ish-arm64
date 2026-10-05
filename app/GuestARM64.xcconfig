@@ -23,8 +23,9 @@ MESON_GUEST_OPTION = -Dguest_arch=arm64
 // memory, so ISH_JIT_EMIT = YES is for development builds only; with NO the
 // JIT never maps executable memory and only runs AOT images that the app
 // target links in (aot_<name>.S from tools/jit_aot/gen.py, see
-// asbestos/guest-arm64/aot.h).
-ISH_ENABLE_JIT = NO
+// asbestos/guest-arm64/aot.h). Without images it runs everything in gadgets,
+// as a build with NO does.
+ISH_ENABLE_JIT = YES
 ISH_JIT_EMIT = NO
 
 // ARM64 rootfs URL (Alpine 3.21 aarch64 minirootfs)
