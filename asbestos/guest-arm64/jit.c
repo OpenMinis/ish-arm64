@@ -270,6 +270,7 @@ struct em {
     // segments of the current block installed so far (translation registry)
     unsigned ninst;
     struct { unsigned pos; uint8_t *code; struct rec_seg *rec; } inst[256];
+    bool chain_fwd;        // the block-end edge being emitted goes to a higher address
     int8_t pin[33];        // guest -> host for this segment: pin_of plus loop promotions
     uint16_t uses[33];     // hreg() requests per guest register (loop planning)
     // Self-loop block: guest registers the loop body uses but that are not
@@ -653,19 +654,18 @@ static uint32_t remap(struct em *e, uint32_t x, int kd, int kn, int km, int ka, 
 static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) {
     e->hflags = false;   // the checks below use cmp
     put(e, 0x9240BC00u | (T_A << 5) | T_A);                    // and x9, x9, #0xffffffffffff
-    put(e, 0x12002C00u | (T_A << 5) | T_P);                    // and w8, w9, #0xfff
-    put(e, 0xF100001Fu | ((0x1000 - bytes) << 10) | (T_P << 5));   // cmp x8, #(0x1000-bytes)
-    branch_stub(e, spos, 2);                                   // b.hi stub
-    put(e, 0x9274CC00u | (T_A << 5) | T_P);                    // and x8, x9, #~0xfff
     put(e, 0xD34C6000u | (T_A << 5) | T_I);                    // ubfx x10, x9, #12, #13
     put(e, 0xCA400000u | (T_A << 16) | (25u << 10) | (T_I << 5) | T_I);  // eor x10, x10, x9, lsr #25
     put(e, 0x12003000u | (T_I << 5) | T_I);                    // and w10, w10, #0x1fff
-    put(e, 0xD37BE800u | (T_I << 5) | T_I);                    // lsl x10, x10, #5
-    put(e, 0x8B000000u | (2u << 16) | (T_I << 5) | T_I);       // add x10, x10, x2
+    put(e, 0x8B000000u | (T_I << 16) | (5u << 10) | (2u << 5) | T_I);    // add x10, x2, x10, lsl #5
     unsigned pg = write ? offsetof(struct tlb_entry, page_if_writable) : offsetof(struct tlb_entry, page);
     put(e, 0xF9400000u | ((pg / 8) << 10) | (T_I << 5) | T_E); // ldr x11, [x10, #page]
-    put(e, 0xEB00001Fu | (T_E << 16) | (T_P << 5));            // cmp x8, x11
-    branch_stub(e, spos, 1);                                   // b.ne stub
+    // One check for "this page" and "does not cross it": x9 - page <=
+    // 0x1000 - bytes. An empty entry's page (TLB_PAGE_EMPTY) is above every
+    // 48-bit address, so it never passes.
+    put(e, 0xCB000000u | (T_E << 16) | (T_A << 5) | T_P);      // sub x8, x9, x11
+    put(e, 0xF100001Fu | ((0x1000 - bytes) << 10) | (T_P << 5));   // cmp x8, #(0x1000-bytes)
+    branch_stub(e, spos, 2);                                   // b.hi stub
     put(e, 0xF9400000u | ((offsetof(struct tlb_entry, gen) / 8) << 10) | (T_I << 5) | T_E);  // ldr x11, [x10, #gen]
     int mmu_off = (int) offsetof(struct tlb, mmu) - (int) offsetof(struct tlb, entries);
     put(e, 0xF8400000u | ((uint32_t) (mmu_off & 0x1ff) << 12) | (2u << 5) | T_Q);             // ldur x12, [x2, #mmu]
@@ -1357,9 +1357,16 @@ static void emit_chain_ex(struct em *e, struct fiber_block *b, unsigned long *sl
         // count comes first so a direct link needs nothing but the branch:
         // jit_link() turns the nop into `b <successor hot entry>`, skipping
         // the slot load and the pc store (every native exit stores pc).
-        put(e, 0x110005EFu);                                                     // add w15, w15, #1
-        put(e, 0x720025FFu);                                                     // tst w15, #0x3ff
-        to_poke1 = e->n; put(e, 0x54000000u);                                    // b.eq poke
+        // Forward edges do not count: a cycle of blocks always has an edge
+        // to a lower or equal address (or a ret, which counts too), so poke
+        // and the timer are still seen within bounded time.
+        if (e->chain_fwd && !self_loop) {
+            to_poke1 = ~0u;
+        } else {
+            put(e, 0x110005EFu);                                                 // add w15, w15, #1
+            put(e, 0x720025FFu);                                                 // tst w15, #0x3ff
+            to_poke1 = e->n; put(e, 0x54000000u);                                // b.eq poke
+        }
         if (!pic_on) {
             if (link >= 0 && link < 2) e->link_at[link] = (int) e->n;
             put(e, NOP);
@@ -1418,7 +1425,7 @@ static void emit_chain_ex(struct em *e, struct fiber_block *b, unsigned long *sl
     }
     put(e, 0xAA0903FCu);                                                         // mov x28, x9
     emit_native_dispatch_ex(e, true);
-    patch_here(e, to_poke1);
+    if (to_poke1 != ~0u) patch_here(e, to_poke1);
     if (!reg_cycle) patch_here(e, to_poke2);
     // timer / poke: enter the successor through the run loop
     if (reg_cycle) {
@@ -1458,6 +1465,14 @@ static void emit_ret(struct em *e, struct fiber_block *b, int rn) {
     int h = rn == 31 ? 31 : hreg(e, rn);
     put(e, 0x9240BC00u | ((uint32_t) h << 5) | 10);                              // and x10, xh, #0xffffffffffff
     put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
+    unsigned miss0 = ~0u;
+    if (n_pinned) {
+        // ret counts a cycle: with forward edges uncounted, a loop closed by
+        // a ret to a cached return address would otherwise never see poke
+        put(e, 0x110005EFu);                                                     // add w15, w15, #1
+        put(e, 0x720025FFu);                                                     // tst w15, #0x3ff
+        miss0 = e->n; put(e, 0x54000000u);                                       // b.eq miss (timer/poke)
+    }
     put(e, 0xD3443D4Bu);                                                         // ubfx x11, x10, #4, #12
     put(e, 0x91000000u | (LOCAL_ret_cache << 10) | (1u << 5) | 12);              // add x12, x1, #ret_cache
     put(e, 0xF86B798Cu);                                                         // ldr x12, [x12, x11, lsl #3]
@@ -1491,6 +1506,7 @@ static void emit_ret(struct em *e, struct fiber_block *b, int rn) {
     emit_exit(e, (uintptr_t) jit_fiber_ret);
     patch_here(e, miss1);
     patch_here(e, miss2);
+    if (miss0 != ~0u) patch_here(e, miss0);
     set_last_block(e, b);
     emit_exit(e, (uintptr_t) jit_fiber_ret);
 }
@@ -1639,8 +1655,16 @@ static bool emit_block_end(struct em *e, struct fiber_block *b, const struct jit
         emit_indirect(e, b, u, (x >> 5) & 31, (x & 0x00200000u) != 0, pc + 4);
         return !e->fail;
     }
+    // Does the taken edge go forward (above this branch)? See emit_chain_ex.
+    int64_t toff = 0;
+    if ((x & 0x7C000000u) == 0x14000000u) toff = sext(x & 0x3ffffff, 26);                       // b, bl
+    else if ((x & 0xFF000010u) == 0x54000000u || (x & 0x7E000000u) == 0x34000000u)
+        toff = sext((x >> 5) & 0x7ffff, 19);                                                   // b.cond, cbz
+    else if ((x & 0x7E000000u) == 0x36000000u) toff = sext((x >> 5) & 0x3fff, 14);            // tbz
+    bool taken_fwd = toff > 0;
     if ((x & 0xFC000000u) == 0x14000000u) {                                 // b
         if (!b->jump_ip[0]) return false;
+        e->chain_fwd = taken_fwd;
         emit_chain_ex(e, b, b->jump_ip[0], 0, e->loop);
         return !e->fail;
     }
@@ -1654,6 +1678,7 @@ static bool emit_block_end(struct em *e, struct fiber_block *b, const struct jit
         mov_block_addr(e, 9, code_off(u->start + 1));
         put(e, 0x91000000u | (LOCAL_ret_cache << 10) | (1u << 5) | 10);          // add x10, x1, #ret_cache
         store_ret_cache(e, h, ret, 10);
+        e->chain_fwd = taken_fwd;
         emit_chain(e, b, b->jump_ip[1], 1);
         return !e->fail;
     }
@@ -1668,6 +1693,7 @@ static bool emit_block_end(struct em *e, struct fiber_block *b, const struct jit
     if (is_bcond) {
         unsigned cond = x & 15;
         if (cond >= 14) {   // al / nv
+            e->chain_fwd = taken_fwd;
             emit_chain_ex(e, b, b->jump_ip[0], 0, e->loop);
             return !e->fail;
         }
@@ -1684,8 +1710,10 @@ static bool emit_block_end(struct em *e, struct fiber_block *b, const struct jit
         else e->buf[to_taken] = (x & 0xFF000000u) | (uint32_t) h;
     }
     if (e->loop) emit_canon(e);
+    e->chain_fwd = true;
     emit_chain(e, b, b->jump_ip[1], 1);    // not taken: fall through
     patch_here(e, to_taken);
+    e->chain_fwd = taken_fwd;
     emit_chain_ex(e, b, b->jump_ip[0], 0, e->loop);    // taken
     return !e->fail;
 }
@@ -1710,6 +1738,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
     e->fail = false;
     e->hflags = false;
     e->body_end = -1;
+    e->chain_fwd = false;
     unsigned covered = 0, real = 0;   // real: units that emitted code
     bool ended = false;
     e->b = b;
@@ -2129,7 +2158,7 @@ void ish_aot_register(const struct aot_module *m) {
 
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
-#define JIT_CODE_VERSION 7
+#define JIT_CODE_VERSION 8
 
 // Everything the emitted code bakes in besides the gadgets it names: the
 // conventions, the struct layouts it loads from and the TLB / block cache

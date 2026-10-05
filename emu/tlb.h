@@ -47,7 +47,13 @@ struct tlb {
 #else
 #define TLB_PAGE(addr) ((addr) & 0xfffff000)
 #endif
+#ifdef GUEST_ARM64
+// Not page aligned (no equality check matches it) and above any 48-bit
+// address, so the JIT's `addr - page` range check never matches it either.
+#define TLB_PAGE_EMPTY 0x8000000000000001ull
+#else
 #define TLB_PAGE_EMPTY 1
+#endif
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu);
 void tlb_free(struct tlb *tlb);
 void tlb_flush(struct tlb *tlb);
