@@ -103,6 +103,26 @@ iPhone (build 830 vs 831, interleaved, AOT on) python json -17.6%, node json -15
 grep -r -9.8%, gzip -3.6%; hit rates the same. AOT on vs off in the app: 1.4x (node start) to 3.9x
 (grep -r).
 
+### `1f3bb5a0/minis/`: MinisApp's 26 images
+
+`minis/{S,ios,rec}`, delivery table `1f3bb5a0/minis-delivery-table.md` (module, version, build-id,
+translations, hit rate, sizes). File names carry the package version (`aot_musl_1.2.5-r8.S`), the module
+symbol the same with `.` and `-` as `_`.
+
+- Group A, the modules of the Minis built-in rootfs (musl 1.2.5-r8, busybox 1.37.0-r8, zlib 1.3.1-r2,
+  libcrypto3/libssl3 3.3.2-r4): recorded on a clone of `alpine-arm64-321-old`, whose build-ids are exactly
+  those, without `apk upgrade` (musl_train.sh and busybox_train.sh with grep/find, zlib_train.sh,
+  tls_train.sh; the certificates come from another rootfs since this one has no openssl).
+- Group B, what `apk add` installs on Alpine 3.21 on 2026-10-05: python3 3.12.15 (libpython and ten
+  lib-dynload extensions, pyext_train.sh with the TLS server), sqlite, pillow, libwebp, libjpeg, numpy,
+  pcre2 (`pcre_train2.sh` and its git repo live in `alpine-arm64-321-net/tmp/net`), ssh and scp (an sshd
+  from `ssh/server.sh` in a second ish on a fakefs rootfs); node and gh reuse the `latest/` recordings.
+  Only python3 changed version against the 97963b7f set.
+- Checked in one pure-AOT build: 26 in use, 0 rejected. Hit rates over the AOJIT cases (not the
+  recording workloads): most above 97%; python3 94%, numpy 89%, pillow 85%, libjpeg 56% (thumbnail
+  decoding takes paths pil_train.sh does not); libssl 99.9% for python TLS but 18% under node's https,
+  which no recording covers.
+
 ## Previous set: abi `97963b7f` (JIT_CODE_VERSION 7, compact tables; recorded at `daf8fcc7`, converted)
 
 | image | module | recorded on | latest/S | old/S |
