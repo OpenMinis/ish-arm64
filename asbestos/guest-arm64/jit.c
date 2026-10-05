@@ -1281,6 +1281,12 @@ void jit_unlink(struct fiber_block *from, int i) {
 
 // Patch the branch at `at` (b.cond / cbz / tbz / b) to jump to the current end.
 static void patch_here(struct em *e, unsigned at) {
+    // A full buffer makes put() fail and leaves `at` == n: buf[n] is past the
+    // end (it is e->n itself), so never patch then; the segment is dropped.
+    if (e->fail || at >= e->n) {
+        e->fail = true;
+        return;
+    }
     int64_t d = (int64_t) e->n - (int64_t) at;   // words
     uint32_t x = e->buf[at];
     if ((x & 0x7E000000u) == 0x36000000u) {                                     // tbz/tbnz
@@ -1673,6 +1679,7 @@ static bool emit_block_end(struct em *e, struct fiber_block *b, const struct jit
         int h = hreg(e, rt);
         to_taken = e->n;
         put(e, (x & 0xFF000000u & ~(0u)) | (uint32_t) h);                   // cbz/cbnz/tbz/tbnz (same bit/size), offset patched
+        if (to_taken >= e->n) return false;                                  // buffer full
         if (is_tbz) e->buf[to_taken] = (x & 0xFFF80000u) | (uint32_t) h;    // keep b5/b40
         else e->buf[to_taken] = (x & 0xFF000000u) | (uint32_t) h;
     }
