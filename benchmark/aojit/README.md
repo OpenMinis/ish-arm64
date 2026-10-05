@@ -76,8 +76,34 @@ the same size, since the relative offsets compress less well than the absolute p
 - `97963b7f/`: the compact layout. `latest/` is the 26-image set converted from `daf8fcc7/latest`;
   `minis/` is MinisApp's 25-image set (musl, busybox and zlib from `old/`, libcrypto, libssl and
   pcre2 recorded on the app's rootfs), converted the same way.
+- `1f3bb5a0/`: JIT_CODE_VERSION 8 (one range check per TLB lookup, cycles counted on backward edges
+  and rets), compact layout. `latest/` holds the six images below; the rest are not recorded yet.
 
-## Current set: abi `97963b7f` (JIT_CODE_VERSION 7, compact tables; recorded at `daf8fcc7`, converted)
+## Current set: abi `1f3bb5a0` (JIT_CODE_VERSION 8)
+
+| image | module | recorded on |
+|---|---|---|
+| musl | ld-musl-aarch64.so.1 | musl 1.2.5-r11 |
+| busybox | /bin/busybox | busybox 1.37.0-r14 |
+| python | libpython3.12.so.1.0 | python3 3.12.15-r0 |
+| pyjson | lib-dynload `_json` | python3 3.12.15-r0 |
+| node | /usr/bin/node | nodejs 22.23.2-r0, default node mode |
+| gh | /usr/bin/gh | github-cli 2.63.0-r5 |
+
+Recorded 2026-10-05 on a clone of `alpine-arm64-321-latest` brought up to the Alpine 3.21 packages of
+that day (`apk upgrade`; python3 had moved to 3.12.15), so that `apk add` in a fresh app installs
+exactly these builds. pyjson was recorded with a json encode/decode one-liner because
+`pyext_train.sh` hung without certificates then (fixed); record it again with `pyext_train.sh`.
+Every other image of the set below still has to be recorded for this abi; until then the app runs
+those modules in gadgets. Size: `.S` 2.3 GB in all (node 605 MB, gh 456 MB, python 167 MB), iOS
+objects 306 MB.
+
+Against the same images recorded at abi `97963b7f`: pure-AOT Mac CLI CPU time -7 to -16%; virtual
+iPhone (build 830 vs 831, interleaved, AOT on) python json -17.6%, node json -15.8%, gh -9 to -11%,
+grep -r -9.8%, gzip -3.6%; hit rates the same. AOT on vs off in the app: 1.4x (node start) to 3.9x
+(grep -r).
+
+## Previous set: abi `97963b7f` (JIT_CODE_VERSION 7, compact tables; recorded at `daf8fcc7`, converted)
 
 | image | module | recorded on | latest/S | old/S |
 |---|---|---|---|---|
@@ -93,7 +119,6 @@ the same size, since the relative offsets compress less well than the absolute p
 | ssh, scp | /usr/bin/ssh, /usr/bin/scp | openssh-client-default 9.9_p2-r0 (build-id df164958…, cbc5234e…) | ✅ | |
 | py* (11) | lib-dynload `_json` `_hashlib` `_blake2` `_struct` `_datetime` `binascii` `math` `zlib` `_socket` `select` `_ssl` | python3 3.12.14-r0 | ✅ | |
 | rg | /usr/bin/rg | ripgrep 14.1.1-r0 | ✅ | |
-| gh | /usr/bin/gh | github-cli 2.63.0 (static Go) | not recorded yet | |
 
 Rootfs used: `latest` = `alpine-arm64-321-latest` (musl, busybox, zlib, python, node) and
 `alpine-arm64-321-full` (the other seven). `old` = `alpine-arm64-321-old`. All three are in the main checkout,
@@ -188,13 +213,15 @@ meson setup build-arm64-aot -Dguest_arch=arm64 -Djit=true -Djit_emit=false -Dbui
 ninja -C build-arm64-aot
 ```
 
-App / IPA:
+App / IPA: the ARM64 targets build the AOT runtime by default (`ISH_ENABLE_JIT = YES`,
+`ISH_JIT_EMIT = NO` in `app/GuestARM64.xcconfig`). List the images in `app/AOTImages.local.xcconfig`
+(not committed, included by `app/AppARM64.xcconfig`) and a plain build of the scheme links them:
 
 ```sh
-OBJS=$(ls $PWD/benchmark/aojit/images/$ABI/latest/ios/aot_*_ios.o | tr '\n' ' ')
+{ printf 'ISH_AOT_OBJECTS ='; for f in benchmark/aojit/images/$ABI/latest/ios/aot_*_ios.o; do printf ' $(SRCROOT)/%s' $f; done; echo; } > app/AOTImages.local.xcconfig
 xcodebuild -project iSH.xcodeproj -scheme iSH-ARM64 -configuration Release \
     -archivePath build-ipa/iSH-ARM64.xcarchive -allowProvisioningUpdates DEVELOPMENT_TEAM=<team> \
-    CURRENT_PROJECT_VERSION=<build> ISH_ENABLE_JIT=YES ISH_JIT_EMIT=NO "ISH_AOT_OBJECTS=$OBJS" archive
+    CURRENT_PROJECT_VERSION=<build> archive
 xcodebuild -exportArchive -archivePath build-ipa/iSH-ARM64.xcarchive -exportPath build-ipa/export \
     -exportOptionsPlist build-ipa/ExportOptions.plist -allowProvisioningUpdates
 ```
@@ -206,7 +233,7 @@ build-arm64-aot/ish -r $R /bin/cat /proc/ish/jit      # every image "ok", none "
 build-arm64-aot/ish -r $R /usr/bin/python3 /tmp/aojit/run_cases.py            # quick tier A/B
 build-arm64-aot/ish -r $R /usr/bin/python3 /tmp/aojit/run_cases.py --tier all # everything
 AOJIT_SSH=127.0.0.1:2222 benchmark/aojit/verify.sh build-arm64-aot/ish -r $R   # three-way, exit 1 on a difference
-benchmark/aojit/compat.sh build-arm64-aot/ish                                   # 227 compatibility tests
+benchmark/aojit/compat.sh build-arm64-aot/ish                                   # 232 compatibility tests
 ```
 
 `verify.sh` and the ssh cases need an sshd in a second ish on a fakefs rootfs:
