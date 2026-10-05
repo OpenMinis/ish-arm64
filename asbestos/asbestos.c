@@ -41,6 +41,9 @@ int stage_trace_on(void) { return 0; }
 void dump_stage_trace(void) { }
 
 __thread volatile addr_t jit_saved_pc;  // block start PC, read by signal handler
+#ifdef ISH_JIT
+__thread struct fiber_frame *jit_active_frame;
+#endif
 
 // PC dispatch trace: capture first N consecutive guest PCs hitting the
 // dispatch loop. Used for V8-realistic micro-bench harness. Set
@@ -1063,14 +1066,22 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 atomic_fetch_add_explicit(&s_dispatch_iterations, 1, memory_order_relaxed);
         }
 
-        in_jit = 1;
 #ifdef ISH_JIT
+        struct fiber_frame *previous_frame = jit_active_frame;
+        jit_active_frame = frame;
+        frame->native_fault_host_pc = 0;
         jit_exec_ready();
 #endif
+        in_jit = 1;
         interrupt = fiber_enter(block, frame, tlb);
         in_jit = 0;
+#ifdef ISH_JIT
+        jit_active_frame = previous_frame;
+        frame->native_fault_host_pc = 0;
+#endif
 #ifdef GUEST_ARM64
-        frame->cpu.segfault_precise_pc = 0;
+        if (interrupt != INT_JIT_CRASH)
+            frame->cpu.segfault_precise_pc = 0;
         if (interrupt == INT_GPF)
             fiber_fix_fault_pc(asbestos, frame, tlb);
 #endif

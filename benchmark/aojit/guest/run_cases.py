@@ -14,8 +14,13 @@ per module (the "modules with an image" table of /proc/ish/jit, before vs after)
 
 Progress goes to stderr; results to <out>.json and <out>.txt (default
 /tmp/aojit/results/<time>). Cases whose `needs` are missing are skipped, see cases.json.
+Only complete, successful on/off comparisons with stable equal output get a
+speedup. Volatile cases retain timings but are unverified, not equality passes.
+Exit status: 1 for failed runs/comparisons/setup, 2 for incomplete verification
+(skips, volatile output or no cases), 0 for verified comparisons or explicit cur
+mode timing. These checks are not an instruction-level correctness proof.
 """
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, time
+import argparse, hashlib, json, math, os, re, shutil, subprocess, sys, time
 
 A = '/tmp/aojit'
 JIT = '/proc/ish/jit'
@@ -134,7 +139,8 @@ def summarize(res, modes):
             note.append(f"min {os.path.basename(low[0]).split('.so')[0]} {100 * low[1][1] / low[1][0]:.0f}%")
         if r.get('family'): note.append('family')
         if r.get('holdout'): note.append('holdout')
-        if not r.get('same_output', True): note.append('⚠️ output differs')
+        if r.get('same_output') is False: note.append('⚠️ output differs')
+        if r.get('status') in ('unverified', 'timing-only'): note.append(r['status'])
         if r.get('errors'): note.append('❌ ' + ','.join(sorted(set(map(str, r['errors'])))))
         lines.append(f"{r['id']:24s} {r['title'][:28]:28s} {cols}  {sp}  {hit}  {' '.join(note)}")
     return '\n'.join(lines)
@@ -157,17 +163,29 @@ def run_case(c, args, modes, port):
                     hits_total[mod] = [a + b for a, b in zip(hits_total[mod], v)]
             if rc != 0:
                 rec['errors'].append(rc)
-            rec['outputs'].setdefault(m, set()).add(digest)
-            if dt is not None:
-                rec['times'][m].append(round(dt, 3))
+            elif dt is None or not math.isfinite(dt) or dt <= 0:
+                rec['errors'].append('invalid-duration')
+            else:
+                rec['outputs'].setdefault(m, set()).add(digest)
+                # Keep sub-millisecond durations; round only for display.
+                rec['times'][m].append(dt)
             log(f"   {'🟢' if m == 'on' else '⚪️'} {m:3s} run {k + 1}: " + (f'{dt:7.2f}s' if dt else '  timeout') +
                 ('' if rc == 0 else f'  ❌ rc={rc}'))
     rec['best'] = {m: (min(v) if v else None) for m, v in rec['times'].items()}
-    if rec['best'].get('on') and rec['best'].get('off'):
+    complete = args.repeat > 0 and all(len(rec['times'][m]) == args.repeat for m in modes)
+    outs = [rec['outputs'].get(m, set()) for m in modes]
+    rec['same_output'] = (None if c.get('volatile', False) else
+                          bool(complete and outs and all(o == outs[0] and len(o) == 1 for o in outs)))
+    if rec['errors'] or not complete or rec['same_output'] is False:
+        rec['status'] = 'failed'
+    elif rec['same_output'] is None:
+        rec['status'] = 'unverified'
+    elif set(modes) == {'on', 'off'}:
+        rec['status'] = 'passed'
         rec['speedup'] = round(rec['best']['off'] / rec['best']['on'], 3)
-    outs = [o for o in rec['outputs'].values()]
-    rec['same_output'] = c.get('volatile', False) or all(o == outs[0] and len(o) == 1 for o in outs)
-    rec['outputs'] = {m: sorted(o) for m, o in rec['outputs'].items()}
+    else:
+        rec['status'] = 'timing-only'
+    rec['outputs'] = {m: sorted(rec['outputs'].get(m, set())) for m in modes}
     rec['hits'] = hits_total
     return rec, port
 
@@ -184,21 +202,28 @@ def main():
     ap.add_argument('--setup', action='store_true', help='(re)generate inputs first')
     ap.add_argument('--list', action='store_true')
     args = ap.parse_args()
+    modes = args.modes.split(',')
+    if args.repeat < 1 or args.timeout < 1:
+        ap.error('--repeat and --timeout must be positive')
+    if not (modes == ['cur'] or (len(modes) == 2 and set(modes) == {'on', 'off'})):
+        ap.error('--modes must be on,off (either order), or cur')
 
-    cases = select(json.load(open(f'{A}/cases.json'))['cases'], args)
+    with open(f'{A}/cases.json') as f:
+        cases = select(json.load(f)['cases'], args)
     if args.list:
         for c in cases:
             flags = ' '.join(f for f in ('family', 'holdout') if c.get(f))
             print(f"{c['id']:24s} {c['tier']:5s} {c['title']:30s} {','.join(c.get('images', [])):30s} {flags}")
         return
     if not cases:
-        log('🤷 no case selected'); return
-    modes = [m for m in args.modes.split(',') if m]
+        log('🤷 no case selected'); return 2
     if not os.path.exists(JIT) and modes != ['cur']:
-        log(f'⚠️  {JIT} missing: not an AOJIT build, measuring the current mode only'); modes = ['cur']
+        log(f'⚠️  {JIT} missing: cannot compare AOT; use --modes cur for timing only'); return 2
     if args.setup or not os.path.exists(f'{A}/.setup_done'):
         log('🧰 generating inputs (not timed)…')
-        subprocess.run(['sh', f'{A}/setup.sh'])
+        if subprocess.run(['sh', f'{A}/setup.sh']).returncode:
+            log('❌ setup failed; no timings collected')
+            return 1
 
     out = args.out or f"{A}/results/{time.strftime('%Y%m%d-%H%M%S')}"
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -219,17 +244,24 @@ def main():
         results.append(rec)
         sp = f"  → {rec['speedup']:.2f}×" if rec.get('speedup') else ''
         log('   best ' + ' '.join(f"{m}={v:.2f}s" for m, v in rec['best'].items() if v) + sp +
-            ('' if rec['same_output'] else '  ⚠️ output differs'))
+            ('  ⚠️ output differs' if rec['same_output'] is False else
+             '  unverified' if rec['same_output'] is None else ''))
     if 'cur' not in modes:
         set_mode('on')
 
     text = summarize(results, modes)
-    json.dump({'env': info, 'modes': modes, 'repeat': args.repeat, 'cases': results,
-               'jit_after': read(JIT)}, open(out + '.json', 'w'), ensure_ascii=False, indent=1)
+    with open(out + '.json', 'w') as f:
+        json.dump({'env': info, 'modes': modes, 'repeat': args.repeat, 'cases': results,
+                   'jit_after': read(JIT)}, f, ensure_ascii=False, indent=1)
     with open(out + '.txt', 'w') as f:
         f.write(f"{info['version']}\n{info['date']}\n{' '.join(info['packages'])}\n\n{text}\n")
     log('\n' + text + f'\n\n📄 {out}.json / .txt')
+    if any(r.get('status') == 'failed' for r in results):
+        return 1
+    if any(r.get('skipped') or r.get('status') == 'unverified' for r in results):
+        return 2
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
