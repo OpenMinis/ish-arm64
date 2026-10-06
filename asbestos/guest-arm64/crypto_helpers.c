@@ -8,6 +8,37 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#endif
+
+/*
+ * Whether the host CPU has the SHA512 instructions (FEAT_SHA512). The SHA512
+ * gadgets in crypto.S run them natively when it does and call the helpers
+ * below when it does not: A11/A12 devices lack them, and a guest that uses
+ * them regardless of HWCAP (codex, apk) killed the app with SIGILL.
+ * ISH_HOST_SHA512=0 forces the software path (for testing).
+ */
+unsigned char ish_host_sha512 = 0;
+
+__attribute__((constructor)) static void detect_host_sha512(void) {
+    const char *force = getenv("ISH_HOST_SHA512");
+    if (force != NULL) {
+        ish_host_sha512 = force[0] != '0';
+        return;
+    }
+#if defined(__APPLE__)
+    int v = 0;
+    size_t n = sizeof(v);
+    if (sysctlbyname("hw.optional.armv8_2_sha512", &v, &n, NULL, 0) == 0)
+        ish_host_sha512 = v != 0;
+#elif defined(__linux__) && defined(HWCAP_SHA512)
+    ish_host_sha512 = (getauxval(AT_HWCAP) & HWCAP_SHA512) != 0;
+#endif
+}
 
 /* AES S-box */
 static const uint8_t aes_sbox[256] = {

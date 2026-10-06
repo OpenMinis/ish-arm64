@@ -366,11 +366,35 @@
 
     // Execute native SHA512SU0 instruction
     // SHA512SU0 V0.2D, V1.2D
+    // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
+    adrp x8, NAME(ish_host_sha512)@PAGE
+    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    cbz w8, sha512su0_soft
     .inst 0xcec08020         // sha512su0 v0.2d, v1.2d
 
     // Store result back to Vd
     str q0, [x12, x13]
 
+    gret
+
+sha512su0_soft:
+    stp x19, x20, [sp, #-0x60]!
+    stp x21, x22, [sp, #0x10]
+    stp x23, x24, [sp, #0x20]
+    stp x25, x26, [sp, #0x30]
+    stp x27, x28, [sp, #0x40]
+    str lr, [sp, #0x50]
+    save_c
+    add x0, x12, x13        // vd
+    add x1, x12, x14        // vn
+    bl NAME(sha512su0_helper)
+    restore_c
+    ldr lr, [sp, #0x50]
+    ldp x27, x28, [sp, #0x40]
+    ldp x25, x26, [sp, #0x30]
+    ldp x23, x24, [sp, #0x20]
+    ldp x21, x22, [sp, #0x10]
+    ldp x19, x20, [sp], #0x60
     gret
 
 /*
@@ -397,11 +421,36 @@
 
     // Execute native SHA512SU1 instruction
     // SHA512SU1 V0.2D, V1.2D, V2.2D
+    // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
+    adrp x8, NAME(ish_host_sha512)@PAGE
+    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    cbz w8, sha512su1_soft
     .inst 0xce628820         // sha512su1 v0.2d, v1.2d, v2.2d
 
     // Store result back to Vd
     str q0, [x12, x13]
 
+    gret
+
+sha512su1_soft:
+    stp x19, x20, [sp, #-0x60]!
+    stp x21, x22, [sp, #0x10]
+    stp x23, x24, [sp, #0x20]
+    stp x25, x26, [sp, #0x30]
+    stp x27, x28, [sp, #0x40]
+    str lr, [sp, #0x50]
+    save_c
+    add x0, x12, x13        // vd
+    add x1, x12, x14        // vn
+    add x2, x12, x15        // vm
+    bl NAME(sha512su1_helper)
+    restore_c
+    ldr lr, [sp, #0x50]
+    ldp x27, x28, [sp, #0x40]
+    ldp x25, x26, [sp, #0x30]
+    ldp x23, x24, [sp, #0x20]
+    ldp x21, x22, [sp, #0x10]
+    ldp x19, x20, [sp], #0x60
     gret
 
 /*
@@ -428,11 +477,36 @@
 
     // Execute native SHA512H instruction
     // SHA512H Qd, Qn, Vm.2D -> SHA512H Q0, Q1, V2.2D
+    // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
+    adrp x8, NAME(ish_host_sha512)@PAGE
+    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    cbz w8, sha512h_soft
     .inst 0xce628020         // sha512h q0, q1, v2.2d
 
     // Store result back to Vd
     str q0, [x12, x13]
 
+    gret
+
+sha512h_soft:
+    stp x19, x20, [sp, #-0x60]!
+    stp x21, x22, [sp, #0x10]
+    stp x23, x24, [sp, #0x20]
+    stp x25, x26, [sp, #0x30]
+    stp x27, x28, [sp, #0x40]
+    str lr, [sp, #0x50]
+    save_c
+    add x0, x12, x13        // vd
+    add x1, x12, x14        // vn
+    add x2, x12, x15        // vm
+    bl NAME(sha512h_helper)
+    restore_c
+    ldr lr, [sp, #0x50]
+    ldp x27, x28, [sp, #0x40]
+    ldp x25, x26, [sp, #0x30]
+    ldp x23, x24, [sp, #0x20]
+    ldp x21, x22, [sp, #0x10]
+    ldp x19, x20, [sp], #0x60
     gret
 
 /*
@@ -459,11 +533,36 @@
 
     // Execute native SHA512H2 instruction
     // SHA512H2 Q0, Q1, V2.2D
+    // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
+    adrp x8, NAME(ish_host_sha512)@PAGE
+    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    cbz w8, sha512h2_soft
     .inst 0xce628420         // sha512h2 q0, q1, v2.2d
 
     // Store result back to Vd
     str q0, [x12, x13]
 
+    gret
+
+sha512h2_soft:
+    stp x19, x20, [sp, #-0x60]!
+    stp x21, x22, [sp, #0x10]
+    stp x23, x24, [sp, #0x20]
+    stp x25, x26, [sp, #0x30]
+    stp x27, x28, [sp, #0x40]
+    str lr, [sp, #0x50]
+    save_c
+    add x0, x12, x13        // vd
+    add x1, x12, x14        // vn
+    add x2, x12, x15        // vm
+    bl NAME(sha512h2_helper)
+    restore_c
+    ldr lr, [sp, #0x50]
+    ldp x27, x28, [sp, #0x40]
+    ldp x25, x26, [sp, #0x30]
+    ldp x23, x24, [sp, #0x20]
+    ldp x21, x22, [sp, #0x10]
+    ldp x19, x20, [sp], #0x60
     gret
 
 /*
