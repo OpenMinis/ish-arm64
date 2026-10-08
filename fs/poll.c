@@ -270,6 +270,69 @@ void poll_wakeup(struct fd *fd, int events) {
     unlock(&fd->poll_lock);
 }
 
+// [T-ish-poll-spin-guard] A wait that keeps waking without anything becoming
+// ready must not turn into a host busy loop. The host poll can report an
+// fd as ready while the guest fd's own poll() reports nothing the caller
+// asked for (a level-triggered EOF/HUP on a pipe or socket is the usual
+// shape), so every pass returns from kevent at once, re-scans, finds nothing
+// and waits again — all inside ONE guest syscall. The thread then burns 100%
+// of a core on the host side, and the background CPU governor cannot brake
+// it: its throttle hook only runs between guest blocks, which this thread
+// never reaches. Field case 2026-10-07/08: a ripgrep thread sat in ppoll at
+// ~100% CPU with its syscall count frozen for minutes, the governor reached
+// RED with 3% duty and no effect, and iOS killed the app for exceeding its
+// background CPU budget ~50s after it went to the background.
+//
+// After POLL_SPIN_GRACE wakeups in a row that produced nothing, each further
+// pass sleeps first (1ms, then 10ms, then 50ms). A wait that genuinely becomes
+// ready breaks out on the next scan, so the cost is at most one sleep of
+// latency, and only for a wait that was already spinning. Signals are still
+// checked on every pass. The first stretch of a spin is logged once with
+// what the host reported, so the misbehaving fd type can be found.
+#define POLL_SPIN_GRACE 64
+#define POLL_SPIN_LOG_AT 256
+
+static void poll_spin_backoff(unsigned spurious) {
+    long ns = spurious < 256 ? 1000000L : (spurious < 2048 ? 10000000L : 50000000L);
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = ns};
+    nanosleep(&ts, NULL);
+}
+
+// Called with poll_->lock held.
+static void poll_spin_report(struct poll *poll_, unsigned spurious,
+                             struct real_poll_event *last, int last_n) {
+    char comm[17];
+    memcpy(comm, current->comm, 16);
+    comm[16] = '\0';
+    printk("POLL-SPIN: pid=%d (%s) %u wakeups in a row with nothing ready; backing off\n",
+           current->pid, comm, spurious);
+    for (int i = 0; i < last_n; i++) {
+        struct poll_fd *pfd = rpe_data(&last[i]);
+        if (pfd == NULL) {
+            printk("POLL-SPIN:   host event %#x on the notify pipe\n", rpe_events(&last[i]));
+            continue;
+        }
+        // A registration removed since the event was queued sits on the
+        // freelist with a stale fd pointer (see struct poll): do not touch it.
+        if (pfd->poll == NULL) {
+            printk("POLL-SPIN:   host event %#x on a removed registration\n", rpe_events(&last[i]));
+            continue;
+        }
+        int ready = (pfd->fd != NULL && pfd->fd->ops->poll) ? pfd->fd->ops->poll(pfd->fd) : -1;
+        printk("POLL-SPIN:   host event %#x on guest fd %d: wants %#x, fd poll says %#x, edge-fired %#x, oneshot %d\n",
+               rpe_events(&last[i]), pfd->fd_no, pfd->types, ready,
+               pfd->triggered_types, pfd->oneshot_fired);
+    }
+    struct poll_fd *pfd;
+    int listed = 0;
+    list_for_each_entry(&poll_->poll_fds, pfd, fds) {
+        if (++listed > 8) break;
+        int ready = (pfd->fd != NULL && pfd->fd->ops->poll) ? pfd->fd->ops->poll(pfd->fd) : -1;
+        printk("POLL-SPIN:   registered guest fd %d: wants %#x, fd poll says %#x\n",
+               pfd->fd_no, pfd->types, ready);
+    }
+}
+
 int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struct timespec *timeout) {
     lock(&poll_->lock);
 
@@ -287,6 +350,11 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
 
     // TODO this is pretty broken with regards to timeouts
     int res = 0;
+    // [T-ish-poll-spin-guard] Consecutive host wakeups that left nothing ready.
+    unsigned spurious = 0;
+    bool woke = false;
+    struct real_poll_event last_events[4];
+    int last_n = 0;
     while (true) {
         // check if any fds are ready
         struct poll_fd *poll_fd, *tmp;
@@ -345,11 +413,20 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
             break;
         }
 
+        // [T-ish-poll-spin-guard] The last wakeup produced nothing ready.
+        if (woke) {
+            woke = false;
+            if (++spurious == POLL_SPIN_LOG_AT)
+                poll_spin_report(poll_, spurious, last_events, last_n);
+        }
+
         // wait for a ready notification
         list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
             sockrestart_begin_listen_wait(poll_fd->fd);
         }
         unlock(&poll_->lock);
+        if (spurious >= POLL_SPIN_GRACE)
+            poll_spin_backoff(spurious);
         int err;
         int saved_errno;
         struct real_poll_event e[4];
@@ -390,6 +467,7 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         // If we timed out from our bounded timeout, loop back to re-check
         // fd readiness and signal pending.
         if (err == 0 && wait_timeout == &bounded_timeout) {
+            spurious = 0;
             lock(&poll_->lock);
             list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
                 sockrestart_end_listen_wait(poll_fd->fd);
@@ -472,6 +550,10 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 triggered_poll_fd->triggered_types &= ~rpe_events(&e[i]);
             }
         }
+
+        woke = true;
+        last_n = err < 4 ? err : 4;
+        memcpy(last_events, e, sizeof(e[0]) * last_n);
 
         char fuck;
         if (read(poll_->notify_pipe[0], &fuck, 1) < 0 && errno != EAGAIN) {
