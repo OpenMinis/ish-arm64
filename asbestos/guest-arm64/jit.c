@@ -663,15 +663,14 @@ static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) 
     // One check for "this page" and "does not cross it": x9 - page <=
     // 0x1000 - bytes. An empty entry's page (TLB_PAGE_EMPTY) is above every
     // 48-bit address, so it never passes.
-    put(e, 0xCB000000u | (T_E << 16) | (T_A << 5) | T_P);      // sub x8, x9, x11
+    // tlb->stale (TLB_STALE once another thread changed the mappings) ORed
+    // into the address: a stale TLB fails this check for every page.
+    int stale_off = (int) offsetof(struct tlb, stale) - (int) offsetof(struct tlb, entries);
+    put(e, 0xF8400000u | ((uint32_t) (stale_off & 0x1ff) << 12) | (2u << 5) | T_Q);   // ldur x12, [x2, #stale]
+    put(e, 0xAA000000u | (T_Q << 16) | (T_A << 5) | T_Q);      // orr x12, x9, x12
+    put(e, 0xCB000000u | (T_E << 16) | (T_Q << 5) | T_P);      // sub x8, x12, x11
     put(e, 0xF100001Fu | ((0x1000 - bytes) << 10) | (T_P << 5));   // cmp x8, #(0x1000-bytes)
     branch_stub(e, spos, 2);                                   // b.hi stub
-    put(e, 0xF9400000u | ((offsetof(struct tlb_entry, gen) / 8) << 10) | (T_I << 5) | T_E);  // ldr x11, [x10, #gen]
-    int mmu_off = (int) offsetof(struct tlb, mmu) - (int) offsetof(struct tlb, entries);
-    put(e, 0xF8400000u | ((uint32_t) (mmu_off & 0x1ff) << 12) | (2u << 5) | T_Q);             // ldur x12, [x2, #mmu]
-    put(e, 0xF9400000u | ((offsetof(struct mmu, changes) / 8) << 10) | (T_Q << 5) | T_Q);    // ldr x12, [x12, #changes]
-    put(e, 0xEB00001Fu | (T_Q << 16) | (T_E << 5));            // cmp x11, x12
-    branch_stub(e, spos, 1);                                   // b.ne stub
     put(e, 0xF9400000u | ((offsetof(struct tlb_entry, data_minus_addr) / 8) << 10) | (T_I << 5) | T_E);  // ldr x11, [x10, #dma]
     put(e, 0x8B000000u | (T_A << 16) | (T_E << 5) | T_A);      // add x9, x11, x9
 }
@@ -2158,7 +2157,7 @@ void ish_aot_register(const struct aot_module *m) {
 
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
-#define JIT_CODE_VERSION 8
+#define JIT_CODE_VERSION 9
 
 // Everything the emitted code bakes in besides the gadgets it names: the
 // conventions, the struct layouts it loads from and the TLB / block cache
@@ -2175,7 +2174,8 @@ static uint32_t jit_abi(void) {
         LOCAL_last_block, LOCAL_ret_cache,
         sizeof(struct tlb_entry), offsetof(struct tlb_entry, page), offsetof(struct tlb_entry, page_if_writable),
         offsetof(struct tlb_entry, gen), offsetof(struct tlb_entry, data_minus_addr), TLB_BITS, PAGE_BITS,
-        offsetof(struct tlb, entries), offsetof(struct tlb, mmu), offsetof(struct tlb, block_cache_gen),
+        offsetof(struct tlb, entries), offsetof(struct tlb, mmu), offsetof(struct tlb, stale),
+        offsetof(struct tlb, block_cache_gen),
         offsetof(struct tlb, block_cache), sizeof(((struct tlb *) 0)->block_cache),
         offsetof(struct mmu, changes), offsetof(struct mmu, asbestos), offsetof(struct asbestos, invalidate_gen),
         sizeof(struct aot_module), sizeof(struct aot_trans),

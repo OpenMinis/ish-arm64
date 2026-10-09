@@ -163,6 +163,9 @@ void task_destroy(struct task *task) {
 }
 
 static void task_run_tlb_cleanup(void *arg) {
+#ifdef GUEST_ARM64
+    tlb_detach((struct tlb *) arg);   // exited while running guest code
+#endif
     tlb_free((struct tlb *)arg);
     // [T-ish-mm-leak-refcount-handoff] If the do_exit_group safety valve
     // orphaned this thread (stuck in an uninterruptible host syscall) it
@@ -221,8 +224,14 @@ void task_run_current() {
             pthread_exit(NULL);
         }
         read_wrlock(&self->mem->lock);
+#ifdef GUEST_ARM64
+        tlb_attach(tlb, &self->mem->mmu);
+#endif
         tlb_refresh(tlb, &self->mem->mmu);
         int interrupt = cpu_run_to_interrupt(cpu, tlb);
+#ifdef GUEST_ARM64
+        tlb_detach(tlb);
+#endif
         read_wrunlock(&self->mem->lock);
         handle_interrupt(interrupt);
     }

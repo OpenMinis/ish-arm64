@@ -26,6 +26,15 @@ struct tlb {
     struct mmu *mmu;
     page_t dirty_page;
     unsigned mem_changes;
+#ifdef GUEST_ARM64
+    // TLB_STALE once another thread may have changed the mappings since this
+    // TLB was last checked against mmu->changes, else 0. The inline lookups OR
+    // it into the page they compare, so a stale TLB misses on every page, and
+    // the miss path clears it and flushes. Every valid entry was filled at
+    // mem_changes (a fill flushes first when it moved), so this one bit stands
+    // for all their generations.
+    uint64_t stale;
+#endif
     // this is basically one of the return values of tlb_handle_miss, tlb_{read,write}, and __tlb_{read,write}_cross_page
     // yes, this sucks
     addr_t segfault_addr;
@@ -39,6 +48,11 @@ struct tlb {
 
     // Persistent fiber_frame (avoids malloc/free + ret_cache zeroing per syscall)
     struct fiber_frame *frame;
+
+#ifdef GUEST_ARM64
+    struct mmu *attached;      // whose tlbs list this is on, while running guest code
+    struct list tlbs_link;
+#endif
 };
 
 #define TLB_INDEX(addr) ((((addr >> PAGE_BITS) ^ (addr >> (PAGE_BITS + TLB_BITS))) & (TLB_SIZE - 1)))
@@ -55,6 +69,14 @@ struct tlb {
 #define TLB_PAGE_EMPTY 1
 #endif
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu);
+#ifdef GUEST_ARM64
+#define TLB_STALE (1ull << 48)   // above every 48-bit page: no entry matches
+// Around running guest code (the thread holds the mm and its lock): an
+// attached TLB is marked stale by mmu_tlbs_stale() when the mappings change.
+void tlb_attach(struct tlb *tlb, struct mmu *mmu);
+void tlb_detach(struct tlb *tlb);
+void mmu_tlbs_stale(struct mmu *mmu);
+#endif
 void tlb_free(struct tlb *tlb);
 void tlb_flush(struct tlb *tlb);
 void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type);

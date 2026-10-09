@@ -133,6 +133,10 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
     .ifc \type,write
         str x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
     .endif
+    // A stale TLB (another thread changed the mappings, tlb->stale is
+    // TLB_STALE) then matches no entry and every access takes the miss path.
+    ldr x10, [_tlb, #(-TLB_entries+TLB_stale)]
+    orr x8, x8, x10
 
     // TLB index calculation: (addr >> 12) ^ (addr >> 26) masked to TLB_SIZE-1
     ubfx x9, x7, #12, #13       // (addr >> 12) & 0x1fff (TLB_BITS=13)
@@ -148,18 +152,6 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
     .endif
 
     cmp x8, x10
-    b.ne handle_miss_\id
-
-    // Coherence check: this cached entry's host pointer is only valid while
-    // mmu->changes still equals the generation captured when it was filled.
-    // If another thread remapped the page (CoW/mmap/munmap) mmu->changes has
-    // advanced and data_minus_addr points at the stale host backing — treat
-    // it as a miss and re-translate. Fixes JSC reading a null methodTable /
-    // stale Structure after a concurrent GC/allocator remap.
-    ldr x10, [x9, #TLB_ENTRY_gen]
-    ldr x8, [_tlb, #(-TLB_entries+TLB_mmu)]
-    ldr x8, [x8, #MMU_changes]
-    cmp x10, x8
     b.ne handle_miss_\id
 
     ldr x10, [x9, #TLB_ENTRY_data_minus_addr]
