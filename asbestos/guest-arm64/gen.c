@@ -924,6 +924,7 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     state->last_insn = 0;
     state->b_follow_depth = 0;
     state->oom = false;
+    state->units = false;
     for (int i = 0; i <= 1; i++) {
         state->jump_ip[i] = 0;
     }
@@ -1016,7 +1017,9 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     //   cbnz Xr, skip             ; still referenced → skip
     // On match, emit one gadget_decref and consume all five instructions. This is
     // the single hottest inlined pattern in _PyEval_EvalFrameDefault.
-    if ((insn & 0xffc00000) == 0xf9400000u &&         // LDR Xr, [Xobj, #imm]
+    // Not for the JIT, whose units take at most two instructions.
+    if (!state->units &&
+        (insn & 0xffc00000) == 0xf9400000u &&         // LDR Xr, [Xobj, #imm]
         ((insn >> 10) & 0xfff) == 0) {                // imm offset == 0
         uint32_t r   = insn & 0x1f;
         uint32_t obj = (insn >> 5) & 0x1f;
@@ -1058,7 +1061,9 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     // The b.eq target is the instruction right after the str, so BOTH paths fall
     // through to the next opcode — no branch out of the block. This is the LOAD_FAST
     // / dup-ref hot path, dual of DECREF but with no dealloc branch (always fast).
-    if ((insn & 0xffc00000) == 0xb9400000u &&         // LDR Wr, [Xobj, #imm]
+    // Not for the JIT, whose units take at most two instructions.
+    if (!state->units &&
+        (insn & 0xffc00000) == 0xb9400000u &&         // LDR Wr, [Xobj, #imm]
         ((insn >> 10) & 0xfff) == 0) {                // imm offset == 0
         uint32_t r   = insn & 0x1f;
         uint32_t obj = (insn >> 5) & 0x1f;
@@ -1615,7 +1620,8 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         // Most common pair across CPython workloads (~4.5% of dispatches).
         // Conditions: 32-bit (sf=0), opc=0, rn!=31, rd!=31, follow-up CMP wd,#imm12
         // (sf=0, op=1, S=1, rd=31), follow-up B.cond with cond ∈ supported set.
-        if (opc == 0 && !sf && rn != 31 && rd != 31) {
+        // Not for the JIT, whose units take at most two instructions.
+        if (opc == 0 && !sf && rn != 31 && rd != 31 && !state->units) {
             uint32_t cmp_insn, br_insn;
             if (gen_peek_next_insn(state, &cmp_insn)) {
                 // CMP Wn, #imm12: SUBS WZR, Wn, #imm12  (32-bit, op=1, S=1, sh=0, rd=31, rn=rd_of_AND)

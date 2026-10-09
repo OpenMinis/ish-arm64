@@ -24,6 +24,9 @@ struct gen_state {
     // further; fiber_block_compile() checks this and fails the compile, which
     // the run loop turns into a guest INT_GPF. See [T-ish-jit-oom-abort].
     bool oom;
+    // The JIT turns this block's gadgets into units of at most two
+    // instructions (jit_step_end()): no peephole may fuse more than that.
+    bool units;
 };
 
 bool gen_start(addr_t addr, struct gen_state *state);
