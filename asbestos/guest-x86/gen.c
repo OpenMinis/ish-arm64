@@ -16,7 +16,7 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     return gen_step32(state, tlb, false);
 }
 
-static void gen(struct gen_state *state, unsigned long thing) {
+static void gen(struct gen_state *state, uintptr_t thing) {
     assert(state->size <= state->capacity);
     // See the ARM64 gen() for why this reports failure instead of dying: a
     // single guest process exhausting memory must not take the app with it.
@@ -25,7 +25,7 @@ static void gen(struct gen_state *state, unsigned long thing) {
     if (state->size >= state->capacity) {
         unsigned new_capacity = state->capacity * 2;
         struct fiber_block *bigger_block = realloc(state->block,
-                sizeof(struct fiber_block) + new_capacity * sizeof(unsigned long));
+                sizeof(struct fiber_block) + new_capacity * sizeof(uintptr_t));
         if (bigger_block == NULL) {
             state->oom = true;
             return;
@@ -47,7 +47,7 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     }
     state->block_patch_ip = 0;
 
-    struct fiber_block *block = malloc(sizeof(struct fiber_block) + state->capacity * sizeof(unsigned long));
+    struct fiber_block *block = malloc(sizeof(struct fiber_block) + state->capacity * sizeof(uintptr_t));
     if (block == NULL)
         return false;
     state->block = block;
@@ -72,7 +72,7 @@ void gen_end(struct gen_state *state) {
         list_init(&block->jumps_from_links[i]);
     }
     if (state->block_patch_ip != 0) {
-        block->code[state->block_patch_ip] = (unsigned long) block;
+        block->code[state->block_patch_ip] = (uintptr_t) block;
     }
     if (block->addr != state->ip)
         block->end_addr = state->ip - 1;
@@ -88,7 +88,7 @@ void gen_end(struct gen_state *state) {
 void gen_exit(struct gen_state *state) {
     extern void gadget_exit(void);
     // in case the last instruction didn't end the block
-    gen(state, (unsigned long) gadget_exit);
+    gen(state, (uintptr_t) gadget_exit);
     gen(state, state->ip);
 }
 
@@ -142,7 +142,7 @@ enum repeat {
 
 typedef void (*gadget_t)(void);
 
-#define GEN(thing) gen(state, (unsigned long) (thing))
+#define GEN(thing) gen(state, (uintptr_t) (thing))
 #define g(g) do { extern void gadget_##g(void); GEN(gadget_##g); } while (0)
 #define gg(_g, a) do { g(_g); GEN(a); } while (0)
 #define ggg(_g, a, b) do { g(_g); GEN(a); GEN(b); } while (0)
@@ -256,14 +256,14 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
 
 #define POP(thing,z) \
     gg(pop, state->orig_ip); \
-    state->orig_ip_extra = 1ul << 62; /* marks that on segfault the stack pointer should be adjusted */\
+    state->orig_ip_extra = 1ull << 62; /* marks that on segfault the stack pointer should be adjusted */\
     store(thing, z)
 #define PUSH(thing,z) load(thing, z); gg(push, state->orig_ip)
 
 #define INC(val,z) load(val, z); gz(inc, z); store(val, z)
 #define DEC(val,z) load(val, z); gz(dec, z); store(val, z)
 
-#define fake_ip (state->ip | (1ul << 63))
+#define fake_ip (state->ip | (1ull << 63))
 
 #define jump_ips(off1, off2) \
     state->jump_ip[0] = state->size + off1; \
@@ -305,13 +305,13 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
     gag(skipn, cond_##cc, 0); \
     int start = state->size; \
     load(src, z); store(dst, z); \
-    state->block->code[start - 1] = (state->size - start) * sizeof(long); \
+    state->block->code[start - 1] = (state->size - start) * sizeof(uintptr_t); \
 } while (0)
 #define CMOVN(cc, src, dst,z) do { \
     gag(skip, cond_##cc, 0); \
     int start = state->size; \
     load(src, z); store(dst, z); \
-    state->block->code[start - 1] = (state->size - start) * sizeof(long); \
+    state->block->code[start - 1] = (state->size - start) * sizeof(uintptr_t); \
 } while (0)
 
 #define PUSHF() g(pushf)

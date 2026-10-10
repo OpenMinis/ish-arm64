@@ -312,7 +312,7 @@ volatile int g_watch_field_hit_count;
 // Snapshot the LAST store to the watched field (not just the first): the store
 // that leaves the value wrong is what we want, and it's usually the last one.
 uint64_t g_watch_field_last_regs[32];
-void jit_watch_write_hit(struct cpu_state *cpu, addr_t store_addr, unsigned long *code_ptr) {
+void jit_watch_write_hit(struct cpu_state *cpu, addr_t store_addr, uintptr_t *code_ptr) {
     (void)code_ptr;
     if (cpu && g_watch_field && store_addr == g_watch_field) {
         if (g_watch_field_hit_count++ == 0)
@@ -652,7 +652,7 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
 // guest bytes, same gadget stream) to find the unit it points into. Only runs
 // on a fault, so the stream needs no per-instruction pc table.
 static void fiber_fix_fault_pc(struct asbestos *asbestos, struct fiber_frame *frame, struct tlb *tlb) {
-    unsigned long *stream = (unsigned long *) frame->fault_stream;
+    uintptr_t *stream = (uintptr_t *) frame->fault_stream;
     addr_t block_addr = frame->cpu.pc;
     size_t pos;
     lock(&asbestos->lock);
@@ -795,6 +795,10 @@ static void fiber_free_jetsam(struct asbestos *asbestos) {
     }
 }
 
+#if defined(_WIN32) && defined(__x86_64__)
+// the gadgets keep System V conventions (gadgets-x86_64/entry.S)
+__attribute__((sysv_abi))
+#endif
 int fiber_enter(struct fiber_block *block, struct fiber_frame *frame, struct tlb *tlb);
 static int cpu_single_step(struct cpu_state *cpu, struct tlb *tlb);
 
@@ -1059,7 +1063,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                         }
                         list_remove_safe(&last_block->jumps_from_links[i]);
 #endif
-                        *last_block->jump_ip[i] = (unsigned long) block->code;
+                        *last_block->jump_ip[i] = (uintptr_t) block->code;
                         list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
 #ifdef ISH_JIT
                         jit_link(last_block, i, block);

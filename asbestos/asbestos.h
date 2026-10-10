@@ -62,9 +62,9 @@ struct fiber_block {
     size_t used;
 
     // pointers to the ip values in the last gadget
-    unsigned long *jump_ip[2];
+    uintptr_t *jump_ip[2];
     // original values of *jump_ip[]
-    unsigned long old_jump_ip[2];
+    uintptr_t old_jump_ip[2];
     // blocks that jump to this block
     struct list jumps_from[2];
 
@@ -89,12 +89,11 @@ struct fiber_block {
     void *jit_ctx;              // PIC: module context the native code runs with (x29)
     unsigned jit_idx;           // PIC: its translation's slot in that context
 #endif
-
 #ifdef ISH_XJIT
     void *xjit_code;            // native runs of this block (guest-x86/xjit.c)
 #endif
 
-    unsigned long code[];
+    uintptr_t code[];
 };
 
 // High-bit tracing: detect emulation bugs that leave bits 32+ dirty in guest regs

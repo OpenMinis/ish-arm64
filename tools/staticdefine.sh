@@ -4,18 +4,18 @@ input=$2
 output=$3
 dep=$4
 flags=$(python3 - <<END
-import json
+import json, shlex
 with open('$compile_commands') as f:
     commands = json.load(f)
 for command in commands:
     if command['file'].endswith('asbestos/asbestos.c'):
         break
-command = command['command']
-command = command.split()[:-9] + ['-MD', '-MQ', '$output', '-MF', '$dep']
-print(' '.join(command))
+# shlex: meson quotes every argument on Windows
+command = shlex.split(command['command'])[:-9] + ['-MD', '-MQ', '$output', '-MF', '$dep']
+print(shlex.join(command))
 END
 )
-$flags $input -include "$(dirname $0)/staticdefine.h" -S -o - | \
+eval "$flags" '"$input"' -include "$(dirname $0)/staticdefine.h" -S -o - | \
 sed -ne 's:^[[:space:]]*\.ascii[[:space:]]*"\(.*\)".*:\1:;
          /^->/{s:->#\(.*\):/* \1 */:;
          s:^->\([^ ]*\) [\$$#]*\([^ ]*\) \(.*\):#define \1 \2 /* \3 */:;

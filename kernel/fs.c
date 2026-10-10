@@ -764,7 +764,7 @@ static int fd_ioctl(struct fd *fd, dword_t cmd, addr_t arg) {
     if (size < 0)
         return _ENOTTY;
     if (size == 0)
-        return fd->ops->ioctl(fd, cmd, (void *) (long) arg);
+        return fd->ops->ioctl(fd, cmd, (void *) (uintptr_t) arg);
 
     // praying that this won't break
     char buf[size];

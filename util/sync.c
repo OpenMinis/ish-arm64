@@ -74,6 +74,17 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
         rc = pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
 #elif __APPLE__
         rc = pthread_cond_timedwait_relative_np(&cond->cond, &lock->m, timeout);
+#elif defined(_WIN32)
+        // winpthreads waits against CLOCK_REALTIME
+        struct timespec abs_timeout;
+        clock_gettime(CLOCK_REALTIME, &abs_timeout);
+        abs_timeout.tv_sec += timeout->tv_sec;
+        abs_timeout.tv_nsec += timeout->tv_nsec;
+        if (abs_timeout.tv_nsec >= 1000000000) {
+            abs_timeout.tv_sec++;
+            abs_timeout.tv_nsec -= 1000000000;
+        }
+        rc = pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
 #else
 #error Unimplemented pthread_cond_wait relative timeout.
 #endif

@@ -1590,24 +1590,71 @@ uint64_t fakefs_change_dropped_count(void) {
     return atomic_load_explicit(&g_change_dropped, memory_order_relaxed);
 }
 
-#else /* !__APPLE__ — non-Apple stubs.
-       *
-       * The host (Swift / ObjC) bridge that consumes these events only
-       * exists on Apple. On Linux / x86 iSH builds we still need the
-       * three symbols to resolve at link time (callers in fs/fake.c and
-       * fs/real.c invoke them unconditionally), but they must do
-       * nothing — no ring buffer, no consumer queue, no host wakeups. */
+#else /* !__APPLE__: the same ring, drained by a pthread instead of GCD,
+       * and handed to a plain function pointer instead of a block. */
+
+#define FAKEFS_CHANGE_RING_SIZE 1024  /* must be power of two */
+
+static struct fakefs_change_event g_change_ring[FAKEFS_CHANGE_RING_SIZE];
+static uint64_t g_change_head, g_change_tail;  /* under g_change_lock */
+static _Atomic uint64_t g_change_dropped = 0;
+static pthread_mutex_t g_change_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_change_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic(fakefs_change_handler_t) g_change_handler = NULL;
+
+static void *fakefs_change_consumer(void *arg) {
+    (void) arg;
+    struct fakefs_change_event batch[64];
+    for (;;) {
+        pthread_mutex_lock(&g_change_lock);
+        while (g_change_tail == g_change_head)
+            pthread_cond_wait(&g_change_cond, &g_change_lock);
+        int n = 0;
+        while (g_change_tail < g_change_head && n < 64)
+            batch[n++] = g_change_ring[g_change_tail++ & (FAKEFS_CHANGE_RING_SIZE - 1)];
+        pthread_mutex_unlock(&g_change_lock);
+        fakefs_change_handler_t handler = atomic_load(&g_change_handler);
+        if (handler)
+            handler(batch, n);
+    }
+    return NULL;
+}
 
 void fakefs_record_change(const char *linux_path, int op) {
-    (void)linux_path; (void)op;
+    if (atomic_load(&g_change_handler) == NULL || linux_path == NULL)
+        return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&g_change_lock);
+    if (g_change_head - g_change_tail >= FAKEFS_CHANGE_RING_SIZE) {
+        /* Full — drop oldest. */
+        g_change_tail++;
+        atomic_fetch_add_explicit(&g_change_dropped, 1, memory_order_relaxed);
+    }
+    struct fakefs_change_event *slot = &g_change_ring[g_change_head & (FAKEFS_CHANGE_RING_SIZE - 1)];
+    strlcpy(slot->linux_path, linux_path, sizeof(slot->linux_path));
+    slot->op = op;
+    slot->timestamp_ns = (int64_t) now.tv_sec * 1000000000 + now.tv_nsec;
+    slot->fs_context = (current != NULL && current->group != NULL)
+        ? current->group->fs_context : 0;
+    g_change_head++;
+    pthread_cond_signal(&g_change_cond);
+    pthread_mutex_unlock(&g_change_lock);
 }
 
 void fakefs_install_change_consumer(fakefs_change_handler_t handler) {
-    (void)handler;
+    if (handler == NULL)
+        return;
+    /* Replacing the handler is supported; the thread is started once. */
+    if (atomic_exchange(&g_change_handler, handler) != NULL)
+        return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, fakefs_change_consumer, NULL) == 0)
+        pthread_detach(thread);
 }
 
 uint64_t fakefs_change_dropped_count(void) {
-    return 0;
+    return atomic_load_explicit(&g_change_dropped, memory_order_relaxed);
 }
 
 #endif /* __APPLE__ */

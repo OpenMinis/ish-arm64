@@ -55,7 +55,7 @@ static void __attribute__((constructor)) init_futex_hash() {
 }
 
 static struct futex *futex_get_unlocked(addr_t addr) {
-    int hash = (addr ^ (unsigned long) current->mem) % FUTEX_HASH_SIZE;
+    int hash = (addr ^ (uintptr_t) current->mem) % FUTEX_HASH_SIZE;
     struct list *bucket = &futex_hash[hash];
     struct futex *futex;
     list_for_each_entry(bucket, futex, chain) {

@@ -9,6 +9,15 @@ H="$BUILD/ish-agent-harness"
 ISH="$BUILD/ish"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+# The host paths handed to ish. On Windows (MSYS2) ish is a native program:
+# it wants C:/... paths and must get guest paths like /bin/sh unconverted.
+HWORK=$WORK
+HOST_UNAME=/usr/bin/uname HOST_UNAME_SAYS=Darwin
+if [ -n "${MSYSTEM:-}" ]; then
+    HWORK=$(cygpath -m "$WORK")
+    export MSYS2_ARG_CONV_EXCL='*' MSYS2_ENV_CONV_EXCL='*'
+    HOST_UNAME=$(cygpath -m /usr/bin/uname.exe) HOST_UNAME_SAYS=_NT
+fi
 pass=0 fail=0
 
 check() { # name, expected substring, actual output
@@ -25,23 +34,23 @@ echo host-rw > "$WORK/rw/in.txt"
 echo host-ro > "$WORK/ro/in.txt"
 echo routed > "$WORK/ctx/f.txt"
 
-out=$(ISHT_BIND="/mnt/rw=$WORK/rw" ISHT_CHANGES=1 run "$H" -f "$ROOTFS" /bin/sh -c \
+out=$(ISHT_BIND="/mnt/rw=$HWORK/rw" ISHT_CHANGES=1 run "$H" -f "$ROOTFS" /bin/sh -c \
     'cat /mnt/rw/in.txt; echo guest > /mnt/rw/out.txt; mkdir -p /mnt/rw/d; mv /mnt/rw/out.txt /mnt/rw/d/; ls /mnt/rw/d; sleep 1')
 check bind-read host-rw "$out"
 check bind-readdir out.txt "$out"
 check bind-host-sees-write guest "$(cat "$WORK/rw/d/out.txt" 2>&1)"
 check bind-change-feed "ISHT change op=2" "$out"
 
-out=$(ISHT_BIND="/mnt/ro=$WORK/ro:ro" run "$H" -f "$ROOTFS" /bin/sh -c \
+out=$(ISHT_BIND="/mnt/ro=$HWORK/ro:ro" run "$H" -f "$ROOTFS" /bin/sh -c \
     'cat /mnt/ro/in.txt; touch /mnt/ro/x && echo WROTE || echo DENIED')
 check bind-ro-read host-ro "$out"
 check bind-ro-deny DENIED "$out"
 
 script='i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done; cat /ctx/f.txt 2>&1; echo new > /ctx/g.txt; readlink -f /ctx/g.txt'
-out=$(ISHT_ROUTE="/ctx=$WORK/ctx" ISHT_CTX=1 run "$H" -f "$ROOTFS" /bin/sh -c "$script")
+out=$(ISHT_ROUTE="/ctx=$HWORK/ctx" ISHT_CTX=1 run "$H" -f "$ROOTFS" /bin/sh -c "$script")
 check route-ctx1-read routed "$out"
 check route-ctx1-write new "$(cat "$WORK/ctx/g.txt" 2>&1)"
-out=$(ISHT_ROUTE="/ctx=$WORK/ctx" run "$H" -f "$ROOTFS" /bin/sh -c 'cat /ctx/f.txt 2>&1')
+out=$(ISHT_ROUTE="/ctx=$HWORK/ctx" run "$H" -f "$ROOTFS" /bin/sh -c 'cat /ctx/f.txt 2>&1')
 check route-ctx0-isolated "No such file" "$out"
 
 out=$(ISHT_FORK_LIMIT=2 run "$H" -f "$ROOTFS" /bin/sh -c \
@@ -55,8 +64,8 @@ out=$(ISHT_HANDLER=1 run "$H" -f "$ROOTFS" /bin/sh -c \
 check offload-handler "nativeecho argc=3 [a]" "$out"
 check offload-handler-rc rc=7 "$out"
 
-out=$(run "$ISH" -n "uname=/usr/bin/uname" -f "$ROOTFS" /bin/sh -c 'uname -s')
-check offload-host-binary Darwin "$out"
+out=$(run "$ISH" -n "uname=$HOST_UNAME" -f "$ROOTFS" /bin/sh -c 'uname -s')
+check offload-host-binary "$HOST_UNAME_SAYS" "$out"
 
 out=$(ISHT_TICKS=1 run "$H" -f "$ROOTFS" /bin/sh -c 'i=0; while [ $i -lt 2000 ]; do i=$((i+1)); done')
 check timer-tick-hook "ISHT ticks=" "$out"

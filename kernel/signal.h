@@ -183,7 +183,7 @@ int user_put_sigset(addr_t addr, dword_t size, sigset_t_ set);
 
 static inline sigset_t_ sig_mask(int sig) {
     assert(sig >= 1 && sig < NUM_SIGS);
-    return 1l << (sig - 1);
+    return 1ull << (sig - 1);
 }
 
 static inline bool sigset_has(sigset_t_ set, int sig) {

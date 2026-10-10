@@ -4,6 +4,7 @@
 #ifdef __APPLE__
 #include <CommonCrypto/CommonCrypto.h>
 #include <CommonCrypto/CommonRandom.h>
+#elif defined(_WIN32)
 #else
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -13,6 +14,8 @@
 int get_random(char *buf, size_t len) {
 #ifdef __APPLE__
     return CCRandomGenerateBytes(buf, len) != kCCSuccess;
+#elif defined(_WIN32)
+    return getrandom(buf, len, 0) < 0;
 #else
     return syscall(SYS_getrandom, buf, len, 0) < 0;
 #endif

@@ -890,18 +890,18 @@ error:
 }
 
 // Read a socket timeout option as milliseconds. Returns 0 if unset or error.
-static long sock_get_timeout_ms(int real_fd, int optname) {
+static int64_t sock_get_timeout_ms(int real_fd, int optname) {
     struct timeval tv = {0, 0};
     socklen_t len = sizeof(tv);
     if (getsockopt(real_fd, SOL_SOCKET, optname, &tv, &len) < 0)
         return 0;
-    return (long)tv.tv_sec * 1000L + (long)tv.tv_usec / 1000L;
+    return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
 }
 
-static long monotonic_ms(void) {
+static int64_t monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000L + (long)ts.tv_nsec / 1000000L;
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
 }
 
 // Wait for a socket fd to become ready (readable or writable), with a
@@ -912,9 +912,9 @@ static long monotonic_ms(void) {
 // Returns 0 when ready, _EINTR on guest signal, _EAGAIN on timeout expiry,
 // or a negative errno on poll() error.
 static int sock_wait_for(int real_fd, short events, int timeout_opt) {
-    long timeout_ms = sock_get_timeout_ms(real_fd, timeout_opt);
-    long start_ms = monotonic_ms();
-    long deadline_ms = (timeout_ms > 0) ? (start_ms + timeout_ms) : 0;
+    int64_t timeout_ms = sock_get_timeout_ms(real_fd, timeout_opt);
+    int64_t start_ms = monotonic_ms();
+    int64_t deadline_ms = (timeout_ms > 0) ? (start_ms + timeout_ms) : 0;
     bool slow_logged = false;
     for (;;) {
         if (current->sighand != NULL) {
@@ -927,10 +927,10 @@ static int sock_wait_for(int real_fd, short events, int timeout_opt) {
 
         int poll_ms = 1000;
         if (deadline_ms > 0) {
-            long remaining = deadline_ms - monotonic_ms();
+            int64_t remaining = deadline_ms - monotonic_ms();
             if (remaining <= 0) {
-                printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) deadline-expired after %ldms\n",
-                       current->pid, current->comm, real_fd, events, timeout_ms);
+                printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) deadline-expired after %lldms\n",
+                       current->pid, current->comm, real_fd, events, (long long) timeout_ms);
                 return _EAGAIN;
             }
             if (remaining < poll_ms)

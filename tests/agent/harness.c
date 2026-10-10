@@ -80,6 +80,12 @@ static int nativeecho_main(int argc, char **argv, int UNUSED(in), int out, int U
 
 static atomic_ulong ticks;
 // Init's exit ends in _exit(), so report from the hook instead of atexit.
+static void print_changes(const struct fakefs_change_event *batch, int count) {
+    for (int i = 0; i < count; i++)
+        fprintf(stderr, "ISHT change op=%d ctx=%llu %s\n", batch[i].op,
+                (unsigned long long) batch[i].fs_context, batch[i].linux_path);
+}
+
 static int tick_hook(void) {
     if (atomic_fetch_add(&ticks, 1) == 99)
         fprintf(stderr, "ISHT ticks=100\n");
@@ -133,13 +139,13 @@ int main(int argc, char *const argv[]) {
     }
     if (getenv("ISHT_HANDLER"))
         native_offload_add_handler("nativeecho", nativeecho_main);
-#ifdef __APPLE__
     if (getenv("ISHT_CHANGES"))
+#ifdef __APPLE__
         fakefs_install_change_consumer(^(const struct fakefs_change_event *batch, int count) {
-            for (int i = 0; i < count; i++)
-                fprintf(stderr, "ISHT change op=%d ctx=%llu %s\n", batch[i].op,
-                        (unsigned long long) batch[i].fs_context, batch[i].linux_path);
+            print_changes(batch, count);
         });
+#else
+        fakefs_install_change_consumer(print_changes);
 #endif
     if (getenv("ISHT_TICKS"))
         ish_set_timer_tick_hook(tick_hook);

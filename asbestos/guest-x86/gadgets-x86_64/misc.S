@@ -17,7 +17,7 @@
     leaq 0x8(%rsp), %rsi
     leaq 0x4(%rsp), %rdx
     leaq 0x0(%rsp), %rcx
-    call NAME(helper_cpuid)
+    ccall NAME(helper_cpuid)
     movl 0xc(%rsp), %eax
     movl 0x8(%rsp), %ebx
     movl 0x4(%rsp), %ecx
@@ -114,10 +114,10 @@
         .endif
         .ifin(\type, read,write)
             movq %_addrq, %rsi
-            callq *8(%_ip)
+            ccall_indir 8(%_ip)
         .endifin
         .ifin(\type, 0,1,2)
-            callq *(%_ip)
+            ccall_indir (%_ip)
         .endifin
         restore_c
         load_regs
@@ -192,10 +192,10 @@ do_helper 2
         .endif
 
         .ifin(\rm, read,write)
-            callq *8(%_ip)
+            ccall_indir 8(%_ip)
         .endifin
         .ifin(\rm, reg,imm)
-            callq *(%_ip)
+            ccall_indir (%_ip)
         .endifin
 
         restore_c

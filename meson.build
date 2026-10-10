@@ -54,6 +54,21 @@ endif
 
 add_project_arguments('-Wno-switch', language: 'c')
 
+# Windows: iSH's sources see POSIX through platform/windows/compat.h (forced
+# in) and the empty headers next to it; libpx implements it on Win32.
+host_windows = host_machine.system() == 'windows'
+if host_windows
+    win_dir = meson.current_source_dir() / 'platform' / 'windows'
+    add_project_arguments('-I' + (win_dir / 'include'), '-include', win_dir / 'compat.h',
+        # long is 32 bits here: a pointer squeezed through one is a bug
+        '-Werror=pointer-to-int-cast', '-Werror=int-to-pointer-cast',
+        '-Werror=shift-count-overflow',
+        # GCC bitfield packing, not Microsoft's: the guest structures (and
+        # float80's double_bits) mix bitfield types within one word
+        '-mno-ms-bitfields',
+        language: 'c')
+endif
+
 # ISH_GADGET_PROFILE: enable gadget call ring-buffer + atexit dump.
 # Activate via:  meson setup ... -Dc_args=-DISH_GADGET_PROFILE
 #                or env CFLAGS=-DISH_GADGET_PROFILE meson setup ...
@@ -67,6 +82,21 @@ libm = cc.find_library('m', required: false)
 libdl = cc.find_library('dl', required: false)
 sqlite3 = cc.find_library('sqlite3')
 dependencies = [librt, libm, libdl, threads, sqlite3]
+if host_windows
+    libpx = static_library('px', [
+            'platform/windows/fd.c',
+            'platform/windows/path.c',
+            'platform/windows/net.c',
+            'platform/windows/wait.c',
+            'platform/windows/mman.c',
+            'platform/windows/misc.c',
+        ],
+        c_args: ['-DPX_IMPL', '-D_WIN32_WINNT=0x0A00', '-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX', '-DUNICODE', '-D_UNICODE'],
+        dependencies: threads)
+    dependencies += declare_dependency(link_with: libpx,
+        dependencies: [cc.find_library('ws2_32'), cc.find_library('bcrypt'),
+                       cc.find_library('ntdll'), cc.find_library('psapi')])
+endif
 
 # vdso is arch-specific
 if guest_arch == 'x86'

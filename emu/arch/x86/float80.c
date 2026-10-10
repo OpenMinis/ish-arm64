@@ -31,7 +31,7 @@ static int unbias_denormal(unsigned exp) {
     return unbias(exp);
 }
 
-#define CURSED_BIT (1ul << 63)
+#define CURSED_BIT (1ull << 63)
 
 __thread enum f80_rounding_mode f80_rounding_mode;
 
@@ -101,10 +101,10 @@ bool f80_is_supported(float80 f) {
 }
 
 bool f80_isnan(float80 f) {
-    return f.exp == EXP_SPECIAL && (f.signif & (-1ul >> 1)) != 0;
+    return f.exp == EXP_SPECIAL && (f.signif & (-1ull >> 1)) != 0;
 }
 bool f80_isinf(float80 f) {
-    return f.exp == EXP_SPECIAL && (f.signif & (-1ul >> 1)) == 0;
+    return f.exp == EXP_SPECIAL && (f.signif & (-1ull >> 1)) == 0;
 }
 bool f80_iszero(float80 f) {
     return f.exp == EXP_DENORMAL && f.signif == 0;
@@ -126,7 +126,7 @@ static float80 f80_normalize(float80 f) {
     // number of leading zeroes = how many times we can shift out a leading digit before overflow
     int shift;
     if (f.signif != 0)
-        shift = __builtin_clzl(f.signif);
+        shift = __builtin_clzll(f.signif);
     else
         shift = 64; // __builtin_clzl has undefined result with zero
     if (f.exp - shift < EXP_MIN) {
@@ -143,9 +143,9 @@ static int u128_clz(uint128_t x) {
     // correctly counting leading zeros on a 128-bit int is interesting
     int zeros;
     if (x >> 64 != 0)
-        zeros = __builtin_clzl((uint64_t) (x >> 64));
+        zeros = __builtin_clzll((uint64_t) (x >> 64));
     else if (x != 0)
-        zeros = 64 + __builtin_clzl((uint64_t) x);
+        zeros = 64 + __builtin_clzll((uint64_t) x);
     else
         zeros = 128;
     return zeros;
@@ -222,7 +222,7 @@ int64_t f80_to_int(float80 f) {
 }
 
 struct double_bits {
-    unsigned long signif:52;
+    uint64_t signif:52;
     unsigned exp:11;
     unsigned sign:1;
 };
@@ -278,7 +278,7 @@ double f80_to_double(float80 f) {
     uint64_t db_signif = u128_shift_right_round(f.signif, 11, f.sign);
     // handle the case when f.signif becomes 0x1fffffffffffff after shifting
     // and then is rounded up
-    if (db_signif & (1ul << 53)) {
+    if (db_signif & (1ull << 53)) {
         db_signif >>= 1;
         db.exp++;
     }
@@ -461,7 +461,7 @@ float80 f80_div(float80 a, float80 b) {
         if (f80_iszero(a))
             f = F80_NAN;
     } else {
-        int b_trailing = __builtin_ctzl(b.signif);
+        int b_trailing = __builtin_ctzll(b.signif);
         b.signif >>= b_trailing;
         uint128_t signif = ((uint128_t) a.signif << 64) / b.signif;
         uint128_t remainder = ((uint128_t) a.signif << 64) % b.signif;

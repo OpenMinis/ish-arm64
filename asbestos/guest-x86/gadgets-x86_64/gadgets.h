@@ -17,6 +17,33 @@
 
 .extern fiber_exit
 
+# Calls into C, after save_c, with System V argument registers (at most
+# four). Windows wants them in rcx, rdx, r8, r9 and 32 bytes of shadow space
+# under the return address; the shuffle order matters (rcx is both the 4th
+# System V and the 1st Microsoft argument). ccall_indir loads the target
+# first because r9 is _ip.
+.macro ccall target
+#ifdef _WIN32
+    movq %rcx, %r9
+    movq %rdx, %r8
+    movq %rsi, %rdx
+    movq %rdi, %rcx
+    subq $32, %rsp
+    call \target
+    addq $32, %rsp
+#else
+    call \target
+#endif
+.endm
+.macro ccall_indir target
+#ifdef _WIN32
+    movq \target, %rax
+    ccall *%rax
+#else
+    callq *\target
+#endif
+.endm
+
 #ifndef ISH_GADGET_TEMPLATES
 .macro .gadget name
     .global.name gadget_\()\name

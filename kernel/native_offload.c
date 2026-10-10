@@ -26,6 +26,10 @@
 #include <mach-o/dyld.h>
 #define HAS_POSIX_SPAWN 1
 #endif
+#elif defined(_WIN32)
+#include <spawn.h>
+#include <libgen.h>
+#define HAS_POSIX_SPAWN 1
 #endif
 
 #include "kernel/calls.h"
@@ -43,7 +47,7 @@
 #undef ISH_INTERNAL
 #endif
 
-#if !__APPLE__
+#if !__APPLE__ && !defined(_WIN32)
 int native_offload_add(const char *spec) { (void)spec; return -1; }
 const char *native_offload_lookup(const char *guest_path) { (void)guest_path; return NULL; }
 const char *native_offload_lookup_exec(const char *guest_path, const char *envp, bool *generic_out) {
@@ -98,6 +102,9 @@ static char *auto_detect_host_path(const char *name) {
 
 // Find the redirect dylib next to the ish binary
 static void resolve_dylib_path(void) {
+#ifdef _WIN32
+    // no DYLD_INSERT_LIBRARIES: offloaded programs see host paths as they are
+#else
     char exe[PATH_MAX];
     uint32_t size = sizeof(exe);
     if (_NSGetExecutablePath(exe, &size) != 0)
@@ -112,6 +119,7 @@ static void resolve_dylib_path(void) {
     else
         fprintf(stderr, "native_offload: warning: %s not found, path redirection disabled\n",
                 dylib_path);
+#endif
 }
 
 int native_offload_add(const char *spec) {

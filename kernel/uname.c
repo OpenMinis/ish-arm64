@@ -46,12 +46,18 @@ dword_t sys_sethostname(addr_t UNUSED(hostname_addr), dword_t UNUSED(hostname_le
     return _EPERM;
 }
 
-#if __APPLE__
+#if __APPLE__ || defined(_WIN32)
 static uint64_t get_total_ram() {
+#if __APPLE__
     uint64_t total_ram = 0;
     size_t len = sizeof(total_ram);
     sysctlbyname("hw.memsize", &total_ram, &len, NULL, 0);
     return total_ram;
+#else
+    uint64_t total_ram, avail;
+    px_mem_info(&total_ram, &avail);
+    return total_ram;
+#endif
 }
 static void sysinfo_specific(struct sys_info *info) {
     uint64_t total_ram = get_total_ram();

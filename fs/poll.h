@@ -4,6 +4,9 @@
 
 struct real_poll {
     int fd;
+#ifdef _WIN32
+    struct real_poll_set *set;
+#endif
 };
 
 struct poll {

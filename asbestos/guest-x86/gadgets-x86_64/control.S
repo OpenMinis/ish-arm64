@@ -183,7 +183,7 @@
 .gadget pushf
     save_c
     movq %_cpu, %rdi
-    call NAME(helper_collapse_flags)
+    ccall NAME(helper_collapse_flags)
     restore_c
 
     sub $4, %_esp
@@ -203,7 +203,7 @@
 
     save_c
     movq %_cpu, %rdi
-    call NAME(helper_expand_flags)
+    ccall NAME(helper_expand_flags)
     restore_c
     gret
 
@@ -213,7 +213,7 @@
     xchgb %al, %ah
     save_c
     movq %_cpu, %rdi
-    call NAME(helper_expand_flags)
+    ccall NAME(helper_expand_flags)
     restore_c
     gret
 

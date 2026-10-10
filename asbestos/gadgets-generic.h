@@ -16,6 +16,8 @@
 .macro .pushsection_rodata
 #if __APPLE__
     .pushsection __DATA,__const
+#elif defined(_WIN32)
+    .pushsection .rdata,"dr"
 #else
     .pushsection .data.rel.ro
 #endif
@@ -23,6 +25,8 @@
 .macro .pushsection_bullshit
 #if __APPLE__
     .pushsection __TEXT,__text_bullshit,regular,pure_instructions
+#elif defined(_WIN32)
+    .pushsection .text$bullshit,"xr"
 #else
     .pushsection .text.bullshit
 #endif
@@ -39,7 +43,7 @@
 .endm
 
 .macro .type_compat type:vararg
-#if !__APPLE__
+#if !__APPLE__ && !defined(_WIN32)
     .type \type
 #endif
 .endm

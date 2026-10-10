@@ -77,6 +77,28 @@ static const char *schema = Q(
     pragma user_version=3;
 );
 
+#ifdef _WIN32
+// archive_read_data_into_fd() writes through the C runtime's fds, which are
+// not the fds platform/windows hands out; copy the blocks over ourselves.
+static int read_data_into_fd(struct archive *archive, int fd) {
+    const void *buf;
+    size_t size;
+    la_int64_t offset;
+    int err;
+    while ((err = archive_read_data_block(archive, &buf, &size, &offset)) == ARCHIVE_OK) {
+        for (size_t done = 0; done < size;) {
+            ssize_t n = pwrite(fd, (const char *) buf + done, size - done, offset + done);
+            if (n <= 0)
+                return ARCHIVE_FATAL;
+            done += n;
+        }
+    }
+    return err == ARCHIVE_EOF ? ARCHIVE_OK : err;
+}
+#else
+#define read_data_into_fd archive_read_data_into_fd
+#endif
+
 bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_error *err_out, struct progress p) {
     int err = mkdir(fs, 0777);
     if (err < 0)
@@ -192,7 +214,7 @@ bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_er
         // second, fill in contents, if needed
         switch (archive_entry_filetype(entry)) {
             case AE_IFREG:
-                if (archive_read_data_into_fd(archive, fd) != ARCHIVE_OK)
+                if (read_data_into_fd(archive, fd) != ARCHIVE_OK)
                     ARCHIVE_ERR(archive);
                 break;
 
@@ -329,7 +351,7 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
         archive_entry_set_size(entry, real_stat.st_size);
 #if __APPLE__
 #define TIMESPEC(x) st_##x##timespec
-#elif __linux__
+#elif __linux__ || defined(_WIN32)
 #define TIMESPEC(x) st_##x##tim
 #endif
         archive_entry_set_atime(entry, real_stat.st_atime, real_stat.TIMESPEC(a).tv_nsec);

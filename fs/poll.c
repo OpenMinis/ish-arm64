@@ -23,6 +23,8 @@ extern _Noreturn void do_exit_group(int status);
 #elif defined(__APPLE__)
 #include <sys/event.h>
 #define HAVE_KQUEUE 1
+#elif defined(_WIN32)
+#define HAVE_PX_POLL 1
 #endif
 
 static int real_poll_init(struct real_poll *real);
@@ -32,6 +34,9 @@ struct real_poll_event {
     struct epoll_event real;
 #elif HAVE_KQUEUE
     struct kevent real;
+#elif HAVE_PX_POLL
+    void *data;
+    int events;
 #endif
 };
 static void *rpe_data(struct real_poll_event *rpe);
@@ -601,9 +606,107 @@ static int rpe_events(struct real_poll_event *rpe) {
     return 0;
 }
 
+#elif HAVE_PX_POLL
+
+// No epoll or kqueue: keep the interest set here and hand it to poll() (the
+// px layer's, which waits on sockets, pipes and stdin alike) on every wait.
+// Level-triggered only, so an edge-triggered real fd that stays ready is
+// reported again on the next wait instead of once.
+struct real_poll_set {
+    pthread_mutex_t lock;
+    struct real_poll_entry {
+        int fd;
+        int types;
+        void *data;
+    } *entries;
+    int count, capacity;
+    int start; // round-robin start, so one busy fd cannot starve the rest
+};
+
+static int real_poll_init(struct real_poll *real) {
+    real->fd = -1;
+    real->set = calloc(1, sizeof(*real->set));
+    if (real->set == NULL)
+        return -1;
+    pthread_mutex_init(&real->set->lock, NULL);
+    return 0;
+}
+
+static int real_poll_update(struct real_poll *real, int fd, int types, void *data) {
+    struct real_poll_set *set = real->set;
+    types &= POLL_READ | POLL_PRI | POLL_WRITE | POLL_ERR | POLL_HUP;
+    pthread_mutex_lock(&set->lock);
+    int i;
+    for (i = 0; i < set->count; i++)
+        if (set->entries[i].fd == fd)
+            break;
+    if (types == 0) {
+        if (i < set->count)
+            set->entries[i] = set->entries[--set->count];
+    } else {
+        if (i == set->count) {
+            if (set->count == set->capacity) {
+                set->capacity = set->capacity ? set->capacity * 2 : 8;
+                set->entries = realloc(set->entries, set->capacity * sizeof(*set->entries));
+            }
+            set->count++;
+        }
+        set->entries[i] = (struct real_poll_entry) {fd, types, data};
+    }
+    pthread_mutex_unlock(&set->lock);
+    return 0;
+}
+
+static int real_poll_wait(struct real_poll *real, struct real_poll_event *events, int max, struct timespec *timeout) {
+    struct real_poll_set *set = real->set;
+    pthread_mutex_lock(&set->lock);
+    int n = set->count;
+    struct pollfd *pfds = malloc((n ? n : 1) * sizeof(*pfds));
+    void **datas = malloc((n ? n : 1) * sizeof(*datas));
+    for (int i = 0; i < n; i++) {
+        pfds[i] = (struct pollfd) {.fd = set->entries[i].fd, .events = set->entries[i].types};
+        datas[i] = set->entries[i].data;
+    }
+    int start = n ? set->start++ % n : 0;
+    pthread_mutex_unlock(&set->lock);
+
+    int millis = -1;
+    if (timeout != NULL)
+        millis = timeout->tv_sec * 1000 + (timeout->tv_nsec + 999999) / 1000000;
+    int res = poll(pfds, n, millis);
+    if (res > 0) {
+        int out = 0;
+        for (int j = 0; j < n && out < max; j++) {
+            int i = (start + j) % n;
+            if (pfds[i].revents == 0)
+                continue;
+            events[out].data = datas[i];
+            events[out].events = pfds[i].revents;
+            out++;
+        }
+        res = out;
+    }
+    free(pfds);
+    free(datas);
+    return res;
+}
+
+static void *rpe_data(struct real_poll_event *rpe) {
+    return rpe->data;
+}
+static int rpe_events(struct real_poll_event *rpe) {
+    return rpe->events;
+}
+
 #endif
 
 static void real_poll_close(struct real_poll *real) {
+#if HAVE_PX_POLL
+    free(real->set->entries);
+    pthread_mutex_destroy(&real->set->lock);
+    free(real->set);
+#else
     safe_close(real->fd);
+#endif
 }
 

@@ -244,6 +244,9 @@ void task_run_current() {
 static void *task_thread(void *vtask) {
     current = vtask;
     update_thread_name();
+#ifdef _WIN32
+    px_prof_register();
+#endif
     task_run_current();
     die("task_thread returned"); // above function call should never return
 }

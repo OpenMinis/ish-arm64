@@ -37,7 +37,7 @@ static int getpath(int fd, char *buf) {
     if (size >= 0)
         buf[size] = '\0';
     return size;
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(_WIN32)
     return fcntl(fd, F_GETPATH, buf);
 #endif
 }
@@ -146,7 +146,7 @@ static void copy_stat(struct statbuf *fake_stat, struct stat *real_stat) {
     fake_stat->ctime = real_stat->st_ctime;
 #if __APPLE__
 #define TIMESPEC(x) st_##x##timespec
-#elif __linux__
+#elif __linux__ || defined(_WIN32)
 #define TIMESPEC(x) st_##x##tim
 #endif
     fake_stat->atime_nsec = real_stat->TIMESPEC(a).tv_nsec;
@@ -611,7 +611,14 @@ int realfs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
 static char flock_dir[PATH_MAX];
 
 static void flock_proxy_dir_init(void) {
+#if defined(_WIN32)
+    // TMPDIR, when there is one, is usually an MSYS path the host can't use
+    const char *tmp = getenv("TEMP");
+    if (tmp == NULL)
+        tmp = getenv("TMP");
+#else
     const char *tmp = getenv("TMPDIR");
+#endif
     char buf[PATH_MAX];
 #if defined(__APPLE__)
     if (tmp == NULL && confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf)) > 0)

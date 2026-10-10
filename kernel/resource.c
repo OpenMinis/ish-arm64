@@ -5,6 +5,8 @@
 #elif __APPLE__
 // pull in thread_info and friends
 #include <mach/mach.h>
+#elif defined(_WIN32)
+#include <sys/resource.h>
 #else
 #error
 #endif
@@ -177,7 +179,7 @@ __attribute__((weak)) void minis_diag_note_thread_port_released(void) {}
 struct rusage_ rusage_get_current() {
     // only the time fields are currently implemented
     struct rusage_ rusage;
-#if __linux__
+#if __linux__ || defined(_WIN32)
     struct rusage usage;
     int err = getrusage(RUSAGE_THREAD, &usage);
     assert(err == 0);

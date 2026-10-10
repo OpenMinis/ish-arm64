@@ -42,9 +42,20 @@ if libarchive.found()
         'fakefs.c',
         '../util/fchdir.c',
     ]
-    fakefsify = executable('fakefsify', fakefsify_src, dependencies: [libarchive], link_with: [libfakefs], include_directories: [includes])
-    custom_target('unfakefsify',
-        build_by_default: true,
-        command: ['ln', '-sf', 'fakefsify', '@OUTPUT@'],
-        output: 'unfakefsify')
+    if host_windows
+        fakefsify = executable('fakefsify', fakefsify_src, dependencies: [libarchive] + dependencies,
+            link_with: [libfakefs], include_directories: [includes], c_args: ['-DPX_WITH_WINDOWS_H'])
+        # no symlinks to rely on; fakefsify picks its mode from argv[0]
+        custom_target('unfakefsify',
+            build_by_default: true,
+            input: fakefsify,
+            command: ['cp', '@INPUT@', '@OUTPUT@'],
+            output: 'unfakefsify.exe')
+    else
+        fakefsify = executable('fakefsify', fakefsify_src, dependencies: [libarchive], link_with: [libfakefs], include_directories: [includes])
+        custom_target('unfakefsify',
+            build_by_default: true,
+            command: ['ln', '-sf', 'fakefsify', '@OUTPUT@'],
+            output: 'unfakefsify')
+    endif
 endif

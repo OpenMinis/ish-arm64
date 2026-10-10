@@ -15,5 +15,5 @@ struct fiber_frame {
     // ARM64: code-stream pointer (_pc) at the last fiber_exit, so an INT_GPF
     // can be mapped back to the faulting guest instruction.
     uint64_t fault_stream;
-    long ret_cache[FIBER_RETURN_CACHE_SIZE]; // a map of ip to pointer-to-call-gadget-arguments
+    intptr_t ret_cache[FIBER_RETURN_CACHE_SIZE]; // a map of ip to pointer-to-call-gadget-arguments
 };

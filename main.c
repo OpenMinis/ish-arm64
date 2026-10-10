@@ -6,9 +6,11 @@
 #include "util/signpost.h"
 #include <termios.h>
 #include <unistd.h>
-#include <mach/mach.h>
 #include <pthread.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
 #include <sys/sysctl.h>   // [T-ish-cli-memory-governor] hw.memsize
+#endif
 #include "kernel/calls.h"
 #include "kernel/mm.h"    // [T-ish-cli-memory-governor] ish_set_memory_status
 #include "kernel/task.h"
@@ -131,10 +133,10 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     // Non-JIT crash: dump state and exit
     char buf[512];
     int len;
-    ucontext_t *uc = (ucontext_t *)ctx;
     len = snprintf(buf, sizeof(buf), "\n=== HOST CRASH: signal %d ===\nfault addr: %p\n", sig, info->si_addr);
     write(STDERR_FILENO, buf, len);
-#ifdef __aarch64__
+#if defined(__aarch64__) && defined(__APPLE__)
+    ucontext_t *uc = (ucontext_t *)ctx;
     len = snprintf(buf, sizeof(buf),
         "pc:  0x%llx\nlr:  0x%llx\nsp:  0x%llx\n"
         "x0:  0x%llx\nx1:  0x%llx\nx2:  0x%llx\n"
@@ -333,6 +335,17 @@ void *poll_fn(void *arg) {
 //   * a 250ms dispatch timer would drag libdispatch into a build that does not
 //     otherwise need it, so this is a plain detached pthread on the same
 //     cadence. The kernel's >2s staleness rule still fails closed if it dies.
+#ifdef _WIN32
+static uint64_t ish_cli_phys_footprint(void) {
+    return px_process_footprint();
+}
+
+static uint64_t ish_cli_host_ram(void) {
+    uint64_t total, avail;
+    px_mem_info(&total, &avail);
+    return total;
+}
+#else
 static uint64_t ish_cli_phys_footprint(void) {
     task_vm_info_data_t info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
@@ -350,6 +363,7 @@ static uint64_t ish_cli_host_ram(void) {
         return 0;
     return bytes;
 }
+#endif
 
 static void ish_cli_memory_governor_tick(void) {
     uint64_t ram = ish_cli_host_ram();
@@ -458,6 +472,10 @@ int main(int argc, char *const argv[]) {
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
+#ifdef _WIN32
+    px_crash_init();
+    px_prof_register();
+#endif
     char envp[512] = {0};
     size_t p = 0;
     if (getenv("TERM")) {

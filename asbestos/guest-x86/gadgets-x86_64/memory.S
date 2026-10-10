@@ -72,7 +72,7 @@ handle_\type\()_miss:
     .else
         movq $1, %rdx
     .endif
-    call NAME(tlb_handle_miss)
+    ccall NAME(tlb_handle_miss)
     movq %rax, %r15
     restore_c
     testq %r15, %r15
@@ -106,7 +106,7 @@ crosspage_load:
     movl %_addr, %esi
     leaq LOCAL_value(%_cpu), %rdx
     movq %r14, %rcx
-    call NAME(__tlb_read_cross_page)
+    ccall NAME(__tlb_read_cross_page)
     movq %rax, %r14
     restore_c odd
     testq %r14, %r14
@@ -122,7 +122,7 @@ crosspage_store:
     movl LOCAL_value_addr(%_cpu), %esi
     leaq LOCAL_value(%_cpu), %rdx
     movq %r14, %rcx
-    call NAME(__tlb_write_cross_page)
+    ccall NAME(__tlb_write_cross_page)
     movq %rax, %r14
     restore_c odd
     testq %r14, %r14
