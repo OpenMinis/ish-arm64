@@ -67,6 +67,12 @@ struct px_desc {
     bool is_tty;        // isatty(): the console, or stdin bridged from it
     bool is_pipe;       // a pipe() end: EPIPE rather than ECONNRESET
     int domain, type, protocol; // sockets, Linux values
+    // An emulated ICMP datagram ("ping") socket: s reads the replies that
+    // the IcmpSendEcho2 workers write into icmp_tx (see net.c).
+    bool is_icmp;
+    bool icmp_striphdr;           // IP_STRIPHDR: no IP header (else raw-like)
+    SOCKET icmp_tx;
+    struct sockaddr_in icmp_peer; // connect()ed destination, if any
     int64_t rcvtimeo_ms, sndtimeo_ms; // SO_RCVTIMEO/SO_SNDTIMEO, as stored
     SRWLOCK lock;       // pos
     int64_t pos;        // files: the offset, kept here (all I/O is positional)

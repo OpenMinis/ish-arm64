@@ -26,13 +26,30 @@ RESULTS_DIR="$SCRIPT_DIR/results"
 ASSETS_DIR="$SCRIPT_DIR/assets"
 DATE=$(date +%Y%m%d_%H%M%S)
 
-ISH_X86="$PROJECT_DIR/build-x86-release/ish"
-ISH_ARM64="$PROJECT_DIR/build-arm64-release/ish"
-FAKEFS_X86="$PROJECT_DIR/alpine-x86-fakefs"
-FAKEFS_ARM64="$PROJECT_DIR/alpine-arm64-fakefs"
+# All overridable from the environment. ARCHS="x86" runs a single column (a
+# host with only one guest build, e.g. Windows x64); the other is "SKIP".
+ISH_X86="${ISH_X86:-$PROJECT_DIR/build-x86-release/ish}"
+ISH_ARM64="${ISH_ARM64:-$PROJECT_DIR/build-arm64-release/ish}"
+FAKEFS_X86="${FAKEFS_X86:-$PROJECT_DIR/alpine-x86-fakefs}"
+FAKEFS_ARM64="${FAKEFS_ARM64:-$PROJECT_DIR/alpine-arm64-fakefs}"
+ARCHS="${ARCHS:-x86 arm64}"
+has_arch() { [[ " $ARCHS " == *" $1 "* ]]; }
 
-PERF_MD="$SCRIPT_DIR/BENCHMARK_PERF.md"
-COMPAT_MD="$SCRIPT_DIR/BENCHMARK_COMPAT.md"
+PERF_MD="${PERF_MD:-$SCRIPT_DIR/BENCHMARK_PERF.md}"
+COMPAT_MD="${COMPAT_MD:-$SCRIPT_DIR/BENCHMARK_COMPAT.md}"
+# Failing compat tests with their output, for diagnosis
+FAIL_LOG="${FAIL_LOG:-$RESULTS_DIR/compat_failures_$(date +%Y%m%d_%H%M%S).log}"
+
+# MSYS2 (Windows): ish.exe is a native program; don't let MSYS rewrite guest
+# paths like /bin/sh in its arguments or environment.
+if [ -n "${MSYSTEM:-}" ]; then
+    export MSYS2_ARG_CONV_EXCL='*' MSYS2_ENV_CONV_EXCL='*'
+fi
+if command -v sw_vers >/dev/null 2>&1; then
+    HOST_DESC="macOS $(sw_vers -productVersion)"
+else
+    HOST_DESC="$(uname -s) $(uname -r | cut -d- -f1)"
+fi
 CSV="$RESULTS_DIR/run_${DATE}.csv"
 RUNS=3
 TIMEOUT_S=120
@@ -50,10 +67,14 @@ hr()   { echo "─────────────────────�
 # ── Preflight ───────────────────────────────────────────────────────
 preflight() {
     local ok=1
-    [ -x "$ISH_X86" ]       || { fail "x86 binary: $ISH_X86"; ok=0; }
-    [ -x "$ISH_ARM64" ]     || { fail "ARM64 binary: $ISH_ARM64"; ok=0; }
-    [ -d "$FAKEFS_X86" ]    || { fail "x86 fakefs: $FAKEFS_X86"; ok=0; }
-    [ -d "$FAKEFS_ARM64" ]  || { fail "ARM64 fakefs: $FAKEFS_ARM64"; ok=0; }
+    if has_arch x86; then
+        [ -x "$ISH_X86" ]       || { fail "x86 binary: $ISH_X86"; ok=0; }
+        [ -d "$FAKEFS_X86" ]    || { fail "x86 fakefs: $FAKEFS_X86"; ok=0; }
+    fi
+    if has_arch arm64; then
+        [ -x "$ISH_ARM64" ]     || { fail "ARM64 binary: $ISH_ARM64"; ok=0; }
+        [ -d "$FAKEFS_ARM64" ]  || { fail "ARM64 fakefs: $FAKEFS_ARM64"; ok=0; }
+    fi
     [ $ok -eq 0 ] && exit 1
 }
 
@@ -584,6 +605,15 @@ _ensure_packages() {
         log "Installing on $label:$missing_pkgs"
         timeout 600 "$ish_bin" "$fs_flag" "$fs_path" /bin/sh -c \
             "apk update >/dev/null 2>&1; apk add --no-cache $missing_pkgs 2>&1 | tail -3" 2>&1 | grep -v fork
+        # One package missing from this architecture's repository (or the
+        # timeout) fails the whole batch: retry what is still absent one by
+        # one, so the rest still get installed.
+        for p in $missing_pkgs; do
+            if ! timeout 10 "$ish_bin" "$fs_flag" "$fs_path" /sbin/apk info -e "$p" >/dev/null 2>&1; then
+                timeout 600 "$ish_bin" "$fs_flag" "$fs_path" /sbin/apk add --no-cache -q "$p" 2>&1 \
+                    | grep -v NETDIAG | tail -1 | sed "s/^/  $p: /"
+            fi
+        done
         ok "$label packages ready"
     else
         ok "$label: all packages present"
@@ -608,27 +638,44 @@ _purge_fakefs_special_files() {
     fi
 }
 
+# Runs one compat test; on failure appends the command, exit status and the
+# tail of its output to $FAIL_LOG.
+_compat_run() {
+    local t="$1" ish="$2" fs="$3" arch="$4" cat="$5" name="$6" cmd="$7"
+    local out rc
+    out=$(timeout "$t" "$ish" -f "$fs" /bin/sh -c "$cmd" 2>&1 </dev/null); rc=$?
+    [ $rc -eq 0 ] && return 0
+    {
+        echo "=== [$arch] $cat | $name  (rc=$rc$([ $rc -eq 124 ] && echo ', timeout'))"
+        echo "\$ $cmd"
+        echo "$out" | grep -v '^NETDIAG' | tail -15
+        echo
+    } >> "$FAIL_LOG"
+    return 1
+}
+
 suite_compat() {
     log "Compatibility tests (x86 vs ARM64)"
     hr
 
     # Purge stale blocking special files before anything touches the fakefs.
-    _purge_fakefs_special_files "$FAKEFS_X86" "x86"
-    _purge_fakefs_special_files "$FAKEFS_ARM64" "ARM64"
+    has_arch x86 && _purge_fakefs_special_files "$FAKEFS_X86" "x86"
+    has_arch arm64 && _purge_fakefs_special_files "$FAKEFS_ARM64" "ARM64"
 
     # Auto-install missing packages on both architectures
-    _ensure_packages "$ISH_X86" -f "$FAKEFS_X86" "x86"
-    _ensure_packages "$ISH_ARM64" -f "$FAKEFS_ARM64" "ARM64"
+    has_arch x86 && _ensure_packages "$ISH_X86" -f "$FAKEFS_X86" "x86"
+    has_arch arm64 && _ensure_packages "$ISH_ARM64" -f "$FAKEFS_ARM64" "ARM64"
 
     # Push test assets used by COMPAT_TESTS into both rootfs (e.g. the bun
     # language/stdlib conformance script). Deployed to both archs; x86 will
     # still FAIL the bun test since bun isn't installed there.
     for asset in bun_lang_test.js; do
         [ -f "$ASSETS_DIR/$asset" ] || continue
-        cat "$ASSETS_DIR/$asset" | timeout 10 "$ISH_X86" -f "$FAKEFS_X86" /bin/sh -c "cat > /tmp/$asset" 2>/dev/null || true
-        cat "$ASSETS_DIR/$asset" | timeout 10 "$ISH_ARM64" -f "$FAKEFS_ARM64" /bin/sh -c "cat > /tmp/$asset" 2>/dev/null || true
+        has_arch x86 && { cat "$ASSETS_DIR/$asset" | timeout 10 "$ISH_X86" -f "$FAKEFS_X86" /bin/sh -c "cat > /tmp/$asset" 2>/dev/null || true; }
+        has_arch arm64 && { cat "$ASSETS_DIR/$asset" | timeout 10 "$ISH_ARM64" -f "$FAKEFS_ARM64" /bin/sh -c "cat > /tmp/$asset" 2>/dev/null || true; }
     done
     echo ""
+    : > "$FAIL_LOG"
 
     local total=${#COMPAT_TESTS[@]} n=0
     local x86p=0 x86f=0 armp=0 armf=0
@@ -655,28 +702,33 @@ suite_compat() {
             # "claude --version" keeps the 15s default (measured ~3-5s)
         esac
 
-        local xr ar
-        if timeout "$t" "$ISH_X86" -f "$FAKEFS_X86" /bin/sh -c "$cmd" >/dev/null 2>&1; then
-            xr="PASS"; x86p=$((x86p+1))
-        else
-            xr="FAIL"; x86f=$((x86f+1))
+        local xr=SKIP ar=SKIP
+        if has_arch x86; then
+            if _compat_run "$t" "$ISH_X86" "$FAKEFS_X86" "x86" "$cat" "$name" "$cmd"; then
+                xr="PASS"; x86p=$((x86p+1))
+            else
+                xr="FAIL"; x86f=$((x86f+1))
+            fi
         fi
-        if timeout "$t" "$ISH_ARM64" -f "$FAKEFS_ARM64" /bin/sh -c "$cmd" >/dev/null 2>&1; then
-            ar="PASS"; armp=$((armp+1))
-        else
-            ar="FAIL"; armf=$((armf+1))
+        if has_arch arm64; then
+            if _compat_run "$t" "$ISH_ARM64" "$FAKEFS_ARM64" "ARM64" "$cat" "$name" "$cmd"; then
+                ar="PASS"; armp=$((armp+1))
+            else
+                ar="FAIL"; armf=$((armf+1))
+            fi
         fi
 
         local xs as
-        [ "$xr" = "PASS" ] && xs="${GREEN}PASS${NC}" || xs="${RED}FAIL${NC}"
-        [ "$ar" = "PASS" ] && as="${GREEN}PASS${NC}" || as="${RED}FAIL${NC}"
+        case "$xr" in PASS) xs="${GREEN}PASS${NC}";; FAIL) xs="${RED}FAIL${NC}";; *) xs="${DIM}SKIP${NC}";; esac
+        case "$ar" in PASS) as="${GREEN}PASS${NC}";; FAIL) as="${RED}FAIL${NC}";; *) as="${DIM}SKIP${NC}";; esac
         printf "%-9s %-22s │ %b │ %b\n" "$cat" "$name" "$xs" "$as"
         rows+=("$cat|$name|$xr|$ar")
     done
 
     echo ""
-    ok "x86:   $x86p / $total pass ($(( x86p * 100 / total ))%)"
-    ok "ARM64: $armp / $total pass ($(( armp * 100 / total ))%)"
+    has_arch x86 && ok "x86:   $x86p / $total pass ($(( x86p * 100 / total ))%)"
+    has_arch arm64 && ok "ARM64: $armp / $total pass ($(( armp * 100 / total ))%)"
+    [ -s "$FAIL_LOG" ] && echo "  Failure details: $FAIL_LOG"
 
     _md_compat "$x86p" "$x86f" "$armp" "$armf" "$total" "${rows[@]}"
 }
@@ -688,7 +740,7 @@ _md_compat() {
     cat > "$COMPAT_MD" << EOF
 # iSH Compatibility: x86 vs ARM64
 
-> **Generated:** $(date '+%Y-%m-%d %H:%M:%S') | **Tests:** $total | **Host:** macOS $(sw_vers -productVersion)
+> **Generated:** $(date '+%Y-%m-%d %H:%M:%S') | **Tests:** $total | **Host:** $HOST_DESC
 >
 > Both architectures use **fakefs** mode with virtual device nodes.
 > x86 rootfs = Alpine x86 minirootfs (busybox only)

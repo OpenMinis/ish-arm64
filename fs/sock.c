@@ -259,8 +259,9 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     if (sock < 0)
         return errno_map();
 
-#ifdef __APPLE__
-    if (domain == AF_INET_ && type == SOCK_DGRAM_) {
+#if defined(__APPLE__) || defined(_WIN32)
+    // (type carries SOCK_CLOEXEC/SOCK_NONBLOCK too)
+    if (domain == AF_INET_ && (type & SOCKET_TYPE_MASK) == SOCK_DGRAM_) {
         // in some cases, such as ICMP, datagram sockets on mac can default to
         // including the IP header like raw sockets
         int one = 1;

@@ -107,6 +107,8 @@ static void desc_free(struct px_desc *d) {
             break;
         case PX_SOCK:
             closesocket(d->s);
+            if (d->is_icmp)
+                closesocket(d->icmp_tx);
             break;
         case PX_CONSOLE_OUT:
         case PX_NUL:

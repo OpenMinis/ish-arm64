@@ -7,6 +7,8 @@
 #include <string.h>
 #include <mstcpip.h>
 #include <afunix.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 
 int px_errno_wsa(int err) {
     switch (err) {
@@ -155,10 +157,130 @@ static int sock_install(SOCKET s, int domain, int type, int protocol, int flags)
     return px_install(d, 0, flags & 02000000 /* SOCK_CLOEXEC */);
 }
 
+// ---- ICMP datagram sockets
+//
+// Linux (and Darwin) let unprivileged programs ping through SOCK_DGRAM
+// IPPROTO_ICMP sockets: write an echo request, read back the reply without
+// its IP header. Winsock has no such socket, so emulate one over
+// IcmpSendEcho2: each echo request goes to a worker thread, and the reply it
+// gets is rebuilt as an ICMP echo reply and queued on a loopback datagram
+// pair, prefixed with the address it came from. The read end is what the fd
+// polls and reads.
+
+struct icmp_job {
+    SOCKET tx;
+    IPAddr dest;
+    uint16_t id, seq;
+    size_t len;
+    unsigned char data[];
+};
+
+static uint16_t icmp_checksum(const unsigned char *p, size_t n) {
+    uint32_t sum = 0;
+    for (; n > 1; p += 2, n -= 2)
+        sum += (p[0] << 8) | p[1];
+    if (n)
+        sum += p[0] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t) ~sum;
+}
+
+static DWORD WINAPI icmp_worker(void *param) {
+    struct icmp_job *job = param;
+    HANDLE icmp = IcmpCreateFile();
+    size_t reply_size = sizeof(ICMP_ECHO_REPLY) + job->len + 8 + 64;
+    void *reply = malloc(reply_size);
+    if (icmp != INVALID_HANDLE_VALUE &&
+            IcmpSendEcho2(icmp, NULL, NULL, NULL, job->dest, job->data, (WORD) job->len, NULL,
+                reply, (DWORD) reply_size, 4000) > 0) {
+        ICMP_ECHO_REPLY *r = reply;
+        if (r->Status == IP_SUCCESS) {
+            size_t n = r->DataSize;
+            unsigned char *pkt = malloc(8 + 8 + n);
+            memcpy(pkt, &r->Address, 4);
+            pkt[4] = r->Options.Ttl;
+            pkt[5] = pkt[6] = pkt[7] = 0;
+            unsigned char *icmp_hdr = pkt + 8;
+            icmp_hdr[0] = 0; // echo reply
+            icmp_hdr[1] = 0;
+            icmp_hdr[2] = icmp_hdr[3] = 0;
+            icmp_hdr[4] = job->id >> 8;
+            icmp_hdr[5] = job->id & 0xff;
+            icmp_hdr[6] = job->seq >> 8;
+            icmp_hdr[7] = job->seq & 0xff;
+            memcpy(icmp_hdr + 8, r->Data, n);
+            uint16_t sum = icmp_checksum(icmp_hdr, 8 + n);
+            icmp_hdr[2] = sum >> 8;
+            icmp_hdr[3] = sum & 0xff;
+            send(job->tx, (char *) pkt, (int) (8 + 8 + n), 0);
+            free(pkt);
+        }
+    }
+    if (icmp != INVALID_HANDLE_VALUE)
+        IcmpCloseHandle(icmp);
+    free(reply);
+    closesocket(job->tx);
+    free(job);
+    return 0;
+}
+
+static int icmp_socket_new(int flags) {
+    SOCKET pair[2];
+    if (px_sock_pair(SOCK_DGRAM, pair) < 0)
+        return -1;
+    struct px_desc *d = px_desc_new(PX_SOCK);
+    d->s = pair[0];
+    d->icmp_tx = pair[1];
+    d->is_icmp = true;
+    d->flags = PX_O_RDWR | ((flags & 04000) ? PX_O_NONBLOCK : 0);
+    d->domain = 2;
+    d->type = 2;
+    d->protocol = 1;
+    return px_install(d, 0, flags & 02000000);
+}
+
+static ssize_t icmp_send(struct px_desc *d, const void *buf, size_t n, const void *addr, px_socklen_t len) {
+    const struct sockaddr_in *to = addr;
+    if (to == NULL)
+        to = &d->icmp_peer;
+    else if (len < (px_socklen_t) sizeof(struct sockaddr_in))
+        return px_fail(EINVAL);
+    if (to->sin_addr.s_addr == 0 && addr == NULL)
+        return px_fail(EDESTADDRREQ);
+    const unsigned char *p = buf;
+    if (n < 8 || p[0] != 8 /* echo request */)
+        return px_fail(EINVAL);
+    struct icmp_job *job = malloc(sizeof(*job) + n - 8);
+    // The worker owns a duplicate of the write end: the fd may close first.
+    WSAPROTOCOL_INFOW info;
+    if (WSADuplicateSocketW(d->icmp_tx, GetCurrentProcessId(), &info) != 0 ||
+            (job->tx = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, &info, 0,
+                WSA_FLAG_OVERLAPPED)) == INVALID_SOCKET) {
+        free(job);
+        return px_fail_wsa();
+    }
+    job->dest = to->sin_addr.s_addr;
+    job->id = (p[4] << 8) | p[5];
+    job->seq = (p[6] << 8) | p[7];
+    job->len = n - 8;
+    memcpy(job->data, p + 8, n - 8);
+    HANDLE t = CreateThread(NULL, 0, icmp_worker, job, 0, NULL);
+    if (t == NULL) {
+        closesocket(job->tx);
+        free(job);
+        return px_fail_win();
+    }
+    CloseHandle(t);
+    return n;
+}
+
 int px_socket(int domain, int type, int protocol) {
     px_init();
     int flags = type & (04000 | 02000000);
     type &= 0xf;
+    if (domain == 2 && type == SOCK_DGRAM && protocol == 1 /* IPPROTO_ICMP */)
+        return icmp_socket_new(flags);
     int af = af_to_win(domain);
     if (af < 0 || af == AF_UNSPEC)
         return px_fail(EAFNOSUPPORT);
@@ -339,6 +461,10 @@ int px_bind(int fd, const void *addr, px_socklen_t len) {
     struct px_desc *d = sock_get(fd);
     if (d == NULL)
         return -1;
+    if (d->is_icmp) {
+        px_put(d);
+        return 0;
+    }
     struct sockaddr_storage wa;
     int wlen, res = addr_to_win(addr, len, &wa, &wlen);
     if (res == 0 && bind(d->s, (struct sockaddr *) &wa, wlen) == SOCKET_ERROR)
@@ -351,6 +477,12 @@ int px_connect(int fd, const void *addr, px_socklen_t len) {
     struct px_desc *d = sock_get(fd);
     if (d == NULL)
         return -1;
+    if (d->is_icmp) {
+        if (len >= (px_socklen_t) sizeof(struct sockaddr_in))
+            memcpy(&d->icmp_peer, addr, sizeof(d->icmp_peer));
+        px_put(d);
+        return 0;
+    }
     struct sockaddr_storage wa;
     int wlen, res = addr_to_win(addr, len, &wa, &wlen);
     if (res < 0)
@@ -432,6 +564,11 @@ ssize_t px_sendto(int fd, const void *buf, size_t n, int flags, const void *addr
     struct sockaddr_storage wa;
     int wlen = 0;
     ssize_t res;
+    if (d->is_icmp) {
+        res = icmp_send(d, buf, n, addr, len);
+        px_put(d);
+        return res;
+    }
     if (addr != NULL && addr_to_win(addr, len, &wa, &wlen) < 0) {
         res = -1;
     } else {
@@ -446,12 +583,72 @@ ssize_t px_sendto(int fd, const void *buf, size_t n, int flags, const void *addr
     return res;
 }
 
+// One queued reply: strips the prefix (source address, TTL), fills in a Linux
+// sockaddr_in and the TTL. Like Darwin's ICMP datagram sockets, the reply
+// comes with an IPv4 header unless IP_STRIPHDR was set: iSH maps the guest's
+// SOCK_RAW onto these, and raw readers (busybox ping as root) parse it.
+static ssize_t icmp_recv(struct px_desc *d, void *buf, size_t n, bool dontwait, int *trunc,
+        void *addr, px_socklen_t *len, int *ttl) {
+    char *pkt = malloc(65536 + 64);
+    int got = BLOCKING(d, dontwait, POLLRDNORM, timeout_of(d->rcvtimeo_ms), recv(d->s, pkt, 65000, 0));
+    if (got == SOCKET_ERROR || got < 8) {
+        free(pkt);
+        return got == SOCKET_ERROR ? -1 : px_fail(EAGAIN);
+    }
+    size_t body = got - 8;
+    char *src = pkt + 8;
+    if (!d->icmp_striphdr) {
+        // synthesize the IP header in front of the ICMP message
+        // the prefix (address, TTL) sits in bytes 0-7, which the move keeps
+        memmove(pkt + 20, pkt + 8, body);
+        unsigned char *ip = (unsigned char *) pkt;
+        unsigned char ttl8 = (unsigned char) ip[4];
+        uint32_t from;
+        memcpy(&from, ip, 4);
+        memset(ip, 0, 20);
+        ip[0] = 0x45;
+        ip[2] = (20 + body) >> 8;
+        ip[3] = (20 + body) & 0xff;
+        ip[8] = ttl8;
+        ip[9] = 1; // ICMP
+        memcpy(ip + 12, &from, 4);
+        ip[16] = 127; ip[19] = 1; // to: us
+        uint16_t sum = icmp_checksum(ip, 20);
+        ip[10] = sum >> 8;
+        ip[11] = sum & 0xff;
+        if (ttl != NULL)
+            *ttl = ttl8;
+        memcpy(pkt + 65536, &from, 4); // keep the source for the address below
+        body += 20;
+        src = pkt;
+    } else if (ttl != NULL) {
+        *ttl = (unsigned char) pkt[4];
+    }
+    *trunc = body > n;
+    memcpy(buf, src, body < n ? body : n);
+    if (addr != NULL && len != NULL) {
+        struct { uint16_t family, port; uint32_t addr; char zero[8]; } in = {2, 0, 0, {0}};
+        memcpy(&in.addr, d->icmp_striphdr ? pkt : pkt + 65536, 4);
+        size_t c = (size_t) *len < sizeof(in) ? (size_t) *len : sizeof(in);
+        memcpy(addr, &in, c);
+        *len = sizeof(in);
+    }
+    free(pkt);
+    return body < n ? body : n;
+}
+
 ssize_t px_recvfrom(int fd, void *buf, size_t n, int flags, void *addr, px_socklen_t *len) {
     struct px_desc *d = sock_get(fd);
     if (d == NULL)
         return -1;
     bool dontwait;
     int wflags = msg_flags_to_win(flags, &dontwait);
+    if (d->is_icmp) {
+        int trunc;
+        ssize_t r = icmp_recv(d, buf, n, dontwait, &trunc, addr, len, NULL);
+        px_put(d);
+        return r;
+    }
     struct sockaddr_storage wa;
     int wlen = sizeof(wa);
     if (n > INT_MAX)
@@ -491,6 +688,18 @@ ssize_t px_sendmsg(int fd, const struct px_msghdr *msg, int flags) {
     }
     bool dontwait;
     int wflags = msg_flags_to_win(flags, &dontwait);
+    if (d->is_icmp) {
+        size_t total = 0;
+        for (size_t i = 0; i < msg->msg_iovlen; i++)
+            total += msg->msg_iov[i].iov_len;
+        char *flat = malloc(total ? total : 1);
+        for (size_t i = 0, off = 0; i < msg->msg_iovlen; off += msg->msg_iov[i].iov_len, i++)
+            memcpy(flat + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
+        ssize_t r = icmp_send(d, flat, total, msg->msg_name, msg->msg_namelen);
+        free(flat);
+        px_put(d);
+        return r;
+    }
     WSABUF bufs[64];
     DWORD nbufs = msg->msg_iovlen < 64 ? (DWORD) msg->msg_iovlen : 64;
     for (DWORD i = 0; i < nbufs; i++) {
@@ -516,6 +725,37 @@ ssize_t px_recvmsg(int fd, struct px_msghdr *msg, int flags) {
         return -1;
     bool dontwait;
     DWORD wflags = msg_flags_to_win(flags, &dontwait);
+    if (d->is_icmp) {
+        char *tmp = malloc(65536);
+        int trunc;
+        px_socklen_t nl = msg->msg_namelen;
+        int ttl = 64;
+        ssize_t r = icmp_recv(d, tmp, 65536, dontwait, &trunc, msg->msg_name, &nl, &ttl);
+        // IP_TTL control message, Linux layout {size_t len; int level, type;} + int
+        struct { size_t len; int level, type; int ttl; } cm = {sizeof(size_t) + 3 * sizeof(int), 0, 2, ttl};
+        if (r >= 0 && msg->msg_control != NULL && msg->msg_controllen >= sizeof(cm)) {
+            memcpy(msg->msg_control, &cm, sizeof(cm));
+            msg->msg_controllen = (sizeof(cm) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
+        } else {
+            msg->msg_controllen = 0;
+        }
+        msg->msg_flags = 0;
+        if (r >= 0) {
+            msg->msg_namelen = nl;
+            size_t off = 0;
+            for (size_t i = 0; i < msg->msg_iovlen && off < (size_t) r; i++) {
+                size_t c = msg->msg_iov[i].iov_len < (size_t) r - off ? msg->msg_iov[i].iov_len : (size_t) r - off;
+                memcpy(msg->msg_iov[i].iov_base, tmp + off, c);
+                off += c;
+            }
+            if (off < (size_t) r)
+                msg->msg_flags |= 0x20; // MSG_TRUNC
+            r = off;
+        }
+        free(tmp);
+        px_put(d);
+        return r;
+    }
     WSABUF bufs[64];
     DWORD nbufs = msg->msg_iovlen < 64 ? (DWORD) msg->msg_iovlen : 64;
     for (DWORD i = 0; i < nbufs; i++) {
@@ -725,6 +965,10 @@ int px_setsockopt(int fd, int level, int name, const void *val, px_socklen_t len
     if (d == NULL)
         return -1;
     int res = 0;
+    if (d->is_icmp && level == 0 && name == 23 /* IP_STRIPHDR */) {
+        d->icmp_striphdr = len >= (px_socklen_t) sizeof(int) && *(const int *) val;
+        goto out;
+    }
     if (level == 1 && (name == 20 || name == 21)) { /* SO_RCVTIMEO, SO_SNDTIMEO */
         if (len < (px_socklen_t) sizeof(struct px_timeval)) {
             res = px_fail(EINVAL);

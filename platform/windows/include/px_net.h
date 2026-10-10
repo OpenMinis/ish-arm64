@@ -69,6 +69,8 @@
 #define IP_RETOPTS 7
 #define IP_MTU_DISCOVER 10
 #define IP_RECVERR 11
+// Darwin's: strip the IP header from ICMP datagram sockets (see net.c)
+#define IP_STRIPHDR 23
 #define IP_MULTICAST_IF 32
 #define IP_MULTICAST_TTL 33
 #define IP_MULTICAST_LOOP 34
