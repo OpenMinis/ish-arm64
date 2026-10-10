@@ -97,6 +97,12 @@ bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to);
 // running guest code.
 void jit_exec_ready(void);
 
+// Module and file offset of guest address pc in the address space of tlb, the
+// same in every process (-1: not in a module), and a module's path: the block
+// profiler (ISH_BLOCK_PROF_FILE) counts by these.
+int jit_prof_locate(struct tlb *tlb, addr_t pc, uint64_t *off);
+void jit_module_path(int mod, char *buf, size_t size);
+
 // Host fault in native code: sync pinned guest registers into cpu_state.
 bool jit_crash_sync(void *ucontext);
 

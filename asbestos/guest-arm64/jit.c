@@ -2955,6 +2955,21 @@ static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base) {
     return mod;
 }
 
+int jit_prof_locate(struct tlb *tlb, addr_t pc, uint64_t *off) {
+    struct tlb *saved = cm_tlb;
+    cm_tlb = tlb;
+    uint64_t base;
+    int mod = jit_locate(pc, off, &base);
+    cm_tlb = saved;
+    return mod;
+}
+
+void jit_module_path(int mod, char *buf, size_t size) {
+    pthread_mutex_lock(&cm_lock);
+    snprintf(buf, size, "%s", (unsigned) mod < cm_nmods ? cm_mods[mod].path : "?");
+    pthread_mutex_unlock(&cm_lock);
+}
+
 // Was image m recorded from this module (IMG_SAME: by build-id when both have
 // one, the same build anywhere in the file system, else by path), or from
 // another version of it (IMG_FAMILY: the file name matches the image's

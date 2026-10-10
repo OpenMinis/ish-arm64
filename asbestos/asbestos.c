@@ -195,6 +195,20 @@ static inline void blk_prof_record(uint64_t addr, uint64_t insns) {
         }
     }
 }
+// With the JIT the key is the block's module and file offset (BLK_PROF_MOD |
+// module << 40 | offset), the same in every process: dumped as
+// "<module path> <offset> <insns> <count>".
+#define BLK_PROF_MOD (1ull << 63)
+static inline uint64_t blk_prof_key(struct tlb *tlb, uint64_t addr) {
+#ifdef ISH_JIT
+    uint64_t off;
+    int mod = jit_prof_locate(tlb, addr, &off);
+    if (mod >= 0 && mod < (1 << 22) && off < (1ull << 40))
+        return BLK_PROF_MOD | (uint64_t) mod << 40 | off;
+#endif
+    (void) tlb;
+    return addr;
+}
 void dump_block_prof(void) {
     const char *path = getenv("ISH_BLOCK_PROF_FILE");
     if (!path || !blk_prof) return;
@@ -205,6 +219,16 @@ void dump_block_prof(void) {
         uint64_t a = blk_prof[i].addr;
         if (!a) continue;
         uint64_t cl = blk_prof[i].cnt_len;
+#ifdef ISH_JIT
+        if (a & BLK_PROF_MOD) {
+            char mod[1024];
+            jit_module_path((int) (a >> 40 & ((1 << 22) - 1)), mod, sizeof(mod));
+            fprintf(f, "%s %llx %llu %llu\n", mod, (unsigned long long)(a & ((1ull << 40) - 1)),
+                    (unsigned long long)(cl & 0xff), (unsigned long long)(cl >> 8));
+            n++;
+            continue;
+        }
+#endif
         fprintf(f, "%llx %llu %llu\n", (unsigned long long)a,
                 (unsigned long long)(cl & 0xff), (unsigned long long)(cl >> 8));
         n++;
@@ -1049,7 +1073,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         jit_saved_pc = frame->cpu.pc;
 
         if (blk_prof_on() && block != NULL)
-            blk_prof_record(block->addr, (block->end_addr - block->addr) >> 2);
+            blk_prof_record(blk_prof_key(tlb, block->addr), (block->end_addr - block->addr) >> 2);
 
         // Count dispatch-loop iterations (gated). Cached env check.
         {
