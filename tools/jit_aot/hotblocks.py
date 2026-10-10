@@ -13,9 +13,7 @@ With --max the image keeps that many translations: those for the coverage first,
 order the recording first translated them. Code that runs early (start-up, the runtime's core) serves
 workloads the profile never saw better than code that is merely rare in it: for node, 128000
 translations picked this way ran the node cases 0.9% faster than the first 123464 the recording made,
-and 5.9% faster than the 128000 worth most. --max is also the cap for an image that has to link: ld
-fails on an object with too many references from its tables to its code ("too many large addends",
-ld-27037: between 339384 and 349699 references, about 136000 translations of node).
+and 5.9% faster than the 128000 worth most; all 155894 ran them 0.2% faster than those 128000.
 """
 import argparse
 import json

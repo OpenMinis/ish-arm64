@@ -218,6 +218,14 @@ def sha256_of(path):
     return h.digest()
 
 
+# A linker-private symbol (l...) every ANCHOR_EVERY translations, in the code and in the tables: a
+# table's 32-bit pointer into the code (target - field) is relocated against the nearest ones before the
+# target and the field, with small addends, not against the two sections with offsets into them. ld
+# (ld-27037) fails on an object with too many large addends ("too many large addends", about 136000
+# translations of node without the anchors).
+ANCHOR_EVERY = 32
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('recording')
@@ -284,6 +292,8 @@ def main():
         if not ok:
             stats['dropped'] += 1
             continue
+        if ti % ANCHOR_EVERY == 0:
+            code.append(f'l_ish_aot_{args.name}_{ti}:')
         code += body
         keep.append(ti)
     # A dropped translation's code is gone: branches into it would dangle.
@@ -303,6 +313,8 @@ def main():
             name = t['keysym'].get(str(g))
             key[g] = key[g + 1] = 0
             gadgets.append(link_name(syms, name) if name else None)
+        if ti % ANCHOR_EVERY == 0:
+            data.append(f'l_ish_aot_{args.name}_k{ti}:')
         data.append('    .p2align 3')
         data.append(f'Lk{ti}:')
         for i in range(0, len(key), 8):
@@ -345,6 +357,8 @@ def main():
             site = next((f'{seg_label(ti, si)}_l{slot}' for si, seg in enumerate(t['segs'])
                          for l in seg['links'] if l[0] == slot), None)
             links.append(site or '0')
+        if ti % ANCHOR_EVERY == 0:
+            lines.append(f'l_ish_aot_{args.name}_t{ti}:')
         lines.append(f'    .quad {t["off"]}')
         lines.append(f'    .long {t["idx"]}, {len(t["key"])}')
         lines.append(f'    .quad Lk{ti}, Lg{ti}, Ls{ti}')

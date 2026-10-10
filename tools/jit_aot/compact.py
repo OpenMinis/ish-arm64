@@ -49,6 +49,8 @@ def compact_lines(lines, abi):
 
     for line in lines:
         t = line.strip()
+        if t.startswith('l_ish_aot_'):   # gen.py's anchors: not part of a table
+            out.append(line); continue
         if t.startswith('.section'):
             in_data = '__DATA,__const' in t
         if not in_data:
