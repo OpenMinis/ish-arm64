@@ -153,6 +153,9 @@ struct cpu_state {
             bitfield y:1;
         };
     };
+    // SSE control/status (ldmxcsr/stmxcsr); the rounding control applies to
+    // the rounding conversions (cvtsd2si and friends)
+    dword_t mxcsr;
 
     // TLS bullshit
     word_t gs;

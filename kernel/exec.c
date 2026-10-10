@@ -493,6 +493,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     current->cpu.esp = sp;
     current->cpu.eip = entry;
     current->cpu.fcw = 0x37f;
+    current->cpu.mxcsr = 0x1f80;
 
     // This code was written when I discovered that the glibc entry point
     // interprets edx as the address of a function to call on exit, as

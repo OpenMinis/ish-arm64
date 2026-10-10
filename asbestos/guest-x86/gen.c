@@ -424,6 +424,8 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FSTENV(val,z) h_write(fpu_stenv, z)
 #define FLDENV(val,z) h_write(fpu_ldenv, z)
 #define FSAVE(val,z) h_write(fpu_save, z)
+#define LDMXCSR(z) h_read(sse_ldmxcsr, z)
+#define STMXCSR(z) h_write(sse_stmxcsr, z)
 #define FRESTORE(val,z) h_write(fpu_restore, z)
 #define FCLEX() h(fpu_clex)
 #define FPOP h(fpu_pop)

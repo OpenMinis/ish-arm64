@@ -388,14 +388,17 @@ void vec_fcmp_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t 
 }
 
 // come to the dark side of macros
-#define _ISNAN_int32_t(x) false
-#define _ISNAN_float(x) isnan(x)
-#define _ISNAN_double(x) isnan(x)
-#define _ISNAN(x, t) _ISNAN_##t(x)
+// A float that doesn't fit in an int32 (or is NaN) converts to the "integer
+// indefinite" 0x80000000 on x86; a C cast is undefined there, and saturates
+// on arm64 hosts.
+#define _NOFIT_int32_t(x) false
+#define _NOFIT_float(x) (isnan(x) || (x) >= 2147483648.0f || (x) < -2147483648.0f)
+#define _NOFIT_double(x) (isnan(x) || (x) >= 2147483648.0 || (x) < -2147483648.0)
+#define _NOFIT(x, t) _NOFIT_##t(x)
 #define _VEC_CVT(src, dst, src_t, dst_t, n) \
     do { \
         for (int i = 0; i < n; ++i) { \
-            if (_ISNAN(((src_t *)src)[i], src_t)) \
+            if (_NOFIT(((src_t *)src)[i], src_t)) \
                 ((dst_t *)dst)[i] = INT32_MIN; \
             else \
                 ((dst_t *)dst)[i] = ((src_t *)src)[i]; \
@@ -602,4 +605,202 @@ void vec_muluu128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
         uint32_t res = dst->u16[i] * src->u16[i];
         dst->u16[i] = ((res >> 16) & 0xffff);
     }
+}
+
+// ---- SSE/SSE2 completions: packed arithmetic, reciprocals, compares,
+// conversions, and MXCSR
+
+void vec_div_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 4; i++) dst->f32[i] /= src->f32[i];
+}
+void vec_div_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 2; i++) dst->f64[i] /= src->f64[i];
+}
+// min/max return the second (source) operand when either is NaN or both are
+// zero, like the scalar versions above
+void vec_min_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 4; i++)
+        if (!(dst->f32[i] < src->f32[i])) dst->f32[i] = src->f32[i];
+}
+void vec_max_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 4; i++)
+        if (!(dst->f32[i] > src->f32[i])) dst->f32[i] = src->f32[i];
+}
+void vec_min_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 2; i++)
+        if (!(dst->f64[i] < src->f64[i])) dst->f64[i] = src->f64[i];
+}
+void vec_max_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 2; i++)
+        if (!(dst->f64[i] > src->f64[i])) dst->f64[i] = src->f64[i];
+}
+void vec_sqrt_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg s = *src;
+    for (int i = 0; i < 4; i++) dst->f32[i] = sqrtf(s.f32[i]);
+}
+void vec_sqrt_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg s = *src;
+    for (int i = 0; i < 2; i++) dst->f64[i] = sqrt(s.f64[i]);
+}
+// rcp/rsqrt are approximations on hardware (12 bits); exact is within spec
+void vec_rcp_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg s = *src;
+    for (int i = 0; i < 4; i++) dst->f32[i] = 1.0f / s.f32[i];
+}
+void vec_rsqrt_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg s = *src;
+    for (int i = 0; i < 4; i++) dst->f32[i] = 1.0f / sqrtf(s.f32[i]);
+}
+void vec_single_rcp32(NO_CPU, const float *src, float *dst) { *dst = 1.0f / *src; }
+void vec_single_rsqrt32(NO_CPU, const float *src, float *dst) { *dst = 1.0f / sqrtf(*src); }
+
+void vec_fcmp_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t type) {
+    for (int i = 0; i < 4; i++)
+        dst->u32[i] = cmps(dst->f32[i], src->f32[i], type) ? -1 : 0;
+}
+
+void vec_fmovmask_s128(NO_CPU, const union xmm_reg *src, uint32_t *dst) {
+    *dst = 0;
+    for (int i = 0; i < 4; i++)
+        if (signbit(src->f32[i]))
+            *dst |= 1 << i;
+}
+
+void vec_movhl_ps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    dst->qw[0] = src->qw[1];
+}
+void vec_movlh_ps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    dst->qw[1] = src->qw[0];
+}
+
+// widening/narrowing conversions; src may be memory of the size in the name
+void vec_cvtps2pd64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    float a = src->f32[0], b = src->f32[1];
+    dst->f64[0] = a;
+    dst->f64[1] = b;
+}
+void vec_cvtpd2ps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    double a = src->f64[0], b = src->f64[1];
+    dst->f32[0] = (float) a;
+    dst->f32[1] = (float) b;
+    dst->qw[1] = 0;
+}
+void vec_cvtdq2ps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg s = *src;
+    for (int i = 0; i < 4; i++) dst->f32[i] = (float) (int32_t) s.u32[i];
+}
+void vec_cvtdq2pd64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    int32_t a = (int32_t) src->u32[0], b = (int32_t) src->u32[1];
+    dst->f64[0] = a;
+    dst->f64[1] = b;
+}
+
+// The rounding conversions round as MXCSR.RC says.
+static double round_mxcsr(struct cpu_state *cpu, double x) {
+    switch ((cpu->mxcsr >> 13) & 3) {
+        case 0: return nearbyint(x); // to nearest even (the host's default mode)
+        case 1: return floor(x);
+        case 2: return ceil(x);
+        default: return trunc(x);
+    }
+}
+static int32_t round_to_i32(struct cpu_state *cpu, double x) {
+    double r = round_mxcsr(cpu, x);
+    if (isnan(r) || r >= 2147483648.0 || r < -2147483648.0)
+        return INT32_MIN;
+    return (int32_t) r;
+}
+void vec_cvtps2dq128(struct cpu_state *cpu, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg s = *src;
+    for (int i = 0; i < 4; i++) dst->u32[i] = round_to_i32(cpu, s.f32[i]);
+}
+void vec_cvtpd2dq128(struct cpu_state *cpu, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg s = *src;
+    dst->u32[0] = round_to_i32(cpu, s.f64[0]);
+    dst->u32[1] = round_to_i32(cpu, s.f64[1]);
+    dst->qw[1] = 0;
+}
+void vec_cvtsd2si64(struct cpu_state *cpu, const double *src, int32_t *dst) {
+    *dst = round_to_i32(cpu, *src);
+}
+void vec_cvtss2si32(struct cpu_state *cpu, const float *src, int32_t *dst) {
+    *dst = round_to_i32(cpu, *src);
+}
+
+// ldmxcsr/stmxcsr through the memory helpers
+void sse_ldmxcsr32(struct cpu_state *cpu, const uint32_t *src) {
+    cpu->mxcsr = *src & 0xffff;
+}
+void sse_stmxcsr32(struct cpu_state *cpu, uint32_t *dst) {
+    *dst = cpu->mxcsr;
+}
+
+// ---- SSSE3 (66 0f 38 xx, 66 0f 3a 0f). Not advertised in CPUID, but used
+// unconditionally by code that picks its kernels from the CPU model
+// (OpenBLAS), so they have to work anyway.
+
+static int16_t sat16(int32_t x) { return x > INT16_MAX ? INT16_MAX : x < INT16_MIN ? INT16_MIN : x; }
+
+void vec_pshufb128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg d = *dst, s = *src;
+    for (int i = 0; i < 16; i++)
+        dst->u8[i] = (s.u8[i] & 0x80) ? 0 : d.u8[s.u8[i] & 15];
+}
+#define HORIZONTAL(name, type, field, n, expr) \
+    void vec_##name##128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) { \
+        union xmm_reg d = *dst, s = *src; \
+        for (int i = 0; i < n / 2; i++) { \
+            type a = (type) d.field[2 * i], b = (type) d.field[2 * i + 1]; \
+            dst->field[i] = expr; \
+            a = (type) s.field[2 * i]; b = (type) s.field[2 * i + 1]; \
+            dst->field[n / 2 + i] = expr; \
+        } \
+    }
+HORIZONTAL(phaddw, int16_t, u16, 8, (int16_t) (a + b))
+HORIZONTAL(phaddd, int32_t, u32, 4, (int32_t) ((uint32_t) a + (uint32_t) b))
+HORIZONTAL(phaddsw, int16_t, u16, 8, sat16(a + b))
+HORIZONTAL(phsubw, int16_t, u16, 8, (int16_t) (a - b))
+HORIZONTAL(phsubd, int32_t, u32, 4, (int32_t) ((uint32_t) a - (uint32_t) b))
+HORIZONTAL(phsubsw, int16_t, u16, 8, sat16(a - b))
+#undef HORIZONTAL
+
+void vec_pmaddubsw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    union xmm_reg d = *dst, s = *src;
+    for (int i = 0; i < 8; i++)
+        dst->u16[i] = sat16(d.u8[2 * i] * (int8_t) s.u8[2 * i] + d.u8[2 * i + 1] * (int8_t) s.u8[2 * i + 1]);
+}
+void vec_pmulhrsw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 8; i++)
+        dst->u16[i] = (int16_t) ((((int32_t) (int16_t) dst->u16[i] * (int16_t) src->u16[i]) >> 14) + 1) >> 1;
+}
+#define SIGN(name, type, field, n) \
+    void vec_##name##128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) { \
+        for (int i = 0; i < n; i++) { \
+            type s = (type) src->field[i]; \
+            if (s < 0) dst->field[i] = -(type) dst->field[i]; \
+            else if (s == 0) dst->field[i] = 0; \
+        } \
+    }
+SIGN(psignb, int8_t, u8, 16)
+SIGN(psignw, int16_t, u16, 8)
+SIGN(psignd, int32_t, u32, 4)
+#undef SIGN
+#define ABS(name, type, field, n) \
+    void vec_##name##128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) { \
+        for (int i = 0; i < n; i++) { \
+            type s = (type) src->field[i]; \
+            dst->field[i] = s < 0 ? -s : s; \
+        } \
+    }
+ABS(pabsb, int8_t, u8, 16)
+ABS(pabsw, int16_t, u16, 8)
+ABS(pabsd, int32_t, u32, 4)
+#undef ABS
+
+void vec_palignr128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm) {
+    uint8_t cat[32];
+    memcpy(cat, src->u8, 16);       // low half: the source
+    memcpy(cat + 16, dst->u8, 16);  // high half: the destination
+    for (int i = 0; i < 16; i++)
+        dst->u8[i] = imm + i < 32 ? cat[imm + i] : 0;
 }
