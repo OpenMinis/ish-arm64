@@ -563,6 +563,7 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
 #endif
 #ifdef ISH_JIT
     struct jit_units *jit_units = jit_units_begin();
+    state.units = jit_units != NULL;
 #endif
     while (true) {
 #ifdef ISH_JIT

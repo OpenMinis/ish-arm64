@@ -25,6 +25,7 @@ static void mem_changed(struct mem *mem);
 static struct mmu_ops mem_mmu_ops;
 
 #include "kernel/mm.h"
+#include "emu/tlb.h"
 
 
 #ifdef GUEST_ARM64
@@ -40,6 +41,8 @@ void mem_init(struct mem *mem) {
     mem->mmu.ops = &mem_mmu_ops;
     mem->mmu.asbestos = asbestos_new(&mem->mmu);
     mem->mmu.changes = 0;
+    lock_init(&mem->mmu.tlbs_lock);
+    list_init(&mem->mmu.tlbs);
     wrlock_init(&mem->lock);
     lock_init(&mem->cow_lock);
 }
@@ -1022,7 +1025,10 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 }
 
 static void mem_changed(struct mem *mem) {
-    __atomic_add_fetch(&mem->mmu.changes, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&mem->mmu.changes, 1, __ATOMIC_SEQ_CST);
+#ifdef GUEST_ARM64
+    mmu_tlbs_stale(&mem->mmu);
+#endif
 }
 
 // Public wrapper: bump the memory-change generation so other threads' TLB

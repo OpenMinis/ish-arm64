@@ -23,6 +23,40 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
     tlb_flush(tlb);
 }
 
+#ifdef GUEST_ARM64
+void tlb_attach(struct tlb *tlb, struct mmu *mmu) {
+    lock(&mmu->tlbs_lock);
+    list_add(&mmu->tlbs, &tlb->tlbs_link);
+    unlock(&mmu->tlbs_lock);
+    tlb->attached = mmu;
+    // Cleared before the caller compares mmu->changes (tlb_refresh()): a
+    // change that compare misses comes after the list_add, so it marks this
+    // TLB stale again.
+    __atomic_store_n(&tlb->stale, 0, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+void tlb_detach(struct tlb *tlb) {
+    struct mmu *mmu = tlb->attached;
+    if (mmu == NULL)
+        return;
+    lock(&mmu->tlbs_lock);
+    list_remove(&tlb->tlbs_link);
+    unlock(&mmu->tlbs_lock);
+    tlb->attached = NULL;
+}
+
+// After mmu->changes moved: the threads running in this address space may
+// hold entries for the old mappings.
+void mmu_tlbs_stale(struct mmu *mmu) {
+    lock(&mmu->tlbs_lock);
+    struct tlb *tlb;
+    list_for_each_entry(&mmu->tlbs, tlb, tlbs_link)
+        __atomic_store_n(&tlb->stale, TLB_STALE, __ATOMIC_SEQ_CST);
+    unlock(&mmu->tlbs_lock);
+}
+#endif
+
 void tlb_flush(struct tlb *tlb) {
     tlb->mem_changes = tlb->mmu->changes;
     for (unsigned i = 0; i < TLB_SIZE; i++)
@@ -80,7 +114,12 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     // translation (the per-block coherence check will still catch a later
     // change).
     for (int attempt = 0; ; attempt++) {
-        gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
+#ifdef GUEST_ARM64
+        // Clear the stale mark before reading the generation: a change this
+        // read misses marks the TLB stale again (mmu_tlbs_stale()).
+        __atomic_store_n(&tlb->stale, 0, __ATOMIC_SEQ_CST);
+#endif
+        gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_SEQ_CST);
         if (gen != tlb->mem_changes)
             tlb_flush(tlb);
         tlb->mem_changes = gen;
