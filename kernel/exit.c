@@ -187,10 +187,16 @@ noreturn void do_exit(int status) {
 
         // notify parent that we died
         struct task *parent = leader->parent;
-        if (parent == NULL && current->pid != 1) {
+        // Whether this is init is the LEADER's pid: the last thread out of a
+        // multithreaded init (a Go program run as pid 1 whose os.Exit ran on
+        // another thread) is not pid 1 itself, and "reparenting" init to
+        // pid 1 made it its own parent, so it never halted.
+        if (parent == NULL && leader->pid != 1) {
             // Non-init process with no parent - try to find one
             // This can happen during reparenting or if parent exited first
             parent = pid_get_task(1); // Reparent to init
+            if (parent == leader)
+                parent = NULL;
             if (parent != NULL)
                 leader->parent = parent;
         }
@@ -444,6 +450,11 @@ static void halt_system(int status) {
         int tasks_found = 0;
         for (int i = 2; i < MAX_PID; i++) {
             struct task *task = pid_get_task(i);
+            // the caller can be another thread of init (see do_exit): not a
+            // task to be killed, and pthread_kill(SIGTERM) on itself would
+            // take the whole host process down with status 143
+            if (task == current)
+                continue;
             if (task != NULL) {
                 tasks_found++;
                 switch (state) {

@@ -17,8 +17,8 @@
 int xsave_extra = 0;
 int fxsave_extra = 0;
 static void sigmask_set(sigset_t_ set);
-static void altstack_to_user(struct sighand *sighand, struct stack_t_ *user_stack);
-static bool is_on_altstack(addr_t sp, struct sighand *sighand);
+static void altstack_to_user(struct task *task, struct stack_t_ *user_stack);
+static bool is_on_altstack(addr_t sp, struct task *task);
 
 static int signal_is_blockable(int sig) {
     return sig != SIGKILL_ && sig != SIGSTOP_;
@@ -308,6 +308,41 @@ static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
     term[1] = 0;  // size = 0
 }
 #else
+// The x87/MMX/SSE state, saved below the signal frame where sigcontext's
+// fpstate points (as Linux does), and restored by sigreturn. Without it a
+// handler that touches the XMM registers -- Go's signal handler does, through
+// memmove -- hands the interrupted code corrupted registers.
+static void save_fpstate(struct fpstate_ *fp, struct cpu_state *cpu) {
+    memset(fp, 0, sizeof(*fp));
+    fp->cw = 0xffff0000 | cpu->fcw;
+    fp->sw = 0xffff0000 | cpu->fsw;
+    fp->tag = 0xffffffff;
+    for (int i = 0; i < 8; i++) {
+        float80 *st = &cpu->fp[(cpu->top + i) % 8];
+        memcpy(&fp->st[i], st, 10);
+        memcpy(&fp->fxsr_st[i], st, 10);
+    }
+    fp->magic = 0; // FXSR data follows
+    fp->_fxsr_env[0] = cpu->fcw | ((dword_t) cpu->fsw << 16);
+    fp->mxcsr = cpu->mxcsr;
+    memcpy(fp->xmm, cpu->xmm, sizeof(fp->xmm));
+    // iSH keeps the MMX registers apart from the x87 stack
+    static_assert(sizeof(fp->padding) >= sizeof(cpu->mm), "room for mm");
+    memcpy(fp->padding, cpu->mm, sizeof(cpu->mm));
+}
+
+static void restore_fpstate(struct cpu_state *cpu, const struct fpstate_ *fp) {
+    cpu->fcw = fp->cw;
+    cpu->fsw = fp->sw;
+    for (int i = 0; i < 8; i++)
+        memcpy(&cpu->fp[(cpu->top + i) % 8], fp->magic == 0 ? (const void *) &fp->fxsr_st[i] : (const void *) &fp->st[i], 10);
+    if (fp->magic == 0) {
+        cpu->mxcsr = fp->mxcsr & 0xffff;
+        memcpy(cpu->xmm, fp->xmm, sizeof(cpu->xmm));
+        memcpy(cpu->mm, fp->padding, sizeof(cpu->mm));
+    }
+}
+
 static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
     sc->ax = cpu->eax;
     sc->bx = cpu->ebx;
@@ -352,7 +387,7 @@ static void setup_rt_sigframe(struct siginfo_ *info, struct rt_sigframe_ *frame)
     frame->info = *info;
     frame->uc.flags = 0;
     frame->uc.link = 0;
-    altstack_to_user(current->sighand, &frame->uc.stack);
+    altstack_to_user(current, &frame->uc.stack);
     setup_sigcontext(&frame->uc.mcontext, &current->cpu);
     frame->uc.sigmask = current->blocked;
 
@@ -539,9 +574,9 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
     // on the altstack made sp fall outside those bounds, so the handler took
     // the bail path and never parked — the GC suspender then re-signalled
     // forever (the claude-cli startup deadlock).
-    if ((action->flags & SA_ONSTACK_) && sighand->altstack &&
-            !is_on_altstack(sp, sighand)) {
-        sp = sighand->altstack + sighand->altstack_size;
+    if ((action->flags & SA_ONSTACK_) && current->altstack &&
+            !is_on_altstack(sp, current)) {
+        sp = current->altstack + current->altstack_size;
     }
     if (xsave_extra) {
         // do as the kernel does
@@ -551,6 +586,26 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
         sp &=~ 0x3f;
         sp -= fxsave_extra;
     }
+#if !defined(GUEST_ARM64)
+    // FPU state area (fpu__alloc_mathframe): 16-byte aligned, below the frame
+    sp -= sizeof(struct fpstate_);
+    sp &= ~0xf;
+    addr_t fpstate_addr = sp;
+    {
+        struct fpstate_ fps;
+        save_fpstate(&fps, &current->cpu);
+        if (user_write(fpstate_addr, &fps, sizeof(fps)))
+            fpstate_addr = 0;
+        if (need_siginfo)
+            frame.rt_sigframe.uc.mcontext.fpstate = fpstate_addr;
+        else
+            frame.sigframe.sc.fpstate = fpstate_addr;
+        // the handler starts with a clean FPU, like on Linux
+        current->cpu.fcw = 0x37f;
+        current->cpu.fsw = 0;
+        current->cpu.mxcsr = 0x1f80;
+    }
+#endif
     sp -= frame_size;
 #if defined(GUEST_ARM64)
     // ARM64 requires the stack to be 16-byte aligned.
@@ -721,6 +776,12 @@ static void restore_sigcontext(struct sigcontext_ *context, struct cpu_state *cp
     // Use AC, RF, OF, DF, TF, SF, ZF, AF, PF, CF
 #define USE_FLAGS 0b1010000110111010101
     cpu->eflags = (context->flags & USE_FLAGS) | (cpu->eflags & ~USE_FLAGS);
+    // The gadgets read the arithmetic flags from the lazy state (res, cf,
+    // of, flags_res...), which still holds the handler's last operation:
+    // rebuild it from the restored eflags, or the interrupted code's next
+    // jcc tests the handler's flags (Go's `TESTL $7, ptr; JZ` between a
+    // preemption signal and its sigreturn panicked "unaligned 64-bit atomic").
+    expand_flags(cpu);
 }
 #endif
 
@@ -744,13 +805,20 @@ int64_t sys_rt_sigreturn() {
         return _EFAULT;
     }
     restore_sigcontext(&frame.uc.mcontext, cpu);
+#if !defined(GUEST_ARM64)
+    if (frame.uc.mcontext.fpstate != 0) {
+        struct fpstate_ fps;
+        if (user_get(frame.uc.mcontext.fpstate, fps) == 0)
+            restore_fpstate(cpu, &fps);
+    }
+#endif
 
     lock(&current->sighand->lock);
     // FIXME this duplicates logic from sys_sigaltstack
-    if (!is_on_altstack(sp, current->sighand) &&
+    if (!is_on_altstack(sp, current) &&
             frame.uc.stack.size >= MINSIGSTKSZ_) {
-        current->sighand->altstack = frame.uc.stack.stack;
-        current->sighand->altstack_size = frame.uc.stack.size;
+        current->altstack = frame.uc.stack.stack;
+        current->altstack_size = frame.uc.stack.size;
     }
     sigmask_set(frame.uc.sigmask);
     unlock(&current->sighand->lock);
@@ -785,6 +853,13 @@ int64_t sys_sigreturn() {
         return _EFAULT;
     }
     restore_sigcontext(&frame.sc, cpu);
+#if !defined(GUEST_ARM64)
+    if (frame.sc.fpstate != 0) {
+        struct fpstate_ fps;
+        if (user_get(frame.sc.fpstate, fps) == 0)
+            restore_fpstate(cpu, &fps);
+    }
+#endif
 
     lock(&current->sighand->lock);
 #if defined(GUEST_ARM64)
@@ -950,62 +1025,53 @@ int_t sys_rt_sigpending(addr_t set_addr, dword_t size) {
     return user_put_sigset(set_addr, size, pending);
 }
 
-static bool is_on_altstack(addr_t sp, struct sighand *sighand) {
-    return sp > sighand->altstack && sp <= sighand->altstack + sighand->altstack_size;
+static bool is_on_altstack(addr_t sp, struct task *task) {
+    return sp > task->altstack && sp <= task->altstack + task->altstack_size;
 }
 
-static void altstack_to_user(struct sighand *sighand, struct stack_t_ *user_stack) {
-    user_stack->stack = sighand->altstack;
-    user_stack->size = sighand->altstack_size;
+static void altstack_to_user(struct task *task, struct stack_t_ *user_stack) {
+    user_stack->stack = task->altstack;
+    user_stack->size = task->altstack_size;
     user_stack->flags = 0;
-    if (sighand->altstack == 0)
+    if (task->altstack == 0)
         user_stack->flags |= SS_DISABLE_;
 #if defined(GUEST_ARM64)
-    if (is_on_altstack(current->cpu.sp, sighand))
+    if (is_on_altstack(task->cpu.sp, task))
 #else
-    if (is_on_altstack(current->cpu.esp, sighand))
+    if (is_on_altstack(task->cpu.esp, task))
 #endif
         user_stack->flags |= SS_ONSTACK_;
 }
 
 dword_t sys_sigaltstack(addr_t ss_addr, addr_t old_ss_addr) {
     STRACE("sigaltstack(0x%x, 0x%x)", ss_addr, old_ss_addr);
-    struct sighand *sighand = current->sighand;
-    lock(&sighand->lock);
+    // only ever touched by its own thread: no lock
     if (old_ss_addr != 0) {
         struct stack_t_ old_ss;
-        altstack_to_user(sighand, &old_ss);
-        if (user_put(old_ss_addr, old_ss)) {
-            unlock(&sighand->lock);
+        altstack_to_user(current, &old_ss);
+        if (user_put(old_ss_addr, old_ss))
             return _EFAULT;
-        }
     }
     if (ss_addr != 0) {
 #if defined(GUEST_ARM64)
-        if (is_on_altstack(current->cpu.sp, sighand)) {
+        if (is_on_altstack(current->cpu.sp, current))
 #else
-        if (is_on_altstack(current->cpu.esp, sighand)) {
+        if (is_on_altstack(current->cpu.esp, current))
 #endif
-            unlock(&sighand->lock);
             return _EPERM;
-        }
         struct stack_t_ ss;
-        if (user_get(ss_addr, ss)) {
-            unlock(&sighand->lock);
+        if (user_get(ss_addr, ss))
             return _EFAULT;
-        }
         if (ss.flags & SS_DISABLE_) {
-            sighand->altstack = 0;
+            current->altstack = 0;
+            current->altstack_size = 0;
         } else {
-            if (ss.size < MINSIGSTKSZ_) {
-                unlock(&sighand->lock);
+            if (ss.size < MINSIGSTKSZ_)
                 return _ENOMEM;
-            }
-            sighand->altstack = ss.stack;
-            sighand->altstack_size = ss.size;
+            current->altstack = ss.stack;
+            current->altstack_size = ss.size;
         }
     }
-    unlock(&sighand->lock);
     return 0;
 }
 

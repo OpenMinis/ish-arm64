@@ -631,7 +631,8 @@ static void apply_exec_semantics(const char *guest_file) {
             if (action->handler != SIG_IGN_)
                 action->handler = SIG_DFL_;
         }
-        current->sighand->altstack = 0;
+        current->altstack = 0;
+        current->altstack_size = 0;
         unlock(&current->sighand->lock);
     }
 }

@@ -157,8 +157,6 @@ void sigmask_set_temp(sigset_t_ mask);
 struct sighand {
     atomic_uint refcount;
     struct sigaction_ action[NUM_SIGS];
-    addr_t altstack;
-    dword_t altstack_size;
     lock_t lock;
 };
 struct sighand *sighand_new(void);

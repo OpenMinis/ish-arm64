@@ -39,6 +39,11 @@ struct task {
 
     // locked by sighand->lock
     struct sighand *sighand;
+    // sigaltstack() is per thread on Linux, not per sighand: Go gives every
+    // thread its own signal stack, and sharing one (the last thread's) made
+    // concurrent handlers run on each other's stacks.
+    addr_t altstack;
+    dword_t altstack_size;
     sigset_t_ blocked;
     sigset_t_ pending;
     sigset_t_ waiting; // if nonzero, an ongoing call to sigtimedwait is waiting on these

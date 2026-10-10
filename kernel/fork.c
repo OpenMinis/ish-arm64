@@ -241,6 +241,14 @@ static int copy_task(struct task *task, dword_t flags, addr_t stack, addr_t ptid
     unlock(&old_group->lock);
     unlock(&pids_lock);
 
+    // A new thread (shared mm, not vfork) starts without an alternate signal
+    // stack, as on Linux; a forked process keeps the parent's (task_create_
+    // copied it).
+    if ((flags & CLONE_VM_) && !(flags & CLONE_VFORK_)) {
+        task->altstack = 0;
+        task->altstack_size = 0;
+    }
+
     if (flags & CLONE_SETTLS_) {
 #if defined(GUEST_ARM64)
         // On ARM64, the TLS argument is the actual TLS pointer value (for TPIDR_EL0),
