@@ -683,6 +683,7 @@ static void fiber_fix_fault_pc(struct asbestos *asbestos, struct fiber_frame *fr
     frame->cpu.segfault_block_pc = block_addr;
     frame->cpu.segfault_precise_pc = fault_pc;
 }
+#endif
 
 // W^X compile wrapper. Guest JITs (bun/JSC) patch their code pages in place
 // (inline caches, repatched branches). Without protection, a block compiled
@@ -738,7 +739,6 @@ static struct fiber_block *fiber_block_compile_protected(struct asbestos *asbest
         fiber_block_free(NULL, block);
     }
 }
-#endif
 
 // Remove all pointers to the block. It can't be freed yet because another
 // thread may be executing it.
@@ -981,11 +981,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 lock(&asbestos->lock);
                 block = fiber_lookup(asbestos, ip);
                 if (block == NULL) {
-#ifdef GUEST_ARM64
                     block = fiber_block_compile_protected(asbestos, ip, tlb);
-#else
-                    block = fiber_block_compile(ip, tlb);
-#endif
                     if (block == NULL) {
                         unlock(&asbestos->lock);
                         interrupt = INT_GPF;
