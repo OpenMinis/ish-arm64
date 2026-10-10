@@ -7,13 +7,13 @@
 #include "emu/arch/x86/vec.h"
 #include "emu/interrupt.h"
 
-static int gen_step32(struct gen_state *state, struct tlb *tlb);
-static int gen_step16(struct gen_state *state, struct tlb *tlb);
+static int gen_step32(struct gen_state *state, struct tlb *tlb, bool seg_gs_in);
+static int gen_step16(struct gen_state *state, struct tlb *tlb, bool seg_gs_in);
 
 int gen_step(struct gen_state *state, struct tlb *tlb) {
     state->orig_ip = state->ip;
     state->orig_ip_extra = 0;
-    return gen_step32(state, tlb);
+    return gen_step32(state, tlb, false);
 }
 
 static void gen(struct gen_state *state, unsigned long thing) {
@@ -92,7 +92,7 @@ void gen_exit(struct gen_state *state) {
 #define DECLARE_LOCALS \
     dword_t addr_offset = 0; \
     bool end_block = false; \
-    bool seg_gs = false
+    bool seg_gs = seg_gs_in
 
 #define FINISH \
     return !end_block
@@ -566,8 +566,10 @@ static inline bool gen_vec(enum arg src, enum arg dst, void (*helper)(), gadget_
 
 #define DECODER_RET static int
 #define DECODER_NAME gen_step
-#define DECODER_ARGS struct gen_state *state, struct tlb *tlb
-#define DECODER_PASS_ARGS state, tlb
+// A 0x66 prefix re-enters the other operand-size decoder, so a %gs prefix
+// read before it (65 66 0f 6e ...) has to be handed over.
+#define DECODER_ARGS struct gen_state *state, struct tlb *tlb, bool seg_gs_in
+#define DECODER_PASS_ARGS state, tlb, seg_gs
 
 #define OP_SIZE 32
 #include "emu/arch/x86/decode.h"

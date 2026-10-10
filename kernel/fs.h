@@ -116,10 +116,19 @@ bool mount_param_flag(const char *info, const char *flag);
  * to carry the x86 value 1<<16, which no aarch64 guest ever sets — so the
  * generic_openat() ENOTDIR check never fired — while 1<<16 is arm64's O_DIRECT,
  * making O_DIRECT opens look like O_DIRECTORY ones. */
+#ifdef GUEST_ARM64
 #define O_DIRECTORY_ (1 << 14)
 #define O_NOFOLLOW_ (1 << 15)
 #define O_DIRECT_ (1 << 16)
 #define O_LARGEFILE_ (1 << 17)
+#else
+/* i386 keeps the asm-generic values; musl sets O_LARGEFILE (1<<15) on every
+ * open, which the arm64 values would read as O_NOFOLLOW. */
+#define O_DIRECT_ (1 << 14)
+#define O_LARGEFILE_ (1 << 15)
+#define O_DIRECTORY_ (1 << 16)
+#define O_NOFOLLOW_ (1 << 17)
+#endif
 #define O_NOATIME_ (1 << 18)
 #define O_CLOEXEC_ (1 << 19)
 #define O_PATH_ (1 << 21)

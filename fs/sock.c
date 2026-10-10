@@ -122,6 +122,13 @@ static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
 // sendmsg/recvmsg (not send/recv) and passes a sockaddr_nl as msg_name, which
 // the generic path rejects in sockaddr_read() -> EINVAL. These two shims
 // bypass sockaddr handling entirely and move payload only.
+// The guest's struct iovec: pointer-sized base and len.
+#ifdef GUEST_ARM64
+typedef struct iovec64_ guest_iovec_t;
+#else
+typedef struct iovec_ guest_iovec_t;
+#endif
+
 static int netlink_stub_sendmsg(struct fd *sock, addr_t msghdr_addr) {
     addr_t iov_addr; uint64_t iovlen;
 #ifdef GUEST_ARM64
@@ -135,7 +142,7 @@ static int netlink_stub_sendmsg(struct fd *sock, addr_t msghdr_addr) {
 #endif
     char req[4096]; size_t total = 0;
     for (uint64_t i = 0; i < iovlen && total < sizeof(req); i++) {
-        struct iovec64_ iv;
+        guest_iovec_t iv;
         if (user_get(iov_addr + i * sizeof(iv), iv)) return _EFAULT;
         size_t n = (size_t) iv.len;
         if (n > sizeof(req) - total) n = sizeof(req) - total;
@@ -165,7 +172,7 @@ static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr) {
 
     size_t off = 0;
     for (uint64_t i = 0; i < iovlen && off < (size_t) n; i++) {
-        struct iovec64_ iv;
+        guest_iovec_t iv;
         if (user_get(iov_addr + i * sizeof(iv), iv)) return _EFAULT;
         size_t want = (size_t) iv.len, have = (size_t) n - off;
         if (want > have) want = have;

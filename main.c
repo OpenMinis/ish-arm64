@@ -50,6 +50,7 @@ extern void jit_crash_trampoline(void);
 #ifdef ISH_JIT
 #include "asbestos/guest-arm64/jit.h"
 #endif
+#ifdef GUEST_ARM64
 #define CRASH_CPU_pc                offsetof(struct cpu_state, pc)
 #define CRASH_CPU_segfault_addr     offsetof(struct cpu_state, segfault_addr)
 #define CRASH_CPU_segfault_was_write offsetof(struct cpu_state, segfault_was_write)
@@ -64,6 +65,7 @@ static_assert(CRASH_CPU_pc                 == CPU_pc,                 "cpu-offse
 static_assert(CRASH_CPU_segfault_addr      == CPU_segfault_addr,      "cpu-offsets drift: segfault_addr");
 static_assert(CRASH_CPU_segfault_was_write == CPU_segfault_was_write, "cpu-offsets drift: segfault_was_write");
 static_assert(CRASH_LOCAL_jit_exit_sp      == LOCAL_jit_exit_sp,      "cpu-offsets drift: jit_exit_sp");
+#endif
 
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
 #if defined(__aarch64__) && defined(GUEST_ARM64)
