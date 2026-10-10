@@ -17,7 +17,7 @@
 #include "asbestos/guest-arm64/jit.h"
 #endif
 
-static void halt_system(void);
+static void halt_system(int status);
 
 // Weak default: overridden by main.c in CLI builds.
 // In iOS/Xcode builds where main.c is not linked into libish.a,
@@ -197,7 +197,7 @@ noreturn void do_exit(int status) {
 
         if (parent == NULL) {
             // init died
-            halt_system();
+            halt_system(status);
         } else {
             leader->zombie = true;
             notify(&parent->group->child_exit);
@@ -438,7 +438,7 @@ noreturn void do_exit_group(int status) {
 }
 
 // always called from init process
-static void halt_system(void) {
+static void halt_system(int status) {
     int max_iterations = 10; // Timeout: wait maximum 10 seconds
     for (int state = 0; state < 3; state++) {
         int tasks_found = 0;
@@ -490,8 +490,11 @@ static void halt_system(void) {
     // Force exit the entire host process. Orphaned guest threads
     // (stuck in JIT loops after do_exit_group force cleanup) keep
     // the host process alive indefinitely. _exit is safe here since
-    // init dying means we're shutting down completely.
-    _exit(0);
+    // init dying means we're shutting down completely. Report init's status
+    // the way exit_hook would have (it never runs for init: we don't return).
+    if (status & 0xff)
+        _exit(128 + (status & 0xff));
+    _exit((status >> 8) & 0xff);
 }
 
 dword_t sys_exit(dword_t status) {
