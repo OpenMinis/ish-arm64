@@ -120,11 +120,12 @@ tpl_\name\():
 .irp type, read,write
 
 .macro \type\()_prep size, id
+    # TLB_INDEX in emu/tlb.h
     movl %_addr, %r14d
     shrl $12, %r14d
-    andl $0x3ff, %r14d
+    andl $((1 << TLB_BITS) - 1), %r14d
     movl %_addr, %r15d
-    shrl $22, %r15d
+    shrl $(12 + TLB_BITS), %r15d
     xor %r15d, %r14d
     shll $4, %r14d
     movl %_addr, %r15d
