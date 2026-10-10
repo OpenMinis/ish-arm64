@@ -85,6 +85,7 @@ static uint8_t *region;   // executable view
 static intptr_t rw_delta; // writable view - executable view
 static bool dual_map;
 static _Atomic size_t region_used;
+static _Atomic bool region_full;   // an allocation failed: what came after runs as gadgets
 
 #ifndef ISH_JIT_NO_EMIT   // AOT-only builds never map executable memory
 static bool map_dual(void) {
@@ -127,8 +128,10 @@ static bool map_jit(void) {
 
 static uint8_t *region_alloc(size_t bytes) {
     size_t off = atomic_fetch_add(&region_used, (bytes + 15) & ~(size_t) 15);
-    if (off + bytes > REGION_SIZE)
+    if (off + bytes > REGION_SIZE) {
+        region_full = true;
         return NULL;
+    }
     return region + off;
 }
 
@@ -2709,6 +2712,13 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
         pthread_mutex_unlock(&reg_lock);
         return;
     }
+    // Recording translates only the recorded module: the others' code would
+    // only take room in the code region (once it is full nothing more is
+    // translated, so nothing more recorded) and their blocks run as gadgets.
+    if (rec_file && !rec_module(mod)) {
+        pthread_mutex_unlock(&reg_lock);
+        return;
+    }
     if (!reg_table)
         reg_table = calloc(REG_BUCKETS, sizeof(*reg_table));
     struct reg_entry *r = reg_table ? reg_table[h & (REG_BUCKETS - 1)] : NULL;
@@ -3030,8 +3040,11 @@ static void rec_write(const char *path) {
     if (t && w)
         qsort(w, nw, sizeof(*w), rec_where_cmp);
     // The conventions the code was generated with.
-    fprintf(f, "{\"header\": {\"abi\": %u, \"prologue_words\": %d, \"entry_off\": %lu, \"n_pinned\": %d, \"exit_stub\": [",
-            jit_abi(), prologue_words, (unsigned long) entry_off(), n_pinned);
+    // region_full: the code region filled up, so the recording misses what ran after that.
+    fprintf(f, "{\"header\": {\"abi\": %u, \"prologue_words\": %d, \"entry_off\": %lu, \"n_pinned\": %d, "
+            "\"region_full\": %s, \"region_used\": %zu, \"exit_stub\": [",
+            jit_abi(), prologue_words, (unsigned long) entry_off(), n_pinned, region_full ? "true" : "false",
+            region_full ? (size_t) REGION_SIZE : (size_t) region_used);
     for (unsigned i = 0; i < exit_stub_words; i++)
         fprintf(f, "%s%u", i ? ", " : "", ((uint32_t *) exit_stub)[i]);
     fprintf(f, "]}}\n");
@@ -3193,6 +3206,10 @@ size_t jit_describe(char *buf, size_t size) {
                        aot_only ? "AOT images only (no executable memory)" :
                        pic_on ? "JIT, position-independent" : "JIT";
     OUT("mode: %s\n", mode);
+    if (jit_on && !aot_only)
+        OUT("code region: %.1f of %u MB used%s\n",
+            (region_full ? REGION_SIZE : (size_t) region_used) / 1048576.0, REGION_SIZE >> 20,
+            region_full ? " (full: blocks compiled since run as gadgets)" : "");
     OUT("AOT: %s (echo on|off > /proc/ish/jit; affects blocks compiled afterwards, i.e. new processes)\n",
         aot_off ? "off" : "on");
     OUT("blocks translated or looked up: %llu, AOT installs: %llu (moved: %llu, with pc-relative immediates "
@@ -3254,8 +3271,12 @@ void jit_report(void) {
     const char *map = getenv("ISH_JIT_MAP");
     if (map && cm_on)
         cm_write(map);
-    if (rec_file)
+    if (rec_file) {
         rec_write(rec_file);
+        if (region_full)
+            fprintf(stderr, "❌ JIT: the %u MB code region filled up: %s misses what ran after that\n",
+                    REGION_SIZE >> 20, rec_file);
+    }
     if (!getenv("ISH_JIT_STATS"))
         return;
     fprintf(stderr,

@@ -245,6 +245,9 @@ def main():
     if abi in PRE_COMPACT_ABIS:
         sys.exit(f"❌ {args.recording}: recorded by an ish with the 64-bit table layout (abi {abi:08x}); record "
                  "with a current ish (an image in the compact layout needs its abi)")
+    if header.get('region_full'):
+        sys.exit(f"❌ {args.recording}: the JIT code region filled up while recording, so the translations of "
+                 "what ran after that are missing; record a smaller workload")
     mods = {t['mod'] for t in trans}
     if len(mods) != 1:
         sys.exit(f"❌ expected one module in the recording, got {sorted(mods)}")
