@@ -157,9 +157,11 @@ void dump_pc_hist(void) {
     fflush(stderr);
 }
 // --- Block execution profile (ISH_BLOCK_PROF_FILE=/path) ---
-// Records exact per-block dispatch counts + insn length for trace-AOT
-// feasibility study. Build with -DDISABLE_BLOCK_CHAINING for exact counts
-// (otherwise chained transitions bypass the dispatch loop and are missed).
+// Records exact per-block dispatch counts + insn length (tools/jit_aot/hotblocks.py
+// picks an AOT image's translations by them). For exact counts run with
+// ISH_JIT=0 ISH_NO_CHAIN=1: chained transitions bypass the dispatch loop, and
+// unchained, a return-cache hit goes through it too (ISH_NO_RETCACHE=1, which
+// clears the 32 KB cache at every dispatch, is not needed and 10x slower).
 // Open-addressing hash, fixed size; dump at pid-1 exit.
 #define BLK_PROF_SZ (1 << 21)   // 2M entries * 16B = 32MB
 static struct { _Atomic uint64_t addr; _Atomic uint64_t cnt_len; } *blk_prof; // cnt_len = count<<8 | insns

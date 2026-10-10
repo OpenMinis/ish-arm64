@@ -4,7 +4,7 @@
 usage: hotblocks.py <recording.jsonl> <profile.txt>... [--coverage 0.999] [--max N] [--keep out.txt]
 
 profile.txt: the block profiler's "<module> <offset hex> <insns> <count>" lines (ISH_BLOCK_PROF_FILE, run with
-ISH_JIT=0 ISH_NO_CHAIN=1 ISH_NO_RETCACHE=1). A translation is worth what it saves, the guest instructions it runs
+ISH_JIT=0 ISH_NO_CHAIN=1: about 3x the time the workload takes as gadgets). A translation is worth what it saves, the guest instructions it runs
 natively instead of as gadgets (count * insns of its block), and costs its native code: translations are taken by
 worth per byte until they cover the given share of the module's executed instructions. With several profiles
 (workloads), each is scaled to the same total first, so a short workload counts as much as a long one.
