@@ -1867,8 +1867,8 @@ static struct socket_call {
     {(syscall_t) sys_getsockopt, 5},
     {(syscall_t) sys_sendmsg, 3},
     {(syscall_t) sys_recvmsg, 3},
-    {NULL}, // accept4
-    {NULL}, // recvmmsg
+    {(syscall_t) sys_accept4, 4},
+    {(syscall_t) sys_recvmmsg, 5},
     {(syscall_t) sys_sendmmsg, 4},
 };
 

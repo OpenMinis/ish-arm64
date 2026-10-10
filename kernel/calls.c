@@ -74,6 +74,13 @@ void handle_interrupt(int interrupt) {
 #if defined(GUEST_X86) || !defined(GUEST_ARM64)
         // x86: syscall number in eax, args in ebx, ecx, edx, esi, edi, ebp
         unsigned syscall_num = cpu->eax;
+        // Snapshot for SA_RESTART: the return value overwrites eax (the
+        // number); the args survive. `int $0x80` already advanced eip past
+        // itself, so the rewind is eip -= 2 (see receive_signals).
+        current->syscall_restart_num = syscall_num;
+        current->syscall_restart_arg0 = cpu->ebx;
+        current->syscall_restart_pc = cpu->eip;
+        current->syscall_restartable = false;
         if (syscall_num >= syscall_table_size || syscall_table[syscall_num] == NULL) {
             printk("%d(%s) missing syscall %d\n", current->pid, current->comm, syscall_num);
             cpu->eax = _ENOSYS;
@@ -82,9 +89,48 @@ void handle_interrupt(int interrupt) {
                 printk("%d(%s) stub syscall %d\n", current->pid, current->comm, syscall_num);
             }
             STRACE("%d call %-3d ", current->pid, syscall_num);
+            static int systrace = -1;
+            if (systrace == -1) { const char *e = getenv("ISH_SYSTRACE"); systrace = (e && e[0]=='1') ? 1 : 0; }
+            dword_t _a0=cpu->ebx,_a1=cpu->ecx,_a2=cpu->edx,_a3=cpu->esi,_a4=cpu->edi,_a5=cpu->ebp;
+            struct timespec _t0; if (systrace) clock_gettime(CLOCK_MONOTONIC, &_t0);
             int result = syscall_table[syscall_num](cpu->ebx, cpu->ecx, cpu->edx, cpu->esi, cpu->edi, cpu->ebp);
             STRACE(" = 0x%x\n", result);
+            if (systrace)
+                fprintf(stderr, "[sc] %ld.%06ld pid=%d n=%d(%x,%x,%x,%x,%x,%x) = 0x%x\n",
+                        (long)_t0.tv_sec, _t0.tv_nsec/1000, current->pid, syscall_num,
+                        _a0, _a1, _a2, _a3, _a4, _a5, result);
+            // Same restartable set as arm64: calls that re-run correctly with
+            // the same args. Timed sleeps keep returning EINTR.
+            if (result == _EINTR) {
+                switch (syscall_num) {
+                    case 240: // futex
+                    case 256: // epoll_wait
+                    case 319: // epoll_pwait
+                    case 3:   // read
+                    case 4:   // write
+                        current->syscall_restartable = true;
+                        break;
+                }
+            }
             cpu->eax = result;
+        }
+        // See the arm64 branch: the syscall may have left this thread orphaned.
+        if (current->exiting || current->group == NULL)
+            pthread_exit(NULL);
+        atomic_fetch_add(&current->group->syscall_count, 1);
+        // Blocking calls that return and retry don't count as progress.
+        switch (syscall_num) {
+            case 240: case 256: case 319: case 168: case 309: case 142:
+            case 308: case 284: case 114: case 7: case 162: case 267:
+                break;
+            default: {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+                current->last_unblocked_ns = now;
+                atomic_store_explicit(&current->group->last_progress_ns, now,
+                                      memory_order_relaxed);
+            }
         }
         if (current->group->doing_group_exit)
             do_exit(current->group->group_exit_code);

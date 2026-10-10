@@ -493,6 +493,14 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
         current->cpu.regs[0] = current->syscall_restart_arg0;
         current->syscall_restartable = false;
     }
+#else
+    // x86: rewind over `int $0x80` and put the syscall number back in eax.
+    if ((action->flags & SA_RESTART_) && current->syscall_restartable &&
+            current->cpu.eip == current->syscall_restart_pc) {
+        current->cpu.eip -= 2;
+        current->cpu.eax = current->syscall_restart_num;
+        current->syscall_restartable = false;
+    }
 #endif
 
     // setup the frame

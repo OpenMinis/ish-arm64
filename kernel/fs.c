@@ -1490,7 +1490,24 @@ dword_t sys_fadvise64(fd_t f, uint64_t offset, uint64_t len, dword_t advice) {
     return 0;  // Success - hint acknowledged (and ignored)
 }
 
-// ARM64: mincore (syscall 232)
+#else
+// x86: fadvise64 has different signature/calling convention
+dword_t sys_fadvise64(fd_t f, dword_t offset_low, dword_t offset_high,
+                      dword_t len_low, dword_t len_high, dword_t advice) {
+    uint64_t offset = ((uint64_t)offset_high << 32) | offset_low;
+    uint64_t len = ((uint64_t)len_high << 32) | len_low;
+
+    STRACE("fadvise64(%d, %llu, %llu, %d)", f, offset, len, advice);
+
+    struct fd *fd = f_get(f);
+    if (fd == NULL)
+        return _EBADF;
+
+    return 0;  // Success
+}
+#endif
+
+// mincore (arm64 232, i386 218)
 // Determines which pages of a memory mapping are currently in RAM.
 // For our emulator, we just pretend all pages are in memory.
 dword_t sys_mincore(addr_t addr, dword_t length, addr_t vec_addr) {
@@ -1509,19 +1526,3 @@ dword_t sys_mincore(addr_t addr, dword_t length, addr_t vec_addr) {
 
     return 0;  // Success
 }
-#else
-// x86: fadvise64 has different signature/calling convention
-dword_t sys_fadvise64(fd_t f, dword_t offset_low, dword_t offset_high,
-                      dword_t len_low, dword_t len_high, dword_t advice) {
-    uint64_t offset = ((uint64_t)offset_high << 32) | offset_low;
-    uint64_t len = ((uint64_t)len_high << 32) | len_low;
-
-    STRACE("fadvise64(%d, %llu, %llu, %d)", f, offset, len, advice);
-
-    struct fd *fd = f_get(f);
-    if (fd == NULL)
-        return _EBADF;
-
-    return 0;  // Success
-}
-#endif
