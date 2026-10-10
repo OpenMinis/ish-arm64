@@ -28,3 +28,7 @@ option('jit_emit', type: 'boolean', value: true,
        description: 'With jit: translate at run time (needs executable memory). false runs only AOT images linked into the target.')
 option('cli_aot', type: 'array', value: [],
        description: 'AOT images (aot_<name>.S from tools/jit_aot/gen.py) to link into the ish CLI executable only; needs jit.')
+option('agent_harness', type: 'boolean', value: false,
+       description: 'Build ish-agent-harness (tests/agent): the CLI plus env-driven host hooks for agent-runtime tests.')
+option('cli', type: 'feature', value: 'auto',
+       description: 'Build the ish CLI executable. auto: only for native (non-cross) builds; enable for cross builds that run on a desktop host (tools/cross/macos-x86_64.ini).')

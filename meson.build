@@ -1799,7 +1799,7 @@ if get_option('kernel') == 'ish'
         dependencies: dependencies,
         include_directories: includes)
 
-    if not meson.is_cross_build()
+    if get_option('cli').enabled() or (get_option('cli').auto() and not meson.is_cross_build())
         # AOT images are not part of ish: the CLI links them in only when
         # given (-Dcli_aot=aot_<name>.S from tools/jit_aot/gen.py).
         cli_aot = get_option('cli_aot')
@@ -1807,6 +1807,9 @@ if get_option('kernel') == 'ish'
             error('-Dcli_aot needs -Djit=true (the images register with the JIT runtime)')
         endif
         executable('ish', ['main.c'] + files(cli_aot), dependencies: ish)
+    endif
+    if get_option('agent_harness') and not get_option('cli').disabled()
+        executable('ish-agent-harness', ['tests/agent/harness.c'], dependencies: ish)
     endif
 
 elif get_option('kernel') == 'linux'
