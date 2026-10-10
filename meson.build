@@ -1851,6 +1851,9 @@ if get_option('kernel') == 'ish'
         dependencies: dependencies,
         include_directories: includes)
 
+    # Windows: a self-contained ish.exe (winpthread, sqlite, the C++-free
+    # runtime) that runs outside MSYS2 without its DLLs on PATH.
+    cli_link_args = host_windows ? ['-static'] : []
     if get_option('cli').enabled() or (get_option('cli').auto() and not meson.is_cross_build())
         # AOT images are not part of ish: the CLI links them in only when
         # given (-Dcli_aot=aot_<name>.S from tools/jit_aot/gen.py).
@@ -1858,10 +1861,10 @@ if get_option('kernel') == 'ish'
         if cli_aot.length() > 0 and not ish_jit
             error('-Dcli_aot needs -Djit=true (the images register with the JIT runtime)')
         endif
-        executable('ish', ['main.c'] + files(cli_aot), dependencies: ish)
+        executable('ish', ['main.c'] + files(cli_aot), dependencies: ish, link_args: cli_link_args)
     endif
     if get_option('agent_harness') and not get_option('cli').disabled()
-        executable('ish-agent-harness', ['tests/agent/harness.c'], dependencies: ish)
+        executable('ish-agent-harness', ['tests/agent/harness.c'], dependencies: ish, link_args: cli_link_args)
     endif
 
 elif get_option('kernel') == 'linux'

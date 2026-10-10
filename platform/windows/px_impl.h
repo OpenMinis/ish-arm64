@@ -66,6 +66,7 @@ struct px_desc {
     bool is_dir;
     bool is_tty;        // isatty(): the console, or stdin bridged from it
     bool is_pipe;       // a pipe() end: EPIPE rather than ECONNRESET
+    bool is_stdin;      // the stdin bridge: reading or polling it asks the pump for more
     int domain, type, protocol; // sockets, Linux values
     // An emulated ICMP datagram ("ping") socket: s reads the replies that
     // the IcmpSendEcho2 workers write into icmp_tx (see net.c).
@@ -126,6 +127,12 @@ int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms);
 bool px_interrupted(void);
 
 // console (fd.c)
+// The stdin bridge only reads the real stdin when someone wants its data
+// (a read, a poll for input, FIONREAD), so the host's stdin is not drained
+// on behalf of a guest that never reads it.
+void px_stdin_demand(void);
+// The real stdin handle behind the bridge (for a child to inherit).
+HANDLE px_stdin_handle(void);
 int px_console_tcgetattr(struct px_termios *t);
 int px_console_tcsetattr(const struct px_termios *t);
 int px_console_winsize(struct px_winsize *ws);

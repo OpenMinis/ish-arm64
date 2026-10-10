@@ -1031,6 +1031,8 @@ int px_poll(struct px_pollfd *fds, unsigned long nfds, int timeout) {
         switch (d->kind) {
             case PX_SOCK: {
                 short we = 0;
+                if ((ev & PX_POLLIN) && d->is_stdin)
+                    px_stdin_demand();
                 if (ev & PX_POLLIN) we |= POLLRDNORM;
                 if (ev & PX_POLLPRI) we |= POLLRDBAND;
                 if (ev & PX_POLLOUT) we |= POLLWRNORM;

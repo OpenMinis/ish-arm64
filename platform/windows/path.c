@@ -1046,3 +1046,31 @@ int px_closedir(px_DIR *dir) {
     free(dir);
     return res;
 }
+
+// ---- case sensitivity
+
+typedef struct {
+    ULONG Flags;
+} px_case_sensitive_info;
+#define PX_FileCaseSensitiveInformation 71
+#define PX_FILE_CS_FLAG_CASE_SENSITIVE_DIR 0x1
+typedef struct {
+    union { LONG Status; PVOID Pointer; };
+    ULONG_PTR Information;
+} px_io_status;
+NTSYSAPI LONG NTAPI NtSetInformationFile(HANDLE, px_io_status *, PVOID, ULONG, int);
+
+int px_set_case_sensitive(const char *path) {
+    char *abs = px_abspath(PX_AT_FDCWD, path);
+    if (abs == NULL)
+        return -1;
+    HANDLE h = px_open_handle(abs, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, 0);
+    free(abs);
+    if (h == INVALID_HANDLE_VALUE)
+        return px_fail_win();
+    px_case_sensitive_info info = {PX_FILE_CS_FLAG_CASE_SENSITIVE_DIR};
+    px_io_status io;
+    LONG status = NtSetInformationFile(h, &io, &info, sizeof(info), PX_FileCaseSensitiveInformation);
+    CloseHandle(h);
+    return status >= 0 ? 0 : px_fail(ENOTSUP);
+}

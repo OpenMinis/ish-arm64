@@ -265,6 +265,8 @@ ssize_t px_read(int fd, void *buf, size_t n) {
             ReleaseSRWLockExclusive(&d->lock);
             break;
         case PX_SOCK:
+            if (d->is_stdin)
+                px_stdin_demand();
             res = px_sock_read(d, buf, n);
             break;
         case PX_NUL:
@@ -587,6 +589,8 @@ int px_ioctl(int fd, unsigned long req, ...) {
         case 0x541b: { /* FIONREAD */
             int avail = 0;
             if (d->kind == PX_SOCK) {
+                if (d->is_stdin)
+                    px_stdin_demand();
                 res = px_sock_ioctl_fionread(d, &avail);
             } else if (d->kind == PX_FILE && !d->is_dir) {
                 LARGE_INTEGER size;
@@ -631,6 +635,16 @@ int px_isatty(int fd) {
 // is pumped by a thread into a socket so it can be polled like anything else.
 
 static HANDLE con_in = INVALID_HANDLE_VALUE;
+static HANDLE stdin_want; // manual-reset: set while someone waits for stdin data
+
+void px_stdin_demand(void) {
+    if (stdin_want != NULL)
+        SetEvent(stdin_want);
+}
+
+HANDLE px_stdin_handle(void) {
+    return con_in;
+}
 static DWORD con_in_mode_saved, con_out_mode_saved;
 static bool con_in_saved, con_out_saved;
 static HANDLE con_out = INVALID_HANDLE_VALUE;
@@ -658,6 +672,9 @@ static DWORD WINAPI stdin_pump(void *param) {
     char buf[4096];
     wchar_t wbuf[1024];
     for (;;) {
+        // wait until a reader or poller wants data
+        WaitForSingleObject(stdin_want, INFINITE);
+        ResetEvent(stdin_want);
         DWORD got = 0;
         if (console) {
             // ReadConsoleW, not ReadFile: the UTF-8 code page path still loses
@@ -714,7 +731,9 @@ static struct px_desc *stdio_desc(DWORD which) {
     struct px_desc *d = px_desc_new(PX_SOCK);
     d->s = s[0];
     d->is_pipe = true;
+    d->is_stdin = true;
     d->is_tty = console;
+    stdin_want = CreateEventW(NULL, TRUE, FALSE, NULL);
     d->domain = d->type = 1;
     HANDLE thread = CreateThread(NULL, 0, stdin_pump, (void *) s[1], 0, NULL);
     if (thread != NULL)

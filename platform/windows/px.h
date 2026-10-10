@@ -171,6 +171,9 @@ int px_mkfifo(const char *path, px_mode_t mode);
 int px_mkstemp(char *tmpl);
 int px_fstatvfs(int fd, struct px_statvfs *st);
 int px_statvfs(const char *path, struct px_statvfs *st);
+// Makes a directory case sensitive, like a Linux file system; directories
+// created under it later inherit that (NTFS, Windows 10 1803+).
+int px_set_case_sensitive(const char *path);
 // The host path an fd was opened with (F_GETPATH).
 int px_fd_path(int fd, char *buf, size_t size);
 

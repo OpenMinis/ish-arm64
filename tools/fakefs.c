@@ -108,6 +108,12 @@ bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_er
     char path_tmp[PATH_MAX];
     snprintf(path_tmp, sizeof(path_tmp), "%s/data", fs);
     err = mkdir(path_tmp, 0777);
+#ifdef _WIN32
+    // Linux trees have names that differ only in case; every directory
+    // created below inherits this
+    if (px_set_case_sensitive(path_tmp) < 0)
+        fprintf(stderr, "warning: %s is not case sensitive: names that differ only in case will collide\n", path_tmp);
+#endif
     int root_fd = open(path_tmp, O_RDONLY);
     if (root_fd < 0)
         POSIX_ERR();
