@@ -1,8 +1,9 @@
-# musl recording workload: one ish run over pip, matplotlib, python stdlib,
-# node, the busybox pipeline, bzip2 and self-modifying code, so every
-# translation shares one registry (consistent module-context indices).
+# musl recording workload: one ish run over pip, python stdlib, node, the
+# busybox pipeline, bzip2 and self-modifying code, so every translation shares
+# one registry (consistent module-context indices). No matplotlib: with it the
+# run needs more native code than the JIT's 120 MB region holds, and what runs
+# after the region is full (grep, find) is not translated, so not recorded.
 python3 -m pip list > /dev/null
-python3 /tmp/aojit/charts/mpl_chart.py
 python3 -c "
 import hashlib,json,zlib,re,sqlite3
 d=json.dumps(list(range(300000))).encode()
