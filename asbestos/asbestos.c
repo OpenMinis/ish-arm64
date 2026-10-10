@@ -8,6 +8,9 @@
 #include "asbestos/asbestos.h"
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
+#ifdef ISH_XJIT
+#include "asbestos/guest-x86/xjit.h"
+#endif
 #ifdef ISH_JIT
 #include "asbestos/guest-arm64/jit.h"
 #endif
@@ -631,6 +634,9 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
 #ifdef ISH_JIT
     jit_block(state.block, jit_units);
 #endif
+#ifdef ISH_XJIT
+    xjit_block(state.block);
+#endif
     ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
     return state.block;
 }
@@ -769,6 +775,9 @@ static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *bloc
 #ifdef ISH_JIT
     jit_block_free(block);
 #endif
+#ifdef ISH_XJIT
+    xjit_block_free(block);
+#endif
     free(block);
 }
 
@@ -778,6 +787,9 @@ static void fiber_free_jetsam(struct asbestos *asbestos) {
         list_remove(&block->jetsam);
 #ifdef ISH_JIT
         jit_block_free(block);
+#endif
+#ifdef ISH_XJIT
+        xjit_block_free(block);
 #endif
         free(block);
     }

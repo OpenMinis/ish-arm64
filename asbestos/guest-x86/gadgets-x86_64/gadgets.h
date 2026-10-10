@@ -17,6 +17,7 @@
 
 .extern fiber_exit
 
+#ifndef ISH_GADGET_TEMPLATES
 .macro .gadget name
     .global.name gadget_\()\name
 .endm
@@ -24,6 +25,96 @@
     addq $((\pop+1)*8), %_ip
     jmp *-8(%_ip)
 .endm
+.macro .slowpath_begin
+    .pushsection_bullshit
+.endm
+.macro .slowpath_end
+    .popsection
+.endm
+.macro .tpl_noinline
+.endm
+.macro .tpl_close
+.endm
+#else
+# Template build (asbestos/guest-x86/xjit.c). The same sources assembled a
+# second time, each gadget as one contiguous, copyable piece of code: gret
+# falls through to the end of the template instead of dispatching, slow paths
+# sit inline, and a table entry maps the real gadget to its template, the
+# number of argument words it consumes (-1: never falls through, -2: varies)
+# and whether it must not be inlined (.tpl_noinline).
+.macro .gadget name
+    .tpl_close
+    .set tplv_pop, -1
+    .set tplv_noinline, 0
+    .set tplv_open, 1
+    .macro .tpl_entry
+        .pushsection_xjit_table
+        .quad NAME(gadget_\()\name), tpl_\name, 9999b
+        .tpl_quad_pop
+        .popsection
+    .endm
+tpl_\name\():
+.endm
+# The table gets a section of its own so xjit.c can find its bounds.
+.macro .pushsection_xjit_table
+#if __APPLE__
+    .pushsection __DATA,__ish_xjit
+#elif defined(_WIN32)
+    .pushsection .xjit$m,"dr"
+#else
+    .pushsection ish_xjit,"aw"
+#endif
+.endm
+# tplv_pop/tplv_noinline as literals: referencing the symbols from data
+# would freeze them.
+.macro .tpl_quad_pop
+    .irp n, -2,-1,0,1,2,3,4,5,6,7,8
+    .if tplv_pop == \n
+        .quad \n
+    .endif
+    .endr
+    .if tplv_noinline
+        .quad 1
+    .else
+        .quad 0
+    .endif
+.endm
+.macro .tpl_close
+    .ifdef tplv_open
+    .if tplv_open
+9999:
+        .tpl_entry
+        .purgem .tpl_entry
+        .set tplv_open, 0
+    .endif
+    .endif
+.endm
+.macro gret pop=0
+    addq $((\pop+1)*8), %_ip
+    .if tplv_pop == -1
+        .set tplv_pop, \pop
+    .elseif tplv_pop != \pop
+        .set tplv_pop, -2
+    .endif
+    jmp 9999f
+.endm
+.macro .tpl_noinline
+    .set tplv_noinline, 1
+.endm
+.macro .slowpath_begin
+    jmp 8888f
+.endm
+.macro .slowpath_end
+8888:
+.endm
+# Gadget arrays and other global data belong to the real gadgets.
+.purgem .gadget_list
+.macro .gadget_list type, list:vararg
+.endm
+.purgem .gadget_list_size
+.macro .gadget_list_size type, list:vararg
+.endm
+#endif
 
 # memory reading and writing
 .irp type, read,write
@@ -52,7 +143,7 @@
     addq TLB_ENTRY_data_minus_addr(%_tlb,%r14), %_addrq
 back_\id :
 
-.pushsection_bullshit
+.slowpath_begin
 handle_miss_\id :
     call handle_\type\()_miss
     jmp back_\id
@@ -60,7 +151,7 @@ crosspage_load_\id :
     movq $(\size/8), %r14
     call crosspage_load
     jmp back_\id
-.popsection
+.slowpath_end
 .endm
 
 .endr
@@ -69,12 +160,12 @@ crosspage_load_\id :
     cmpq %_addrq, %r14
     je crosspage_store_\id
 back_write_done_\id :
-.pushsection_bullshit
+.slowpath_begin
 crosspage_store_\id :
     movq $(\size/8), %r14
     call crosspage_store
     jmp back_write_done_\id
-.popsection
+.slowpath_end
 .endm
 
 .macro _invoke size, reg, post, macro:vararg

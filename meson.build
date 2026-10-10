@@ -29,11 +29,19 @@ if get_option('no_crlf')
     add_project_arguments('-DNO_CRLF', language: 'c')
 endif
 
-# Native JIT for the ARM64 guest (asbestos/guest-arm64/jit.h). Off by default;
-# without it the build is the plain gadget engine.
-ish_jit = get_option('jit')
+# Native JIT. Off by default; without it the build is the plain gadget engine.
+# ARM64 guest: translator (asbestos/guest-arm64/jit.h), Apple arm64 hosts.
+# x86 guest: gadget-template JIT (asbestos/guest-x86/xjit.h), x86_64 hosts.
+ish_jit = get_option('jit') and guest_arch == 'arm64'
+ish_xjit = get_option('jit') and guest_arch == 'x86'
+if ish_xjit
+    if host_machine.cpu_family() != 'x86_64'
+        error('-Djit=true with guest_arch=x86 needs an x86_64 host')
+    endif
+    add_project_arguments('-DISH_XJIT=1', language: 'c')
+endif
 if ish_jit
-    if guest_arch != 'arm64' or host_machine.system() != 'darwin' or host_machine.cpu_family() != 'aarch64'
+    if host_machine.system() != 'darwin' or host_machine.cpu_family() != 'aarch64'
         error('-Djit=true needs guest_arch=arm64 on an Apple arm64 host')
     endif
     add_project_arguments('-DISH_JIT=1', language: 'c')
@@ -110,6 +118,9 @@ if guest_arch == 'x86'
         gadgets+'/misc.S',
         offsets,
     ]
+    if ish_xjit
+        emu_src += 'asbestos/guest-x86/xjit.c'
+    endif
 elif guest_arch == 'arm64'
     emu_src += [
         'asbestos/asbestos.c',
@@ -136,6 +147,17 @@ elif guest_arch == 'arm64'
 endif
 
 libish_emu = library('ish_emu', emu_src, include_directories: includes)
+
+# The gadgets once more, as copyable templates (ISH_GADGET_TEMPLATES). Nothing
+# references them by name, so they are link_whole'd into ish below.
+xjit_libs = []
+if ish_xjit
+    xjit_libs += static_library('ish_xjit_templates',
+        [gadgets+'/bits.S', gadgets+'/control.S', gadgets+'/math.S',
+         gadgets+'/memory.S', gadgets+'/misc.S', gadgets+'/string.S', offsets],
+        c_args: ['-DISH_GADGET_TEMPLATES'],
+        include_directories: includes)
+endif
 
 # Per-offload verification handlers (dev only, ARM64). Default off: the test
 # files do NOT compile at all. Each offload type has its own switch + files, so
@@ -1795,7 +1817,7 @@ if get_option('kernel') == 'ish'
         sources: offsets,
         # link_whole so the offload test handlers' self-registering constructors
         # survive dead-strip (empty unless -Doffload_test_*=true).
-        link_whole: offload_test_libs,
+        link_whole: offload_test_libs + xjit_libs,
         dependencies: dependencies,
         include_directories: includes)
 

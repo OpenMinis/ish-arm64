@@ -90,6 +90,10 @@ struct fiber_block {
     unsigned jit_idx;           // PIC: its translation's slot in that context
 #endif
 
+#ifdef ISH_XJIT
+    void *xjit_code;            // native runs of this block (guest-x86/xjit.c)
+#endif
+
     unsigned long code[];
 };
 

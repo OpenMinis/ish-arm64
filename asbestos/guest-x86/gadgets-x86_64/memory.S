@@ -42,6 +42,7 @@
 .each_reg x
 .purgem x
 
+#ifndef ISH_GADGET_TEMPLATES
 .pushsection_rodata
 .global.name si_gadgets
 .irp reg, REG_LIST
@@ -50,11 +51,13 @@
     .endr
 .endr
 .popsection
+#endif
 
 .gadget seg_gs
     addl CPU_tls_ptr(%_cpu), %_addr
     gret
 
+#ifndef ISH_GADGET_TEMPLATES
 .irp type, read,write
 
 .global handle_\type\()_miss
@@ -125,3 +128,6 @@ crosspage_store:
     testq %r14, %r14
     jz segfault_write
     ret
+#endif
+
+.tpl_close

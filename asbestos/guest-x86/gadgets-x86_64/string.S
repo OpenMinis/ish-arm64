@@ -113,3 +113,5 @@
     .gadget_list_size \op, REP_LIST
 .endr
 # temporary
+
+.tpl_close

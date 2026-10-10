@@ -275,3 +275,5 @@
     cwde
     gret
 .gadget_list cvte, SIZE_LIST
+
+.tpl_close

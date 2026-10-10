@@ -161,12 +161,14 @@
         gret
 
     .gadget skip_\cond
+        .tpl_noinline // moves _ip by a variable amount
         do_jump \cond, 1f
         gret 1
     1:
         addq (%_ip), %_ip
         gret 1
     .gadget skipn_\cond
+        .tpl_noinline // moves _ip by a variable amount
         do_jump \cond, 1f
         addq (%_ip), %_ip
     1:
@@ -214,3 +216,5 @@
     call NAME(helper_expand_flags)
     restore_c
     gret
+
+.tpl_close

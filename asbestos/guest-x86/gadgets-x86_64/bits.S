@@ -143,3 +143,5 @@
 .each_reg x
 .purgem x
 .gadget_list bswap, REG_LIST
+
+.tpl_close

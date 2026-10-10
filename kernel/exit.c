@@ -486,6 +486,10 @@ static void halt_system(int status) {
     dump_pc_hist();
     extern void dump_wx_stats(void);
     dump_wx_stats();
+#ifdef ISH_XJIT
+    extern void xjit_dump_stats(void);
+    xjit_dump_stats();
+#endif
 
     // Force exit the entire host process. Orphaned guest threads
     // (stuck in JIT loops after do_exit_group force cleanup) keep

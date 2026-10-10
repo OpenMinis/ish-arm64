@@ -52,6 +52,9 @@ bool gen_start(addr_t addr, struct gen_state *state) {
         return false;
     state->block = block;
     block->addr = addr;
+#ifdef ISH_XJIT
+    block->xjit_code = NULL;
+#endif
     return true;
 }
 

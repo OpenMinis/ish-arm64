@@ -224,3 +224,5 @@ do_helper 2
 .gadget fstsw_ax
     movw CPU_fsw(%_cpu), %ax
     gret
+
+.tpl_close
