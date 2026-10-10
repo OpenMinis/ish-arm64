@@ -76,6 +76,9 @@
     .set tplv_open, 1
     .macro .tpl_entry
         .pushsection_xjit_table
+        # 8-byte alignment, so the 40-byte entries of different objects
+        # follow each other without padding
+        .p2align 3
         .quad NAME(gadget_\()\name), tpl_\name, 9999b
         .tpl_quad_pop
         .popsection

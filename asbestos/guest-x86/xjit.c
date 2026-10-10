@@ -26,6 +26,23 @@ struct tpl_entry {
 #if defined(__APPLE__)
 extern const struct tpl_entry tpl_table_start[] __asm("section$start$__DATA$__ish_xjit");
 extern const struct tpl_entry tpl_table_end[] __asm("section$end$__DATA$__ish_xjit");
+#elif defined(_WIN32)
+// COFF has no __start_/__stop_ symbols. The linker orders the parts of a
+// grouped section by what follows the '$', so these bracket the entries
+// (.xjit$m, from gadgets.h).
+__attribute__((section(".xjit$a"), used, aligned(8)))
+static const struct tpl_entry tpl_table_head = {0};
+__attribute__((section(".xjit$z"), used, aligned(8)))
+static const struct tpl_entry tpl_table_tail = {0};
+// Walking from one object to another is undefined behaviour the optimizer
+// exploits (it folded the entry count to 0): launder the addresses.
+static inline const struct tpl_entry *tpl_opaque(const struct tpl_entry *p) {
+    uintptr_t v = (uintptr_t) p;
+    __asm__("" : "+r"(v));
+    return (const struct tpl_entry *) v;
+}
+#define tpl_table_start (tpl_opaque(&tpl_table_head) + 1)
+#define tpl_table_end (tpl_opaque(&tpl_table_tail))
 #else
 extern const struct tpl_entry __start_ish_xjit[], __stop_ish_xjit[];
 #define tpl_table_start __start_ish_xjit
