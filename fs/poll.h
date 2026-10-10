@@ -106,4 +106,12 @@ void poll_destroy(struct poll *poll);
 // for fd_close
 void poll_cleanup_fd(struct fd *fd);
 
+// [T-ish-poll-spin-guard] /proc/ish/poll_spin: counters of host wakeups that
+// found nothing ready, plus switches for the four guards (regfile, hupedge, deadline,
+// backoff) so their effect can be measured A/B on a device without a rebuild.
+// describe writes a text report; control takes "<name> <0|1>" or
+// "<name>=<0|1>" and returns 0, or -1 for an unknown command.
+void poll_spin_describe(char *out, size_t size);
+int poll_spin_control(const char *cmd, size_t len);
+
 #endif

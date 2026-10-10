@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <stdio.h>
 #include "misc.h"
 #include "util/list.h"
 #include "kernel/errno.h"
@@ -81,6 +83,39 @@ static struct poll_fd *poll_find_fd(struct poll *poll, struct fd *fd, int fd_no)
     return NULL;
 }
 
+// [T-ish-poll-spin-guard] Switches (see /proc/ish/poll_spin) and counters.
+static _Atomic bool poll_guard_regfile = true;
+static _Atomic bool poll_guard_hupedge = true;
+static _Atomic bool poll_guard_deadline = true;
+static _Atomic bool poll_guard_backoff = true;
+static _Atomic uint64_t poll_stat_spurious;      // host wakeups that found nothing ready
+static _Atomic uint64_t poll_stat_spins;         // waits that reached POLL_SPIN_GRACE
+static _Atomic uint64_t poll_stat_backoffs;      // sleeps taken by the backoff
+static _Atomic uint64_t poll_stat_deadline;      // waits ended by their deadline after spurious wakeups
+static _Atomic uint64_t poll_stat_regfile_skips; // host registrations skipped for files/dirs
+
+// Whether the host should watch this fd at all. A regular file or directory
+// is always ready for reading and writing and never hangs up, so the guest
+// check sees everything it can report without the host's help. kqueue,
+// however, fires EVFILT_READ on a vnode whenever its offset is short of its
+// size - NOTE_LOWAT (our "hangup only" marker) is ignored for vnodes - so a
+// poll that wants only HUP/ERR on such an fd (events=0, as the Rust runtime
+// probes fds 0-2 before main) would be woken for nothing, forever: `rg x <
+// file`, or a log another process keeps appending to. Pipes, sockets and
+// character devices keep their registration.
+static bool poll_fd_wants_host(struct fd *fd) {
+    if (!poll_guard_regfile)
+        return true;
+    struct stat st;
+    if (fstat(fd->real_fd, &st) < 0)
+        return true;
+    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) {
+        poll_stat_regfile_skips++;
+        return false;
+    }
+    return true;
+}
+
 // Recompute the host (real) registration for `fd` in this poll as the UNION
 // of the event types of every registration referring to it. Several guest
 // registrations (different fd numbers, same description after dup) share one
@@ -97,6 +132,8 @@ static int poll_real_refresh(struct poll *poll, struct fd *fd) {
                 types |= pf->types;
         }
     }
+    if (types != 0 && !poll_fd_wants_host(fd))
+        types = 0;
     return real_poll_update(&poll->real, fd->real_fd, types, first);
 }
 
@@ -270,6 +307,73 @@ void poll_wakeup(struct fd *fd, int events) {
     unlock(&fd->poll_lock);
 }
 
+// [T-ish-poll-spin-guard] A wait that keeps waking without anything becoming
+// ready must not turn into a host busy loop. The host poll can report an
+// fd as ready while the guest fd's own poll() reports nothing the caller
+// asked for (a level-triggered EOF/HUP on a pipe or socket is the usual
+// shape), so every pass returns from kevent at once, re-scans, finds nothing
+// and waits again — all inside ONE guest syscall. The thread then burns 100%
+// of a core on the host side, and the background CPU governor cannot brake
+// it: its throttle hook only runs between guest blocks, which this thread
+// never reaches. Field case 2026-10-07/08: a ripgrep thread sat in ppoll at
+// ~100% CPU with its syscall count frozen for minutes, the governor reached
+// RED with 3% duty and no effect, and iOS killed the app for exceeding its
+// background CPU budget ~50s after it went to the background.
+//
+// After POLL_SPIN_GRACE wakeups in a row that produced nothing, each further
+// pass sleeps first (1ms, then 10ms, then 50ms). A wait that genuinely becomes
+// ready breaks out on the next scan, so the cost is at most one sleep of
+// latency, and only for a wait that was already spinning. Signals are still
+// checked on every pass. The first stretch of a spin is logged once with
+// what the host reported, so the misbehaving fd type can be found.
+#define POLL_SPIN_GRACE 64
+#define POLL_SPIN_LOG_AT 256
+
+static void poll_spin_backoff(unsigned spurious) {
+    if (!poll_guard_backoff)
+        return;
+    poll_stat_backoffs++;
+    long ns = spurious < 256 ? 1000000L : (spurious < 2048 ? 10000000L : 50000000L);
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = ns};
+    nanosleep(&ts, NULL);
+}
+
+// Called with poll_->lock held.
+static void poll_spin_report(struct poll *poll_, unsigned spurious,
+                             struct real_poll_event *last, int last_n) {
+    char comm[17];
+    memcpy(comm, current->comm, 16);
+    comm[16] = '\0';
+    printk("POLL-SPIN: pid=%d (%s) %u wakeups in a row with nothing ready; %s\n",
+           current->pid, comm, spurious,
+           poll_guard_backoff ? "backing off" : "backoff DISABLED, spinning");
+    for (int i = 0; i < last_n; i++) {
+        struct poll_fd *pfd = rpe_data(&last[i]);
+        if (pfd == NULL) {
+            printk("POLL-SPIN:   host event %#x on the notify pipe\n", rpe_events(&last[i]));
+            continue;
+        }
+        // A registration removed since the event was queued sits on the
+        // freelist with a stale fd pointer (see struct poll): do not touch it.
+        if (pfd->poll == NULL) {
+            printk("POLL-SPIN:   host event %#x on a removed registration\n", rpe_events(&last[i]));
+            continue;
+        }
+        int ready = (pfd->fd != NULL && pfd->fd->ops->poll) ? pfd->fd->ops->poll(pfd->fd) : -1;
+        printk("POLL-SPIN:   host event %#x on guest fd %d: wants %#x, fd poll says %#x, edge-fired %#x, oneshot %d\n",
+               rpe_events(&last[i]), pfd->fd_no, pfd->types, ready,
+               pfd->triggered_types, pfd->oneshot_fired);
+    }
+    struct poll_fd *pfd;
+    int listed = 0;
+    list_for_each_entry(&poll_->poll_fds, pfd, fds) {
+        if (++listed > 8) break;
+        int ready = (pfd->fd != NULL && pfd->fd->ops->poll) ? pfd->fd->ops->poll(pfd->fd) : -1;
+        printk("POLL-SPIN:   registered guest fd %d: wants %#x, fd poll says %#x\n",
+               pfd->fd_no, pfd->types, ready);
+    }
+}
+
 int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struct timespec *timeout) {
     lock(&poll_->lock);
 
@@ -287,6 +391,22 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
 
     // TODO this is pretty broken with regards to timeouts
     int res = 0;
+    // [T-ish-poll-spin-guard] Consecutive host wakeups that left nothing ready.
+    unsigned spurious = 0;
+    // A finite wait ends when its time is up. The loop below only treats a
+    // host wait that returned NO events as a timeout, so a host that keeps
+    // reporting something the guest check then rejects never let a finite
+    // wait end - with timeout 0 not even after the first pass.
+    uint64_t deadline_ns = 0;
+    if (timeout != NULL) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        deadline_ns = (uint64_t) now.tv_sec * 1000000000ULL + now.tv_nsec
+            + (uint64_t) timeout->tv_sec * 1000000000ULL + timeout->tv_nsec;
+    }
+    bool woke = false;
+    struct real_poll_event last_events[4];
+    int last_n = 0;
     while (true) {
         // check if any fds are ready
         struct poll_fd *poll_fd, *tmp;
@@ -345,11 +465,31 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
             break;
         }
 
+        // [T-ish-poll-spin-guard] The last wakeup produced nothing ready.
+        if (woke) {
+            woke = false;
+            poll_stat_spurious++;
+            if (++spurious == POLL_SPIN_GRACE)
+                poll_stat_spins++;
+            if (spurious == POLL_SPIN_LOG_AT)
+                poll_spin_report(poll_, spurious, last_events, last_n);
+            if (timeout != NULL && poll_guard_deadline) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if ((uint64_t) now.tv_sec * 1000000000ULL + now.tv_nsec >= deadline_ns) {
+                    poll_stat_deadline++;
+                    break; // res is 0: timed out
+                }
+            }
+        }
+
         // wait for a ready notification
         list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
             sockrestart_begin_listen_wait(poll_fd->fd);
         }
         unlock(&poll_->lock);
+        if (spurious >= POLL_SPIN_GRACE)
+            poll_spin_backoff(spurious);
         int err;
         int saved_errno;
         struct real_poll_event e[4];
@@ -390,6 +530,7 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         // If we timed out from our bounded timeout, loop back to re-check
         // fd readiness and signal pending.
         if (err == 0 && wait_timeout == &bounded_timeout) {
+            spurious = 0;
             lock(&poll_->lock);
             list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
                 sockrestart_end_listen_wait(poll_fd->fd);
@@ -473,6 +614,10 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
             }
         }
 
+        woke = true;
+        last_n = err < 4 ? err : 4;
+        memcpy(last_events, e, sizeof(e[0]) * last_n);
+
         char fuck;
         if (read(poll_->notify_pipe[0], &fuck, 1) < 0 && errno != EAGAIN) {
             res = errno_map();
@@ -491,6 +636,50 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
 
     unlock(&poll_->lock);
     return res;
+}
+
+void poll_spin_describe(char *out, size_t size) {
+    snprintf(out, size,
+             "regfile %d\n"
+             "hupedge %d\n"
+             "deadline %d\n"
+             "backoff %d\n"
+             "spurious_wakeups %llu\n"
+             "spinning_waits %llu\n"
+             "backoff_sleeps %llu\n"
+             "deadline_returns %llu\n"
+             "regfile_skips %llu\n",
+             (int) poll_guard_regfile, (int) poll_guard_hupedge, (int) poll_guard_deadline, (int) poll_guard_backoff,
+             (unsigned long long) poll_stat_spurious, (unsigned long long) poll_stat_spins,
+             (unsigned long long) poll_stat_backoffs, (unsigned long long) poll_stat_deadline,
+             (unsigned long long) poll_stat_regfile_skips);
+}
+
+int poll_spin_control(const char *cmd, size_t len) {
+    char buf[64];
+    if (len >= sizeof(buf))
+        return -1;
+    memcpy(buf, cmd, len);
+    buf[len] = '\0';
+    char name[16];
+    int value;
+    if (sscanf(buf, " %15[a-z] = %d", name, &value) != 2 &&
+            sscanf(buf, " %15[a-z] %d", name, &value) != 2)
+        return -1;
+    if (value != 0 && value != 1)
+        return -1;
+    if (strcmp(name, "regfile") == 0)
+        poll_guard_regfile = value;
+    else if (strcmp(name, "hupedge") == 0)
+        poll_guard_hupedge = value;
+    else if (strcmp(name, "deadline") == 0)
+        poll_guard_deadline = value;
+    else if (strcmp(name, "backoff") == 0)
+        poll_guard_backoff = value;
+    else
+        return -1;
+    printk("POLL-SPIN: guard %s set to %d\n", name, value);
+    return 0;
 }
 
 void poll_destroy(struct poll *poll) {
@@ -568,6 +757,18 @@ static int real_poll_update(struct real_poll *real, int fd, int types, void *dat
         // Set the low water mark really high so we'll only get woken up on a hangup
         e[0].fflags = NOTE_LOWAT;
         e[0].data = INT_MAX;
+        // [T-ish-poll-spin-guard] xnu clamps the low water mark of a pipe to
+        // its buffer size, so a FULL pipe fires EVFILT_READ anyway, level-
+        // triggered, while the guest check (rightly) reports no hangup. A
+        // reader that probes before reading - the Rust runtime polls fds 0-2
+        // with events=0 before main() - then waits forever on a pipe its
+        // upstream filled first, and the upstream stays blocked on that full
+        // pipe: `head -n 7604 big.py | rg ...` hung at 100% CPU in the field.
+        // Edge-triggered, the full buffer wakes the wait once; a real hangup
+        // is still caught by the guest-side scan, which runs before every
+        // wait, so nothing is missed.
+        if (poll_guard_hupedge)
+            e[0].flags |= EV_CLEAR;
     }
     for (int i = 0; i < 3; i++) {
         e[i].ident = fd;
