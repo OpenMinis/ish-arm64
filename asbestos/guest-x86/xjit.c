@@ -426,14 +426,22 @@ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 // data region for what translated code writes (xlat.c's guesses): writing
 // to a page that holds code is self-modifying code to the CPU, and makes
 // Rosetta throw its translation of the page away.
-#define REGION_SIZE (256u << 20)
-#define DATA_REGION_SIZE (32u << 20)
+// On Windows (the target) both are reserved up front and committed as they
+// fill, straight on VirtualAlloc. Elsewhere (the Mac build is for checking
+// translations) they are plain RWX / RW mappings the kernel backs lazily.
+#define REGION_SIZE (1024u << 20)
+#define DATA_REGION_SIZE (64u << 20)
+#define COMMIT_STEP (16u << 20)
 #define CHUNK 64u
-#define NCLASSES 64  // free lists for sizes up to 64 * CHUNK
+// Free lists: one per size up to NEXACT chunks, then one per power of two
+// (rounded up), so that everything freed can be handed out again.
+#define NEXACT 64
+#define NCLASSES (NEXACT + 32)
 
 struct arena {
-    uint8_t *base, *next, *end;
-    void *free_lists[NCLASSES + 1];
+    uint8_t *base, *next, *end, *committed;
+    int prot;
+    void *free_lists[NCLASSES];
     pthread_mutex_t lock;
 };
 static struct arena code_arena = {.lock = PTHREAD_MUTEX_INITIALIZER};
@@ -445,21 +453,35 @@ struct code_hdr {
     uint32_t pad[3];
 };
 
+// rel32 reach, less some room for the binary itself around the anchor
 static bool reachable(uintptr_t a, uintptr_t b) {
     uintptr_t d = a > b ? a - b : b - a;
-    return d < (1u << 31) - (REGION_SIZE + DATA_REGION_SIZE + (64u << 20));
+    return d < (1u << 31) - (64u << 20);
 }
 
-static void *map_near(uintptr_t anchor, size_t size, int prot) {
-    for (int64_t delta = 64ll << 20; delta < (1ll << 31); delta += 64ll << 20) {
+// A mapping of size whose both ends reach both ends of [lo, hi].
+static void *map_near(uintptr_t lo, uintptr_t hi, size_t size, int prot) {
+    for (int64_t delta = 0; delta < (1ll << 31); delta += 64ll << 20) {
         for (int sign = 1; sign >= -1; sign -= 2) {
-            uintptr_t hint = (anchor + sign * delta) & ~(uintptr_t) 0xfffff;
+            uintptr_t hint = (sign > 0 ? hi + delta : lo - delta - size) & ~(uintptr_t) 0xfffff;
+#ifdef _WIN32
+            (void) prot;
+            void *p = px_jit_reserve((void *) hint, size);
+            if (p == NULL)
+                continue;
+#else
             void *p = mmap((void *) hint, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0);
             if (p == MAP_FAILED)
                 continue;
-            if (reachable((uintptr_t) p, anchor) && reachable((uintptr_t) p + size, anchor))
+#endif
+            uintptr_t a = (uintptr_t) p, b = a + size;
+            if (reachable(a, lo) && reachable(a, hi) && reachable(b, lo) && reachable(b, hi))
                 return p;
+#ifdef _WIN32
+            px_jit_release(p);
+#else
             munmap(p, size);
+#endif
         }
     }
     return NULL;
@@ -467,30 +489,74 @@ static void *map_near(uintptr_t anchor, size_t size, int prot) {
 
 static void region_init(void) {
     uintptr_t anchor = (uintptr_t) tpl_table_start;
-    uint8_t *code = map_near(anchor, REGION_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint8_t *code = map_near(anchor, anchor, REGION_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
     if (code == NULL)
         return;
-    uint8_t *data = map_near(anchor, DATA_REGION_SIZE, PROT_READ | PROT_WRITE);
+    // the code addresses it rip-relative
+    uint8_t *data = map_near((uintptr_t) code, (uintptr_t) code + REGION_SIZE, DATA_REGION_SIZE,
+                             PROT_READ | PROT_WRITE);
     if (data == NULL) {
+#ifdef _WIN32
+        px_jit_release(code);
+#else
         munmap(code, REGION_SIZE);
+#endif
         return;
     }
     code_arena.base = code_arena.next = region = code;
     code_arena.end = region_end = code + REGION_SIZE;
+    code_arena.prot = PROT_READ | PROT_WRITE | PROT_EXEC;
     data_arena.base = data_arena.next = data;
     data_arena.end = data + DATA_REGION_SIZE;
+    data_arena.prot = PROT_READ | PROT_WRITE;
+#ifdef _WIN32
+    code_arena.committed = code;   // committed as they fill
+    data_arena.committed = data;
+#else
+    code_arena.committed = code_arena.end;
+    data_arena.committed = data_arena.end;
+#endif
+}
+
+// size in chunks -> free list, and the size that list's pieces have
+static unsigned size_class(size_t *chunks) {
+    if (*chunks <= NEXACT)
+        return (unsigned) *chunks - 1;
+    unsigned log = 0;
+    while (((size_t) 1 << log) < *chunks)
+        log++;
+    *chunks = (size_t) 1 << log;
+    return NEXACT + log;
 }
 
 static void *arena_alloc(struct arena *ar, size_t size) {
     size_t chunks = (size + sizeof(struct code_hdr) + CHUNK - 1) / CHUNK;
+    unsigned cls = size_class(&chunks);
+    if (cls >= NCLASSES)
+        return NULL;
     pthread_mutex_lock(&ar->lock);
     struct code_hdr *h = NULL;
-    if (chunks <= NCLASSES && ar->free_lists[chunks] != NULL) {
-        h = ar->free_lists[chunks];
-        ar->free_lists[chunks] = *(void **) h;
+    if (ar->free_lists[cls] != NULL) {
+        h = ar->free_lists[cls];
+        ar->free_lists[cls] = *(void **) h;
     } else if (ar->base != NULL && ar->next + chunks * CHUNK <= ar->end) {
-        h = (struct code_hdr *) ar->next;
-        ar->next += chunks * CHUNK;
+        uint8_t *end = ar->next + chunks * CHUNK;
+        while (end > ar->committed) {
+            size_t step = (size_t) (ar->end - ar->committed);
+            if (step > COMMIT_STEP)
+                step = COMMIT_STEP;
+#ifdef _WIN32
+            if (!px_jit_commit(ar->committed, step, ar->prot & PROT_EXEC))
+                break;
+#else
+            break;  // mapped whole
+#endif
+            ar->committed += step;
+        }
+        if (end <= ar->committed) {
+            h = (struct code_hdr *) ar->next;
+            ar->next = end;
+        }
     }
     pthread_mutex_unlock(&ar->lock);
     if (h == NULL)
@@ -501,11 +567,11 @@ static void *arena_alloc(struct arena *ar, size_t size) {
 
 static void arena_free(struct arena *ar, void *p) {
     struct code_hdr *h = (struct code_hdr *) p - 1;
-    if (h->chunks > NCLASSES)
-        return;  // large pieces are rare; leave them
+    size_t chunks = h->chunks;
+    unsigned cls = size_class(&chunks);
     pthread_mutex_lock(&ar->lock);
-    *(void **) h = ar->free_lists[h->chunks];
-    ar->free_lists[h->chunks] = h;
+    *(void **) h = ar->free_lists[cls];
+    ar->free_lists[cls] = h;
     pthread_mutex_unlock(&ar->lock);
 }
 

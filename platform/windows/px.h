@@ -211,6 +211,11 @@ int px_poll(struct px_pollfd *fds, unsigned long nfds, int timeout);
 void *px_mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off);
 int px_munmap(void *addr, size_t len);
 int px_mprotect(void *addr, size_t len, int prot);
+// The JIT's code and data regions, straight on VirtualAlloc: reserve address
+// space (no commit charge) near hint, then commit pieces as they fill.
+void *px_jit_reserve(void *hint, size_t len);
+bool px_jit_commit(void *addr, size_t len, bool exec);
+void px_jit_release(void *addr);
 int px_madvise(void *addr, size_t len, int advice);
 int px_msync(void *addr, size_t len, int flags);
 

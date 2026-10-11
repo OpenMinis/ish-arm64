@@ -334,6 +334,8 @@ extern void handle_write_miss(void) __asm__("handle_write_miss");
 extern void crosspage_load(void) __asm__("crosspage_load");
 extern void crosspage_store(void) __asm__("crosspage_store");
 extern void fiber_ret_chain(void) __asm__("fiber_ret_chain");
+extern void fiber_ret_lookup(void) __asm__("fiber_ret_lookup");
+extern void fiber_ret(void) __asm__("fiber_ret");
 
 #define CPU_OFF(f) ((int32_t) offsetof(struct cpu_state, f))
 #define TLBREL(f) ((int32_t) offsetof(struct tlb, f) - (int32_t) offsetof(struct tlb, entries))
@@ -652,6 +654,9 @@ enum {
     K_OPREG,     // register in the opcode: mov imm, xchg rax, bswap
     K_PUSH, K_POP, K_PUSHI, K_LEAVE,
     K_JCC, K_JMP,
+    K_CALL, K_CALLI, K_JMPI, K_RET,       // call rel32, call/jmp through r/m, ret
+    // bodies of the memory accesses those make (e_body)
+    K_B_LOADT, K_B_PUSHRET, K_B_POPRET,
 };
 enum { A_NONE, A_R, A_W, A_RW };
 
@@ -716,7 +721,9 @@ static bool classify(const struct gi *g, struct cls *c) {
         if (op >= 0x50 && op <= 0x57) { c->kind = K_PUSH; return !reps && !g->p66; }
         if (op >= 0x58 && op <= 0x5f) { c->kind = K_POP; return !reps && !g->p66; }
         if (op == 0x68 || op == 0x6a) { c->kind = K_PUSHI; return !reps && !g->p66; }
-        if (reps && !(op >= 0x70 && op <= 0x7f) && op != 0xeb && op != 0xe9)
+        // rep/bnd prefixes mean nothing on branches (`repz ret`, `bnd jmp`)
+        if (reps && !(op >= 0x70 && op <= 0x7f) && op != 0xeb && op != 0xe9 &&
+                op != 0xe8 && op != 0xc3 && op != 0xc2 && op != 0xff)
             return false;
         switch (op) {
             case 0x63:
@@ -811,7 +818,15 @@ static bool classify(const struct gi *g, struct cls *c) {
                     default: return false;                                      // div: #DE
                 }
             }
-            case 0xfe: case 0xff:
+            case 0xff:
+                if (g->rawreg == 2 || g->rawreg == 4) {
+                    if (g->p66) return false;
+                    c->kind = g->rawreg == 2 ? K_CALLI : K_JMPI;
+                    return true;
+                }
+                if (reps) return false;
+                // fallthrough
+            case 0xfe:
                 if (g->rawreg > 1) return false;
                 c->kind = K_GENERIC; c->acc = A_RW;
                 c->rm_byte = op == 0xfe;
@@ -824,6 +839,12 @@ static bool classify(const struct gi *g, struct cls *c) {
                 return true;
             case 0xeb: case 0xe9:
                 c->kind = K_JMP;
+                return true;
+            case 0xe8:
+                c->kind = K_CALL;
+                return true;
+            case 0xc3: case 0xc2:
+                c->kind = K_RET;
                 return true;
         }
         return false;
@@ -1166,6 +1187,88 @@ static void e_exit_chain(struct xctx *x, unsigned s, uint16_t live) {
     a->cur = SEC_MAIN;
 }
 
+// An indirect jump to the guest address in r10: the block the run loop's
+// cache has for it, looked up inline as fiber_ret_lookup does, so that each
+// jump site has a jmp of its own for the branch predictor (an interpreter's
+// dispatch is one site per opcode handler; through the shared lookup they
+// all mispredicted). Misses, pokes and the timer tick go the shared way.
+static void e_dispatch_r10(struct xctx *x) {
+    struct xasm *a = x->a;
+    unsigned l_slow = new_label(a);
+    // pending interrupt
+    e_mov_load(a, R14, XMEM(H_CPU, CPU_OFF(poked_ptr)));
+    b1(a, 0x41); b1(a, 0x80); b1(a, 0x3e); b1(a, 0x00);              // cmpb $0, (%r14)
+    e_jcc_lab(a, 5, l_slow);
+    // the run loop's timer tick (fiber_ret_lookup does the same)
+    e_mov_load(a, R14, XMEM(H_CPU, CPU_OFF(cycle)));
+    e_rex(a, true, -1, -1, R14, false); b1(a, 0xff); b1(a, modrm_b(3, 0, R14));      // inc %r14
+    e_rex(a, false, -1, -1, R14, false); b1(a, 0xf7); b1(a, modrm_b(3, 0, R14)); b4(a, 0x3ff);  // test
+    e_jcc_lab(a, 4, l_slow);                                          // jz
+    e_mov_store(a, XMEM(H_CPU, CPU_OFF(cycle)), R14);
+    // the cache valid? tlb->block_cache_gen == mmu->asbestos->invalidate_gen
+    e_mov_load(a, R14, XMEM(H_TLB, TLBREL(mmu)));
+    e_mov_load(a, R14, XMEM(R14, (int32_t) offsetof(struct mmu, asbestos)));
+    e_rm(a, false, 0x8b, R14, XMEM(R14, (int32_t) offsetof(struct asbestos, invalidate_gen)));
+    e_rm(a, false, 0x3b, R14, XMEM(H_TLB, TLBREL(block_cache_gen)));
+    e_jcc_lab(a, 5, l_slow);
+    // block = block_cache[(ip ^ (ip >> 12)) & (FIBER_CACHE_SIZE - 1)]
+    e_mov_rr(a, R14, R10);
+    e_rex(a, true, -1, -1, R14, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, R14)); b1(a, 12);  // shr $12
+    e_rr(a, true, 0x31, R10, R14);                                   // xor %r10, %r14
+    e_rex(a, false, -1, -1, R14, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R14)); b4(a, FIBER_CACHE_SIZE - 1);
+    e_mov_load(a, R14, (struct xmem) {H_TLB, R14, 3, TLBREL(block_cache)});
+    e_rr(a, true, 0x85, R14, R14);                                   // test %r14, %r14
+    e_jcc_lab(a, 4, l_slow);
+    e_rm(a, true, 0x3b, R10, XMEM(R14, (int32_t) offsetof(struct fiber_block, addr)));
+    e_jcc_lab(a, 5, l_slow);
+    // enter it the gadget way: r9 = &code[1], jmp *code[0]
+    e_lea(a, H_IP, XMEM(R14, (int32_t) offsetof(struct fiber_block, code) + 8));
+    b1(a, 0x41); b1(a, 0xff); b1(a, 0x61); b1(a, 0xf8);              // jmp *-8(%r9)
+    a->cur = SEC_COLD;
+    lbind(a, l_slow);
+    e_mov_rr(a, H_IP, R10);
+    e_jmp_abs(a, (const void *) fiber_ret_lookup);
+    a->cur = SEC_MAIN;
+}
+
+// A return to the guest address in r10, through the return cache the call
+// gadgets (and translated calls) fill: the entry points at the calling
+// block's call arguments, whose fourth word is its chainable return slot.
+static void e_ret_dispatch(struct xctx *x) {
+    struct xasm *a = x->a;
+    unsigned l_generic = new_label(a), l_unchained = new_label(a);
+    int32_t cache = (int32_t) offsetof(struct fiber_frame, ret_cache);
+    // r14 = (ip & 0xffff) >> 4
+    e_rex(a, false, R14, -1, R10, false); b1(a, 0x0f); b1(a, 0xb7); b1(a, modrm_b(3, R14, R10));  // movzwl %r10w, %r14d
+    e_rex(a, false, -1, -1, R14, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, R14)); b1(a, 4);
+    e_mov_load(a, R15, (struct xmem) {H_CPU, R14, 3, cache});
+    e_rr(a, true, 0x85, R15, R15);
+    e_jcc_lab(a, 4, l_generic);
+    // the call it returns from (the fake return address, marker bit off)?
+    e_mov_load(a, R14, XMEM(R15, 16));
+    e_rex(a, true, -1, -1, R14, false); b1(a, 0x0f); b1(a, 0xba); b1(a, modrm_b(3, 6, R14)); b1(a, 63);  // btr $63
+    e_rr(a, true, 0x39, R14, R10);                                   // cmp %r14, %r10
+    e_jcc_lab(a, 5, l_generic);
+    e_mov_load(a, H_IP, XMEM(R15, 24));                              // the return slot
+    e_rex(a, true, -1, -1, H_IP, false); b1(a, 0x0f); b1(a, 0xba); b1(a, modrm_b(3, 4, H_IP)); b1(a, 63);  // bt $63
+    e_jcc_lab(a, 2, l_unchained);                                    // jc
+    e_mov_load(a, R14, XMEM(H_CPU, CPU_OFF(poked_ptr)));
+    b1(a, 0x41); b1(a, 0x80); b1(a, 0x3e); b1(a, 0x00);              // cmpb $0, (%r14)
+    e_jcc_lab(a, 5, l_generic);
+    e_lea(a, H_IP, XMEM(H_IP, 8));
+    b1(a, 0x41); b1(a, 0xff); b1(a, 0x61); b1(a, 0xf8);              // jmp *-8(%r9)
+    a->cur = SEC_COLD;
+    // not chained yet: tell the run loop which block's slot to chain
+    lbind(a, l_unchained);
+    e_mov_load(a, R14, XMEM(R15, 8));
+    e_mov_store(a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, last_block)), R14);
+    e_mov_rr(a, H_IP, R10);
+    e_jmp_abs(a, (const void *) fiber_ret);
+    a->cur = SEC_MAIN;
+    lbind(a, l_generic);
+    e_dispatch_r10(x);
+}
+
 // The guest address of a memory operand into dst. Slot registers go through
 // r14 (base) and r15 (index). Doesn't touch the flags.
 static void e_addr(struct xctx *x, const struct gi *g, int dst, bool seg) {
@@ -1230,6 +1333,7 @@ struct body {
     const struct cls *c;
     const struct xinsn *in;
     const struct plan *p;
+    uint64_t imm;   // K_B_PUSHRET: the return address; K_B_POPRET: how far rsp moves
 };
 
 // The memory operand in the host: guest address + data_minus_addr
@@ -1318,6 +1422,13 @@ static void e_body(struct xasm *a, const struct body *bd) {
         case K_LEAVE:
             e_mov_load(a, R15, hmem(NULL));
             break;
+        case K_B_LOADT: case K_B_POPRET:
+            e_mov_load(a, R10, hmem(NULL));
+            break;
+        case K_B_PUSHRET:
+            e_movabs(a, R15, bd->imm);
+            e_mov_store(a, hmem(NULL), R15);
+            break;
     }
 }
 
@@ -1337,6 +1448,12 @@ static void e_after(struct xasm *a, const struct body *bd) {
         case K_LEAVE:
             e_lea(a, R8, XMEM(RBP, 8));
             e_mov_rr(a, RBP, R15);
+            break;
+        case K_B_PUSHRET:
+            e_lea(a, R8, XMEM(R8, -8));
+            break;
+        case K_B_POPRET:
+            e_lea(a, R8, XMEM(R8, (int32_t) bd->imm));
             break;
     }
 }
@@ -1408,31 +1525,16 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
     e_jmp_lab(a, l_back);
 
+    // Crossing a page: rare, so no second copy of the body for it. The
+    // instruction runs in its gadgets instead, from its first stream slot
+    // (the gadgets handle crossing pages), and the block goes on there.
     lbind(a, l_cross);
-    if (sync) {
-        e_restore_flags(a);
-        e_sync_flags(a, sync);
-    }
-    // movl $size, %r14d
-    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, size);
-    b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
-    e_call_abs(a, (const void *) crosspage_load);
-    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
     if (keep)
         e_restore_flags(a);
-    if (load_flags)
-        e_call_abs(a, load_flags_stub);
-    e_body(a, bd);
-    if (write) {
-        e_lea(a, RSP, XMEM(RSP, -8));
-        b1(a, 0x9c);  // pushfq
-        b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, size);
-        b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
-        e_call_abs(a, (const void *) crosspage_store);
-        b1(a, 0x9d);  // popfq
-        e_lea(a, RSP, XMEM(RSP, 8));
-    }
-    e_jmp_lab(a, l_after);
+    e_sync_flags(a, sync);
+    e_note_block(x);
+    e_movabs(a, H_IP, slot_addr(x, bd->in->s0 + 1));
+    e_jmp_abs(a, (const void *) x->code[bd->in->s0]);
     // the faulting instruction's address, where the fault path reads it
     while (xpos(a) & 7)
         b1(a, 0xcc);
@@ -1803,6 +1905,59 @@ static void xlat_note_thread(void) {
 }
 static bool xlat_on;
 
+// call / call through r/m / jmp through r/m / ret. The successor is unknown
+// (or a whole function away): every dirty flag goes to the lazy state first.
+static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct xi *xi) {
+    struct xasm *a = x->a;
+    const struct gi *g = &xi->g;
+    unsigned kind = xi->c.kind;
+    sync_dirty(x);
+    x->valid = 0;
+    struct cls bc = {0};
+    struct body bd = {g, &bc, in, NULL, 0};
+
+    if (kind == K_CALLI || kind == K_JMPI) {
+        // the target, before the call's push moves rsp
+        if (g->mod == 3) {
+            int gr = g->rm;
+            if (gr >= 8)
+                e_mov_load(a, R10, XMEM(H_CPU, slot_off(gr)));
+            else
+                e_mov_rr(a, R10, gr == 4 ? R8 : gr);
+        } else {
+            e_addr(x, g, R13, true);
+            bc.kind = K_B_LOADT;
+            e_mem_insn(x, &bd, 8, false, 0, false);
+        }
+    }
+    if (kind == K_CALL || kind == K_CALLI) {
+        e_lea(a, R13, XMEM(R8, -8));
+        bc.kind = K_B_PUSHRET;
+        bd.imm = g->next;
+        e_mem_insn(x, &bd, 8, true, 0, false);
+        // ret_cache[(return address & 0xffff) >> 4] = the call's arguments
+        e_movabs(a, R14, slot_addr(x, xi->fall));
+        e_mov_store(a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, ret_cache) +
+                                   (int32_t) (((g->next & 0xffff) >> 4) * 8)), R14);
+    }
+    switch (kind) {
+        case K_CALL:
+            e_exit_chain(x, xi->taken, F_ALL);
+            break;
+        case K_CALLI: case K_JMPI:
+            e_dispatch_r10(x);
+            break;
+        case K_RET: {
+            e_mov_rr(a, R13, R8);
+            bc.kind = K_B_POPRET;
+            bd.imm = 8 + (g->immlen == 2 ? (uint64_t) (in->bytes[g->immoff] | in->bytes[g->immoff + 1] << 8) : 0);
+            e_mem_insn(x, &bd, 8, false, 0, false);
+            e_ret_dispatch(x);
+            break;
+        }
+    }
+}
+
 static unsigned dbg_kinds = ~0u;  // ISH_XLAT_KINDS: bit per K_* translated
 static unsigned dbg_op_lo = 0, dbg_op_hi = ~0u;  // ISH_XLAT_OPS=lo:hi
 static bool dbg_nth_on;
@@ -1835,6 +1990,35 @@ static bool plan_insn(struct xctx *x, const struct xinsn *in, struct xi *xi, uns
     switch (xi->c.kind) {
         case K_GENERIC:
             return plan_generic(g, &xi->c, &xi->p);
+        case K_CALL: case K_CALLI: case K_JMPI: case K_RET: {
+            extern void gadget_call(void), gadget_call_indir(void), gadget_jmp_indir(void), gadget_ret(void);
+            if (n_left != 1)
+                return false;
+            unsigned s0 = in->s0, s1 = in->s1;
+            switch (xi->c.kind) {
+                case K_CALL:   // call, orig_ip, block, fake ret, return slot, target slot
+                    if (s1 != s0 + 6 || x->code[s0] != (uintptr_t) gadget_call)
+                        return false;
+                    xi->fall = s0 + 1;     // what the return cache points at
+                    xi->taken = s0 + 5;
+                    break;
+                case K_CALLI:  // ... call_indir, orig_ip, block, fake ret, return slot
+                    if (s1 < s0 + 5 || x->code[s1 - 5] != (uintptr_t) gadget_call_indir)
+                        return false;
+                    xi->fall = s1 - 4;
+                    break;
+                case K_JMPI:
+                    if (x->code[s1 - 1] != (uintptr_t) gadget_jmp_indir)
+                        return false;
+                    break;
+                case K_RET:    // ret, orig_ip, 8 + imm
+                    if (s1 != s0 + 3 || x->code[s0] != (uintptr_t) gadget_ret)
+                        return false;
+                    break;
+            }
+            xi->terminal = true;
+            return true;
+        }
         case K_JCC: case K_JMP: {
             if (n_left != 1)
                 return false;
@@ -2090,6 +2274,11 @@ static bool xlat_block(struct fiber_block *block) {
                 x.dirty = dirty;
             }
             e_exit_chain(&x, xi->taken, succ_live(target));
+            in_run = false;
+            continue;
+        }
+        if (c->kind == K_CALL || c->kind == K_CALLI || c->kind == K_JMPI || c->kind == K_RET) {
+            e_branch_insn(&x, in, xi);
             in_run = false;
             continue;
         }

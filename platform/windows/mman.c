@@ -329,3 +329,18 @@ int px_msync(void *addr, size_t len, int flags) {
     FlushViewOfFile(addr, len);
     return 0;
 }
+
+// ---- the JIT's regions (asbestos/guest-x86/xjit.c): no mapping table, no
+// emulation of POSIX protections, just the two VirtualAlloc steps.
+void *px_jit_reserve(void *hint, size_t len) {
+    void *p = VirtualAlloc((void *) ((uintptr_t) hint & ~(uintptr_t) 0xffff), len, MEM_RESERVE, PAGE_NOACCESS);
+    return p;
+}
+
+bool px_jit_commit(void *addr, size_t len, bool exec) {
+    return VirtualAlloc(addr, len, MEM_COMMIT, exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE) != NULL;
+}
+
+void px_jit_release(void *addr) {
+    VirtualFree(addr, 0, MEM_RELEASE);
+}
