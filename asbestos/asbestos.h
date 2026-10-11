@@ -95,6 +95,9 @@ struct fiber_block {
     uintptr_t xjit_entry;       // translation of code[0], or 0
     uint8_t *xjit_link[2];      // rel32 of the native exit through jump_ip[i], or NULL
     uintptr_t xjit_link_orig[2]; // where it points while unchained
+    void *xjit_stub;            // counting entry while it runs as gadgets, or NULL
+    uint8_t *xjit_counter;      // its count (data region)
+    uintptr_t xjit_gadget0;     // the gadget code[0] held before the stub
 #endif
 
     uintptr_t code[];

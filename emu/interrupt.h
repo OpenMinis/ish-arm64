@@ -14,5 +14,7 @@
 #define INT_TIMER 32
 #define INT_SYSCALL 0x80
 #define INT_JIT_CRASH 0x100  // JIT SIGSEGV recovery (stale TLB after CoW)
+#define INT_XJIT_PROMOTE 0x300  // x86_64 xjit: a block ran often enough to translate
+                                 // (frame->xjit_promote); the run loop does it and goes on
 #define INT_PREBUILT_RET 0x200  // nested guest call from a prebuilt-gadget spec_fn
                                  // returned to its sentinel LR (ARM64 only)

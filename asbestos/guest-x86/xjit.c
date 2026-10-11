@@ -578,6 +578,7 @@ static void arena_free(struct arena *ar, void *p) {
 static void *code_alloc(size_t size) { return arena_alloc(&code_arena, size); }
 static void code_free(void *p) { arena_free(&code_arena, p); }
 
+static void xjit_splice(struct fiber_block *block);
 #ifdef GUEST_X86_64
 #include "asbestos/guest-x86_64/xlat.c"
 #endif
@@ -665,6 +666,10 @@ void xjit_block(struct fiber_block *block) {
     block->xjit_data = NULL;
     block->xjit_entry = 0;
     block->xjit_link[0] = block->xjit_link[1] = NULL;
+#ifdef GUEST_X86_64
+    block->xjit_stub = NULL;
+    block->xjit_counter = NULL;
+#endif
     pthread_once(&init_once, xjit_init_all);
     if (!xjit_on || region == NULL)
         return;
@@ -672,7 +677,12 @@ void xjit_block(struct fiber_block *block) {
     if (xlat_block(block))
         return;
 #endif
+    xjit_splice(block);
+}
 
+// Splices the templates of the block's gadget runs together (the i386
+// guest's JIT; for x86_64, what a block the translator can't do gets).
+static void xjit_splice(struct fiber_block *block) {
     uintptr_t *code = block->code;
     size_t n = block->used;
     // Slots something else jumps into (skip targets) must start a run: only
@@ -765,6 +775,14 @@ void xjit_block(struct fiber_block *block) {
 void xjit_block_free(struct fiber_block *block) {
     if (block->xjit_code != NULL)
         code_free(block->xjit_code);
+#ifdef GUEST_X86_64
+    if (block->xjit_stub != NULL)
+        code_free(block->xjit_stub);
+    if (block->xjit_counter != NULL)
+        arena_free(&data_arena, block->xjit_counter);
+    block->xjit_stub = NULL;
+    block->xjit_counter = NULL;
+#endif
     if (block->xjit_data != NULL)
         arena_free(&data_arena, block->xjit_data);
     block->xjit_data = NULL;

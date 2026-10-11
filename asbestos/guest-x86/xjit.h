@@ -29,6 +29,10 @@ struct tlb;
 void xjit_insn_begin(struct gen_state *state);
 void xjit_insn_end(struct gen_state *state, struct tlb *tlb);
 void xjit_insns_done(struct gen_state *state);
+// INT_XJIT_PROMOTE: translate block now. tmp is the same block compiled
+// again just before (so the instruction log is fresh), skip[] its slots that
+// differ by design (jump slots, the block pointer slot).
+void xjit_promote(struct fiber_block *block, struct fiber_block *tmp, const unsigned *skip, int nskip);
 #endif
 
 // After gen_end(), before the block is published.

@@ -507,33 +507,101 @@ void px_crash_init(void) {
 #define PROF_THREADS 64
 #define PROF_SLOTS 65536
 static HANDLE prof_threads[PROF_THREADS];
+static ULONG64 prof_cycles[PROF_THREADS];  // a thread that hardly ran since the last tick is waiting: not sampled
+static uint64_t prof_idle;
 static atomic_int prof_nthreads;
 static struct { uint64_t pc, count; } prof_hist[PROF_SLOTS];
 static uint64_t prof_total, prof_dropped;
+// samples in system DLLs, by the first ish.exe frame up the stack
+static struct { uint64_t pc, count; } prof_via[PROF_SLOTS];
+static uint64_t prof_via_total, prof_via_lost;
+
+static void prof_add(void *table, uint64_t pc) {
+    struct { uint64_t pc, count; } *h = table;
+    size_t j = (pc * 0x9e3779b97f4a7c15ull) >> 48;
+    for (size_t probe = 0; probe < PROF_SLOTS; probe++, j = (j + 1) % PROF_SLOTS) {
+        if (h[j].pc == pc || h[j].count == 0) {
+            h[j].pc = pc;
+            h[j].count++;
+            return;
+        }
+    }
+    prof_dropped++;
+}
+
+// Walks up from a pc in some DLL to the first frame in ish.exe (x64 unwind
+// data; JIT code has none, which ends the walk).
+static uint64_t prof_unwind_to_image(CONTEXT *c, uintptr_t base) {
+#ifdef __x86_64__
+    for (int k = 0; k < 64; k++) {
+        uint64_t pc = c->Rip;
+        if (pc >= base && pc - base < (64u << 20))
+            return pc;
+        DWORD64 image;
+        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(pc, &image, NULL);
+        if (fe == NULL)
+            return 0;
+        void *handler_data;
+        DWORD64 frame;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, pc, fe, c, &handler_data, &frame, NULL);
+        if (c->Rip == 0)
+            return 0;
+    }
+#endif
+    (void) c; (void) base;
+    return 0;
+}
 static bool prof_on;
 static void (*prof_describe)(FILE *f, uintptr_t pc, unsigned count, uint64_t total);
 static void (*prof_finish)(void);
 
 static DWORD WINAPI prof_thread(void *param) {
     (void) param;
+    uintptr_t base = (uintptr_t) GetModuleHandleW(NULL);
     timeBeginPeriod(1);
     for (;;) {
         Sleep(1);
         int n = atomic_load(&prof_nthreads);
         for (int i = 0; i < n && i < PROF_THREADS; i++) {
             HANDLE t = prof_threads[i];
-            if (t == NULL || SuspendThread(t) == (DWORD) -1)
+            if (t == NULL)
                 continue;
-            CONTEXT c = {.ContextFlags = CONTEXT_CONTROL};
+            ULONG64 cyc = 0;
+            // a waiting thread that wakes up now and then still uses a few
+            // cycles: count it only if it ran for a good part of the tick
+            if (QueryThreadCycleTime(t, &cyc) && cyc - prof_cycles[i] < 1000000) {
+                prof_cycles[i] = cyc;
+                prof_idle++;
+                continue;
+            }
+            prof_cycles[i] = cyc;
+            if (SuspendThread(t) == (DWORD) -1)
+                continue;
+            CONTEXT c = {.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER};
             BOOL ok = GetThreadContext(t, &c);
-            ResumeThread(t);
-            if (!ok)
+            if (!ok) {
+                ResumeThread(t);
                 continue;
+            }
 #ifdef __x86_64__
             uint64_t pc = c.Rip;
 #else
             uint64_t pc = c.Pc;
 #endif
+            // in a DLL (not ish.exe, not JIT code: those have no module)?
+            HMODULE mod = NULL;
+            if ((pc < base || pc - base >= (64u << 20)) &&
+                    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR) pc, &mod)) {
+                CONTEXT u = c;
+                uint64_t via = prof_unwind_to_image(&u, base);
+                prof_via_total++;
+                if (via != 0)
+                    prof_add(prof_via, via);
+                else
+                    prof_via_lost++;
+            }
+            ResumeThread(t);
             prof_total++;
             size_t j = (pc * 0x9e3779b97f4a7c15ull) >> 48;
             for (size_t probe = 0;; j = (j + 1) % PROF_SLOTS) {
@@ -559,7 +627,7 @@ void px_prof_register(void) {
     if (i >= PROF_THREADS)
         return;
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &prof_threads[i],
-            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, 0);
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0);
 }
 
 void px_prof_hooks(void (*describe)(FILE *f, uintptr_t pc, unsigned count, uint64_t total),
@@ -583,8 +651,9 @@ void px_prof_dump(void) {
     if (f == NULL)
         f = stderr;
     uintptr_t base = (uintptr_t) GetModuleHandleW(NULL);
-    fprintf(f, "[prof] %llu samples (%llu dropped), ish.exe at %p\n",
-            (unsigned long long) prof_total, (unsigned long long) prof_dropped, (void *) base);
+    fprintf(f, "[prof] %llu samples (%llu dropped, %llu idle skipped), ish.exe at %p\n",
+            (unsigned long long) prof_total, (unsigned long long) prof_dropped,
+            (unsigned long long) prof_idle, (void *) base);
     for (int rank = 0; rank < 3000; rank++) {
         size_t best = 0;
         for (size_t j = 0; j < PROF_SLOTS; j++)
@@ -597,11 +666,36 @@ void px_prof_dump(void) {
         if (pc >= base && pc - base < (64u << 20))
             fprintf(f, "%6u %5.2f%% ish.exe+%#llx\n", count, 100.0 * count / prof_total,
                     (unsigned long long) (pc - base));
-        else if (prof_describe != NULL)
-            prof_describe(f, pc, count, prof_total);
-        else
-            fprintf(f, "%6u %5.2f%% %p\n", count, 100.0 * count / prof_total, (void *) pc);
+        else {
+            HMODULE m = NULL;
+            bool in_dll = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR) (uintptr_t) pc, &m);
+            if (!in_dll && prof_describe != NULL) {
+                prof_describe(f, pc, count, prof_total);
+                prof_hist[best].count = 0;
+                continue;
+            }
+            wchar_t name[MAX_PATH] = L"?";
+            if (in_dll)
+                GetModuleFileNameW(m, name, MAX_PATH);
+            const wchar_t *bn = wcsrchr(name, L'\\');
+            fprintf(f, "%6u %5.2f%% DLL %ls+%#llx\n", count, 100.0 * count / prof_total,
+                    bn ? bn + 1 : name, (unsigned long long) (pc - (uintptr_t) m));
+        }
         prof_hist[best].count = 0;
+    }
+    fprintf(f, "VIA %llu samples in DLLs (%llu not traced back to ish.exe), by caller:\n",
+            (unsigned long long) prof_via_total, (unsigned long long) prof_via_lost);
+    for (int rank = 0; rank < 200; rank++) {
+        size_t best = 0;
+        for (size_t j = 0; j < PROF_SLOTS; j++)
+            if (prof_via[j].count > prof_via[best].count)
+                best = j;
+        if (prof_via[best].count == 0)
+            break;
+        fprintf(f, "%6u %5.2f%% via ish.exe+%#llx\n", (unsigned) prof_via[best].count,
+                100.0 * prof_via[best].count / prof_total, (unsigned long long) (prof_via[best].pc - base));
+        prof_via[best].count = 0;
     }
     if (f != stderr)
         fclose(f);

@@ -16,4 +16,5 @@ struct fiber_frame {
     // can be mapped back to the faulting guest instruction.
     uint64_t fault_stream;
     intptr_t ret_cache[FIBER_RETURN_CACHE_SIZE]; // a map of ip to pointer-to-call-gadget-arguments
+    struct fiber_block *xjit_promote; // the block INT_XJIT_PROMOTE is about
 };

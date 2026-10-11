@@ -564,6 +564,49 @@ static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr) 
     return NULL;
 }
 
+#if defined(ISH_XJIT) && defined(GUEST_X86_64)
+// INT_XJIT_PROMOTE: compile block's code once more, the way
+// fiber_block_compile() did, for the instruction log; then translate.
+static void fiber_block_promote(struct fiber_block *block, struct tlb *tlb) {
+    struct gen_state state;
+    if (!gen_start(block->addr, &state))
+        return;
+    while (true) {
+        xjit_insn_begin(&state);
+        bool more = gen_step(&state, tlb);
+        xjit_insn_end(&state, tlb);
+        if (!more || state.oom)
+            break;
+        if (state.ip - block->addr >= PAGE_SIZE - 15) {
+            gen_exit(&state);
+            break;
+        }
+    }
+    if (!state.oom) {
+        xjit_insns_done(&state);
+        unsigned skip[3];
+        int nskip = 0;
+        for (int i = 0; i <= 1; i++)
+            if (state.jump_ip[i] != 0)
+                skip[nskip++] = state.jump_ip[i];
+        if (state.block_patch_ip != 0)
+            skip[nskip++] = state.block_patch_ip;
+        xjit_promote(block, state.block, skip, nskip);
+        // blocks chained to it while it had no translation: link them to it now
+        if (block->xjit_entry != 0) {
+            for (int i = 0; i <= 1; i++) {
+                struct fiber_block *prev;
+                list_for_each_entry(&block->jumps_from[i], prev, jumps_from_links[i]) {
+                    if (prev->jump_ip[i] != NULL && *prev->jump_ip[i] == (uintptr_t) block->code)
+                        xjit_link(prev, i, block);
+                }
+            }
+        }
+    }
+    free(state.block);
+}
+#endif
+
 static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     ISH_SIGNPOST_SCOPE_BEGIN(jit, "block_compile", _bc_spid);
     struct gen_state state;
@@ -1133,6 +1176,17 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
 #endif
         interrupt = fiber_enter(block, frame, tlb);
         in_jit = 0;
+#if defined(ISH_XJIT) && defined(GUEST_X86_64)
+        if (interrupt == INT_XJIT_PROMOTE) {
+            struct fiber_block *hot = frame->xjit_promote;
+            frame->xjit_promote = NULL;
+            lock(&asbestos->lock);
+            if (hot != NULL && !hot->is_jetsam)
+                fiber_block_promote(hot, tlb);
+            unlock(&asbestos->lock);
+            interrupt = INT_NONE;
+        }
+#endif
 #ifdef GUEST_ARM64
         frame->cpu.segfault_precise_pc = 0;
         if (interrupt == INT_GPF)

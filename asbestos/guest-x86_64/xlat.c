@@ -25,6 +25,7 @@
 #include "emu/cpu.h"
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
+#include "emu/interrupt.h"
 
 #if defined(__x86_64__)
 #include <cpuid.h>
@@ -336,6 +337,7 @@ extern void crosspage_store(void) __asm__("crosspage_store");
 extern void fiber_ret_chain(void) __asm__("fiber_ret_chain");
 extern void fiber_ret_lookup(void) __asm__("fiber_ret_lookup");
 extern void fiber_ret(void) __asm__("fiber_ret");
+extern void fiber_exit(void) __asm__("fiber_exit");
 
 #define CPU_OFF(f) ((int32_t) offsetof(struct cpu_state, f))
 #define TLBREL(f) ((int32_t) offsetof(struct tlb, f) - (int32_t) offsetof(struct tlb, entries))
@@ -1121,7 +1123,9 @@ static bool plan_generic(const struct gi *g, const struct cls *c, struct plan *p
 struct xctx {
     struct xasm *a;
     struct fiber_block *block;
-    uintptr_t *code;
+    uintptr_t *code;          // the block's stream: what the translation points into
+    const uintptr_t *plan;    // the stream as gen made it: what it reads (the same,
+                              // but for a promotion, see xjit_promote())
     uint16_t valid, dirty;  // flags valid in the host's eflags / not yet in the lazy state
     // the patchable jumps of the block's exits: their stream slot, and where
     // the rel32 is in the main section
@@ -1534,7 +1538,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     e_sync_flags(a, sync);
     e_note_block(x);
     e_movabs(a, H_IP, slot_addr(x, bd->in->s0 + 1));
-    e_jmp_abs(a, (const void *) x->code[bd->in->s0]);
+    e_jmp_abs(a, (const void *) x->plan[bd->in->s0]);
     // the faulting instruction's address, where the fault path reads it
     while (xpos(a) & 7)
         b1(a, 0xcc);
@@ -1721,7 +1725,7 @@ static void e_tpl_range(struct xctx *x, unsigned s0, unsigned s1) {
     e_movabs(x->a, H_IP, slot_addr(x, s0 + 1));
     unsigned s = s0;
     while (s < s1) {
-        const struct tpl *t = tpl_lookup(x->code[s]);
+        const struct tpl *t = tpl_lookup(x->plan[s]);
         e_template(x->a, t);
         if (t->pop < 0)
             break;
@@ -1732,6 +1736,8 @@ static void e_tpl_range(struct xctx *x, unsigned s0, unsigned s1) {
 // ---------------------------------------------------------------- stats
 
 static _Atomic uint64_t st_native, st_tpl, st_stream;
+static _Atomic uint64_t st_promote_ok, st_promote_differs, st_promote_failed, st_counted;
+
 static _Atomic uint32_t st_fallback_op[3 * 256];
 
 static void count_fallback(const struct xinsn *in, const struct gi *g, bool decoded) {
@@ -1747,6 +1753,9 @@ static void count_fallback(const struct xinsn *in, const struct gi *g, bool deco
 }
 
 static void xlat_dump_stats(FILE *out) {
+    fprintf(out, "[xlat] tiers: counted=%llu promoted=%llu differs=%llu failed=%llu\n",
+            (unsigned long long) st_counted, (unsigned long long) st_promote_ok,
+            (unsigned long long) st_promote_differs, (unsigned long long) st_promote_failed);
     fprintf(out, "[xlat] insns native=%llu template=%llu stream=%llu\n",
             (unsigned long long) st_native, (unsigned long long) st_tpl,
             (unsigned long long) st_stream);
@@ -1997,22 +2006,22 @@ static bool plan_insn(struct xctx *x, const struct xinsn *in, struct xi *xi, uns
             unsigned s0 = in->s0, s1 = in->s1;
             switch (xi->c.kind) {
                 case K_CALL:   // call, orig_ip, block, fake ret, return slot, target slot
-                    if (s1 != s0 + 6 || x->code[s0] != (uintptr_t) gadget_call)
+                    if (s1 != s0 + 6 || x->plan[s0] != (uintptr_t) gadget_call)
                         return false;
                     xi->fall = s0 + 1;     // what the return cache points at
                     xi->taken = s0 + 5;
                     break;
                 case K_CALLI:  // ... call_indir, orig_ip, block, fake ret, return slot
-                    if (s1 < s0 + 5 || x->code[s1 - 5] != (uintptr_t) gadget_call_indir)
+                    if (s1 < s0 + 5 || x->plan[s1 - 5] != (uintptr_t) gadget_call_indir)
                         return false;
                     xi->fall = s1 - 4;
                     break;
                 case K_JMPI:
-                    if (x->code[s1 - 1] != (uintptr_t) gadget_jmp_indir)
+                    if (x->plan[s1 - 1] != (uintptr_t) gadget_jmp_indir)
                         return false;
                     break;
                 case K_RET:    // ret, orig_ip, 8 + imm
-                    if (s1 != s0 + 3 || x->code[s0] != (uintptr_t) gadget_ret)
+                    if (s1 != s0 + 3 || x->plan[s0] != (uintptr_t) gadget_ret)
                         return false;
                     break;
             }
@@ -2033,16 +2042,16 @@ static bool plan_insn(struct xctx *x, const struct xinsn *in, struct xi *xi, uns
             uint64_t target = (g->next + (uint64_t) rel) | (1ull << 63);
             unsigned s0 = in->s0;
             if (xi->c.kind == K_JMP) {
-                if (in->s1 != s0 + 2 || x->code[s0 + 1] != target)
+                if (in->s1 != s0 + 2 || x->plan[s0 + 1] != target)
                     return false;
                 xi->taken = s0 + 1;
             } else {
                 if (in->s1 != s0 + 3)
                     return false;
-                if (x->code[s0 + 1] == target) {
+                if (x->plan[s0 + 1] == target) {
                     xi->taken = s0 + 1;
                     xi->fall = s0 + 2;
-                } else if (x->code[s0 + 2] == target) {
+                } else if (x->plan[s0 + 2] == target) {
                     xi->taken = s0 + 2;
                     xi->fall = s0 + 1;
                 } else {
@@ -2139,7 +2148,7 @@ fail:
 
 // Translates the block the instruction log describes. False: leave it to
 // the template splicer.
-static bool xlat_block(struct fiber_block *block) {
+static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
     if (!xlat_on || !xlog_ok || xlog_n == 0 || xlog[0].s0 != 0 || block->addr != xlog[0].ip)
         return false;
 
@@ -2156,7 +2165,7 @@ static bool xlat_block(struct fiber_block *block) {
     struct xasm *a = &xa_tls;
     if (!xa_init(a))
         return false;
-    struct xctx x = {.a = a, .block = block, .code = block->code};
+    struct xctx x = {.a = a, .block = block, .code = block->code, .plan = plan};
 
     // the stream past the last instruction (gen_exit()), as one more
     struct xinsn tail = {.ip = 0, .s0 = xlog[n - 1].s1, .s1 = xlog_size, .bad = true};
@@ -2177,7 +2186,7 @@ static bool xlat_block(struct fiber_block *block) {
             continue;
         }
         bool term;
-        if (tpl_range(block->code, in->s0, in->s1, &term)) {
+        if (tpl_range(plan, in->s0, in->s1, &term)) {
             xi->mode = M_TPL;
             xi->terminal = term;
         } else {
@@ -2265,11 +2274,11 @@ static bool xlat_block(struct fiber_block *block) {
                 x.valid = F_ALL;
             }
             uint16_t dirty = x.dirty;
-            uint64_t target = (x.code[xi->taken] & ~(1ull << 63));
+            uint64_t target = (x.plan[xi->taken] & ~(1ull << 63));
             if (c->kind == K_JCC) {
                 unsigned l_taken = new_label(a);
                 e_jcc_lab(a, c->cc, l_taken);
-                e_exit_chain(&x, xi->fall, succ_live(x.code[xi->fall] & ~(1ull << 63)));
+                e_exit_chain(&x, xi->fall, succ_live(x.plan[xi->fall] & ~(1ull << 63)));
                 lbind(a, l_taken);
                 x.dirty = dirty;
             }
@@ -2301,6 +2310,119 @@ static bool xlat_block(struct fiber_block *block) {
     return xlat_finish(&x, block, entry_slot, entry_off, nentries);
 }
 
+// ---------------------------------------------------------------- tiers
+
+// Most blocks of a starting process run once or a few times: translating
+// them costs more than running their gadgets. So a new block first runs as
+// gadgets behind a counting entry; after xlat_hot runs it asks the run loop
+// (INT_XJIT_PROMOTE) to translate it. ISH_XLAT_HOT=1 translates at once.
+static unsigned xlat_hot = 4;
+
+static int32_t rel_to(const uint8_t *field_end, const void *target) {
+    return (int32_t) ((intptr_t) target - (intptr_t) field_end);
+}
+
+static bool xlat_install_counter(struct fiber_block *block) {
+    uint8_t *stub = code_alloc(64);
+    uint8_t *counter = arena_alloc(&data_arena, 8);
+    if (stub == NULL || counter == NULL) {
+        if (stub) code_free(stub);
+        if (counter) arena_free(&data_arena, counter);
+        return false;
+    }
+    *counter = (uint8_t) (xlat_hot > 255 ? 255 : xlat_hot);
+    uintptr_t gadget0 = block->code[0];
+    uint8_t *p = stub;
+    int32_t r;
+    // decb counter(%rip); jz promote; jmp gadget0
+    *p++ = 0xfe; *p++ = 0x0d; r = rel_to(p + 4, counter); memcpy(p, &r, 4); p += 4;
+    *p++ = 0x0f; *p++ = 0x84; uint8_t *jz = p; p += 4;
+    *p++ = 0xe9; r = rel_to(p + 4, (const void *) gadget0); memcpy(p, &r, 4); p += 4;
+    r = rel_to(jz + 4, p); memcpy(jz, &r, 4);
+    // promote: frame->xjit_promote = block; _ip = its address; leave with INT_XJIT_PROMOTE
+    *p++ = 0x49; *p++ = 0xba; uint64_t v = (uint64_t) (uintptr_t) block; memcpy(p, &v, 8); p += 8;   // movabs $block, %r10
+    int32_t off = (int32_t) offsetof(struct fiber_frame, xjit_promote);
+    *p++ = 0x4d; *p++ = 0x89; *p++ = 0x93; memcpy(p, &off, 4); p += 4;                                // mov %r10, off(%r11)
+    *p++ = 0x49; *p++ = 0xb9; v = block->addr; memcpy(p, &v, 8); p += 8;                                 // movabs $addr, %r9
+    *p++ = 0x41; *p++ = 0xba; uint32_t code = INT_XJIT_PROMOTE; memcpy(p, &code, 4); p += 4;           // movl $INT, %r10d
+    *p++ = 0xe9; r = rel_to(p + 4, (const void *) fiber_exit); memcpy(p, &r, 4); p += 4;
+    block->xjit_stub = stub;
+    block->xjit_counter = counter;
+    block->xjit_gadget0 = gadget0;
+    block->code[0] = (uintptr_t) stub;
+    return true;
+}
+
+static bool xlat_block(struct fiber_block *block) {
+    if (xlat_hot <= 1)
+        return xlat_translate(block, block->code);
+    if (!xlat_on || !xlog_ok || xlog_n == 0)
+        return false;
+    // nothing to translate in a block whose start can't be: leave it be
+    if (xlog[0].bad)
+        return xlat_translate(block, block->code);
+    if (!xlat_install_counter(block))
+        return xlat_translate(block, block->code);
+    if (stats_on)
+        atomic_fetch_add_explicit(&st_counted, 1, memory_order_relaxed);
+    return true;
+}
+
+void xjit_promote(struct fiber_block *block, struct fiber_block *tmp, const unsigned *skip, int nskip) {
+    if (block->xjit_stub == NULL || block->code[0] != (uintptr_t) block->xjit_stub)
+        return;
+    // the counter stays at 0 from here: the stub won't ask twice
+    bool same = xlog_ok && xlog_n > 0 && xlog[0].s0 == 0;
+    unsigned n = xlog_size;
+    for (unsigned i = 1; same && i < n; i++) {
+        bool skipped = false;
+        for (int k = 0; k < nskip; k++)
+            skipped |= skip[k] == i;
+        if (!skipped && tmp->code[i] != block->code[i])
+            same = false;
+    }
+    if (same && tmp->code[0] != block->xjit_gadget0)
+        same = false;
+    if (!same && stats_on) {
+        atomic_fetch_add_explicit(&st_promote_differs, 1, memory_order_relaxed);
+        if (getenv("ISH_XLAT_PROMOTE_LOG")) {
+            for (unsigned i = 0; i < n; i++)
+                if (tmp->code[i] != block->code[i])
+                    fprintf(stderr, "[promote] %llx slot %u: %llx vs %llx\n", (unsigned long long) block->addr, i,
+                            (unsigned long long) tmp->code[i], (unsigned long long) block->code[i]);
+        }
+    }
+    if (same) {
+        block->code[0] = block->xjit_gadget0;
+        bool ok = xlat_translate(block, tmp->code) && block->xjit_code != NULL;
+        if (stats_on)
+            atomic_fetch_add_explicit(ok ? &st_promote_ok : &st_promote_failed, 1, memory_order_relaxed);
+        if (!ok) {
+            // what a block the translator can't do gets at once
+            block->code[0] = block->xjit_gadget0;
+            if (block->xjit_code == NULL)
+                xjit_splice(block);
+        } else if (block->code[0] == block->xjit_gadget0) {
+            // slot 0 not translated: the gadget again
+            block->code[0] = block->xjit_gadget0;
+        }
+        if (ok) {
+            // jumps chained while it ran as gadgets: link them natively too
+            for (int i = 0; i <= 1; i++) {
+                if (block->jump_ip[i] == NULL || (*block->jump_ip[i] >> 63))
+                    continue;
+                if (*block->jump_ip[i] == block->old_jump_ip[i])
+                    continue;
+                struct fiber_block *to = (struct fiber_block *)
+                    (*block->jump_ip[i] - offsetof(struct fiber_block, code));
+                xjit_link(block, i, to);
+            }
+        }
+        return;
+    }
+    block->code[0] = block->xjit_gadget0;
+}
+
 static void xlat_init(void) {
     const char *e = getenv("ISH_XLAT");
     xlat_on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
@@ -2330,6 +2452,8 @@ static void xlat_init(void) {
     }
     if ((e = getenv("ISH_XLAT_KINDS")) != NULL)
         dbg_kinds = (unsigned) strtoul(e, NULL, 0);
+    if ((e = getenv("ISH_XLAT_HOT")) != NULL)
+        xlat_hot = (unsigned) strtoul(e, NULL, 0);
     e = getenv("ISH_XLAT_BMI2");
     if (e && e[0] == '0')
         have_bmi2 = false;
