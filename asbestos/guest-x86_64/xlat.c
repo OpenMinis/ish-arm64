@@ -1040,6 +1040,8 @@ static void shift_flags(const struct gi *g, const struct xinsn *x, struct cls *c
 // exit to there has to leave in the lazy state. Interrupts in between are
 // fine: the rest a signal handler sees is about to be overwritten anyway.
 static bool dbg_nosucc;
+static bool dbg_allpoke;   // ISH_XLAT_ALLPOKE: check for interrupts at every exit
+static bool dbg_nogroup;   // ISH_XLAT_NOGROUP: check every memory access on its own
 // Guest bytes outside the block a translation depended on (what succ_live()
 // read): a cached translation is only valid while they are the same.
 #define XDEPS_MAX 32
@@ -1218,17 +1220,27 @@ static void e_exit_slot(struct xctx *x, unsigned s) {
 // Leaves the block for the target in stream slot s, live: the flags the
 // target may read. A jmp chaining can point straight at the target's
 // translation (xjit_link()); until then it goes the way of e_exit_slot().
-static void e_exit_chain(struct xctx *x, unsigned s, uint16_t live) {
+// poke: check for a pending interrupt first. Every loop of chained blocks
+// has an edge back to an address no higher, or an indirect jump or a ret
+// (which check), so the forward edges needn't: the code between two checks
+// is finite.
+static void e_exit_chain(struct xctx *x, unsigned s, uint16_t live, bool poke) {
     struct xasm *a = x->a;
     e_sync_flags(a, x->dirty & live);
     unsigned l_stub = new_label(a);
     // an interrupt pending: leave through the gadgets, which see to it
-    e_mov_load(a, R14, XMEM(H_CPU, CPU_OFF(poked_ptr)));
-    b1(a, 0x41); b1(a, 0x80); b1(a, 0x3e); b1(a, 0x00);  // cmpb $0, (%r14)
-    e_jcc_lab(a, 5, l_stub);
-    // the rel32 aligned, so that patching it is one atomic store
-    while ((xpos(a) + 1) & 3)
-        b1(a, 0x90);
+    if (poke) {
+        e_mov_load(a, R14, XMEM(H_CPU, CPU_OFF(poked_ptr)));
+        b1(a, 0x41); b1(a, 0x80); b1(a, 0x3e); b1(a, 0x00);  // cmpb $0, (%r14)
+        e_jcc_lab(a, 5, l_stub);
+    }
+    // the rel32 aligned, so that patching it is one atomic store; the
+    // padding one nop (it runs every time)
+    switch (3 - ((xpos(a) + 4) & 3)) {
+        case 1: b1(a, 0x90); break;
+        case 2: b1(a, 0x66); b1(a, 0x90); break;
+        case 3: b1(a, 0x0f); b1(a, 0x1f); b1(a, 0x00); break;
+    }
     b1(a, 0xe9);
     if (x->nlinks < 2)
         x->links[x->nlinks++] = (typeof(x->links[0])) {s, xpos(a)};
@@ -1524,25 +1536,84 @@ static void e_after(struct xasm *a, const struct body *bd) {
 // page (and the TLB isn't stale): the check is a subtraction and a compare,
 // not a lookup, and the access waits only for its address. Otherwise the
 // TLB is looked up the usual way and the site learns the page.
+// A group (struct mgrp): accesses of a run with the same base and index,
+// which no instruction between them changes, all on one page. The first
+// one (lead) checks [r13 + lo, r13 + hi) and needs the page writable if any
+// of them writes; the others only load its data_minus_addr. If its page
+// can't be had for the whole range, the lead runs in its gadgets, and the
+// block goes on there.
+struct mgrp {
+    int lo, hi;      // lead: the range, from its own address
+    bool write;      // lead: some access writes
+    unsigned site;   // set by the lead's e_mem_insn()
+};
+
+static unsigned new_site(void) {
+    static _Atomic unsigned next_site;
+    return atomic_fetch_add_explicit(&next_site, 1, memory_order_relaxed) %
+           array_size(((struct tlb *) 0)->xsite);
+}
+#define SITE_PAGE(n) XMEM(H_TLB, TLBREL(xsite) + (int32_t) (n) * 16)
+#define SITE_DMA(n) XMEM(H_TLB, TLBREL(xsite) + (int32_t) (n) * 16 + 8)
+
+// TLB lookup for [r13 + lo, r13 + hi), on one page: on a hit r9 = its
+// data_minus_addr and the site learns the page; else to l_miss.
+static void e_range_lookup(struct xasm *a, int lo, int hi, bool write, struct xmem site_page,
+                           struct xmem site_dma, unsigned l_miss) {
+    int32_t ent = write ? TLBENT(page_if_writable) : TLBENT(page);
+    e_tlb_index(a);
+    // the page of the range's first byte, when it isn't r13's
+    if (lo < 0) {
+        e_lea(a, R15, XMEM(R13, lo));
+        e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, (uint32_t) -4096);
+        e_rm(a, true, 0x3b, R15, (struct xmem) {H_TLB, R14, 0, ent});
+        e_jcc_lab(a, 5, l_miss);  // jne
+    }
+    // the page of its last byte, so that crossing a page misses
+    e_lea(a, R15, XMEM(R13, hi - 1));
+    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, (uint32_t) -4096);
+    e_rm(a, true, 0x0b, R15, XMEM(H_TLB, TLBREL(stale)));
+    e_rm(a, true, 0x3b, R15, (struct xmem) {H_TLB, R14, 0, ent});
+    e_jcc_lab(a, 5, l_miss);  // jne
+    // a hit: r15 is the page; the site learns it
+    e_mov_load(a, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
+    e_mov_store(a, site_page, R15);
+    e_mov_store(a, site_dma, R9);
+}
+
+// A group's access after the lead's: the lead checked its page.
+static void e_mem_member(struct xctx *x, const struct body *bd, const struct mgrp *mg, bool load_flags) {
+    struct xasm *a = x->a;
+    e_mov_load(a, R9, SITE_DMA(mg->site));
+    if (load_flags)
+        e_call_abs(a, load_flags_stub);
+    e_body(a, bd);
+    e_after(a, bd);
+}
+
 static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, bool write,
-                       uint16_t keep, bool load_flags) {
+                       uint16_t keep, bool load_flags, struct mgrp *mg) {
     struct xasm *a = x->a;
     unsigned l_miss = new_label(a), l_back = new_label(a), l_cross = new_label(a),
              l_after = new_label(a), l_orig = new_label(a), l_lookup = new_label(a);
     uint16_t sync = keep & x->dirty;
+    int lo = mg ? mg->lo : 0, hi = mg ? mg->hi : (int) size;
+    bool gwrite = mg ? mg->write : write;
 
     if (keep)
         e_save_flags(a);
-    static _Atomic unsigned next_site;
-    unsigned n = atomic_fetch_add_explicit(&next_site, 1, memory_order_relaxed) %
-                 array_size(((struct tlb *) 0)->xsite);
-    struct xmem site_page = XMEM(H_TLB, TLBREL(xsite) + (int32_t) n * 16);
-    struct xmem site_dma = XMEM(H_TLB, TLBREL(xsite) + (int32_t) n * 16 + 8);
-    // mov %r13, %r15; sub page, %r15; or stale, %r15; cmp $(4096 - size), %r15; ja lookup
-    e_rr(a, true, 0x89, R13, R15);
+    unsigned n = new_site();
+    if (mg)
+        mg->site = n;
+    struct xmem site_page = SITE_PAGE(n), site_dma = SITE_DMA(n);
+    // mov %r13, %r15 (lea lo(%r13)); sub page, %r15; or stale, %r15; cmp $(4096 - size), %r15; ja lookup
+    if (lo == 0)
+        e_rr(a, true, 0x89, R13, R15);
+    else
+        e_lea(a, R15, XMEM(R13, lo));
     e_rm(a, true, 0x2b, R15, site_page);
     e_rm(a, true, 0x0b, R15, XMEM(H_TLB, TLBREL(stale)));
-    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 7, R15)); b4(a, 4096 - size);
+    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 7, R15)); b4(a, (uint32_t) (4096 - (hi - lo)));
     e_jcc_lab(a, 7, l_lookup);  // ja
     e_mov_load(a, R9, site_dma);
     lbind(a, l_back);
@@ -1557,25 +1628,15 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     // slow paths
     a->cur = SEC_COLD;
     lbind(a, l_lookup);
-    e_tlb_index(a);
-    // the page of the operand's last byte, so that crossing a page misses
-    e_lea(a, R15, XMEM(R13, (int32_t) size - 1));
-    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, (uint32_t) -4096);
-    e_rm(a, true, 0x0b, R15, XMEM(H_TLB, TLBREL(stale)));
-    e_rm(a, true, 0x3b, R15, (struct xmem) {H_TLB, R14, 0,
-         write ? TLBENT(page_if_writable) : TLBENT(page)});
-    e_jcc_lab(a, 5, l_miss);  // jne
-    // a hit: r15 is the operand's page; the site learns it
-    e_mov_load(a, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
-    e_mov_store(a, site_page, R15);
-    e_mov_store(a, site_dma, R9);
+    e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_miss);
     e_jmp_lab(a, l_back);
 
     lbind(a, l_miss);
-    // mov %r13d, %r15d; and $0xfff, %r15d; cmp $(0x1000 - size), %r15d; ja cross
-    e_rr(a, false, 0x89, R13, R15);
-    e_rex(a, false, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, 0xfff);
-    e_rex(a, false, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 7, R15)); b4(a, 0x1000 - size);
+    // lea lo(%r13), %r14; lea hi-1(%r13), %r15; xor %r14, %r15; cmp $0xfff, %r15; ja cross
+    e_lea(a, R14, XMEM(R13, lo));
+    e_lea(a, R15, XMEM(R13, hi - 1));
+    e_rr(a, true, 0x31, R14, R15);
+    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 7, R15)); b4(a, 0xfff);
     e_jcc_lab(a, 7, l_cross);  // ja
     if (sync) {
         e_restore_flags(a);
@@ -1584,9 +1645,17 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     // lea orig(%rip), %r9
     b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
     e_call_abs(a, write ? (const void *) handle_write_miss : (const void *) handle_read_miss);
-    // r13 is the host address now
-    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
-    e_jmp_lab(a, l_back);
+    if (mg == NULL) {
+        // r13 is the host address now
+        b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
+        e_jmp_lab(a, l_back);
+    } else {
+        // The others need the page too: the address again, and the TLB
+        // has its page now, if the page is enough for all of them.
+        e_addr(x, bd->g, R13, true);
+        e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_cross);
+        e_jmp_lab(a, l_back);
+    }
 
     // Crossing a page: rare, so no second copy of the body for it. The
     // instruction runs in its gadgets instead, from its first stream slot
@@ -1609,9 +1678,11 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
 // ---------------------------------------------------------------- insns
 
 // Emits one translated instruction; live: flags live after it, inb: those
-// of them the block's own native instructions read.
+// of them the block's own native instructions read. mg: its memory access
+// leads a group (member: or is one of the others).
 static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
-                     const struct cls *c, const struct plan *p, uint16_t live, uint16_t inb) {
+                     const struct cls *c, const struct plan *p, uint16_t live, uint16_t inb,
+                     struct mgrp *mg, bool member) {
     struct xasm *a = x->a;
     struct body bd = {g, c, in, c->kind == K_GENERIC ? p : NULL};
     uint16_t live_in = c->fr | (live & ~c->fw);
@@ -1626,7 +1697,7 @@ static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
     bool has_mem = (c->kind == K_GENERIC && p->mem) || c->kind == K_PUSH || c->kind == K_PUSHI ||
                    c->kind == K_POP || c->kind == K_LEAVE;
     uint16_t held = x->valid & live_in;
-    if (has_mem && !load_flags && held != 0 && (held & (c->fr | (inb & ~c->fw))) == 0) {
+    if (has_mem && !member && !load_flags && held != 0 && (held & (c->fr | (inb & ~c->fw))) == 0) {
         // Live only for where the block leaves: write them to the lazy state
         // now (leaving would) rather than keep them across this access and
         // the ones after it. Before the address, which may use r14/r15.
@@ -1660,9 +1731,14 @@ static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
             break;
     }
 
-    if (mem) {
+    if (mem && member) {
+        // no check, so nothing to keep the flags from
+        e_mem_member(x, &bd, mg, load_flags);
+        if (load_flags)
+            x->valid = F_ALL;
+    } else if (mem) {
         uint16_t keep = load_flags ? 0 : (x->valid & live_in);
-        e_mem_insn(x, &bd, size, write, keep, load_flags);
+        e_mem_insn(x, &bd, size, write, keep, load_flags, mg);
         x->valid &= keep;
         x->dirty &= keep;
         if (load_flags)
@@ -1948,8 +2024,109 @@ struct xi {
     bool terminal;
     unsigned taken, fall;   // jcc/jmp: the stream slots of the targets
     uint16_t live_taken, live_fall;   // jcc/jmp: what the targets read (succ_live())
+    int lead;          // memory access in a group: its lead's index (its own if it leads), else -1
+    struct mgrp grp;   // the lead's
 };
 enum { M_STREAM, M_TPL, M_NATIVE };
+
+// ---------------------------------------------------------------- groups
+
+// A memory access that can be in a group: a plain base(+index) operand.
+static bool grp_access(const struct xi *xi) {
+    const struct gi *g = &xi->g;
+    return xi->mode == M_NATIVE && !xi->terminal && xi->c.kind == K_GENERIC && xi->p.mem &&
+           xi->c.msize > 0 && g->seg == 0 && !g->a32 && g->base >= 0 && g->base != BASE_RIP;
+}
+
+// Whether the instruction may change guest register r. Only what is known
+// for sure says no.
+// ah..bh (a byte operand 4..7 without REX) are in rax..rbx
+static int grp_reg(const struct gi *g, int gr, bool byte) {
+    return byte && !g->rex && gr >= 4 && gr <= 7 ? gr - 4 : gr;
+}
+
+static bool grp_writes(const struct xi *xi, int r) {
+    const struct gi *g = &xi->g;
+    const struct cls *c = &xi->c;
+    if (r < 0)
+        return false;
+    switch (c->kind) {
+        case K_NOP:
+            return false;
+        case K_LEA:
+            return g->reg == r;
+        case K_OPREG: {
+            int gr = (g->op & 7) | ((g->rex & 1) ? 8 : 0);
+            if (g->map == 0 && g->op >= 0x90 && g->op <= 0x97)   // xchg with rax
+                return gr == r || r == 0;
+            return grp_reg(g, gr, g->map == 0 && g->op >= 0xb0 && g->op <= 0xb7) == r;
+        }
+        case K_GENERIC:
+            // implicit operands: mul/div (rax, rdx), cmpxchg (rax)
+            if (g->map == 0 && (g->op == 0xf6 || g->op == 0xf7))
+                return true;
+            if (g->map == 1 && (g->op == 0xb0 || g->op == 0xb1))
+                return true;
+            if (g->map > 1)
+                return true;
+            if (c->reg_gpr && !(c->reg_rw == RW_R) && grp_reg(g, g->reg, c->reg_byte) == r)
+                return true;
+            if (!xi->p.mem && g->mod == 3 && !(c->rm_rw == RW_R) && grp_reg(g, g->rm, c->rm_byte) == r)
+                return true;
+            return false;
+        default:
+            return true;
+    }
+}
+
+// Finds the groups of xis[0..total).
+static void find_groups(struct xi *xis, unsigned total) {
+    for (unsigned i = 0; i < total; i++)
+        xis[i].lead = -1;
+    for (unsigned i = 0; i < total; i++) {
+        struct xi *l = &xis[i];
+        if (l->lead >= 0 || !grp_access(l))
+            continue;
+        int base = l->g.base, index = l->g.index;
+        if (grp_writes(l, base) || grp_writes(l, index))
+            continue;
+        int lo = 0, hi = l->c.msize;
+        bool write = l->c.acc == A_W || l->c.acc == A_RW;
+        unsigned members = 0;
+        for (unsigned j = i + 1; j < total && j < i + 32; j++) {
+            struct xi *m = &xis[j];
+            if (m->mode != M_NATIVE || m->terminal)
+                break;
+            if (grp_access(m) && m->g.base == base && m->g.index == index &&
+                    (index < 0 || m->g.scale == l->g.scale)) {
+                int64_t rel = m->g.disp - l->g.disp;
+                int nlo = rel < lo ? (int) rel : lo;
+                int nhi = rel + m->c.msize > hi ? (int) (rel + m->c.msize) : hi;
+                if (rel < -64 || rel > 64 || nhi - nlo > 64)
+                    break;
+                lo = nlo, hi = nhi;
+                m->lead = (int) i;
+                members++;
+                write |= m->c.acc == A_W || m->c.acc == A_RW;
+                if (grp_writes(m, base) || grp_writes(m, index))
+                    break;
+                continue;
+            }
+            // another access (its miss path may flush the TLB), or a branch
+            bool other_mem = (m->c.kind == K_GENERIC && m->p.mem) || m->c.kind == K_PUSH ||
+                             m->c.kind == K_PUSHI || m->c.kind == K_POP || m->c.kind == K_LEAVE;
+            if (other_mem || !(m->c.kind == K_GENERIC || m->c.kind == K_LEA || m->c.kind == K_NOP ||
+                               m->c.kind == K_OPREG))
+                break;
+            if (grp_writes(m, base) || grp_writes(m, index))
+                break;
+        }
+        if (members > 0) {
+            l->lead = (int) i;
+            l->grp = (struct mgrp) {lo, hi, write, 0};
+        }
+    }
+}
 
 static __thread struct xi *xis;
 static __thread unsigned xis_cap;
@@ -2018,14 +2195,14 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
         } else {
             e_addr(x, g, R13, true);
             bc.kind = K_B_LOADT;
-            e_mem_insn(x, &bd, 8, false, 0, false);
+            e_mem_insn(x, &bd, 8, false, 0, false, NULL);
         }
     }
     if (kind == K_CALL || kind == K_CALLI) {
         e_lea(a, R13, XMEM(R8, -8));
         bc.kind = K_B_PUSHRET;
         bd.imm = g->next;
-        e_mem_insn(x, &bd, 8, true, 0, false);
+        e_mem_insn(x, &bd, 8, true, 0, false, NULL);
         // ret_cache[(return address & 0xffff) >> 4] = the call's arguments
         e_movabs_slot(x, R14, xi->fall);
         e_mov_store(a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, ret_cache) +
@@ -2033,7 +2210,7 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
     }
     switch (kind) {
         case K_CALL:
-            e_exit_chain(x, xi->taken, F_ALL);
+            e_exit_chain(x, xi->taken, F_ALL, true);
             break;
         case K_CALLI: case K_JMPI:
             e_dispatch_r10(x);
@@ -2042,7 +2219,7 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
             e_mov_rr(a, R13, R8);
             bc.kind = K_B_POPRET;
             bd.imm = 8 + (g->immlen == 2 ? (uint64_t) (in->bytes[g->immoff] | in->bytes[g->immoff + 1] << 8) : 0);
-            e_mem_insn(x, &bd, 8, false, 0, false);
+            e_mem_insn(x, &bd, 8, false, 0, false, NULL);
             e_ret_dispatch(x);
             break;
         }
@@ -2322,6 +2499,12 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
         after_inb = xi->c.fr | (after_inb & ~xi->c.fw);
     }
 
+    if (!dbg_nogroup)
+        find_groups(xis, total);
+    else
+        for (unsigned i = 0; i < total; i++)
+            xis[i].lead = -1;
+
     // emit
     if (entry_cap < total) {
         free(entry_slot);
@@ -2380,11 +2563,12 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             if (c->kind == K_JCC) {
                 unsigned l_taken = new_label(a);
                 e_jcc_lab(a, c->cc, l_taken);
-                e_exit_chain(&x, xi->fall, xi->live_fall);
+                e_exit_chain(&x, xi->fall, xi->live_fall, false);   // g->next: forward
                 lbind(a, l_taken);
                 x.dirty = dirty;
             }
-            e_exit_chain(&x, xi->taken, xi->live_taken);
+            e_exit_chain(&x, xi->taken, xi->live_taken,
+                         dbg_allpoke || (x.plan[xi->taken] & ~(1ull << 63)) <= g->ip);
             in_run = false;
             continue;
         }
@@ -2394,7 +2578,8 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             continue;
         }
         (void) g;
-        e_native(&x, in, g, c, &xi->p, live[i].all, live[i].inb);
+        e_native(&x, in, g, c, &xi->p, live[i].all, live[i].inb,
+                 xi->lead >= 0 ? &xis[xi->lead].grp : NULL, xi->lead >= 0 && xi->lead != (int) i);
         if (a->overflow)
             return false;
     }
@@ -3036,6 +3221,8 @@ static void xlat_init(void) {
     if (__get_cpuid_count(7, 0, &ra, &rb, &rc, &rd))
         have_bmi2 = (rb >> 8) & 1;
     dbg_nosucc = getenv("ISH_XLAT_NOSUCC") != NULL;
+    dbg_allpoke = getenv("ISH_XLAT_ALLPOKE") != NULL;
+    dbg_nogroup = getenv("ISH_XLAT_NOGROUP") != NULL;
     if ((e = getenv("ISH_XLAT_OPS")) != NULL) {
         char *end;
         dbg_op_lo = (unsigned) strtoul(e, &end, 0);
