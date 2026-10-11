@@ -68,6 +68,13 @@ noreturn void do_exit(int status) {
     { extern void dump_wx_stats(void);
       static int wx_dumped = 0;
       if (!wx_dumped && current && current->pid == 1) { wx_dumped = 1; dump_wx_stats(); } }
+#if defined(ISH_XJIT) && defined(GUEST_X86_64)
+    // a guest process ending: more are coming, the translation cache pays off
+    if (current && current->pid != 1) {
+        extern void xjit_process_exited(void);
+        xjit_process_exited();
+    }
+#endif
     // If this thread was already marked as leaked by the safety valve,
     // the group leader has finished exiting and the group struct may be
     // freed. Don't touch any shared state — just kill the host thread.

@@ -216,6 +216,17 @@ int px_mprotect(void *addr, size_t len, int prot);
 void *px_jit_reserve(void *hint, size_t len);
 bool px_jit_commit(void *addr, size_t len, bool exec);
 void px_jit_release(void *addr);
+// A file mapped shared and read-write, size bytes (grown sparse if shorter),
+// for the translation cache other ish processes map too. NULL on failure.
+// path is UTF-8; directories are created.
+void *px_shared_file_map(const char *path, size_t size);
+// This executable's path (UTF-8, '/' separated), or NULL.
+const char *px_self_exe(void);
+// Brings [addr, addr + len) of a mapping in with one call (PrefetchVirtualMemory)
+// instead of a fault per page.
+void px_prefetch(void *addr, size_t len);
+// %LOCALAPPDATA% (UTF-8), or NULL.
+const char *px_local_appdata(void);
 int px_madvise(void *addr, size_t len, int advice);
 int px_msync(void *addr, size_t len, int flags);
 

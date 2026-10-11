@@ -21,6 +21,9 @@
 // translation order; one prints it), ISH_XLAT_NOSUCC, ISH_XLAT_NOLINK.
 
 #include <stddef.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "emu/tlb.h"
 #include "emu/cpu.h"
 #include "asbestos/gen.h"
@@ -1775,7 +1778,7 @@ static void e_tpl_range(struct xctx *x, unsigned s0, unsigned s1) {
 // ---------------------------------------------------------------- stats
 
 static _Atomic uint64_t st_native, st_tpl, st_stream;
-static size_t xc_bytes, xc_limit = (size_t) 256 << 20;
+static size_t xc_limit = (size_t) 256 << 20;
 static _Atomic uint64_t st_xc_hits, st_xc_misses, st_xc_inserts, st_xc_rejects;
 static _Atomic uint64_t st_promote_ok, st_promote_differs, st_promote_failed, st_counted;
 
@@ -1793,10 +1796,12 @@ static void count_fallback(const struct xinsn *in, const struct gi *g, bool deco
     atomic_fetch_add_explicit(&st_fallback_op[key], 1, memory_order_relaxed);
 }
 
+static uint64_t xs_used(bool count);
 static void xlat_dump_stats(FILE *out) {
-    fprintf(out, "[xlat] xcache: hits=%llu misses=%llu inserts=%llu rejected(full)=%llu bytes=%zu\n",
+    fprintf(out, "[xlat] xcache: hits=%llu misses=%llu inserts=%llu rejected(full)=%llu used=%llu entries=%llu\n",
             (unsigned long long) st_xc_hits, (unsigned long long) st_xc_misses,
-            (unsigned long long) st_xc_inserts, (unsigned long long) st_xc_rejects, xc_bytes);
+            (unsigned long long) st_xc_inserts, (unsigned long long) st_xc_rejects,
+            (unsigned long long) xs_used(false), (unsigned long long) xs_used(true));
     fprintf(out, "[xlat] tiers: counted=%llu promoted=%llu differs=%llu failed=%llu\n",
             (unsigned long long) st_counted, (unsigned long long) st_promote_ok,
             (unsigned long long) st_promote_differs, (unsigned long long) st_promote_failed);
@@ -2369,46 +2374,231 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
 
 // ---------------------------------------------------------------- xcache
 
-// Translations kept for the next block of the same guest code: every guest
-// process re-translates the libraries it shares with the last one (python3
-// twenty times in a shell loop translates libpython twenty times). An entry
-// holds the assembler's output before linking (sections, fixups, labels,
-// entries, links), so a hit costs a copy and the fixups.
+// Translations kept for the next block of the same guest code. Every guest
+// process re-translates the libraries it has in common with the last one
+// (python3 twenty times in a shell loop translates libpython twenty times),
+// and every ish process does it all again. An entry holds the assembler's
+// output before linking (sections, fixups, labels, entries, links), so a
+// hit costs a copy and the fixups.
 //
-// A hit must be what translating would give: same guest address, the same
-// instructions byte for byte (from the instruction log of the block just
-// compiled), at the same stream slots, and the same bytes everywhere else
+// A hit must be what translating would give: the same guest address, the
+// same instructions byte for byte (from the instruction log of the block
+// just compiled), at the same stream slots, and the same bytes wherever else
 // the translation looked (xdeps). Anything else is a miss and translates.
+//
+// The store is one region of offsets, no pointers: an anonymous mapping, or
+// with ISH_XCACHE_FILE a file other ish processes map at the same time
+// (sparse on Windows). Its header carries a hash of this executable, so
+// another build never reads it (it gets a store of its own instead).
+// Writers append with an atomic bump of `used` and publish an entry with a
+// CAS on its bucket after its checksum; nothing is ever removed (a full
+// store stops taking entries). Targets in this binary are kept relative to
+// an anchor in it, as another process maps the binary elsewhere.
+#define XS_MAGIC 0x3165686361637878ull   // "xxcache1"
+#define XS_VERSION 3
+#define XS_BUCKETS 65536
+#define FIX_STUB 6   // in the store only: a call to load_flags_stub
+
+struct xs_header {
+    uint64_t magic, version, build, capacity;
+    _Atomic uint64_t state;   // 0: new, 1: being set up, 2: ready
+    _Atomic uint64_t used, count;
+    uint64_t pad;
+    _Atomic uint64_t buckets[XS_BUCKETS];
+};
+
 struct xc_insn {
     uint8_t len;
     bool bad;
     uint32_t s0, s1;
 };
 
-struct xc_entry {
-    struct xc_entry *next;
+struct xs_entry {
+    uint64_t next;       // offset of the next entry in the bucket, 0: none
+    uint64_t checksum;   // of everything after it
     uint64_t addr;
-    uint32_t ninsn, guest_len, stream_size;
-    uint32_t ndeps, nfix, nlab, nent, nlinks, ndata;
-    uint32_t main_len, cold_len;
-    size_t size;
-    struct xc_insn *insn;
-    uint8_t *guest;
-    struct xdep *deps;
-    struct xfix *fix;
-    struct xlabel *lab;
-    uint32_t *ent_slot, *ent_off;
-    uint8_t *main, *cold;
-    struct { unsigned slot; uint32_t field; } links[2];
+    uint32_t size;
+    uint32_t ninsn, guest_len, stream_size, ndeps, nfix, nlab, nent, nlinks, ndata, main_len, cold_len;
+    uint32_t o_insn, o_guest, o_deps, o_fix, o_lab, o_eslot, o_eoff, o_main, o_cold;
+    uint32_t link_slot[2], link_field[2];
 };
+#define XS_PART(e, o) ((void *) ((uint8_t *) (e) + (e)->o))
 
-#define XC_BUCKETS 65536
-static struct xc_entry **xc_table;
-static pthread_mutex_t xc_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct xs_header *xs;
 static bool xc_on;
+// The process's own store fills only once a guest process has exited: an
+// ish running one command (MinisApp's way) would pay for filling it and
+// never read it. A shared file is used from the start.
+static _Atomic bool xc_armed;
+static bool xs_anon;            // the store is this process's own
+static uint8_t *_Atomic xs_committed;  // Windows: committed up to here
+static pthread_mutex_t xs_commit_lock = PTHREAD_MUTEX_INITIALIZER;
+// Link cached translations at first compile, not only at promotion
+// (ISH_XCACHE_EAGER=0: promotions only). Right for the process's own store;
+// with a file every page an entry sits on has to come in first.
+static bool xc_eager = true;
 
-static unsigned xc_hash(uint64_t addr) {
-    return (unsigned) ((addr * 0x9e3779b97f4a7c15ull) >> 48) & (XC_BUCKETS - 1);
+static uint64_t xs_used(bool count) {
+    if (xs == NULL)
+        return 0;
+    return count ? atomic_load(&xs->count) : atomic_load(&xs->used);
+}
+
+void xjit_process_exited(void) {
+    atomic_store_explicit(&xc_armed, true, memory_order_relaxed);
+}
+
+// Windows, the process's own store: commit [.., end) before writing there.
+static bool xs_commit(uint64_t end) {
+#ifdef _WIN32
+    if (!xs_anon)
+        return true;
+    uint8_t *want = (uint8_t *) xs + end;
+    if (want <= atomic_load(&xs_committed))
+        return true;
+    pthread_mutex_lock(&xs_commit_lock);
+    bool ok = true;
+    while (ok && want > xs_committed) {
+        size_t step = 4u << 20;
+        if (xs_committed + step > (uint8_t *) xs + xs->capacity)
+            step = (size_t) ((uint8_t *) xs + xs->capacity - xs_committed);
+        ok = step > 0 && px_jit_commit(xs_committed, step, false);
+        if (ok)
+            atomic_store(&xs_committed, xs_committed + step);
+    }
+    pthread_mutex_unlock(&xs_commit_lock);
+    return ok;
+#else
+    (void) end;
+    return true;
+#endif
+}
+
+static uintptr_t xs_anchor(void) {
+    return (uintptr_t) tpl_table_start;
+}
+
+static uint64_t xs_hash(const uint8_t *p, size_t n, uint64_t h) {
+    h ^= 0x9e3779b97f4a7c15ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0xff51afd7ed558ccdull;
+        h ^= h >> 32;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001b3ull;
+    return h ^ (h >> 29);
+}
+
+// This executable's contents (and what else decides a translation).
+static uint64_t xs_build(void) {
+    const char *path = NULL;
+#ifdef _WIN32
+    path = px_self_exe();
+#elif defined(__APPLE__)
+    extern int _NSGetExecutablePath(char *buf, uint32_t *size);
+    static char buf[4096];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0)
+        path = buf;
+#else
+    path = "/proc/self/exe";
+#endif
+    if (path == NULL)
+        return 0;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL)
+        return 0;
+    uint64_t h = XS_VERSION * 0x100 + have_bmi2;
+    static uint8_t chunk[1 << 16];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
+        h = xs_hash(chunk, n, h);
+    fclose(f);
+    return h ? h : 1;
+}
+
+static void *xs_map_file(const char *path, size_t size) {
+#ifdef _WIN32
+    return px_shared_file_map(path, size);
+#else
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0)
+        return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || ((size_t) st.st_size < size && ftruncate(fd, (off_t) size) != 0)) {
+        close(fd);
+        return NULL;
+    }
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    return p == MAP_FAILED ? NULL : p;
+#endif
+}
+
+static void xs_init(size_t capacity, bool persistent) {
+    char path[1024] = "";
+    const char *e = getenv("ISH_XCACHE_FILE");
+    if (persistent && e != NULL)
+        snprintf(path, sizeof(path), "%s", e);
+    // a file's header names the build that wrote it (the process's own store doesn't need to)
+    uint64_t build = path[0] != '\0' ? xs_build() : 1;
+    if (build == 0)
+        path[0] = '\0';
+    // No file by default: measured on Windows, one ish per command gains
+    // nothing from it (translating is about as fast as bringing the file's
+    // pages in); the process's own store is what pays off.
+    struct xs_header *h = NULL;
+    if (path[0] != '\0')
+        h = xs_map_file(path, capacity);
+    if (h == NULL) {
+        xs_anon = true;
+#ifdef _WIN32
+        // reserved; committed as it fills (xs_commit())
+        h = px_jit_reserve(NULL, capacity);
+        if (h != NULL && !px_jit_commit(h, 1u << 20, false))
+            h = NULL;
+        if (h != NULL)
+            xs_committed = (uint8_t *) h + (1u << 20);
+#else
+        h = mmap(NULL, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (h == MAP_FAILED)
+            h = NULL;
+#endif
+    }
+    if (h == NULL)
+        return;
+    uint64_t expect = 0;
+    if (atomic_compare_exchange_strong(&h->state, &expect, 1)) {
+        h->magic = XS_MAGIC;
+        h->version = XS_VERSION;
+        h->build = build;
+        h->capacity = capacity;
+        atomic_store(&h->used, (sizeof(*h) + 63) & ~(uint64_t) 63);
+        atomic_store(&h->state, 2);
+    } else {
+        // someone else sets it up
+        for (int i = 0; i < 2000 && atomic_load(&h->state) != 2; i++)
+            usleep(1000);
+    }
+    if (atomic_load(&h->state) != 2 || h->magic != XS_MAGIC || h->version != XS_VERSION ||
+            h->build != build || h->capacity != capacity) {
+        // another build's (a named file): keep this process's own instead
+        if (path[0] != '\0')
+            xs_init(capacity, false);
+        return;
+    }
+    xs = h;
+    if (!xs_anon)
+        atomic_store(&xc_armed, true);
+#ifdef _WIN32
+    // what is there in one go: a fault per page of a mapped file costs more
+    // than translating the block on it
+    if (path[0] != '\0')
+        px_prefetch(h, (size_t) atomic_load(&h->used));
+#endif
 }
 
 // Only code from file mappings that aren't writable is kept: that is what
@@ -2438,28 +2628,41 @@ static uint64_t xlog_end(void) {
     return last->ip + (last->len ? last->len : 1);
 }
 
+static unsigned xc_hash(uint64_t addr) {
+    return (unsigned) ((addr * 0x9e3779b97f4a7c15ull) >> 48) & (XS_BUCKETS - 1);
+}
+
 // The instructions of the block just compiled, against an entry.
-static bool xc_matches(const struct xc_entry *e, uint64_t addr) {
+static bool xc_matches(const struct xs_entry *e, uint64_t addr) {
     if (e->addr != addr || e->ninsn != xlog_n || e->stream_size != xlog_size)
         return false;
+    const struct xc_insn *ins = XS_PART(e, o_insn);
+    const uint8_t *guest = XS_PART(e, o_guest);
     uint32_t off = 0;
     for (unsigned i = 0; i < xlog_n; i++) {
         const struct xinsn *in = &xlog[i];
-        const struct xc_insn *c = &e->insn[i];
+        const struct xc_insn *c = &ins[i];
         if (in->bad != c->bad || in->len != c->len || in->s0 != c->s0 || in->s1 != c->s1 ||
-                in->ip != addr + off)
+                in->ip != addr + off || off + in->len > e->guest_len)
             return false;
-        if (in->len != 0 && memcmp(in->bytes, e->guest + off, in->len) != 0)
+        if (in->len != 0 && memcmp(in->bytes, guest + off, in->len) != 0)
             return false;
         off += in->len;
     }
+    const struct xdep *deps = XS_PART(e, o_deps);
     for (unsigned i = 0; i < e->ndeps; i++) {
-        const struct xdep *d = &e->deps[i];
         uint8_t now[15];
-        if (xlog_tlb == NULL || !tlb_read(xlog_tlb, d->addr, now, d->len) || memcmp(now, d->bytes, d->len) != 0)
+        if (deps[i].len > 15 || xlog_tlb == NULL || !tlb_read(xlog_tlb, deps[i].addr, now, deps[i].len) ||
+                memcmp(now, deps[i].bytes, deps[i].len) != 0)
             return false;
     }
     return true;
+}
+
+static bool xs_entry_ok(const struct xs_entry *e) {
+    if (e->size < sizeof(*e) || e->size > xs->capacity)
+        return false;
+    return xs_hash((const uint8_t *) e + 16, e->size - 16, 0) == e->checksum;
 }
 
 static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *entry_slot,
@@ -2483,59 +2686,71 @@ static bool xa_grow(struct xasm *a, unsigned nfix, unsigned nlab) {
 
 // Links a cached translation into block. True: done.
 static bool xc_link(struct fiber_block *block) {
-    if (!xc_on || xc_table == NULL || !xlog_ok || xlog_n == 0 || !xc_file_code(block->addr, xlog_end()))
+    if (!xc_on || xs == NULL || !atomic_load_explicit(&xc_armed, memory_order_relaxed) ||
+            !xlog_ok || xlog_n == 0 || !xc_file_code(block->addr, xlog_end()))
         return false;
-    struct xasm *a = &xa_tls;
-    if (!xa_init(a))
-        return false;
-    struct xctx x = {.a = a, .block = block, .code = block->code};
-    static __thread unsigned *eslot;
-    static __thread uint32_t *eoff;
-    static __thread unsigned ecap;
-    unsigned nent = 0;
-    bool found = false;
-
-    pthread_mutex_lock(&xc_lock);
-    struct xc_entry *e = xc_table[xc_hash(block->addr)];
-    for (; e != NULL; e = e->next)
-        if (xc_matches(e, block->addr))
+    const struct xs_entry *e = NULL;
+    uint64_t off = atomic_load_explicit(&xs->buckets[xc_hash(block->addr)], memory_order_acquire);
+    for (int guard = 0; off != 0 && off < xs->capacity && guard < 4096; guard++) {
+        const struct xs_entry *c = (const struct xs_entry *) ((uint8_t *) xs + off);
+        if (xc_matches(c, block->addr) && xs_entry_ok(c)) {
+            e = c;
             break;
-    if (e != NULL && e->main_len <= XBUF_SIZE && e->cold_len <= XBUF_SIZE &&
-            xa_grow(a, e->nfix, e->nlab)) {
-        bool ok = true;
-        if (ecap < e->nent) {
-            free(eslot); free(eoff);
-            ecap = e->nent * 2;
-            eslot = malloc(ecap * sizeof(*eslot));
-            eoff = malloc(ecap * sizeof(*eoff));
-            if (eslot == NULL || eoff == NULL) { ecap = 0; ok = false; }
         }
-        if (ok) {
-            // into the assembler's buffers, as if it had just emitted it
-            memcpy(a->sec[SEC_MAIN].base, e->main, e->main_len);
-            a->sec[SEC_MAIN].p = a->sec[SEC_MAIN].base + e->main_len;
-            memcpy(a->sec[SEC_COLD].base, e->cold, e->cold_len);
-            a->sec[SEC_COLD].p = a->sec[SEC_COLD].base + e->cold_len;
-            memcpy(a->fix, e->fix, e->nfix * sizeof(*e->fix));
-            a->nfix = e->nfix;
-            memcpy(a->lab, e->lab, e->nlab * sizeof(*e->lab));
-            a->nlab = e->nlab;
-            memcpy(eslot, e->ent_slot, e->nent * sizeof(*eslot));
-            memcpy(eoff, e->ent_off, e->nent * sizeof(*eoff));
-            nent = e->nent;
-            x.nlinks = e->nlinks;
-            memcpy(x.links, e->links, sizeof(x.links));
-            x.ndata = e->ndata;
-            found = true;
-        }
+        off = c->next;
     }
-    pthread_mutex_unlock(&xc_lock);
-    if (!found) {
+    if (e == NULL || e->main_len > XBUF_SIZE || e->cold_len > XBUF_SIZE || e->nent == 0) {
         if (stats_on)
             atomic_fetch_add_explicit(&st_xc_misses, 1, memory_order_relaxed);
         return false;
     }
-    if (nent == 0 || !xlat_finish(&x, block, eslot, eoff, nent))
+    struct xasm *a = &xa_tls;
+    if (!xa_init(a) || !xa_grow(a, e->nfix, e->nlab))
+        return false;
+    static __thread unsigned *eslot;
+    static __thread uint32_t *eoff;
+    static __thread unsigned ecap;
+    if (ecap < e->nent) {
+        free(eslot);
+        free(eoff);
+        ecap = e->nent * 2;
+        eslot = malloc(ecap * sizeof(*eslot));
+        eoff = malloc(ecap * sizeof(*eoff));
+        if (eslot == NULL || eoff == NULL) {
+            ecap = 0;
+            return false;
+        }
+    }
+    // into the assembler's buffers, as if it had just emitted it
+    memcpy(a->sec[SEC_MAIN].base, XS_PART(e, o_main), e->main_len);
+    a->sec[SEC_MAIN].p = a->sec[SEC_MAIN].base + e->main_len;
+    memcpy(a->sec[SEC_COLD].base, XS_PART(e, o_cold), e->cold_len);
+    a->sec[SEC_COLD].p = a->sec[SEC_COLD].base + e->cold_len;
+    const struct xfix *fix = XS_PART(e, o_fix);
+    uintptr_t anchor = xs_anchor();
+    for (unsigned i = 0; i < e->nfix; i++) {
+        struct xfix f = fix[i];
+        if (f.kind == FIX_STUB) {
+            f.kind = FIX_ABS;
+            f.target = (uintptr_t) load_flags_stub;
+        } else if (f.kind == FIX_ABS || f.kind == FIX_MOVED) {
+            f.target = anchor + f.target;
+        }
+        a->fix[i] = f;
+    }
+    a->nfix = e->nfix;
+    memcpy(a->lab, XS_PART(e, o_lab), e->nlab * sizeof(struct xlabel));
+    a->nlab = e->nlab;
+    memcpy(eslot, XS_PART(e, o_eslot), e->nent * sizeof(*eslot));
+    memcpy(eoff, XS_PART(e, o_eoff), e->nent * sizeof(*eoff));
+    struct xctx x = {.a = a, .block = block, .code = block->code};
+    x.nlinks = e->nlinks;
+    for (int k = 0; k < 2; k++) {
+        x.links[k].slot = e->link_slot[k];
+        x.links[k].field = e->link_field[k];
+    }
+    x.ndata = e->ndata;
+    if (!xlat_finish(&x, block, eslot, eoff, e->nent))
         return false;
     if (stats_on)
         atomic_fetch_add_explicit(&st_xc_hits, 1, memory_order_relaxed);
@@ -2546,77 +2761,99 @@ static bool xc_link(struct fiber_block *block) {
 static void xc_insert(const struct xctx *x, const struct fiber_block *block,
                       const unsigned *eslot, const uint32_t *eoff, unsigned nent) {
     const struct xasm *a = x->a;
-    if (!xc_on || xc_table == NULL || xdeps_overflow || !xlog_ok || xlog_n == 0 || nent == 0 ||
-            !xc_file_code(block->addr, xlog_end()))
+    if (!xc_on || xs == NULL || !atomic_load_explicit(&xc_armed, memory_order_relaxed) ||
+            xdeps_overflow || !xlog_ok || xlog_n == 0 || nent == 0 || !xc_file_code(block->addr, xlog_end()))
         return;
     uint32_t guest_len = 0;
     for (unsigned i = 0; i < xlog_n; i++)
         guest_len += xlog[i].len;
     uint32_t main_len = (uint32_t) (a->sec[SEC_MAIN].p - a->sec[SEC_MAIN].base);
     uint32_t cold_len = (uint32_t) (a->sec[SEC_COLD].p - a->sec[SEC_COLD].base);
-    size_t size = sizeof(struct xc_entry) + xlog_n * sizeof(struct xc_insn) + guest_len +
-        xdeps_n * sizeof(struct xdep) + a->nfix * sizeof(struct xfix) + a->nlab * sizeof(struct xlabel) +
-        nent * 8 + main_len + cold_len + 80;
-    pthread_mutex_lock(&xc_lock);
-    bool full = xc_bytes + size > xc_limit;
-    if (!full)
-        xc_bytes += size;
-    pthread_mutex_unlock(&xc_lock);
-    if (full) {
-        if (stats_on)
-            atomic_fetch_add_explicit(&st_xc_rejects, 1, memory_order_relaxed);
-        return;
-    }
-    struct xc_entry *e = calloc(1, size);
-    if (e == NULL)
-        return;
-    uint8_t *p = (uint8_t *) (e + 1);
-#define XC_TAKE(field, n) do { e->field = (void *) p; p += (n); p = (uint8_t *) (((uintptr_t) p + 7) & ~(uintptr_t) 7); } while (0)
-    XC_TAKE(insn, xlog_n * sizeof(struct xc_insn));
-    XC_TAKE(guest, guest_len);
-    XC_TAKE(deps, xdeps_n * sizeof(struct xdep));
-    XC_TAKE(fix, a->nfix * sizeof(struct xfix));
-    XC_TAKE(lab, a->nlab * sizeof(struct xlabel));
-    XC_TAKE(ent_slot, nent * 4);
-    XC_TAKE(ent_off, nent * 4);
-    XC_TAKE(main, main_len);
-    XC_TAKE(cold, cold_len);
-#undef XC_TAKE
+    // the layout
+    uint32_t size = sizeof(struct xs_entry);
+#define XS_LAY(field, n) do { size = (size + 7) & ~7u; field = size; size += (uint32_t) (n); } while (0)
+    uint32_t o_insn, o_guest, o_deps, o_fix, o_lab, o_eslot, o_eoff, o_main, o_cold;
+    XS_LAY(o_insn, xlog_n * sizeof(struct xc_insn));
+    XS_LAY(o_guest, guest_len);
+    XS_LAY(o_deps, xdeps_n * sizeof(struct xdep));
+    XS_LAY(o_fix, a->nfix * sizeof(struct xfix));
+    XS_LAY(o_lab, a->nlab * sizeof(struct xlabel));
+    XS_LAY(o_eslot, nent * 4);
+    XS_LAY(o_eoff, nent * 4);
+    XS_LAY(o_main, main_len);
+    XS_LAY(o_cold, cold_len);
+#undef XS_LAY
+    size = (size + 63) & ~63u;
+    uint64_t off = atomic_load_explicit(&xs->used, memory_order_relaxed);
+    do {
+        if (off + size > xs->capacity) {
+            if (stats_on)
+                atomic_fetch_add_explicit(&st_xc_rejects, 1, memory_order_relaxed);
+            return;
+        }
+    } while (!atomic_compare_exchange_weak_explicit(&xs->used, &off, off + size,
+                                                    memory_order_relaxed, memory_order_relaxed));
+    if (!xs_commit(off + size))
+        return;   // (the space is lost)
+    struct xs_entry *e = (struct xs_entry *) ((uint8_t *) xs + off);
+    memset(e, 0, sizeof(*e));
     e->addr = block->addr;
+    e->size = size;
     e->ninsn = xlog_n;
     e->guest_len = guest_len;
     e->stream_size = xlog_size;
-    uint32_t off = 0;
-    for (unsigned i = 0; i < xlog_n; i++) {
-        e->insn[i] = (struct xc_insn) {xlog[i].len, xlog[i].bad, xlog[i].s0, xlog[i].s1};
-        memcpy(e->guest + off, xlog[i].bytes, xlog[i].len);
-        off += xlog[i].len;
-    }
     e->ndeps = xdeps_n;
-    memcpy(e->deps, xdeps, xdeps_n * sizeof(struct xdep));
     e->nfix = a->nfix;
-    memcpy(e->fix, a->fix, a->nfix * sizeof(struct xfix));
     e->nlab = a->nlab;
-    memcpy(e->lab, a->lab, a->nlab * sizeof(struct xlabel));
     e->nent = nent;
-    memcpy(e->ent_slot, eslot, nent * 4);
-    memcpy(e->ent_off, eoff, nent * 4);
-    e->main_len = main_len;
-    memcpy(e->main, a->sec[SEC_MAIN].base, main_len);
-    e->cold_len = cold_len;
-    memcpy(e->cold, a->sec[SEC_COLD].base, cold_len);
     e->nlinks = x->nlinks;
-    for (unsigned k = 0; k < 2; k++) {
-        e->links[k].slot = x->links[k].slot;
-        e->links[k].field = x->links[k].field;
-    }
     e->ndata = x->ndata;
-    e->size = size;
-    pthread_mutex_lock(&xc_lock);
-    unsigned h = xc_hash(e->addr);
-    e->next = xc_table[h];
-    xc_table[h] = e;
-    pthread_mutex_unlock(&xc_lock);
+    e->main_len = main_len;
+    e->cold_len = cold_len;
+    e->o_insn = o_insn; e->o_guest = o_guest; e->o_deps = o_deps; e->o_fix = o_fix; e->o_lab = o_lab;
+    e->o_eslot = o_eslot; e->o_eoff = o_eoff; e->o_main = o_main; e->o_cold = o_cold;
+    for (int k = 0; k < 2; k++) {
+        e->link_slot[k] = x->links[k].slot;
+        e->link_field[k] = x->links[k].field;
+    }
+    struct xc_insn *ins = XS_PART(e, o_insn);
+    uint8_t *guest = XS_PART(e, o_guest);
+    uint32_t g = 0;
+    for (unsigned i = 0; i < xlog_n; i++) {
+        ins[i] = (struct xc_insn) {xlog[i].len, xlog[i].bad, xlog[i].s0, xlog[i].s1};
+        memcpy(guest + g, xlog[i].bytes, xlog[i].len);
+        g += xlog[i].len;
+    }
+    memcpy(XS_PART(e, o_deps), xdeps, xdeps_n * sizeof(struct xdep));
+    // targets in the binary relative to the anchor; the shared stub by name
+    struct xfix *fix = XS_PART(e, o_fix);
+    uintptr_t anchor = xs_anchor();
+    for (unsigned i = 0; i < a->nfix; i++) {
+        struct xfix f = a->fix[i];
+        if (f.kind == FIX_ABS && f.target == (uintptr_t) load_flags_stub) {
+            f.kind = FIX_STUB;
+            f.target = 0;
+        } else if (f.kind == FIX_ABS || f.kind == FIX_MOVED) {
+            intptr_t d = (intptr_t) (f.target - anchor);
+            if (d > (intptr_t) 1 << 30 || d < -((intptr_t) 1 << 30))
+                return;   // something outside the binary: not for keeping (the space is lost)
+            f.target = (uintptr_t) d;
+        }
+        fix[i] = f;
+    }
+    memcpy(XS_PART(e, o_lab), a->lab, a->nlab * sizeof(struct xlabel));
+    memcpy(XS_PART(e, o_eslot), eslot, nent * 4);
+    memcpy(XS_PART(e, o_eoff), eoff, nent * 4);
+    memcpy(XS_PART(e, o_main), a->sec[SEC_MAIN].base, main_len);
+    memcpy(XS_PART(e, o_cold), a->sec[SEC_COLD].base, cold_len);
+    // publish: checksum, then the bucket
+    _Atomic uint64_t *bucket = &xs->buckets[xc_hash(block->addr)];
+    uint64_t head = atomic_load_explicit(bucket, memory_order_acquire);
+    do {
+        e->next = head;
+        e->checksum = xs_hash((const uint8_t *) e + 16, size - 16, 0);
+    } while (!atomic_compare_exchange_weak_explicit(bucket, &head, off, memory_order_release, memory_order_acquire));
+    atomic_fetch_add_explicit(&xs->count, 1, memory_order_relaxed);
     if (stats_on)
         atomic_fetch_add_explicit(&st_xc_inserts, 1, memory_order_relaxed);
 }
@@ -2665,8 +2902,12 @@ static bool xlat_install_counter(struct fiber_block *block) {
 }
 
 static bool xlat_block(struct fiber_block *block) {
-    if (xc_link(block))
-        return true;
+    // With tiers, the cache is for promotions: linking a cached translation
+    // is cheaper than translating, but dearer than running a block that
+    // only runs once or twice as gadgets (most of a starting process's).
+    if (xlat_hot <= 1 || xc_eager)
+        if (xc_link(block))
+            return true;
     if (xlat_hot <= 1)
         return xlat_translate(block, block->code);
     if (!xlat_on || !xlog_ok || xlog_n == 0)
@@ -2767,15 +3008,22 @@ static void xlat_init(void) {
         dbg_kinds = (unsigned) strtoul(e, NULL, 0);
     if ((e = getenv("ISH_XLAT_HOT")) != NULL)
         xlat_hot = (unsigned) strtoul(e, NULL, 0);
-    e = getenv("ISH_XCACHE");
-    xc_on = !(e && e[0] == '0');
-    if ((e = getenv("ISH_XCACHE_MB")) != NULL)
-        xc_limit = (size_t) strtoul(e, NULL, 0) << 20;
-    if (xc_on && (xc_table = calloc(XC_BUCKETS, sizeof(*xc_table))) == NULL)
-        xc_on = false;
     e = getenv("ISH_XLAT_BMI2");
     if (e && e[0] == '0')
         have_bmi2 = false;
+    e = getenv("ISH_XCACHE");
+    xc_on = !(e && e[0] == '0');
+    if ((e = getenv("ISH_XCACHE_EAGER")) != NULL)
+        xc_eager = e[0] != '0';
+    if ((e = getenv("ISH_XCACHE_MB")) != NULL)
+        xc_limit = (size_t) strtoul(e, NULL, 0) << 20;
+    if (xc_on) {
+        // a translation made with a debugging switch on is not for keeping
+        bool debug = getenv("ISH_XLAT_KINDS") || getenv("ISH_XLAT_OPS") || getenv("ISH_XLAT_NTH") ||
+            getenv("ISH_XLAT_NOSUCC") || getenv("ISH_XLAT_NOLINK");
+        xs_init(xc_limit, !debug);
+        xc_on = xs != NULL;
+    }
 #endif
     struct xasm *a = &xa_tls;
     if (!xa_init(a)) {

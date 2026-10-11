@@ -33,6 +33,8 @@ void xjit_insns_done(struct gen_state *state);
 // again just before (so the instruction log is fresh), skip[] its slots that
 // differ by design (jump slots, the block pointer slot).
 void xjit_promote(struct fiber_block *block, struct fiber_block *tmp, const unsigned *skip, int nskip);
+// A guest process exited (not init).
+void xjit_process_exited(void);
 #endif
 
 // After gen_end(), before the block is published.

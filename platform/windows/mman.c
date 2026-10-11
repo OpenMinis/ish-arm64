@@ -8,6 +8,7 @@
 // copies -- written back on munmap/msync when shared and writable -- and so is
 // a file mapped MAP_FIXED over memory already reserved.
 #include "px_impl.h"
+#include <winioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -343,4 +344,87 @@ bool px_jit_commit(void *addr, size_t len, bool exec) {
 
 void px_jit_release(void *addr) {
     VirtualFree(addr, 0, MEM_RELEASE);
+}
+
+// ---- the translation cache's file (asbestos/guest-x86_64/xlat.c)
+static wchar_t *px_utf8_to_w(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    wchar_t *w = n > 0 ? malloc(n * sizeof(wchar_t)) : NULL;
+    if (w != NULL)
+        MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
+    return w;
+}
+
+void *px_shared_file_map(const char *path, size_t size) {
+    wchar_t *w = px_utf8_to_w(path);
+    if (w == NULL)
+        return NULL;
+    // the directories on the way
+    for (wchar_t *p = w + 3; *p; p++) {
+        if (*p == L'/' || *p == L'\\') {
+            wchar_t c = *p;
+            *p = 0;
+            CreateDirectoryW(w, NULL);
+            *p = c;
+        }
+    }
+    HANDLE f = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    if (f == INVALID_HANDLE_VALUE)
+        return NULL;
+    // sparse: only what is written takes disk space (ISH_XCACHE_SPARSE=0: not)
+    const char *sp = getenv("ISH_XCACHE_SPARSE");
+    if (!(sp && sp[0] == '0')) {
+        DWORD ret;
+        DeviceIoControl(f, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &ret, NULL);
+    }
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, (DWORD) ((uint64_t) size >> 32), (DWORD) size, NULL);
+    CloseHandle(f);
+    if (m == NULL)
+        return NULL;
+    void *p = MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    CloseHandle(m);
+    return p;
+}
+
+static char *px_w_to_utf8(const wchar_t *w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *s = n > 0 ? malloc(n) : NULL;
+    if (s != NULL) {
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL);
+        for (char *p = s; *p; p++)
+            if (*p == '\\')
+                *p = '/';
+    }
+    return s;
+}
+
+void px_prefetch(void *addr, size_t len) {
+    WIN32_MEMORY_RANGE_ENTRY range = {addr, len};
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+}
+
+const char *px_self_exe(void) {
+    static char *path;
+    if (path == NULL) {
+        wchar_t w[MAX_PATH * 2];
+        DWORD n = GetModuleFileNameW(NULL, w, MAX_PATH * 2);
+        if (n == 0 || n >= MAX_PATH * 2)
+            return NULL;
+        path = px_w_to_utf8(w);
+    }
+    return path;
+}
+
+const char *px_local_appdata(void) {
+    static char *path;
+    if (path == NULL) {
+        wchar_t w[MAX_PATH * 2];
+        DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", w, MAX_PATH * 2);
+        if (n == 0 || n >= MAX_PATH * 2)
+            return NULL;
+        path = px_w_to_utf8(w);
+    }
+    return path;
 }
