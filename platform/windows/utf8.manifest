@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Run with the process code page set to UTF-8 (Windows 10 1903+): argv,
+     getenv() and every narrow Win32/CRT call then use UTF-8, which is what
+     the px layer and the guest already speak. Without it the CRT converts
+     the UTF-16 command line to the ANSI code page and non-ASCII arguments
+     (a Chinese file name in `sh -c`, a host path in ISHT_BIND) become '?'. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

@@ -1,0 +1,2 @@
+// Embeds utf8.manifest (resource type 24 = RT_MANIFEST, id 1 = the process manifest).
+1 24 "utf8.manifest"

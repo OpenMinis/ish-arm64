@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -120,12 +121,21 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
         fs_chdir(current->fs, pwd);
     }
 
-    char argv_copy[4096];
     int i = optind;
     size_t p = 0;
     size_t exec_argc = 0;
     if (argv[optind] == NULL)
 	    return _ENOENT;
+    // The guest argv, NUL-separated. Sized from the real arguments: a fixed
+    // 4096-byte buffer let a long `sh -c` script (an agent writing a file
+    // with a heredoc) overflow the stack. 512 extra bytes cover the flags
+    // injected below.
+    size_t argv_bytes = 512;
+    for (int k = optind; k < argc; k++)
+        argv_bytes += strlen(argv[k]) + 1;
+    char *argv_copy = malloc(argv_bytes);
+    if (argv_copy == NULL)
+        return _ENOMEM;
 #ifdef GUEST_ARM64
     // Inject V8 flags for node to work around scope corruption in emulation.
     // --jitless: disable JIT (avoids V8 code gen incompatible with our JIT)
@@ -254,6 +264,7 @@ do_exec:
 #else
     err = do_execve(argv[optind], exec_argc, argv_copy, envp == NULL ? "\0" : envp);
 #endif
+    free(argv_copy); // do_execve copied it into the guest
     if (err < 0)
         return err;
     tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;
