@@ -58,11 +58,13 @@ void xjit_insn_begin(struct gen_state *state) {
     xlog_cur_ip = state->ip;
 }
 
+static void xlat_note_thread(void);
 void xjit_insn_end(struct gen_state *state, struct tlb *tlb) {
     xlog_tlb = tlb;
     if (!xlog_ok)
         return;
     if (xlog_n == xlog_cap) {
+        xlat_note_thread();
         unsigned cap = xlog_cap ? xlog_cap * 2 : 256;
         struct xinsn *bigger = realloc(xlog, cap * sizeof(*xlog));
         if (bigger == NULL) {
@@ -148,7 +150,9 @@ struct xasm {
 
 static __thread struct xasm xa_tls;
 
+static void xlat_note_thread(void);
 static bool xa_init(struct xasm *a) {
+    xlat_note_thread();
     for (int s = 0; s < 2; s++) {
         if (a->sec[s].base == NULL) {
             a->sec[s].base = malloc(XBUF_SIZE);
@@ -1758,6 +1762,45 @@ enum { M_STREAM, M_TPL, M_NATIVE };
 
 static __thread struct xi *xis;
 static __thread unsigned xis_cap;
+static __thread uint16_t *live;
+static __thread unsigned live_cap;
+static __thread unsigned *entry_slot;
+static __thread uint32_t *entry_off;
+static __thread unsigned entry_cap;
+
+// Every guest thread is a host thread, and a shell pipeline starts hundreds:
+// what one allocated to translate goes when it exits (a key's destructor
+// runs on the exiting thread, so it can see that thread's variables).
+static pthread_key_t xlat_key;
+static pthread_once_t xlat_key_once = PTHREAD_ONCE_INIT;
+static __thread bool xlat_key_set;
+
+static void xlat_thread_exit(void *unused) {
+    (void) unused;
+    struct xasm *a = &xa_tls;
+    for (int i = 0; i < 2; i++) {
+        free(a->sec[i].base);
+        a->sec[i].base = a->sec[i].p = a->sec[i].end = NULL;
+    }
+    free(a->fix); a->fix = NULL; a->capfix = a->nfix = 0;
+    free(a->lab); a->lab = NULL; a->caplab = a->nlab = 0;
+    free(xlog); xlog = NULL; xlog_cap = xlog_n = 0;
+    free(xis); xis = NULL; xis_cap = 0;
+    free(live); live = NULL; live_cap = 0;
+    free(entry_slot); entry_slot = NULL;
+    free(entry_off); entry_off = NULL; entry_cap = 0;
+    xlat_key_set = false;
+}
+static void xlat_key_init(void) {
+    pthread_key_create(&xlat_key, xlat_thread_exit);
+}
+static void xlat_note_thread(void) {
+    if (xlat_key_set)
+        return;
+    pthread_once(&xlat_key_once, xlat_key_init);
+    pthread_setspecific(xlat_key, (void *) 1);
+    xlat_key_set = true;
+}
 static bool xlat_on;
 
 static unsigned dbg_kinds = ~0u;  // ISH_XLAT_KINDS: bit per K_* translated
@@ -1962,8 +2005,6 @@ static bool xlat_block(struct fiber_block *block) {
 
     // flag liveness, backwards: what each native instruction must leave
     // valid behind it
-    static __thread uint16_t *live;
-    static __thread unsigned live_cap;
     if (live_cap < total) {
         free(live);
         live_cap = total * 2;
@@ -1986,9 +2027,6 @@ static bool xlat_block(struct fiber_block *block) {
     }
 
     // emit
-    static __thread unsigned *entry_slot;
-    static __thread uint32_t *entry_off;
-    static __thread unsigned entry_cap;
     if (entry_cap < total) {
         free(entry_slot);
         free(entry_off);
