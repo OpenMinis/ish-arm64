@@ -91,6 +91,9 @@ struct fiber_block {
 #endif
 #ifdef ISH_XJIT
     void *xjit_code;            // native runs of this block (guest-x86/xjit.c)
+    uintptr_t xjit_entry;       // translation of code[0], or 0
+    uint8_t *xjit_link[2];      // rel32 of the native exit through jump_ip[i], or NULL
+    uintptr_t xjit_link_orig[2]; // where it points while unchained
 #endif
 
     uintptr_t code[];

@@ -779,6 +779,9 @@ static void fiber_block_disconnect(struct asbestos *asbestos, struct fiber_block
 #ifdef ISH_JIT
             jit_unlink(prev_block, i);
 #endif
+#ifdef ISH_XJIT
+            xjit_unlink(prev_block, i);
+#endif
             list_remove(&prev_block->jumps_from_links[i]);
         }
     }
@@ -1062,9 +1065,16 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 // and is thus assumed to have no pointers left
                 if (!last_block->is_jetsam && !block->is_jetsam) {
                     for (int i = 0; i <= 1; i++) {
+#ifdef GUEST_X86_64
+                        // fake_ip: the address with bit 63 set
+                        if (last_block->jump_ip[i] == NULL ||
+                                (*last_block->jump_ip[i] & ~(1ull << 63)) != block->addr)
+                            continue;
+#else
                         if (last_block->jump_ip[i] == NULL ||
                                 (*last_block->jump_ip[i] & 0xffffffff) != block->addr)
                             continue;
+#endif
 #ifdef ISH_JIT
                         if (!jit_chain_ok(last_block, i, block)) {
                             // still unchained, but its native code may enter block
@@ -1081,6 +1091,9 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                         list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
 #ifdef ISH_JIT
                         jit_link(last_block, i, block);
+#endif
+#ifdef ISH_XJIT
+                        xjit_link(last_block, i, block);
 #endif
                     }
                 }

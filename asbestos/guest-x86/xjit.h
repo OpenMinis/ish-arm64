@@ -33,6 +33,10 @@ void xjit_insns_done(struct gen_state *state);
 
 // After gen_end(), before the block is published.
 void xjit_block(struct fiber_block *block);
+// Chaining made jump_ip[i] of from point at to: let from's native exit
+// jump straight into to's translation. Unlink undoes it.
+void xjit_link(struct fiber_block *from, int i, struct fiber_block *to);
+void xjit_unlink(struct fiber_block *from, int i);
 // The block is being freed (no thread runs it).
 void xjit_block_free(struct fiber_block *block);
 void xjit_dump_stats(void);

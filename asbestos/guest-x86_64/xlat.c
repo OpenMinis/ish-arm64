@@ -21,6 +21,7 @@
 #include "emu/tlb.h"
 #include "emu/cpu.h"
 #include "asbestos/gen.h"
+#include "asbestos/frame.h"
 
 #if defined(__x86_64__)
 #include <cpuid.h>
@@ -43,6 +44,7 @@ static __thread unsigned xlog_n, xlog_cap;
 static __thread bool xlog_ok;
 static __thread uint32_t xlog_cur_s0, xlog_size;
 static __thread uint64_t xlog_cur_ip;
+static __thread struct tlb *xlog_tlb;
 
 void xjit_insn_begin(struct gen_state *state) {
     if (state->size == 0) {
@@ -54,6 +56,7 @@ void xjit_insn_begin(struct gen_state *state) {
 }
 
 void xjit_insn_end(struct gen_state *state, struct tlb *tlb) {
+    xlog_tlb = tlb;
     if (!xlog_ok)
         return;
     if (xlog_n == xlog_cap) {
@@ -468,7 +471,8 @@ struct gi {
 // The operand layout of an opcode, for the decoder
 enum { IMM_NONE, IMM_B, IMM_Z, IMM_W, IMM_V };
 
-static bool gdecode(const struct xinsn *x, struct gi *g) {
+// exact: the instruction is all of x->len bytes; else it starts them
+static bool gdecode_n(const struct xinsn *x, struct gi *g, bool exact) {
     const uint8_t *p = x->bytes;
     unsigned n = x->len, i = 0;
     memset(g, 0, sizeof(*g));
@@ -607,11 +611,17 @@ static bool gdecode(const struct xinsn *x, struct gi *g) {
     g->immoff = (uint8_t) i;
     g->immlen = (uint8_t) isz;
     i += isz;
-    if (i != n)
+    if (exact ? i != n : i > n)
         return false;
+    g->len = (uint8_t) i;
+    g->next = x->ip + i;
     if (g->base == BASE_RIP)
         g->disp += (int64_t) g->next;  // the absolute address
     return true;
+}
+
+static bool gdecode(const struct xinsn *x, struct gi *g) {
+    return gdecode_n(x, g, true);
 }
 
 // ---------------------------------------------------------------- classify
@@ -913,6 +923,36 @@ static void shift_flags(const struct gi *g, const struct xinsn *x, struct cls *c
     }
 }
 
+// Flags the guest code at addr may read before it writes them: all a block
+// exit to there has to leave in the lazy state. Interrupts in between are
+// fine: the rest a signal handler sees is about to be overwritten anyway.
+static uint16_t succ_live(uint64_t addr) {
+    if (xlog_tlb == NULL)
+        return F_ALL;
+    uint16_t live = 0, written = 0;
+    for (int k = 0; k < 16; k++) {
+        struct xinsn in = {.ip = addr, .len = 15};
+        unsigned room = 0x1000 - (unsigned) (addr & 0xfff);
+        if (room < in.len)
+            in.len = (uint8_t) room;
+        if (!tlb_read(xlog_tlb, addr, in.bytes, in.len))
+            break;
+        struct gi g;
+        struct cls c;
+        if (!gdecode_n(&in, &g, false) || !classify(&g, &c))
+            break;
+        shift_flags(&g, &in, &c);
+        live |= c.fr & ~written;
+        written |= c.fw;
+        if (written == F_ALL)
+            return live;
+        if (c.kind == K_JCC || c.kind == K_JMP)
+            break;
+        addr = g.next;
+    }
+    return live | (F_ALL & ~written);
+}
+
 // ---------------------------------------------------------------- operands
 
 // Where an operand lives on the host: a register, or a cpu slot it is
@@ -979,8 +1019,13 @@ static bool plan_generic(const struct gi *g, const struct cls *c, struct plan *p
 
 struct xctx {
     struct xasm *a;
+    struct fiber_block *block;
     uintptr_t *code;
     uint16_t valid, dirty;  // flags valid in the host's eflags / not yet in the lazy state
+    // the patchable jumps of the block's exits: their stream slot, and where
+    // the rel32 is in the main section
+    struct { unsigned slot; uint32_t field; } links[2];
+    unsigned nlinks;
 };
 
 static void sync_dirty(struct xctx *x) {
@@ -1004,6 +1049,34 @@ static void e_exit_slot(struct xctx *x, unsigned s) {
     e_movabs(x->a, H_IP, slot_addr(x, s));
     e_mov_load(x->a, H_IP, XMEM(H_IP, 0));
     e_jmp_abs(x->a, (const void *) fiber_ret_chain);
+}
+
+// Leaves the block for the target in stream slot s, live: the flags the
+// target may read. A jmp chaining can point straight at the target's
+// translation (xjit_link()); until then it goes the way of e_exit_slot().
+static void e_exit_chain(struct xctx *x, unsigned s, uint16_t live) {
+    struct xasm *a = x->a;
+    e_sync_flags(a, x->dirty & live);
+    unsigned l_stub = new_label(a);
+    // an interrupt pending: leave through the gadgets, which see to it
+    e_mov_load(a, R14, XMEM(H_CPU, CPU_OFF(poked_ptr)));
+    b1(a, 0x41); b1(a, 0x80); b1(a, 0x3e); b1(a, 0x00);  // cmpb $0, (%r14)
+    e_jcc_lab(a, 5, l_stub);
+    // the rel32 aligned, so that patching it is one atomic store
+    while ((xpos(a) + 1) & 3)
+        b1(a, 0x90);
+    b1(a, 0xe9);
+    if (x->nlinks < 2)
+        x->links[x->nlinks++] = (typeof(x->links[0])) {s, xpos(a)};
+    rel_lab(a, l_stub);
+    a->cur = SEC_COLD;
+    lbind(a, l_stub);
+    // this block jumps: what chaining patches (it may have been entered
+    // through a link, which doesn't say)
+    e_movabs(a, R14, (uint64_t) (uintptr_t) x->block);
+    e_mov_store(a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, last_block)), R14);
+    e_exit_slot(x, s);
+    a->cur = SEC_MAIN;
 }
 
 // The guest address of a memory operand into dst. Slot registers go through
@@ -1478,6 +1551,90 @@ static void xlat_dump_stats(FILE *out) {
     }
 }
 
+// ---------------------------------------------------------------- profiling
+
+#ifdef _WIN32
+// ISH_PROF (platform/windows/prof.c): which translated block a pc is in
+void px_prof_hooks(void (*describe)(FILE *f, uintptr_t pc, unsigned count, uint64_t total),
+                   void (*finish)(void));
+
+struct prof_block {
+    uint8_t *mem;
+    uint32_t main_len, total;
+    uint64_t addr;
+};
+static struct prof_block *prof_blocks;
+static unsigned prof_nblocks, prof_capblocks;
+static pthread_mutex_t prof_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool prof_on;
+
+static void prof_note(uint8_t *mem, size_t main_len, size_t total, uint64_t addr) {
+    if (!prof_on)
+        return;
+    pthread_mutex_lock(&prof_lock);
+    if (prof_nblocks == prof_capblocks) {
+        unsigned cap = prof_capblocks ? prof_capblocks * 2 : 1024;
+        struct prof_block *bigger = realloc(prof_blocks, cap * sizeof(*bigger));
+        if (bigger != NULL) {
+            prof_blocks = bigger;
+            prof_capblocks = cap;
+        }
+    }
+    if (prof_nblocks < prof_capblocks)
+        prof_blocks[prof_nblocks++] = (struct prof_block) {mem, (uint32_t) main_len, (uint32_t) total, addr};
+    pthread_mutex_unlock(&prof_lock);
+}
+
+static struct prof_block *prof_find(uintptr_t pc) {
+    for (unsigned i = prof_nblocks; i-- > 0;) {
+        struct prof_block *b = &prof_blocks[i];
+        if (pc >= (uintptr_t) b->mem && pc < (uintptr_t) b->mem + b->total)
+            return b;
+    }
+    return NULL;
+}
+
+static void prof_describe(FILE *f, uintptr_t pc, unsigned count, uint64_t total) {
+    double pct = total ? 100.0 * count / (double) total : 0;
+    struct prof_block *b = prof_find(pc);
+    if (b != NULL) {
+        uint32_t off = (uint32_t) (pc - (uintptr_t) b->mem);
+        fprintf(f, "%6u %5.2f%% X %llx +%x%s mem=%p\n", count, pct, (unsigned long long) b->addr,
+                off, off >= b->main_len ? " cold" : "", (void *) b->mem);
+    } else if (pc >= (uintptr_t) region && pc < (uintptr_t) region_end) {
+        fprintf(f, "%6u %5.2f%% R %p\n", count, pct, (void *) pc);
+    } else {
+        fprintf(f, "%6u %5.2f%% C %p\n", count, pct, (void *) pc);
+    }
+}
+
+// The code of every translated block, for disassembling.
+static void prof_dump_code(void) {
+    const char *e = getenv("PX_PROF");
+    if (!prof_on || e == NULL || !strcmp(e, "1"))
+        return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s.code", e);
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+        return;
+    for (unsigned i = 0; i < prof_nblocks; i++) {
+        struct prof_block *b = &prof_blocks[i];
+        fprintf(f, "BLOCK %llx %p %u %u\n", (unsigned long long) b->addr, (void *) b->mem,
+                b->main_len, b->total);
+        for (uint32_t j = 0; j < b->total; j++)
+            fprintf(f, "%02x", b->mem[j]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+#else
+static void prof_note(uint8_t *mem, size_t main_len, size_t total, uint64_t addr) {
+    (void) mem; (void) main_len; (void) total; (void) addr;
+}
+#endif
+
 // ---------------------------------------------------------------- blocks
 
 struct xi {
@@ -1578,9 +1735,22 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
         int32_t v32 = (int32_t) v;
         memcpy(field, &v32, 4);
     }
-    for (unsigned i = 0; i < nentries; i++)
+    for (unsigned i = 0; i < nentries; i++) {
         block->code[entry_slot[i]] = (uintptr_t) (mem + entry_off[i]);
+        if (entry_slot[i] == 0)
+            block->xjit_entry = (uintptr_t) (mem + entry_off[i]);
+    }
+    for (unsigned k = 0; k < x->nlinks; k++) {
+        uint8_t *field = mem + x->links[k].field;
+        for (int i = 0; i <= 1; i++) {
+            if (block->jump_ip[i] == &block->code[x->links[k].slot]) {
+                block->xjit_link[i] = field;
+                block->xjit_link_orig[i] = (uintptr_t) (field + 4) + (intptr_t) rd32(field);
+            }
+        }
+    }
     block->xjit_code = mem;
+    prof_note(mem, main_len, total, block->addr);
     if (stats_on) {
         atomic_fetch_add_explicit(&st_blocks, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&st_runs, nentries, memory_order_relaxed);
@@ -1597,6 +1767,7 @@ fail:
 static bool xlat_block(struct fiber_block *block) {
     if (!xlat_on || !xlog_ok || xlog_n == 0 || xlog[0].s0 != 0 || block->addr != xlog[0].ip)
         return false;
+
     unsigned n = xlog_n;
     if (xis_cap < n + 1) {
         free(xis);
@@ -1610,7 +1781,7 @@ static bool xlat_block(struct fiber_block *block) {
     struct xasm *a = &xa_tls;
     if (!xa_init(a))
         return false;
-    struct xctx x = {.a = a, .code = block->code};
+    struct xctx x = {.a = a, .block = block, .code = block->code};
 
     // the stream past the last instruction (gen_exit()), as one more
     struct xinsn tail = {.ip = 0, .s0 = xlog[n - 1].s1, .s1 = xlog_size, .bad = true};
@@ -1722,15 +1893,15 @@ static bool xlat_block(struct fiber_block *block) {
                 x.valid = F_ALL;
             }
             uint16_t dirty = x.dirty;
+            uint64_t target = (x.code[xi->taken] & ~(1ull << 63));
             if (c->kind == K_JCC) {
                 unsigned l_taken = new_label(a);
                 e_jcc_lab(a, c->cc, l_taken);
-                e_sync_flags(a, dirty);
-                e_exit_slot(&x, xi->fall);
+                e_exit_chain(&x, xi->fall, succ_live(x.code[xi->fall] & ~(1ull << 63)));
                 lbind(a, l_taken);
+                x.dirty = dirty;
             }
-            e_sync_flags(a, dirty);
-            e_exit_slot(&x, xi->taken);
+            e_exit_chain(&x, xi->taken, succ_live(target));
             in_run = false;
             continue;
         }
@@ -1758,6 +1929,12 @@ static void xlat_init(void) {
     xlat_on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
     if (!xlat_on)
         return;
+#ifdef _WIN32
+    e = getenv("PX_PROF");
+    prof_on = e != NULL && e[0] != '\0';
+    if (prof_on)
+        px_prof_hooks(prof_describe, prof_dump_code);
+#endif
 #if defined(__x86_64__)
     unsigned ra, rb, rc, rd;
     if (__get_cpuid_count(7, 0, &ra, &rb, &rc, &rd))

@@ -101,7 +101,8 @@ if host_windows
         dependencies: threads)
     dependencies += declare_dependency(link_with: libpx,
         dependencies: [cc.find_library('ws2_32'), cc.find_library('bcrypt'),
-                       cc.find_library('ntdll'), cc.find_library('psapi'), cc.find_library('iphlpapi')])
+                       cc.find_library('ntdll'), cc.find_library('psapi'), cc.find_library('iphlpapi'),
+                       cc.find_library('winmm')])
 endif
 
 # vdso is arch-specific

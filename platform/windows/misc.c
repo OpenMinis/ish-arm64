@@ -1,6 +1,7 @@
 // The rest of POSIX the build needs: system information, time, randomness,
 // backtraces, symbols, and child processes.
 #include "px_impl.h"
+#include <mmsystem.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -498,25 +499,28 @@ void px_crash_init(void) {
     SetUnhandledExceptionFilter(crash_filter);
 }
 
-// ---- PX_PROF=1: a sampling profiler for hosts without perf. A thread
-// samples the instruction pointer of every thread that ran the guest (the
-// thread that called px_prof_register), and px_exit prints the hottest
-// offsets into ish.exe for llvm-symbolizer.
+// ---- PX_PROF=1 (or =<file>): a sampling profiler for hosts without perf. A
+// thread samples the instruction pointer of every thread that ran the guest
+// (the thread that called px_prof_register) once a millisecond, and px_exit
+// prints the hottest pcs: as offsets into ish.exe for llvm-symbolizer, or as
+// whatever the JIT's describe hook makes of its own code.
 #define PROF_THREADS 64
 #define PROF_SLOTS 65536
 static HANDLE prof_threads[PROF_THREADS];
 static atomic_int prof_nthreads;
 static struct { uint64_t pc, count; } prof_hist[PROF_SLOTS];
-static uint64_t prof_total, prof_outside;
+static uint64_t prof_total, prof_dropped;
 static bool prof_on;
+static void (*prof_describe)(FILE *f, uintptr_t pc, unsigned count, uint64_t total);
+static void (*prof_finish)(void);
 
 static DWORD WINAPI prof_thread(void *param) {
     (void) param;
-    uintptr_t base = (uintptr_t) GetModuleHandleW(NULL);
+    timeBeginPeriod(1);
     for (;;) {
         Sleep(1);
         int n = atomic_load(&prof_nthreads);
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n && i < PROF_THREADS; i++) {
             HANDLE t = prof_threads[i];
             if (t == NULL || SuspendThread(t) == (DWORD) -1)
                 continue;
@@ -531,15 +535,15 @@ static DWORD WINAPI prof_thread(void *param) {
             uint64_t pc = c.Pc;
 #endif
             prof_total++;
-            if (pc < base || pc - base > (64u << 20)) {
-                prof_outside++;
-                continue;
-            }
-            pc -= base;
-            for (size_t j = (pc * 0x9e3779b97f4a7c15ull) >> 48;; j = (j + 1) % PROF_SLOTS) {
+            size_t j = (pc * 0x9e3779b97f4a7c15ull) >> 48;
+            for (size_t probe = 0;; j = (j + 1) % PROF_SLOTS) {
                 if (prof_hist[j].pc == pc || prof_hist[j].count == 0) {
                     prof_hist[j].pc = pc;
                     prof_hist[j].count++;
+                    break;
+                }
+                if (++probe == PROF_SLOTS) {
+                    prof_dropped++;
                     break;
                 }
             }
@@ -558,6 +562,12 @@ void px_prof_register(void) {
             THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, 0);
 }
 
+void px_prof_hooks(void (*describe)(FILE *f, uintptr_t pc, unsigned count, uint64_t total),
+                   void (*finish)(void)) {
+    prof_describe = describe;
+    prof_finish = finish;
+}
+
 void px_prof_init(void) {
     if (getenv("PX_PROF") == NULL)
         return;
@@ -568,17 +578,33 @@ void px_prof_init(void) {
 void px_prof_dump(void) {
     if (!prof_on || prof_total == 0)
         return;
-    fprintf(stderr, "[prof] %llu samples, %llu outside ish.exe\n",
-            (unsigned long long) prof_total, (unsigned long long) prof_outside);
-    for (int rank = 0; rank < 40; rank++) {
+    const char *path = getenv("PX_PROF");
+    FILE *f = strcmp(path, "1") != 0 ? fopen(path, "w") : NULL;
+    if (f == NULL)
+        f = stderr;
+    uintptr_t base = (uintptr_t) GetModuleHandleW(NULL);
+    fprintf(f, "[prof] %llu samples (%llu dropped), ish.exe at %p\n",
+            (unsigned long long) prof_total, (unsigned long long) prof_dropped, (void *) base);
+    for (int rank = 0; rank < 3000; rank++) {
         size_t best = 0;
         for (size_t j = 0; j < PROF_SLOTS; j++)
             if (prof_hist[j].count > prof_hist[best].count)
                 best = j;
         if (prof_hist[best].count == 0)
             break;
-        fprintf(stderr, "[prof] %#llx %5.2f%%\n", (unsigned long long) prof_hist[best].pc,
-                100.0 * prof_hist[best].count / prof_total);
+        uint64_t pc = prof_hist[best].pc;
+        unsigned count = (unsigned) prof_hist[best].count;
+        if (pc >= base && pc - base < (64u << 20))
+            fprintf(f, "%6u %5.2f%% ish.exe+%#llx\n", count, 100.0 * count / prof_total,
+                    (unsigned long long) (pc - base));
+        else if (prof_describe != NULL)
+            prof_describe(f, pc, count, prof_total);
+        else
+            fprintf(f, "%6u %5.2f%% %p\n", count, 100.0 * count / prof_total, (void *) pc);
         prof_hist[best].count = 0;
     }
+    if (f != stderr)
+        fclose(f);
+    if (prof_finish != NULL)
+        prof_finish();
 }

@@ -550,8 +550,28 @@ static uint8_t *emit_run(uint8_t *out, const uintptr_t *code, const struct run *
     return out;
 }
 
+void xjit_link(struct fiber_block *from, int i, struct fiber_block *to) {
+    uint8_t *field = from->xjit_link[i];
+    if (field == NULL || to->xjit_entry == 0)
+        return;
+    int64_t v = (int64_t) to->xjit_entry - (int64_t) (uintptr_t) (field + 4);
+    if (v != (int32_t) v)
+        return;
+    __atomic_store_n((int32_t *) field, (int32_t) v, __ATOMIC_RELEASE);
+}
+
+void xjit_unlink(struct fiber_block *from, int i) {
+    uint8_t *field = from->xjit_link[i];
+    if (field == NULL)
+        return;
+    int32_t v = (int32_t) ((intptr_t) from->xjit_link_orig[i] - (intptr_t) (field + 4));
+    __atomic_store_n((int32_t *) field, v, __ATOMIC_RELEASE);
+}
+
 void xjit_block(struct fiber_block *block) {
     block->xjit_code = NULL;
+    block->xjit_entry = 0;
+    block->xjit_link[0] = block->xjit_link[1] = NULL;
     pthread_once(&init_once, xjit_init_all);
     if (!xjit_on || region == NULL)
         return;
