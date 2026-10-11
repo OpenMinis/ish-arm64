@@ -54,11 +54,12 @@ struct tlb {
     struct list tlbs_link;
 #endif
 #ifdef GUEST_X86_64
-    // The x86_64 translator's guesses of data_minus_addr, one per memory
-    // access site (modulo the size). Per thread: threads touch different
-    // pages from the same code (their stacks), and shared guesses would
-    // overwrite each other's on every access.
-    uint64_t xguess[1 << 13];
+    // The x86_64 translator's memory access sites (modulo the size): the
+    // page each one found last time in this thread and its data_minus_addr,
+    // so that an access to the same page again needs no lookup. Per thread:
+    // threads touch different pages from the same code (their stacks).
+    // Valid as long as the TLB's entries are: tlb_flush() empties them.
+    struct { uint64_t page, data_minus_addr; } xsite[1 << 13];
 #endif
 };
 

@@ -61,6 +61,10 @@ void tlb_flush(struct tlb *tlb) {
     tlb->mem_changes = tlb->mmu->changes;
     for (unsigned i = 0; i < TLB_SIZE; i++)
         tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+#ifdef GUEST_X86_64
+    for (unsigned i = 0; i < sizeof(tlb->xsite) / sizeof(tlb->xsite[0]); i++)
+        tlb->xsite[i].page = TLB_PAGE_EMPTY;
+#endif
 }
 
 void tlb_free(struct tlb *tlb) {

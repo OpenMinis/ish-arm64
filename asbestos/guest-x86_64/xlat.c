@@ -361,15 +361,24 @@ static uint8_t *load_flags_stub;  // lazy flags -> host eflags; clobbers r14, r1
 static void e_sync_flags(struct xasm *a, uint16_t mask) {
     if (mask == 0)
         return;
-    b1(a, 0x9c);                         // pushfq
-    b1(a, 0x41); b1(a, 0x5e);            // pop %r14
-    // eflags bits (CF and OF too, harmless: collapse_flags rewrites them)
-    // mov %r14d, %r15d; and $mask, %r15d
-    e_rr(a, false, 0x89, R14, R15);
-    e_rex(a, false, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, mask);
-    // andl $~mask, eflags(%r11); orl %r15d, eflags(%r11)
-    e_rm(a, false, 0x81, 4, XMEM(H_CPU, CPU_OFF(eflags))); b4(a, (uint32_t) ~mask);
-    e_rm(a, false, 0x09, R15, XMEM(H_CPU, CPU_OFF(eflags)));
+    // lahf and seto, not pushfq (microcoded, the slowest part of this):
+    // r14 = SF ZF - AF - PF - CF in bits 8-15, OF in bit 0
+    e_mov_rr(a, R15, RAX);
+    b1(a, 0x9f);                                   // lahf
+    b1(a, 0x0f); b1(a, 0x90); b1(a, 0xc0);         // seto %al
+    b1(a, 0x44); b1(a, 0x0f); b1(a, 0xb7); b1(a, modrm_b(3, R14, RAX));  // movzwl %ax, %r14d
+    e_mov_rr(a, RAX, R15);
+    // eflags bits (not OF: collapse_flags rewrites it from of, as CF from cf)
+    uint16_t low = mask & (F_CF | F_PF | F_AF | F_ZF | F_SF);
+    if (low) {
+        // mov %r14d, %r15d; shr $8, %r15d; and $low, %r15d
+        e_rr(a, false, 0x89, R14, R15);
+        e_rex(a, false, -1, -1, R15, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, R15)); b1(a, 8);
+        e_rex(a, false, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, low);
+        // andl $~low, eflags(%r11); orl %r15d, eflags(%r11)
+        e_rm(a, false, 0x81, 4, XMEM(H_CPU, CPU_OFF(eflags))); b4(a, (uint32_t) ~low);
+        e_rm(a, false, 0x09, R15, XMEM(H_CPU, CPU_OFF(eflags)));
+    }
     uint8_t res = 0;
     if (mask & F_PF) res |= PF_RES;
     if (mask & F_ZF) res |= ZF_RES;
@@ -380,14 +389,12 @@ static void e_sync_flags(struct xasm *a, uint16_t mask) {
         e_rm(a, false, 0x80, 4, XMEM(H_CPU, CPU_OFF(flags_res))); b1(a, (uint8_t) ~res);
     }
     if (mask & F_CF) {
-        // bt $0, %r14d; setc cf(%r11)
-        e_rex(a, false, -1, -1, R14, false); b1(a, 0x0f); b1(a, 0xba); b1(a, modrm_b(3, 4, R14)); b1(a, 0);
+        // bt $8, %r14d; setc cf(%r11)
+        e_rex(a, false, -1, -1, R14, false); b1(a, 0x0f); b1(a, 0xba); b1(a, modrm_b(3, 4, R14)); b1(a, 8);
         e_rm2(a, false, 0x0f, 0x92, 0, XMEM(H_CPU, CPU_OFF(cf)));
     }
-    if (mask & F_OF) {
-        e_rex(a, false, -1, -1, R14, false); b1(a, 0x0f); b1(a, 0xba); b1(a, modrm_b(3, 4, R14)); b1(a, 11);
-        e_rm2(a, false, 0x0f, 0x92, 0, XMEM(H_CPU, CPU_OFF(of)));
-    }
+    if (mask & F_OF)
+        e_rm(a, false, 0x88, R14, XMEM(H_CPU, CPU_OFF(of)));   // mov %r14b, of(%r11)
 }
 
 // Keeps the arithmetic flags in r10 across code that clobbers them (lahf
@@ -1511,35 +1518,33 @@ static void e_after(struct xasm *a, const struct body *bd) {
 // the body on the host address. Flags in `sync` are written to the lazy
 // state before anything here can fault.
 //
-// The operand is (%r13,%r9) with r9 the data_minus_addr this access found
-// last time in this thread (tlb->xguess), so the access itself waits
-// only for its address: the TLB entry is checked in parallel, in program
-// order before it, and the access a wrong guess sends astray is squashed
-// with the mispredicted branch. A wrong guess takes the slow path, which
-// learns the right one.
+// Each access site has an entry in the thread's tlb->xsite: the page it
+// found last time and that page's data_minus_addr. The operand is
+// (%r13,%r9) with r9 that data_minus_addr, when the operand is all on that
+// page (and the TLB isn't stale): the check is a subtraction and a compare,
+// not a lookup, and the access waits only for its address. Otherwise the
+// TLB is looked up the usual way and the site learns the page.
 static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, bool write,
                        uint16_t keep, bool load_flags) {
     struct xasm *a = x->a;
     unsigned l_miss = new_label(a), l_back = new_label(a), l_cross = new_label(a),
-             l_after = new_label(a), l_orig = new_label(a), l_wrong = new_label(a);
+             l_after = new_label(a), l_orig = new_label(a), l_lookup = new_label(a);
     uint16_t sync = keep & x->dirty;
 
     if (keep)
         e_save_flags(a);
-    static _Atomic unsigned next_guess;
-    unsigned n = atomic_fetch_add_explicit(&next_guess, 1, memory_order_relaxed);
-    struct xmem guess = XMEM(H_TLB, TLBREL(xguess) + (int32_t) (n % array_size(((struct tlb *) 0)->xguess)) * 8);
-    e_mov_load(a, R9, guess);
-    e_tlb_index(a);
-    // the page of the operand's last byte, so that crossing a page misses
-    e_lea(a, R15, XMEM(R13, (int32_t) size - 1));
-    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, (uint32_t) -4096);
+    static _Atomic unsigned next_site;
+    unsigned n = atomic_fetch_add_explicit(&next_site, 1, memory_order_relaxed) %
+                 array_size(((struct tlb *) 0)->xsite);
+    struct xmem site_page = XMEM(H_TLB, TLBREL(xsite) + (int32_t) n * 16);
+    struct xmem site_dma = XMEM(H_TLB, TLBREL(xsite) + (int32_t) n * 16 + 8);
+    // mov %r13, %r15; sub page, %r15; or stale, %r15; cmp $(4096 - size), %r15; ja lookup
+    e_rr(a, true, 0x89, R13, R15);
+    e_rm(a, true, 0x2b, R15, site_page);
     e_rm(a, true, 0x0b, R15, XMEM(H_TLB, TLBREL(stale)));
-    e_rm(a, true, 0x3b, R15, (struct xmem) {H_TLB, R14, 0,
-         write ? TLBENT(page_if_writable) : TLBENT(page)});
-    e_jcc_lab(a, 5, l_miss);  // jne
-    e_rm(a, true, 0x3b, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
-    e_jcc_lab(a, 5, l_wrong);  // jne
+    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 7, R15)); b4(a, 4096 - size);
+    e_jcc_lab(a, 7, l_lookup);  // ja
+    e_mov_load(a, R9, site_dma);
     lbind(a, l_back);
     if (keep)
         e_restore_flags(a);
@@ -1551,9 +1556,19 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
 
     // slow paths
     a->cur = SEC_COLD;
-    lbind(a, l_wrong);
+    lbind(a, l_lookup);
+    e_tlb_index(a);
+    // the page of the operand's last byte, so that crossing a page misses
+    e_lea(a, R15, XMEM(R13, (int32_t) size - 1));
+    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R15)); b4(a, (uint32_t) -4096);
+    e_rm(a, true, 0x0b, R15, XMEM(H_TLB, TLBREL(stale)));
+    e_rm(a, true, 0x3b, R15, (struct xmem) {H_TLB, R14, 0,
+         write ? TLBENT(page_if_writable) : TLBENT(page)});
+    e_jcc_lab(a, 5, l_miss);  // jne
+    // a hit: r15 is the operand's page; the site learns it
     e_mov_load(a, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
-    e_mov_store(a, guess, R9);
+    e_mov_store(a, site_page, R15);
+    e_mov_store(a, site_dma, R9);
     e_jmp_lab(a, l_back);
 
     lbind(a, l_miss);
@@ -1593,9 +1608,10 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
 
 // ---------------------------------------------------------------- insns
 
-// Emits one translated instruction; live: flags live after it.
+// Emits one translated instruction; live: flags live after it, inb: those
+// of them the block's own native instructions read.
 static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
-                     const struct cls *c, const struct plan *p, uint16_t live) {
+                     const struct cls *c, const struct plan *p, uint16_t live, uint16_t inb) {
     struct xasm *a = x->a;
     struct body bd = {g, c, in, c->kind == K_GENERIC ? p : NULL};
     uint16_t live_in = c->fr | (live & ~c->fw);
@@ -1604,6 +1620,18 @@ static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
         // the lazy state has some of what it reads: complete it, then load
         // everything from it (after any lookup, which would clobber them)
         sync_dirty(x);
+        x->valid = 0;
+    }
+
+    bool has_mem = (c->kind == K_GENERIC && p->mem) || c->kind == K_PUSH || c->kind == K_PUSHI ||
+                   c->kind == K_POP || c->kind == K_LEAVE;
+    uint16_t held = x->valid & live_in;
+    if (has_mem && !load_flags && held != 0 && (held & (c->fr | (inb & ~c->fw))) == 0) {
+        // Live only for where the block leaves: write them to the lazy state
+        // now (leaving would) rather than keep them across this access and
+        // the ones after it. Before the address, which may use r14/r15.
+        e_sync_flags(a, x->dirty & held);
+        x->dirty = 0;
         x->valid = 0;
     }
 
@@ -1919,12 +1947,15 @@ struct xi {
     uint8_t mode;
     bool terminal;
     unsigned taken, fall;   // jcc/jmp: the stream slots of the targets
+    uint16_t live_taken, live_fall;   // jcc/jmp: what the targets read (succ_live())
 };
 enum { M_STREAM, M_TPL, M_NATIVE };
 
 static __thread struct xi *xis;
 static __thread unsigned xis_cap;
-static __thread uint16_t *live;
+// Flags live after each instruction: to the end of the block (all), and
+// read by the block's own native instructions before they are written (inb).
+static __thread struct lv { uint16_t all, inb; } *live;
 static __thread unsigned live_cap;
 static __thread unsigned *entry_slot;
 static __thread uint32_t *entry_off;
@@ -2268,16 +2299,27 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             return false;
         }
     }
-    uint16_t after = F_ALL;
+    uint16_t after = F_ALL, after_inb = 0;
     for (unsigned i = total; i-- > 0;) {
         struct xi *xi = &xis[i];
-        if (xi->mode != M_NATIVE || xi->terminal) {
-            live[i] = F_ALL;
-            after = F_ALL;
+        live[i] = (struct lv) {F_ALL, 0};
+        if (xi->mode == M_NATIVE && (xi->c.kind == K_JCC || xi->c.kind == K_JMP)) {
+            // a block's end: what the targets read, and the jump itself
+            xi->live_taken = succ_live(x.plan[xi->taken] & ~(1ull << 63));
+            xi->live_fall = xi->c.kind == K_JCC ? succ_live(x.plan[xi->fall] & ~(1ull << 63)) : 0;
+            after = xi->c.fr | xi->live_taken | xi->live_fall;
+            after_inb = xi->c.fr;
             continue;
         }
-        live[i] = after;
+        if (xi->mode != M_NATIVE || xi->terminal || xi->c.kind == K_CALL || xi->c.kind == K_CALLI ||
+                xi->c.kind == K_JMPI || xi->c.kind == K_RET) {
+            after = F_ALL;
+            after_inb = 0;
+            continue;
+        }
+        live[i] = (struct lv) {after, after_inb};
         after = xi->c.fr | (after & ~xi->c.fw);
+        after_inb = xi->c.fr | (after_inb & ~xi->c.fw);
     }
 
     // emit
@@ -2335,15 +2377,14 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
                 x.valid = F_ALL;
             }
             uint16_t dirty = x.dirty;
-            uint64_t target = (x.plan[xi->taken] & ~(1ull << 63));
             if (c->kind == K_JCC) {
                 unsigned l_taken = new_label(a);
                 e_jcc_lab(a, c->cc, l_taken);
-                e_exit_chain(&x, xi->fall, succ_live(x.plan[xi->fall] & ~(1ull << 63)));
+                e_exit_chain(&x, xi->fall, xi->live_fall);
                 lbind(a, l_taken);
                 x.dirty = dirty;
             }
-            e_exit_chain(&x, xi->taken, succ_live(target));
+            e_exit_chain(&x, xi->taken, xi->live_taken);
             in_run = false;
             continue;
         }
@@ -2353,7 +2394,7 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             continue;
         }
         (void) g;
-        e_native(&x, in, g, c, &xi->p, live[i]);
+        e_native(&x, in, g, c, &xi->p, live[i].all, live[i].inb);
         if (a->overflow)
             return false;
     }
