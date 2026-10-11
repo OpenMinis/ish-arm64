@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 
 #include "kernel/calls.h"
 #include "fs/tty.h"
@@ -82,6 +83,33 @@ static struct termios_ termios_from_real(struct termios real) {
 
 static struct termios old_termios;
 static bool real_tty_is_open;
+
+#ifdef _WIN32
+// A Windows console (or ConPTY) has no SIGWINCH and ReadConsoleW drops the
+// resize events, so watch the window size and pass changes to the guest tty
+// like the iOS terminal view does. Only host-side changes count: a guest
+// TIOCSWINSZ is left alone until the console itself is resized.
+static void *real_tty_winch_thread(void *_tty) {
+    struct tty *tty = _tty;
+    struct winsize last;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &last) < 0)
+        return NULL;
+    while (real_tty_is_open) {
+        struct timespec delay = {.tv_nsec = 200 * 1000 * 1000};
+        nanosleep(&delay, NULL);
+        struct winsize now;
+        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &now) < 0)
+            continue;
+        if (now.ws_col == last.ws_col && now.ws_row == last.ws_row)
+            continue;
+        last = now;
+        lock(&tty->lock);
+        tty_set_winsize(tty, (struct winsize_) {.col = now.ws_col, .row = now.ws_row});
+        unlock(&tty->lock);
+    }
+    return NULL;
+}
+#endif
 static int real_tty_init(struct tty *tty) {
     if (tty->num != REAL_TTY_NUM)
         return 0;
@@ -116,6 +144,11 @@ notty:
         return _EIO;
     pthread_detach(tty->thread);
     real_tty_is_open = true;
+#ifdef _WIN32
+    pthread_t winch;
+    if (tty->winsize.col != 0 && pthread_create(&winch, NULL, real_tty_winch_thread, tty) == 0)
+        pthread_detach(winch);
+#endif
     return 0;
 }
 
