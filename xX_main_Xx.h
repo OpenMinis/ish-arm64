@@ -19,6 +19,29 @@
 #endif
 
 void real_tty_reset_term(void);
+int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_only);
+
+// -b GUEST=HOST[:ro]: show host directory (or file) HOST at GUEST, read-only
+// with :ro. Needs -f; the mount point is replaced by a link to HOST in the
+// rootfs and stays after exit (a later bind of GUEST replaces it).
+static int bind_from_cli(char *spec) {
+    char *host = strchr(spec, '=');
+    if (host == NULL || host == spec || host[1] == '\0') {
+        fprintf(stderr, "ish: -b %s: expected GUEST=HOST[:ro]\n", spec);
+        return _EINVAL;
+    }
+    *host++ = '\0';
+    bool ro = false;
+    size_t n = strlen(host);
+    if (n > 3 && strcmp(host + n - 3, ":ro") == 0) {
+        host[n - 3] = '\0';
+        ro = true;
+    }
+    int err = fakefs_bind_mount(spec, host, ro);
+    if (err < 0)
+        fprintf(stderr, "ish: -b %s=%s: bind failed (%d)\n", spec, host, err);
+    return err;
+}
 
 static void exit_handler(struct task *task, int code) {
     if (task->parent != NULL)
@@ -58,7 +81,9 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     const char *workdir = NULL;
     const struct fs_ops *fs = &realfs;
     const char *console = "/dev/tty1";
-    while ((opt = getopt(argc, argv, "+r:f:d:c:n:")) != -1) {
+    char **binds = NULL;
+    int nbinds = 0;
+    while ((opt = getopt(argc, argv, "+r:f:d:c:n:b:")) != -1) {
         switch (opt) {
             case 'r':
             case 'f':
@@ -75,6 +100,10 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
             case 'n':
                 if (native_offload_add(optarg) < 0)
                     fprintf(stderr, "warning: ignoring -n %s\n", optarg);
+                break;
+            case 'b':
+                binds = realloc(binds, (nbinds + 1) * sizeof(*binds));
+                binds[nbinds++] = strdup(optarg);
                 break;
         }
     }
@@ -94,6 +123,14 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
 
     become_first_process();
     current->thread = pthread_self();
+
+    for (int k = 0; k < nbinds; k++) {
+        err = bind_from_cli(binds[k]);
+        if (err < 0)
+            return err;
+        free(binds[k]);
+    }
+    free(binds);
 
     // Create essential device nodes (only works with fakefs)
     if (fs != &realfs) {

@@ -107,6 +107,16 @@ struct fakefs_bind_mount {
 };
 
 static struct fakefs_bind_mount g_bind_mounts[FAKEFS_MAX_BIND_MOUNTS];
+
+/* fakefs_bind_mount's step-by-step trace, for debugging binds: off unless
+ * ISH_BIND_DEBUG is set. Failures are always reported. */
+static bool bind_debug(void) {
+    static int on = -1;
+    if (on < 0)
+        on = getenv("ISH_BIND_DEBUG") != NULL;
+    return on;
+}
+#define BIND_LOG(...) do { if (bind_debug()) fprintf(stderr, __VA_ARGS__); } while (0)
 struct mount *g_fakefs_mount = NULL;
 
 /* Optional host-provided override hooks for guest↔host path translation.
@@ -1170,7 +1180,7 @@ static int create_relative_symlink(int root_fd, const char *host_link,
     char rel_target[PATH_MAX];
     compute_relative_path(link_abs, host_real, rel_target, sizeof(rel_target));
 
-    fprintf(stderr, "create_relative_symlink: \"%s\" -> \"%s\" (relative: \"%s\")\n",
+    BIND_LOG("create_relative_symlink: \"%s\" -> \"%s\" (relative: \"%s\")\n",
             host_link, host_path, rel_target);
 
     return symlinkat(rel_target, root_fd, host_link);
@@ -1206,7 +1216,7 @@ static void remove_tree_at(int dir_fd, const char *path) {
 }
 
 int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_only) {
-    fprintf(stderr, "fakefs_bind_mount: ENTER linux_path=\"%s\" (len=%zu) host_path=\"%s\" (len=%zu) read_only=%d\n",
+    BIND_LOG("fakefs_bind_mount: ENTER linux_path=\"%s\" (len=%zu) host_path=\"%s\" (len=%zu) read_only=%d\n",
             linux_path, strlen(linux_path), host_path, strlen(host_path), read_only ? 1 : 0);
 
     if (g_fakefs_mount == NULL) {
@@ -1215,14 +1225,14 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
     }
 
     const char *fixed = fix_path(linux_path);
-    fprintf(stderr, "fakefs_bind_mount: fix_path(\"%s\") => \"%s\" (len=%zu)\n",
+    BIND_LOG("fakefs_bind_mount: fix_path(\"%s\") => \"%s\" (len=%zu)\n",
             linux_path, fixed, strlen(fixed));
 
     /* Log root_fd info for context */
     {
         char fd_path[PATH_MAX];
         if (fcntl(g_fakefs_mount->root_fd, F_GETPATH, fd_path) == 0) {
-            fprintf(stderr, "fakefs_bind_mount: root_fd=%d path=\"%s\"\n",
+            BIND_LOG("fakefs_bind_mount: root_fd=%d path=\"%s\"\n",
                     g_fakefs_mount->root_fd, fd_path);
         } else {
             fprintf(stderr, "fakefs_bind_mount: root_fd=%d (F_GETPATH failed)\n",
@@ -1275,7 +1285,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
                     if (inode_read_stat_if_exist(fs, existing, &prev)) {
                         prev.mode = top_mode;
                         inode_write_stat(fs, existing, &prev);
-                        fprintf(stderr, "fakefs_bind_mount: slot[%d] updated meta.db mode to 0%o\n",
+                        BIND_LOG("fakefs_bind_mount: slot[%d] updated meta.db mode to 0%o\n",
                                 i, top_mode & 07777);
                     }
                 } else {
@@ -1283,18 +1293,18 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
                         .mode = top_mode, .uid = 0, .gid = 0, .rdev = 0
                     };
                     path_create(fs, linux_path, &ishstat);
-                    fprintf(stderr, "fakefs_bind_mount: slot[%d] created meta.db entry with mode 0%o\n",
+                    BIND_LOG("fakefs_bind_mount: slot[%d] created meta.db entry with mode 0%o\n",
                             i, top_mode & 07777);
                 }
                 db_commit(fs);
             }
 
             if (!host_changed) {
-                fprintf(stderr, "fakefs_bind_mount: slot[%d] already mounted with same host_path, mode refreshed\n", i);
+                BIND_LOG("fakefs_bind_mount: slot[%d] already mounted with same host_path, mode refreshed\n", i);
                 return 0;
             }
             /* host_path changed (e.g. session switch) — update slot and symlink */
-            fprintf(stderr, "fakefs_bind_mount: slot[%d] host_path changed from \"%s\" to \"%s\"\n",
+            BIND_LOG("fakefs_bind_mount: slot[%d] host_path changed from \"%s\" to \"%s\"\n",
                     i, g_bind_mounts[i].host_path, host_path);
             strlcpy(g_bind_mounts[i].host_path, host_path,
                     sizeof(g_bind_mounts[i].host_path));
@@ -1302,13 +1312,13 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
 
             char host_link[PATH_MAX];
             snprintf(host_link, sizeof(host_link), "%s", fix_path(linux_path));
-            fprintf(stderr, "fakefs_bind_mount: slot[%d] UPDATE symlink: host_link=\"%s\" -> host_path=\"%s\" (root_fd=%d)\n",
+            BIND_LOG("fakefs_bind_mount: slot[%d] UPDATE symlink: host_link=\"%s\" -> host_path=\"%s\" (root_fd=%d)\n",
                     i, host_link, host_path, g_fakefs_mount->root_fd);
             /* Remove whatever is at the path (file, symlink, or directory tree) */
             remove_tree_at(g_fakefs_mount->root_fd, host_link);
             int err = create_relative_symlink(g_fakefs_mount->root_fd, host_link, host_path);
-            fprintf(stderr, "fakefs_bind_mount: slot[%d] symlinkat returned %d (errno=%d)\n", i, err, err < 0 ? errno : 0);
             if (err < 0) {
+                fprintf(stderr, "fakefs_bind_mount: FAIL symlink \"%s\" -> \"%s\" (errno=%d)\n", host_link, host_path, errno);
                 g_bind_mounts[i].active = false;
                 return _EINVAL;
             }
@@ -1319,7 +1329,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
     /* Find a free slot */
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
         if (!g_bind_mounts[i].active) {
-            fprintf(stderr, "fakefs_bind_mount: using free slot[%d]\n", i);
+            BIND_LOG("fakefs_bind_mount: using free slot[%d]\n", i);
             strlcpy(g_bind_mounts[i].path, linux_path,
                     sizeof(g_bind_mounts[i].path));
             g_bind_mounts[i].path_len = strlen(linux_path);
@@ -1334,7 +1344,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             char host_link[PATH_MAX];
             snprintf(host_link, sizeof(host_link), "%s", fix_path(linux_path));
 
-            fprintf(stderr, "fakefs_bind_mount: slot[%d] NEW symlink: host_link=\"%s\" -> host_path=\"%s\" (root_fd=%d)\n",
+            BIND_LOG("fakefs_bind_mount: slot[%d] NEW symlink: host_link=\"%s\" -> host_path=\"%s\" (root_fd=%d)\n",
                     i, host_link, host_path, g_fakefs_mount->root_fd);
 
             /* Remove whatever is at the path (file, symlink, or directory tree) */
@@ -1342,8 +1352,8 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
 
             /* Create the symlink (relative path to avoid iOS sandbox issues) */
             int err = create_relative_symlink(g_fakefs_mount->root_fd, host_link, host_path);
-            fprintf(stderr, "fakefs_bind_mount: slot[%d] symlinkat returned %d (errno=%d)\n", i, err, err < 0 ? errno : 0);
             if (err < 0) {
+                fprintf(stderr, "fakefs_bind_mount: FAIL symlink \"%s\" -> \"%s\" (errno=%d)\n", host_link, host_path, errno);
                 g_bind_mounts[i].active = false;
                 return _EINVAL;
             }
@@ -1353,7 +1363,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             ssize_t rlen = readlinkat(g_fakefs_mount->root_fd, host_link, readbuf, sizeof(readbuf) - 1);
             if (rlen > 0) {
                 readbuf[rlen] = '\0';
-                fprintf(stderr, "fakefs_bind_mount: slot[%d] VERIFY readlinkat(\"%s\") => \"%s\"\n", i, host_link, readbuf);
+                BIND_LOG("fakefs_bind_mount: slot[%d] VERIFY readlinkat(\"%s\") => \"%s\"\n", i, host_link, readbuf);
             } else {
                 fprintf(stderr, "fakefs_bind_mount: slot[%d] VERIFY readlinkat(\"%s\") FAILED (errno=%d)\n", i, host_link, errno);
             }
@@ -1370,7 +1380,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
                     .mode = top_mode, .uid = 0, .gid = 0, .rdev = 0
                 };
                 path_create(fs, linux_path, &ishstat);
-                fprintf(stderr, "fakefs_bind_mount: slot[%d] created meta.db entry for \"%s\" mode=0%o\n",
+                BIND_LOG("fakefs_bind_mount: slot[%d] created meta.db entry for \"%s\" mode=0%o\n",
                         i, linux_path, top_mode & 07777);
             } else {
                 struct ish_stat prev;
@@ -1378,7 +1388,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
                     prev.mode = top_mode;
                     inode_write_stat(fs, ino, &prev);
                 }
-                fprintf(stderr, "fakefs_bind_mount: slot[%d] meta.db entry refreshed for \"%s\" (inode=%lld) mode=0%o\n",
+                BIND_LOG("fakefs_bind_mount: slot[%d] meta.db entry refreshed for \"%s\" (inode=%lld) mode=0%o\n",
                         i, linux_path, (long long)ino, top_mode & 07777);
             }
             db_commit(fs);
