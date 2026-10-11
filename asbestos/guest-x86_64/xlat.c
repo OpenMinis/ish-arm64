@@ -388,8 +388,8 @@ static void e_restore_flags(struct xasm *a) {
     e_mov_rr(a, RAX, R14);
 }
 
-// The lazy flags into the host's eflags. A shared routine: it ends in popfq
-// and ret, which leaves the flags alone. Clobbers r14, r15.
+// The lazy flags into the host's eflags. A shared routine: it ends in sahf
+// (and an add for OF) and ret, which leaves the flags alone. Clobbers r14, r15.
 static void e_load_flags_stub(struct xasm *a) {
     b1(a, 0x50);                       // push %rax
     b1(a, 0x51);                       // push %rcx
@@ -410,10 +410,11 @@ static void e_load_flags_stub(struct xasm *a) {
     b1(a, 0xc1); b1(a, modrm_b(3, 4, RAX)); b1(a, 5);         // shl $5, %eax
     b1(a, 0x25); b4(a, F_ZF | F_SF);                           // and $0xc0, %eax
     b1(a, 0x09); b1(a, modrm_b(3, RAX, RCX));                 // or %eax, %ecx
-    // eax = flags of res: test res; pushfq; pop
+    // eax = flags of res: test res; lahf
     e_mov_load(a, R15, XMEM(H_CPU, CPU_OFF(res)));
     e_rr(a, true, 0x85, R15, R15);                             // test %r15, %r15
-    b1(a, 0x9c); b1(a, 0x58);                                  // pushfq; pop %rax
+    b1(a, 0x9f);                                               // lahf
+    b1(a, 0x0f); b1(a, 0xb6); b1(a, 0xc4);                     // movzbl %ah, %eax
     // AF from op1 ^ op2 ^ res, bit 4
     e_rm(a, true, 0x33, R15, XMEM(H_CPU, CPU_OFF(op1)));       // xor op1, %r15
     e_rm(a, true, 0x33, R15, XMEM(H_CPU, CPU_OFF(op2)));       // xor op2, %r15
@@ -435,14 +436,18 @@ static void e_load_flags_stub(struct xasm *a) {
     b1(a, 0x83); b1(a, modrm_b(3, 4, RAX)); b1(a, 1);
     b1(a, 0xc1); b1(a, modrm_b(3, 4, RAX)); b1(a, 11);
     e_rr(a, false, 0x09, RAX, R14);
-    // the host's other flags (DF, IF...) as they are
-    b1(a, 0x9c); b1(a, 0x58);                                  // pushfq; pop %rax
-    b1(a, 0x25); b4(a, (uint32_t) ~F_ALL);
-    e_rr(a, false, 0x09, R14, RAX);                            // or %r14d, %eax
+    // into the flags as e_restore_flags() does: ah for sahf, al = OF
+    e_rr(a, false, 0x89, R14, RAX);                            // mov %r14d, %eax
+    b1(a, 0x25); b4(a, F_SF | F_ZF | F_AF | F_PF | F_CF);      // and $0xd5, %eax
+    b1(a, 0xc1); b1(a, modrm_b(3, 4, RAX)); b1(a, 8);         // shl $8, %eax
+    e_rr(a, false, 0x89, R14, RCX);                            // mov %r14d, %ecx
+    b1(a, 0xc1); b1(a, modrm_b(3, 5, RCX)); b1(a, 11);        // shr $11, %ecx
+    b1(a, 0x83); b1(a, modrm_b(3, 4, RCX)); b1(a, 1);         // and $1, %ecx
+    b1(a, 0x09); b1(a, modrm_b(3, RCX, RAX));                 // or %ecx, %eax
+    b1(a, 0x04); b1(a, 0x7f);                                  // add $0x7f, %al: OF
+    b1(a, 0x9e);                                               // sahf
     b1(a, 0x59);                                               // pop %rcx
-    // swap the image into place of the saved rax and popfq it
-    b1(a, 0x48); b1(a, 0x87); b1(a, 0x04); b1(a, 0x24);       // xchg %rax, (%rsp)
-    b1(a, 0x9d);                                               // popfq
+    b1(a, 0x58);                                               // pop %rax
     b1(a, 0xc3);                                               // ret
 }
 
@@ -1037,8 +1042,17 @@ static uint64_t slot_addr(struct xctx *x, unsigned slot) {
     return (uint64_t) (uintptr_t) &x->code[slot];
 }
 
+// LOCAL_last_block = this block: the gadgets that leave it (call, ret, an
+// unchained jump) go to the run loop, which chains last_block's jumps --
+// and a block entered through a link (xjit_link()) hasn't said it ran.
+static void e_note_block(struct xctx *x) {
+    e_movabs(x->a, R14, (uint64_t) (uintptr_t) x->block);
+    e_mov_store(x->a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, last_block)), R14);
+}
+
 // Hands over to the gadget stream at slot s.
 static void e_to_stream(struct xctx *x, unsigned s) {
+    e_note_block(x);
     e_movabs(x->a, H_IP, slot_addr(x, s + 1));
     // jmp *-8(%r9)
     b1(x->a, 0x41); b1(x->a, 0xff); b1(x->a, 0x61); b1(x->a, 0xf8);
@@ -1071,10 +1085,7 @@ static void e_exit_chain(struct xctx *x, unsigned s, uint16_t live) {
     rel_lab(a, l_stub);
     a->cur = SEC_COLD;
     lbind(a, l_stub);
-    // this block jumps: what chaining patches (it may have been entered
-    // through a link, which doesn't say)
-    e_movabs(a, R14, (uint64_t) (uintptr_t) x->block);
-    e_mov_store(a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, last_block)), R14);
+    e_note_block(x);
     e_exit_slot(x, s);
     a->cur = SEC_MAIN;
 }
@@ -1878,6 +1889,8 @@ static bool xlat_block(struct fiber_block *block) {
             tpl++;
             sync_dirty(&x);
             x.valid = 0;
+            if (xi->terminal)
+                e_note_block(&x);
             e_tpl_range(&x, in->s0, in->s1);
             if (xi->terminal)
                 in_run = false;

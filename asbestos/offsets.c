@@ -142,6 +142,8 @@ void cpu() {
 #endif
     OFFSET(TLB, tlb, block_cache);      // inline indirect-branch target cache
     OFFSET(TLB, tlb, block_cache_gen);
+    OFFSET(MMU, mmu, asbestos);
+    OFFSET(ASBESTOS, asbestos, invalidate_gen);
     MACRO(TLB_BITS);
     OFFSET(TLB_ENTRY, tlb_entry, page);
     OFFSET(TLB_ENTRY, tlb_entry, page_if_writable);

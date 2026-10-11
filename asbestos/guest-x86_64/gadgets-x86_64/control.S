@@ -36,7 +36,7 @@
     write_done 64, call_indir // clobbers r14
     // jump to target
     movq %tmp, %_ip
-    jmp fiber_ret
+    jmp fiber_ret_lookup
 
 .gadget ret
     movq %_rsp, %_addr
@@ -71,11 +71,11 @@
     // fallthrough
 2:
     movq %tmp, %_ip
-    jmp fiber_ret
+    jmp fiber_ret_lookup
 
 .gadget jmp_indir
     movq %tmp, %_ip
-    jmp fiber_ret
+    jmp fiber_ret_lookup
 .gadget jmp
     movq (%_ip), %_ip
     jmp fiber_ret_chain
