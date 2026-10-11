@@ -372,25 +372,28 @@ static void e_sync_flags(struct xasm *a, uint16_t mask) {
 }
 
 // Keeps the arithmetic flags in r10 across code that clobbers them (lahf
-// form: ah = SF ZF AF PF CF, al = OF). Uses r14.
+// form: ah = SF ZF AF PF CF, al = OF). Uses r15.
 static void e_save_flags(struct xasm *a) {
-    e_mov_rr(a, R14, RAX);
+    e_mov_rr(a, R15, RAX);
     b1(a, 0x9f);                                   // lahf
     b1(a, 0x0f); b1(a, 0x90); b1(a, 0xc0);         // seto %al
     e_mov_rr(a, R10, RAX);
-    e_mov_rr(a, RAX, R14);
+    e_mov_rr(a, RAX, R15);
 }
 static void e_restore_flags(struct xasm *a) {
-    e_mov_rr(a, R14, RAX);
+    e_mov_rr(a, R15, RAX);
     e_mov_rr(a, RAX, R10);
     b1(a, 0x04); b1(a, 0x7f);                      // add $0x7f, %al: OF
     b1(a, 0x9e);                                   // sahf
-    e_mov_rr(a, RAX, R14);
+    e_mov_rr(a, RAX, R15);
 }
 
 // The lazy flags into the host's eflags. A shared routine: it ends in sahf
-// (and an add for OF) and ret, which leaves the flags alone. Clobbers r14, r15.
+// (and an add for OF) and ret, which leaves the flags alone. Preserves
+// everything else.
 static void e_load_flags_stub(struct xasm *a) {
+    b1(a, 0x41); b1(a, 0x56);          // push %r14
+    b1(a, 0x41); b1(a, 0x57);          // push %r15
     b1(a, 0x50);                       // push %rax
     b1(a, 0x51);                       // push %rcx
     // r14d = the stored eflags' status bits; rcx = which come from res
@@ -448,6 +451,8 @@ static void e_load_flags_stub(struct xasm *a) {
     b1(a, 0x9e);                                               // sahf
     b1(a, 0x59);                                               // pop %rcx
     b1(a, 0x58);                                               // pop %rax
+    b1(a, 0x41); b1(a, 0x5f);                                  // pop %r15
+    b1(a, 0x41); b1(a, 0x5e);                                  // pop %r14
     b1(a, 0xc3);                                               // ret
 }
 
@@ -652,7 +657,13 @@ struct cls {
     bool rm_byte;      // the r/m operand is 8 bits
     uint16_t fr, fw;   // flags read / written
     uint8_t cc;        // jcc
+    // what the instruction does with its reg and r/m operands (RW_*; 0:
+    // both): decides which slot registers are loaded and stored back
+    uint8_t reg_rw, rm_rw;
 };
+#define RW_R 1
+#define RW_W 2
+#define RW_RW 3
 
 static unsigned osize(const struct gi *g) {
     return (g->rex & 8) ? 8 : g->p66 ? 2 : 4;
@@ -897,6 +908,58 @@ static bool classify(const struct gi *g, struct cls *c) {
     return false;
 }
 
+// Which of its operands an instruction reads and writes (cls.reg_rw/rm_rw).
+// A write narrower than 32 bits merges into the register: that's a read too.
+static void set_rw(const struct gi *g, struct cls *c) {
+    unsigned op = g->op;
+    bool full = osize(g) >= 4;  // a 32/64-bit destination
+    uint8_t wr = full ? RW_W : RW_RW;
+    if (c->kind != K_GENERIC)
+        return;
+    if (g->map == 0) {
+        if (op < 0x40 && (op & 7) <= 3) {
+            bool cmp = (op >> 3) == 7;
+            bool byte = (op & 1) == 0;
+            if ((op & 7) <= 1) {
+                c->rm_rw = cmp ? RW_R : RW_RW;
+                c->reg_rw = RW_R;
+            } else {
+                c->reg_rw = cmp ? RW_R : RW_RW;
+                c->rm_rw = RW_R;
+            }
+            (void) byte;
+            return;
+        }
+        switch (op) {
+            case 0x84: case 0x85: c->reg_rw = c->rm_rw = RW_R; return;
+            case 0x88: c->reg_rw = RW_R; c->rm_rw = RW_RW; return;
+            case 0x89: c->reg_rw = RW_R; c->rm_rw = wr; return;
+            case 0x8a: c->rm_rw = RW_R; c->reg_rw = RW_RW; return;
+            case 0x8b: case 0x63: case 0x69: case 0x6b: c->rm_rw = RW_R; c->reg_rw = wr; return;
+            case 0x80: case 0x81: case 0x83: c->rm_rw = g->rawreg == 7 ? RW_R : RW_RW; return;
+            case 0xc7: c->rm_rw = wr; return;
+            case 0xf6: case 0xf7:
+                if (g->rawreg <= 1 || g->rawreg == 4 || g->rawreg == 5)
+                    c->rm_rw = RW_R;
+                return;
+        }
+        return;
+    }
+    if (g->map == 1) {
+        if (op >= 0x40 && op <= 0x4f) { c->rm_rw = RW_R; c->reg_rw = RW_RW; return; }
+        switch (op) {
+            case 0xb6: case 0xb7: case 0xbe: case 0xbf: case 0xb8:
+                c->rm_rw = RW_R; c->reg_rw = wr; return;
+            case 0xaf: case 0xbc: case 0xbd: c->rm_rw = RW_R; c->reg_rw = RW_RW; return;
+            case 0xa3: c->reg_rw = c->rm_rw = RW_R; return;
+            case 0xab: case 0xb3: case 0xbb: case 0xa4: case 0xa5: case 0xac: case 0xad:
+            case 0xb0: case 0xb1:
+                c->reg_rw = RW_R; c->rm_rw = RW_RW; return;
+            case 0xba: c->rm_rw = g->rawreg == 4 ? RW_R : RW_RW; return;
+        }
+    }
+}
+
 // Shifts and rotates by an immediate: which flags the count makes them touch.
 static void shift_flags(const struct gi *g, const struct xinsn *x, struct cls *c) {
     unsigned op = g->op;
@@ -965,11 +1028,15 @@ static uint16_t succ_live(uint64_t addr) {
 struct hop {
     int host;     // host register (for a slot: the scratch it is loaded into)
     int slot;     // guest r8-r15: cpu offset, else -1
+    uint8_t rw;   // RW_*
 };
 
 struct plan {
     struct hop reg, rm;   // modrm.reg (if a GPR), modrm.rm (if a register)
     bool mem;
+    // the memory operand is (%r13) holding the host address, not
+    // (%r13,%r14) with r14 = data_minus_addr: when two slots need scratch
+    bool mem_add;
     bool norex;           // uses ah..bh: the encoding can't have a REX prefix
     bool rex;             // needs one
 };
@@ -979,7 +1046,8 @@ static int32_t slot_off(int g) {
 }
 
 // Maps guest register gr (an operand at 8 bits if byte) to the host.
-static void map_reg(const struct gi *g, int gr, bool byte, struct hop *h, struct plan *p, int *next_scratch, int *scratch_for) {
+static void map_reg(const struct gi *g, int gr, bool byte, struct hop *h, struct plan *p,
+                    const int *scratch, unsigned *nscratch, int *scratch_for) {
     h->slot = -1;
     if (byte && !g->rex && gr >= 4 && gr <= 7) {
         h->host = gr;  // ah, ch, dh, bh
@@ -993,7 +1061,7 @@ static void map_reg(const struct gi *g, int gr, bool byte, struct hop *h, struct
         return;
     }
     if (scratch_for[gr - 8] < 0)
-        scratch_for[gr - 8] = (*next_scratch)++;
+        scratch_for[gr - 8] = scratch[(*nscratch)++];
     h->host = scratch_for[gr - 8];
     h->slot = slot_off(gr);
     p->rex = true;
@@ -1002,17 +1070,22 @@ static void map_reg(const struct gi *g, int gr, bool byte, struct hop *h, struct
 static bool plan_generic(const struct gi *g, const struct cls *c, struct plan *p) {
     memset(p, 0, sizeof(*p));
     int scratch_for[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-    int next = R14;
+    p->mem = g->mod != 3;
+    // r14 holds data_minus_addr for a memory operand while it can
+    static const int scratch_reg[] = {R14, R15}, scratch_mem[] = {R15, R14};
+    const int *scratch = p->mem ? scratch_mem : scratch_reg;
+    unsigned nscratch = 0;
     p->reg.host = -1; p->reg.slot = -1;
     p->rm.host = -1; p->rm.slot = -1;
+    p->reg.rw = c->reg_rw ? c->reg_rw : RW_RW;
+    p->rm.rw = c->rm_rw ? c->rm_rw : RW_RW;
     if (c->reg_gpr)
-        map_reg(g, g->reg, c->reg_byte, &p->reg, p, &next, scratch_for);
-    if (g->mod == 3) {
-        map_reg(g, g->rm, c->rm_byte, &p->rm, p, &next, scratch_for);
-    } else {
-        p->mem = true;
+        map_reg(g, g->reg, c->reg_byte, &p->reg, p, scratch, &nscratch, scratch_for);
+    if (!p->mem)
+        map_reg(g, g->rm, c->rm_byte, &p->rm, p, scratch, &nscratch, scratch_for);
+    else
         p->rex = true;  // r13
-    }
+    p->mem_add = p->mem && nscratch > 1;
     if (g->rex & 8)
         p->rex = true;
     if (p->norex && p->rex)
@@ -1129,20 +1202,17 @@ static void e_addr(struct xctx *x, const struct gi *g, int dst, bool seg) {
     }
 }
 
-// The TLB index of the address in r13, times the entry size, into r14.
+// The TLB index of the address in r13 (TLB_INDEX), times the entry size,
+// into r14.
 static void e_tlb_index(struct xasm *a) {
-    unsigned lo = 12 - 5, hi = 12 + TLB_BITS - 5;
+    unsigned shift = 12 - 5;
     if (have_bmi2) {
-        // rorx $lo, %r13, %r14; rorx $hi, %r13, %r15
-        b1(a, 0xc4); b1(a, 0x43); b1(a, 0xfb); b1(a, 0xf0); b1(a, modrm_b(3, R14, R13)); b1(a, (uint8_t) lo);
-        b1(a, 0xc4); b1(a, 0x43); b1(a, 0xfb); b1(a, 0xf0); b1(a, modrm_b(3, R15, R13)); b1(a, (uint8_t) hi);
+        // rorx $shift, %r13, %r14: the bits it rotates in get masked off
+        b1(a, 0xc4); b1(a, 0x43); b1(a, 0xfb); b1(a, 0xf0); b1(a, modrm_b(3, R14, R13)); b1(a, (uint8_t) shift);
     } else {
         e_mov_rr(a, R14, R13);
-        e_rex(a, true, -1, -1, R14, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, R14)); b1(a, (uint8_t) lo);
-        e_mov_rr(a, R15, R13);
-        e_rex(a, true, -1, -1, R15, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, R15)); b1(a, (uint8_t) hi);
+        e_rex(a, true, -1, -1, R14, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, R14)); b1(a, (uint8_t) shift);
     }
-    e_rr(a, true, 0x31, R15, R14);  // xor %r15, %r14
     e_rex(a, false, -1, -1, R14, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R14));
     b4(a, ((1u << TLB_BITS) - 1) << 5);
 }
@@ -1159,16 +1229,26 @@ struct body {
     const struct plan *p;
 };
 
+// The memory operand in the host: (%r13) or (%r13,%r14)
+static struct xmem hmem(const struct plan *p) {
+    if (p == NULL || !p->mem_add)
+        return (struct xmem) {R13, R14, 0, 0};
+    return XMEM(R13, 0);
+}
+
 static void e_slot_loads(struct xasm *a, const struct plan *p) {
-    if (p->reg.slot >= 0)
+    // one slot as both operands: one scratch, loaded if either reads it
+    bool same = p->rm.slot >= 0 && p->rm.host == p->reg.host;
+    if (p->reg.slot >= 0 && ((p->reg.rw & RW_R) || (same && (p->rm.rw & RW_R))))
         e_mov_load(a, p->reg.host, XMEM(H_CPU, p->reg.slot));
-    if (p->rm.slot >= 0 && p->rm.host != p->reg.host)
+    if (p->rm.slot >= 0 && !same && (p->rm.rw & RW_R))
         e_mov_load(a, p->rm.host, XMEM(H_CPU, p->rm.slot));
 }
 static void e_slot_stores(struct xasm *a, const struct plan *p) {
-    if (p->reg.slot >= 0)
+    bool same = p->rm.slot >= 0 && p->rm.host == p->reg.host;
+    if (p->reg.slot >= 0 && ((p->reg.rw & RW_W) || (same && (p->rm.rw & RW_W))))
         e_mov_store(a, XMEM(H_CPU, p->reg.slot), p->reg.host);
-    if (p->rm.slot >= 0 && p->rm.host != p->reg.host)
+    if (p->rm.slot >= 0 && !same && (p->rm.rw & RW_W))
         e_mov_store(a, XMEM(H_CPU, p->rm.slot), p->rm.host);
 }
 
@@ -1181,17 +1261,19 @@ static void e_generic_insn(struct xasm *a, const struct body *bd) {
     if (g->pf3) b1(a, 0xf3);
     if (g->pf2) b1(a, 0xf2);
     int reg = c->reg_gpr ? p->reg.host : g->rawreg;
-    int rm = p->mem ? R13 : p->rm.host;
-    if (!p->norex)
-        e_rex(a, g->rex & 8, c->reg_gpr ? reg : -1, -1, rm, g->rex != 0 || p->rex);
+    struct xmem m = hmem(p);
+    if (!p->norex) {
+        if (p->mem)
+            e_rex(a, g->rex & 8, c->reg_gpr ? reg : -1, m.index, m.base, g->rex != 0 || p->rex);
+        else
+            e_rex(a, g->rex & 8, c->reg_gpr ? reg : -1, -1, p->rm.host, g->rex != 0 || p->rex);
+    }
     if (g->map == 1) b1(a, 0x0f);
     b1(a, g->op);
-    if (p->mem) {
-        b1(a, modrm_b(1, reg, R13));
-        b1(a, 0);
-    } else {
-        b1(a, modrm_b(3, reg, rm));
-    }
+    if (p->mem)
+        e_modrm_mem(a, reg, m);
+    else
+        b1(a, modrm_b(3, reg, p->rm.host));
     bn(a, &bd->in->bytes[g->immoff], g->immlen);
 }
 
@@ -1207,32 +1289,32 @@ static void e_body(struct xasm *a, const struct body *bd) {
             int gr = (g->op & 7) | ((g->rex & 1) ? 8 : 0);
             int h = gr == 4 ? R8 : gr;
             if (gr >= 8) {
-                e_mov_load(a, R14, XMEM(H_CPU, slot_off(gr)));
-                h = R14;
+                e_mov_load(a, R15, XMEM(H_CPU, slot_off(gr)));
+                h = R15;
             }
-            e_mov_store(a, XMEM(R13, 0), h);
+            e_mov_store(a, hmem(NULL), h);
             break;
         }
         case K_PUSHI: {
             int32_t imm = g->immlen == 1 ? (int8_t) bd->in->bytes[g->immoff] :
                 (int32_t) (bd->in->bytes[g->immoff] | bd->in->bytes[g->immoff + 1] << 8 |
                            bd->in->bytes[g->immoff + 2] << 16 | (uint32_t) bd->in->bytes[g->immoff + 3] << 24);
-            e_rm(a, true, 0xc7, 0, XMEM(R13, 0));
+            e_rm(a, true, 0xc7, 0, hmem(NULL));
             b4(a, (uint32_t) imm);
             break;
         }
         case K_POP: {
             int gr = (g->op & 7) | ((g->rex & 1) ? 8 : 0);
             if (gr >= 8) {
-                e_mov_load(a, R14, XMEM(R13, 0));
-                e_mov_store(a, XMEM(H_CPU, slot_off(gr)), R14);
+                e_mov_load(a, R15, hmem(NULL));
+                e_mov_store(a, XMEM(H_CPU, slot_off(gr)), R15);
             } else {
-                e_mov_load(a, gr == 4 ? R8 : gr, XMEM(R13, 0));
+                e_mov_load(a, gr == 4 ? R8 : gr, hmem(NULL));
             }
             break;
         }
         case K_LEAVE:
-            e_mov_load(a, R14, XMEM(R13, 0));
+            e_mov_load(a, R15, hmem(NULL));
             break;
     }
 }
@@ -1252,7 +1334,7 @@ static void e_after(struct xasm *a, const struct body *bd) {
         }
         case K_LEAVE:
             e_lea(a, R8, XMEM(RBP, 8));
-            e_mov_rr(a, RBP, R14);
+            e_mov_rr(a, RBP, R15);
             break;
     }
 }
@@ -1266,6 +1348,7 @@ static void e_after(struct xasm *a, const struct body *bd) {
 static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, bool write,
                        uint16_t keep, bool load_flags) {
     struct xasm *a = x->a;
+    bool mem_add = bd->p != NULL && bd->p->mem_add;
     unsigned l_miss = new_label(a), l_back = new_label(a), l_cross = new_label(a),
              l_after = new_label(a), l_orig = new_label(a);
     uint16_t sync = keep & x->dirty;
@@ -1280,7 +1363,10 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     e_rm(a, true, 0x3b, R15, (struct xmem) {H_TLB, R14, 0,
          write ? TLBENT(page_if_writable) : TLBENT(page)});
     e_jcc_lab(a, 5, l_miss);  // jne
-    e_rm(a, true, 0x03, R13, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
+    if (mem_add)
+        e_rm(a, true, 0x03, R13, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
+    else
+        e_mov_load(a, R14, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
     lbind(a, l_back);
     if (keep)
         e_restore_flags(a);
@@ -1305,6 +1391,8 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     // lea orig(%rip), %r9
     b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
     e_call_abs(a, write ? (const void *) handle_write_miss : (const void *) handle_read_miss);
+    // r13 is the host address now
+    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, 0);  // movl $0, %r14d
     e_jmp_lab(a, l_back);
 
     lbind(a, l_cross);
@@ -1316,6 +1404,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, size);
     b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
     e_call_abs(a, (const void *) crosspage_load);
+    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, 0);  // movl $0, %r14d
     if (keep)
         e_restore_flags(a);
     if (load_flags)
@@ -1345,7 +1434,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
 static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
                      const struct cls *c, const struct plan *p, uint16_t live) {
     struct xasm *a = x->a;
-    struct body bd = {g, c, in, p};
+    struct body bd = {g, c, in, c->kind == K_GENERIC ? p : NULL};
     uint16_t live_in = c->fr | (live & ~c->fw);
     bool load_flags = (c->fr & ~x->valid) != 0;
     if (load_flags) {
@@ -1666,6 +1755,7 @@ static bool plan_insn(struct xctx *x, const struct xinsn *in, struct xi *xi, uns
     if (in->bad || !gdecode(in, &xi->g) || !classify(&xi->g, &xi->c))
         return false;
     shift_flags(&xi->g, in, &xi->c);
+    set_rw(&xi->g, &xi->c);
     const struct gi *g = &xi->g;
     switch (xi->c.kind) {
         case K_GENERIC:
