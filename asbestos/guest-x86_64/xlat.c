@@ -26,6 +26,7 @@
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
 #include "emu/interrupt.h"
+#include "kernel/memory.h"
 
 #if defined(__x86_64__)
 #include <cpuid.h>
@@ -130,7 +131,11 @@ struct xfix {
     uint32_t off;      // of the rel32 field
     uintptr_t target;  // address or label number
 };
-enum { FIX_ABS, FIX_LABEL, FIX_DATA = 3 };  // FIX_DATA: to word n of the block's data
+// FIX_DATA: rel32 to word n of the block's data. FIX_SLOT64 / FIX_BLOCK64:
+// an imm64 that is &block->code[n] / the block: everything that ties the
+// code to one block is a fixup, so a translation can be cached and linked
+// again for another block of the same guest code (xcache below).
+enum { FIX_ABS, FIX_LABEL, FIX_DATA = 3, FIX_SLOT64 = 4, FIX_BLOCK64 = 5 };
 
 struct xlabel {
     uint8_t sec;
@@ -1025,6 +1030,29 @@ static void shift_flags(const struct gi *g, const struct xinsn *x, struct cls *c
 // exit to there has to leave in the lazy state. Interrupts in between are
 // fine: the rest a signal handler sees is about to be overwritten anyway.
 static bool dbg_nosucc;
+// Guest bytes outside the block a translation depended on (what succ_live()
+// read): a cached translation is only valid while they are the same.
+#define XDEPS_MAX 32
+struct xdep {
+    uint64_t addr;
+    uint8_t len;
+    uint8_t bytes[15];
+};
+static __thread struct xdep xdeps[XDEPS_MAX];
+static __thread unsigned xdeps_n;
+static __thread bool xdeps_overflow;
+
+static void xdep_note(uint64_t addr, const uint8_t *bytes, unsigned len) {
+    if (xdeps_n == XDEPS_MAX) {
+        xdeps_overflow = true;
+        return;
+    }
+    struct xdep *d = &xdeps[xdeps_n++];
+    d->addr = addr;
+    d->len = (uint8_t) len;
+    memcpy(d->bytes, bytes, len);
+}
+
 static uint16_t succ_live(uint64_t addr) {
     if (xlog_tlb == NULL || dbg_nosucc)
         return F_ALL;
@@ -1034,8 +1062,11 @@ static uint16_t succ_live(uint64_t addr) {
         unsigned room = 0x1000 - (unsigned) (addr & 0xfff);
         if (room < in.len)
             in.len = (uint8_t) room;
-        if (!tlb_read(xlog_tlb, addr, in.bytes, in.len))
+        if (!tlb_read(xlog_tlb, addr, in.bytes, in.len)) {
+            xdeps_overflow = true;  // what it found depends on a fault: don't cache
             break;
+        }
+        xdep_note(addr, in.bytes, in.len);
         struct gi g;
         struct cls c;
         if (!gdecode_n(&in, &g, false) || !classify(&g, &c))
@@ -1139,29 +1170,37 @@ static void sync_dirty(struct xctx *x) {
     x->dirty = 0;
 }
 
-static uint64_t slot_addr(struct xctx *x, unsigned slot) {
-    return (uint64_t) (uintptr_t) &x->code[slot];
+
+// movabs $&block->code[slot] / $block, %reg
+static void e_movabs_fix(struct xasm *a, int reg, uint8_t kind, uintptr_t target) {
+    e_rex(a, true, -1, -1, reg, false);
+    b1(a, (uint8_t) (0xb8 + (reg & 7)));
+    add_fix(a, kind, target);
+    b8(a, 0);
+}
+static void e_movabs_slot(struct xctx *x, int reg, unsigned slot) {
+    e_movabs_fix(x->a, reg, FIX_SLOT64, slot);
 }
 
 // LOCAL_last_block = this block: the gadgets that leave it (call, ret, an
 // unchained jump) go to the run loop, which chains last_block's jumps --
 // and a block entered through a link (xjit_link()) hasn't said it ran.
 static void e_note_block(struct xctx *x) {
-    e_movabs(x->a, R14, (uint64_t) (uintptr_t) x->block);
+    e_movabs_fix(x->a, R14, FIX_BLOCK64, 0);
     e_mov_store(x->a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, last_block)), R14);
 }
 
 // Hands over to the gadget stream at slot s.
 static void e_to_stream(struct xctx *x, unsigned s) {
     e_note_block(x);
-    e_movabs(x->a, H_IP, slot_addr(x, s + 1));
+    e_movabs_slot(x, H_IP, s + 1);
     // jmp *-8(%r9)
     b1(x->a, 0x41); b1(x->a, 0xff); b1(x->a, 0x61); b1(x->a, 0xf8);
 }
 
 // Leaves the block through the chainable stream slot s (jmp/jcc arguments).
 static void e_exit_slot(struct xctx *x, unsigned s) {
-    e_movabs(x->a, H_IP, slot_addr(x, s));
+    e_movabs_slot(x, H_IP, s);
     e_mov_load(x->a, H_IP, XMEM(H_IP, 0));
     e_jmp_abs(x->a, (const void *) fiber_ret_chain);
 }
@@ -1537,7 +1576,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
         e_restore_flags(a);
     e_sync_flags(a, sync);
     e_note_block(x);
-    e_movabs(a, H_IP, slot_addr(x, bd->in->s0 + 1));
+    e_movabs_slot(x, H_IP, bd->in->s0 + 1);
     e_jmp_abs(a, (const void *) x->plan[bd->in->s0]);
     // the faulting instruction's address, where the fault path reads it
     while (xpos(a) & 7)
@@ -1722,7 +1761,7 @@ static bool tpl_range(const uintptr_t *code, unsigned s0, unsigned s1, bool *ter
 }
 
 static void e_tpl_range(struct xctx *x, unsigned s0, unsigned s1) {
-    e_movabs(x->a, H_IP, slot_addr(x, s0 + 1));
+    e_movabs_slot(x, H_IP, s0 + 1);
     unsigned s = s0;
     while (s < s1) {
         const struct tpl *t = tpl_lookup(x->plan[s]);
@@ -1736,6 +1775,8 @@ static void e_tpl_range(struct xctx *x, unsigned s0, unsigned s1) {
 // ---------------------------------------------------------------- stats
 
 static _Atomic uint64_t st_native, st_tpl, st_stream;
+static size_t xc_bytes, xc_limit = (size_t) 256 << 20;
+static _Atomic uint64_t st_xc_hits, st_xc_misses, st_xc_inserts, st_xc_rejects;
 static _Atomic uint64_t st_promote_ok, st_promote_differs, st_promote_failed, st_counted;
 
 static _Atomic uint32_t st_fallback_op[3 * 256];
@@ -1753,6 +1794,9 @@ static void count_fallback(const struct xinsn *in, const struct gi *g, bool deco
 }
 
 static void xlat_dump_stats(FILE *out) {
+    fprintf(out, "[xlat] xcache: hits=%llu misses=%llu inserts=%llu rejected(full)=%llu bytes=%zu\n",
+            (unsigned long long) st_xc_hits, (unsigned long long) st_xc_misses,
+            (unsigned long long) st_xc_inserts, (unsigned long long) st_xc_rejects, xc_bytes);
     fprintf(out, "[xlat] tiers: counted=%llu promoted=%llu differs=%llu failed=%llu\n",
             (unsigned long long) st_counted, (unsigned long long) st_promote_ok,
             (unsigned long long) st_promote_differs, (unsigned long long) st_promote_failed);
@@ -1945,7 +1989,7 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
         bd.imm = g->next;
         e_mem_insn(x, &bd, 8, true, 0, false);
         // ret_cache[(return address & 0xffff) >> 4] = the call's arguments
-        e_movabs(a, R14, slot_addr(x, xi->fall));
+        e_movabs_slot(x, R14, xi->fall);
         e_mov_store(a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, ret_cache) +
                                    (int32_t) (((g->next & 0xffff) >> 4) * 8)), R14);
     }
@@ -2107,6 +2151,11 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
             v = (int64_t) f->target - (int64_t) (intptr_t) (field + 4);
         } else if (f->kind == FIX_DATA) {
             v = (int64_t) (intptr_t) (data + 8 * f->target) - (int64_t) (intptr_t) (field + 4);
+        } else if (f->kind == FIX_SLOT64 || f->kind == FIX_BLOCK64) {
+            uint64_t p = f->kind == FIX_SLOT64 ? (uint64_t) (uintptr_t) &block->code[f->target]
+                                               : (uint64_t) (uintptr_t) block;
+            memcpy(field, &p, 8);
+            continue;
         } else {
             const uint8_t *orig = (const uint8_t *) f->target;
             v = (int64_t) rd32(orig) - ((int64_t) (intptr_t) field - (int64_t) (intptr_t) orig);
@@ -2148,6 +2197,9 @@ fail:
 
 // Translates the block the instruction log describes. False: leave it to
 // the template splicer.
+static void xc_insert(const struct xctx *x, const struct fiber_block *block,
+                      const unsigned *eslot, const uint32_t *eoff, unsigned nent);
+
 static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
     if (!xlat_on || !xlog_ok || xlog_n == 0 || xlog[0].s0 != 0 || block->addr != xlog[0].ip)
         return false;
@@ -2163,6 +2215,8 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
         }
     }
     struct xasm *a = &xa_tls;
+    xdeps_n = 0;
+    xdeps_overflow = false;
     if (!xa_init(a))
         return false;
     struct xctx x = {.a = a, .block = block, .code = block->code, .plan = plan};
@@ -2307,7 +2361,264 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
     }
     if (nentries == 0)
         return true;
-    return xlat_finish(&x, block, entry_slot, entry_off, nentries);
+    if (!xlat_finish(&x, block, entry_slot, entry_off, nentries))
+        return false;
+    xc_insert(&x, block, entry_slot, entry_off, nentries);
+    return true;
+}
+
+// ---------------------------------------------------------------- xcache
+
+// Translations kept for the next block of the same guest code: every guest
+// process re-translates the libraries it shares with the last one (python3
+// twenty times in a shell loop translates libpython twenty times). An entry
+// holds the assembler's output before linking (sections, fixups, labels,
+// entries, links), so a hit costs a copy and the fixups.
+//
+// A hit must be what translating would give: same guest address, the same
+// instructions byte for byte (from the instruction log of the block just
+// compiled), at the same stream slots, and the same bytes everywhere else
+// the translation looked (xdeps). Anything else is a miss and translates.
+struct xc_insn {
+    uint8_t len;
+    bool bad;
+    uint32_t s0, s1;
+};
+
+struct xc_entry {
+    struct xc_entry *next;
+    uint64_t addr;
+    uint32_t ninsn, guest_len, stream_size;
+    uint32_t ndeps, nfix, nlab, nent, nlinks, ndata;
+    uint32_t main_len, cold_len;
+    size_t size;
+    struct xc_insn *insn;
+    uint8_t *guest;
+    struct xdep *deps;
+    struct xfix *fix;
+    struct xlabel *lab;
+    uint32_t *ent_slot, *ent_off;
+    uint8_t *main, *cold;
+    struct { unsigned slot; uint32_t field; } links[2];
+};
+
+#define XC_BUCKETS 65536
+static struct xc_entry **xc_table;
+static pthread_mutex_t xc_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool xc_on;
+
+static unsigned xc_hash(uint64_t addr) {
+    return (unsigned) ((addr * 0x9e3779b97f4a7c15ull) >> 48) & (XC_BUCKETS - 1);
+}
+
+// Only code from file mappings that aren't writable is kept: that is what
+// the next process maps again (libraries, executables). A guest JIT's code
+// (V8's) sits in anonymous memory it rewrites all the time: caching it only
+// fills the cache and makes every lookup at those addresses longer. The
+// lock may be held the other way round (munmap holds it and then takes the
+// asbestos lock we hold): not getting it at once means not caching.
+static bool xc_file_code(uint64_t addr, uint64_t end) {
+    if (xlog_tlb == NULL || end <= addr)
+        return false;
+    struct mem *mem = container_of(xlog_tlb->mmu, struct mem, mmu);
+    if (!read_wrtrylock(&mem->lock))
+        return false;
+    bool ok = true;
+    page_t pages[2] = {PAGE(addr), PAGE(end - 1)};
+    for (int i = 0; i < 2 && ok; i++) {
+        struct pt_entry *pt = mem_pt(mem, pages[i]);
+        ok = pt != NULL && pt->data != NULL && pt->data->fd != NULL && !(pt->flags & P_WRITE);
+    }
+    read_wrunlock(&mem->lock);
+    return ok;
+}
+
+static uint64_t xlog_end(void) {
+    const struct xinsn *last = &xlog[xlog_n - 1];
+    return last->ip + (last->len ? last->len : 1);
+}
+
+// The instructions of the block just compiled, against an entry.
+static bool xc_matches(const struct xc_entry *e, uint64_t addr) {
+    if (e->addr != addr || e->ninsn != xlog_n || e->stream_size != xlog_size)
+        return false;
+    uint32_t off = 0;
+    for (unsigned i = 0; i < xlog_n; i++) {
+        const struct xinsn *in = &xlog[i];
+        const struct xc_insn *c = &e->insn[i];
+        if (in->bad != c->bad || in->len != c->len || in->s0 != c->s0 || in->s1 != c->s1 ||
+                in->ip != addr + off)
+            return false;
+        if (in->len != 0 && memcmp(in->bytes, e->guest + off, in->len) != 0)
+            return false;
+        off += in->len;
+    }
+    for (unsigned i = 0; i < e->ndeps; i++) {
+        const struct xdep *d = &e->deps[i];
+        uint8_t now[15];
+        if (xlog_tlb == NULL || !tlb_read(xlog_tlb, d->addr, now, d->len) || memcmp(now, d->bytes, d->len) != 0)
+            return false;
+    }
+    return true;
+}
+
+static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *entry_slot,
+                        uint32_t *entry_off, unsigned nentries);
+
+static bool xa_grow(struct xasm *a, unsigned nfix, unsigned nlab) {
+    while (a->capfix < nfix) {
+        unsigned cap = a->capfix ? a->capfix * 2 : 256;
+        struct xfix *bigger = realloc(a->fix, cap * sizeof(*a->fix));
+        if (bigger == NULL) return false;
+        a->fix = bigger; a->capfix = cap;
+    }
+    while (a->caplab < nlab) {
+        unsigned cap = a->caplab ? a->caplab * 2 : 256;
+        struct xlabel *bigger = realloc(a->lab, cap * sizeof(*a->lab));
+        if (bigger == NULL) return false;
+        a->lab = bigger; a->caplab = cap;
+    }
+    return true;
+}
+
+// Links a cached translation into block. True: done.
+static bool xc_link(struct fiber_block *block) {
+    if (!xc_on || xc_table == NULL || !xlog_ok || xlog_n == 0 || !xc_file_code(block->addr, xlog_end()))
+        return false;
+    struct xasm *a = &xa_tls;
+    if (!xa_init(a))
+        return false;
+    struct xctx x = {.a = a, .block = block, .code = block->code};
+    static __thread unsigned *eslot;
+    static __thread uint32_t *eoff;
+    static __thread unsigned ecap;
+    unsigned nent = 0;
+    bool found = false;
+
+    pthread_mutex_lock(&xc_lock);
+    struct xc_entry *e = xc_table[xc_hash(block->addr)];
+    for (; e != NULL; e = e->next)
+        if (xc_matches(e, block->addr))
+            break;
+    if (e != NULL && e->main_len <= XBUF_SIZE && e->cold_len <= XBUF_SIZE &&
+            xa_grow(a, e->nfix, e->nlab)) {
+        bool ok = true;
+        if (ecap < e->nent) {
+            free(eslot); free(eoff);
+            ecap = e->nent * 2;
+            eslot = malloc(ecap * sizeof(*eslot));
+            eoff = malloc(ecap * sizeof(*eoff));
+            if (eslot == NULL || eoff == NULL) { ecap = 0; ok = false; }
+        }
+        if (ok) {
+            // into the assembler's buffers, as if it had just emitted it
+            memcpy(a->sec[SEC_MAIN].base, e->main, e->main_len);
+            a->sec[SEC_MAIN].p = a->sec[SEC_MAIN].base + e->main_len;
+            memcpy(a->sec[SEC_COLD].base, e->cold, e->cold_len);
+            a->sec[SEC_COLD].p = a->sec[SEC_COLD].base + e->cold_len;
+            memcpy(a->fix, e->fix, e->nfix * sizeof(*e->fix));
+            a->nfix = e->nfix;
+            memcpy(a->lab, e->lab, e->nlab * sizeof(*e->lab));
+            a->nlab = e->nlab;
+            memcpy(eslot, e->ent_slot, e->nent * sizeof(*eslot));
+            memcpy(eoff, e->ent_off, e->nent * sizeof(*eoff));
+            nent = e->nent;
+            x.nlinks = e->nlinks;
+            memcpy(x.links, e->links, sizeof(x.links));
+            x.ndata = e->ndata;
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&xc_lock);
+    if (!found) {
+        if (stats_on)
+            atomic_fetch_add_explicit(&st_xc_misses, 1, memory_order_relaxed);
+        return false;
+    }
+    if (nent == 0 || !xlat_finish(&x, block, eslot, eoff, nent))
+        return false;
+    if (stats_on)
+        atomic_fetch_add_explicit(&st_xc_hits, 1, memory_order_relaxed);
+    return true;
+}
+
+// Keeps what xlat_translate() just linked into block.
+static void xc_insert(const struct xctx *x, const struct fiber_block *block,
+                      const unsigned *eslot, const uint32_t *eoff, unsigned nent) {
+    const struct xasm *a = x->a;
+    if (!xc_on || xc_table == NULL || xdeps_overflow || !xlog_ok || xlog_n == 0 || nent == 0 ||
+            !xc_file_code(block->addr, xlog_end()))
+        return;
+    uint32_t guest_len = 0;
+    for (unsigned i = 0; i < xlog_n; i++)
+        guest_len += xlog[i].len;
+    uint32_t main_len = (uint32_t) (a->sec[SEC_MAIN].p - a->sec[SEC_MAIN].base);
+    uint32_t cold_len = (uint32_t) (a->sec[SEC_COLD].p - a->sec[SEC_COLD].base);
+    size_t size = sizeof(struct xc_entry) + xlog_n * sizeof(struct xc_insn) + guest_len +
+        xdeps_n * sizeof(struct xdep) + a->nfix * sizeof(struct xfix) + a->nlab * sizeof(struct xlabel) +
+        nent * 8 + main_len + cold_len + 80;
+    pthread_mutex_lock(&xc_lock);
+    bool full = xc_bytes + size > xc_limit;
+    if (!full)
+        xc_bytes += size;
+    pthread_mutex_unlock(&xc_lock);
+    if (full) {
+        if (stats_on)
+            atomic_fetch_add_explicit(&st_xc_rejects, 1, memory_order_relaxed);
+        return;
+    }
+    struct xc_entry *e = calloc(1, size);
+    if (e == NULL)
+        return;
+    uint8_t *p = (uint8_t *) (e + 1);
+#define XC_TAKE(field, n) do { e->field = (void *) p; p += (n); p = (uint8_t *) (((uintptr_t) p + 7) & ~(uintptr_t) 7); } while (0)
+    XC_TAKE(insn, xlog_n * sizeof(struct xc_insn));
+    XC_TAKE(guest, guest_len);
+    XC_TAKE(deps, xdeps_n * sizeof(struct xdep));
+    XC_TAKE(fix, a->nfix * sizeof(struct xfix));
+    XC_TAKE(lab, a->nlab * sizeof(struct xlabel));
+    XC_TAKE(ent_slot, nent * 4);
+    XC_TAKE(ent_off, nent * 4);
+    XC_TAKE(main, main_len);
+    XC_TAKE(cold, cold_len);
+#undef XC_TAKE
+    e->addr = block->addr;
+    e->ninsn = xlog_n;
+    e->guest_len = guest_len;
+    e->stream_size = xlog_size;
+    uint32_t off = 0;
+    for (unsigned i = 0; i < xlog_n; i++) {
+        e->insn[i] = (struct xc_insn) {xlog[i].len, xlog[i].bad, xlog[i].s0, xlog[i].s1};
+        memcpy(e->guest + off, xlog[i].bytes, xlog[i].len);
+        off += xlog[i].len;
+    }
+    e->ndeps = xdeps_n;
+    memcpy(e->deps, xdeps, xdeps_n * sizeof(struct xdep));
+    e->nfix = a->nfix;
+    memcpy(e->fix, a->fix, a->nfix * sizeof(struct xfix));
+    e->nlab = a->nlab;
+    memcpy(e->lab, a->lab, a->nlab * sizeof(struct xlabel));
+    e->nent = nent;
+    memcpy(e->ent_slot, eslot, nent * 4);
+    memcpy(e->ent_off, eoff, nent * 4);
+    e->main_len = main_len;
+    memcpy(e->main, a->sec[SEC_MAIN].base, main_len);
+    e->cold_len = cold_len;
+    memcpy(e->cold, a->sec[SEC_COLD].base, cold_len);
+    e->nlinks = x->nlinks;
+    for (unsigned k = 0; k < 2; k++) {
+        e->links[k].slot = x->links[k].slot;
+        e->links[k].field = x->links[k].field;
+    }
+    e->ndata = x->ndata;
+    e->size = size;
+    pthread_mutex_lock(&xc_lock);
+    unsigned h = xc_hash(e->addr);
+    e->next = xc_table[h];
+    xc_table[h] = e;
+    pthread_mutex_unlock(&xc_lock);
+    if (stats_on)
+        atomic_fetch_add_explicit(&st_xc_inserts, 1, memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------- tiers
@@ -2354,6 +2665,8 @@ static bool xlat_install_counter(struct fiber_block *block) {
 }
 
 static bool xlat_block(struct fiber_block *block) {
+    if (xc_link(block))
+        return true;
     if (xlat_hot <= 1)
         return xlat_translate(block, block->code);
     if (!xlat_on || !xlog_ok || xlog_n == 0)
@@ -2394,7 +2707,7 @@ void xjit_promote(struct fiber_block *block, struct fiber_block *tmp, const unsi
     }
     if (same) {
         block->code[0] = block->xjit_gadget0;
-        bool ok = xlat_translate(block, tmp->code) && block->xjit_code != NULL;
+        bool ok = (xc_link(block) || xlat_translate(block, tmp->code)) && block->xjit_code != NULL;
         if (stats_on)
             atomic_fetch_add_explicit(ok ? &st_promote_ok : &st_promote_failed, 1, memory_order_relaxed);
         if (!ok) {
@@ -2454,6 +2767,12 @@ static void xlat_init(void) {
         dbg_kinds = (unsigned) strtoul(e, NULL, 0);
     if ((e = getenv("ISH_XLAT_HOT")) != NULL)
         xlat_hot = (unsigned) strtoul(e, NULL, 0);
+    e = getenv("ISH_XCACHE");
+    xc_on = !(e && e[0] == '0');
+    if ((e = getenv("ISH_XCACHE_MB")) != NULL)
+        xc_limit = (size_t) strtoul(e, NULL, 0) << 20;
+    if (xc_on && (xc_table = calloc(XC_BUCKETS, sizeof(*xc_table))) == NULL)
+        xc_on = false;
     e = getenv("ISH_XLAT_BMI2");
     if (e && e[0] == '0')
         have_bmi2 = false;

@@ -231,6 +231,13 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
     lock->pid = current_pid();
 }
 #define write_wrlock(lock) __write_wrlock(lock, __FILE__, __LINE__)
+static inline bool read_wrtrylock(wrlock_t *lock) {
+    if (pthread_rwlock_tryrdlock(&lock->l) != 0)
+        return false;
+    assert(lock->val >= 0);
+    lock->val++;
+    return true;
+}
 static inline bool write_wrtrylock(wrlock_t *lock) {
     int err = pthread_rwlock_trywrlock(&lock->l);
     if (err == EBUSY) return false;
