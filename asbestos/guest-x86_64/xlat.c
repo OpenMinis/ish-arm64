@@ -1033,10 +1033,7 @@ struct hop {
 
 struct plan {
     struct hop reg, rm;   // modrm.reg (if a GPR), modrm.rm (if a register)
-    bool mem;
-    // the memory operand is (%r13) holding the host address, not
-    // (%r13,%r14) with r14 = data_minus_addr: when two slots need scratch
-    bool mem_add;
+    bool mem;             // the r/m operand is memory: (%r13,%r9), see e_mem_insn()
     bool norex;           // uses ah..bh: the encoding can't have a REX prefix
     bool rex;             // needs one
 };
@@ -1071,9 +1068,7 @@ static bool plan_generic(const struct gi *g, const struct cls *c, struct plan *p
     memset(p, 0, sizeof(*p));
     int scratch_for[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     p->mem = g->mod != 3;
-    // r14 holds data_minus_addr for a memory operand while it can
-    static const int scratch_reg[] = {R14, R15}, scratch_mem[] = {R15, R14};
-    const int *scratch = p->mem ? scratch_mem : scratch_reg;
+    static const int scratch[] = {R14, R15};
     unsigned nscratch = 0;
     p->reg.host = -1; p->reg.slot = -1;
     p->rm.host = -1; p->rm.slot = -1;
@@ -1085,7 +1080,6 @@ static bool plan_generic(const struct gi *g, const struct cls *c, struct plan *p
         map_reg(g, g->rm, c->rm_byte, &p->rm, p, scratch, &nscratch, scratch_for);
     else
         p->rex = true;  // r13
-    p->mem_add = p->mem && nscratch > 1;
     if (g->rex & 8)
         p->rex = true;
     if (p->norex && p->rex)
@@ -1229,11 +1223,10 @@ struct body {
     const struct plan *p;
 };
 
-// The memory operand in the host: (%r13) or (%r13,%r14)
+// The memory operand in the host: guest address + data_minus_addr
 static struct xmem hmem(const struct plan *p) {
-    if (p == NULL || !p->mem_add)
-        return (struct xmem) {R13, R14, 0, 0};
-    return XMEM(R13, 0);
+    (void) p;
+    return (struct xmem) {R13, R9, 0, 0};
 }
 
 static void e_slot_loads(struct xasm *a, const struct plan *p) {
@@ -1345,16 +1338,24 @@ static void e_after(struct xasm *a, const struct body *bd) {
 // translate it (keeping the flags in `keep` alive across the lookup), run
 // the body on the host address. Flags in `sync` are written to the lazy
 // state before anything here can fault.
+//
+// The operand is (%r13,%r9) with r9 the data_minus_addr this access found
+// last time (a word next to the slow paths), so the access itself waits
+// only for its address: the TLB entry is checked in parallel, in program
+// order before it, and the access a wrong guess sends astray is squashed
+// with the mispredicted branch. A wrong guess takes the slow path, which
+// learns the right one.
 static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, bool write,
                        uint16_t keep, bool load_flags) {
     struct xasm *a = x->a;
-    bool mem_add = bd->p != NULL && bd->p->mem_add;
     unsigned l_miss = new_label(a), l_back = new_label(a), l_cross = new_label(a),
-             l_after = new_label(a), l_orig = new_label(a);
+             l_after = new_label(a), l_orig = new_label(a), l_guess = new_label(a),
+             l_wrong = new_label(a);
     uint16_t sync = keep & x->dirty;
 
     if (keep)
         e_save_flags(a);
+    b1(a, 0x4c); b1(a, 0x8b); b1(a, 0x0d); rel_lab(a, l_guess);  // mov guess(%rip), %r9
     e_tlb_index(a);
     // the page of the operand's last byte, so that crossing a page misses
     e_lea(a, R15, XMEM(R13, (int32_t) size - 1));
@@ -1363,10 +1364,8 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     e_rm(a, true, 0x3b, R15, (struct xmem) {H_TLB, R14, 0,
          write ? TLBENT(page_if_writable) : TLBENT(page)});
     e_jcc_lab(a, 5, l_miss);  // jne
-    if (mem_add)
-        e_rm(a, true, 0x03, R13, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
-    else
-        e_mov_load(a, R14, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
+    e_rm(a, true, 0x3b, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
+    e_jcc_lab(a, 5, l_wrong);  // jne
     lbind(a, l_back);
     if (keep)
         e_restore_flags(a);
@@ -1378,6 +1377,11 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
 
     // slow paths
     a->cur = SEC_COLD;
+    lbind(a, l_wrong);
+    e_mov_load(a, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
+    b1(a, 0x4c); b1(a, 0x89); b1(a, 0x0d); rel_lab(a, l_guess);  // mov %r9, guess(%rip)
+    e_jmp_lab(a, l_back);
+
     lbind(a, l_miss);
     // mov %r13d, %r15d; and $0xfff, %r15d; cmp $(0x1000 - size), %r15d; ja cross
     e_rr(a, false, 0x89, R13, R15);
@@ -1392,7 +1396,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
     e_call_abs(a, write ? (const void *) handle_write_miss : (const void *) handle_read_miss);
     // r13 is the host address now
-    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, 0);  // movl $0, %r14d
+    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
     e_jmp_lab(a, l_back);
 
     lbind(a, l_cross);
@@ -1404,7 +1408,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, size);
     b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
     e_call_abs(a, (const void *) crosspage_load);
-    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R14 & 7))); b4(a, 0);  // movl $0, %r14d
+    b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
     if (keep)
         e_restore_flags(a);
     if (load_flags)
@@ -1425,6 +1429,8 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
         b1(a, 0xcc);
     lbind(a, l_orig);
     b8(a, bd->g->ip);
+    lbind(a, l_guess);
+    b8(a, 0);
     a->cur = SEC_MAIN;
 }
 
