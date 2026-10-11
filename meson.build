@@ -24,6 +24,12 @@ add_project_arguments('-DENGINE_' + get_option('engine').to_upper() + '=1', lang
 
 guest_arch = get_option('guest_arch')
 add_project_arguments('-DGUEST_' + guest_arch.to_upper() + '=1', language: 'c')
+# x86 and x86_64 share the x86 decoder, gadgets and emu; arm64 and x86_64
+# share the 64-bit kernel (addresses, page tables, struct layouts).
+guest_x86_family = guest_arch in ['x86', 'x86_64']
+if guest_arch in ['arm64', 'x86_64']
+    add_project_arguments('-DGUEST_64BIT=1', language: 'c')
+endif
 
 if get_option('no_crlf')
     add_project_arguments('-DNO_CRLF', language: 'c')
@@ -33,10 +39,10 @@ endif
 # ARM64 guest: translator (asbestos/guest-arm64/jit.h), Apple arm64 hosts.
 # x86 guest: gadget-template JIT (asbestos/guest-x86/xjit.h), x86_64 hosts.
 ish_jit = get_option('jit') and guest_arch == 'arm64'
-ish_xjit = get_option('jit') and guest_arch == 'x86'
+ish_xjit = get_option('jit') and guest_x86_family
 if ish_xjit
     if host_machine.cpu_family() != 'x86_64'
-        error('-Djit=true with guest_arch=x86 needs an x86_64 host')
+        error('-Djit=true with an x86 guest needs an x86_64 host')
     endif
     add_project_arguments('-DISH_XJIT=1', language: 'c')
 endif
@@ -102,6 +108,9 @@ endif
 if guest_arch == 'x86'
     subdir('vdso/x86')
     vdso_inc = include_directories('vdso/x86')
+elif guest_arch == 'x86_64'
+    subdir('vdso/x86_64')
+    vdso_inc = include_directories('vdso/x86_64')
 elif guest_arch == 'arm64'
     subdir('vdso/arm64')
     vdso_inc = include_directories('vdso/arm64')
@@ -118,14 +127,14 @@ emu_src = [
 ]
 
 # Architecture-specific emu sources
-if guest_arch == 'x86'
+if guest_x86_family
     emu_src += [
         'emu/arch/x86/fpu.c',
         'emu/arch/x86/vec.c',
         'emu/arch/x86/mmx.c',
         'emu/arch/x86/float80.c',
     ]
-    gadgets_base = 'asbestos/guest-x86/gadgets-'
+    gadgets_base = guest_arch == 'x86_64' ? 'asbestos/guest-x86_64/gadgets-' : 'asbestos/guest-x86/gadgets-'
 elif guest_arch == 'arm64'
     emu_src += [
         'emu/arch/arm64/fpu.c',
@@ -134,10 +143,10 @@ elif guest_arch == 'arm64'
 endif
 
 gadgets = gadgets_base + host_machine.cpu_family()
-if guest_arch == 'x86'
+if guest_x86_family
     emu_src += [
         'asbestos/asbestos.c',
-        'asbestos/guest-x86/gen.c',
+        guest_arch == 'x86_64' ? 'asbestos/guest-x86_64/gen.c' : 'asbestos/guest-x86/gen.c',
         'asbestos/helpers.c',
         gadgets+'/entry.S',
         gadgets+'/memory.S',
@@ -1752,6 +1761,8 @@ if get_option('kernel') == 'ish'
     # Architecture-specific kernel sources
     if guest_arch == 'x86'
         arch_kernel_src = ['kernel/arch/x86/calls.c']
+    elif guest_arch == 'x86_64'
+        arch_kernel_src = ['kernel/arch/x86_64/calls.c']
     elif guest_arch == 'arm64'
         arch_kernel_src = ['kernel/arch/arm64/calls.c']
     endif

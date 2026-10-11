@@ -25,6 +25,18 @@ void cpu() {
     OFFSET(CPU, cpu_state, eip);
     OFFSET(CPU, cpu_state, gs);
     OFFSET(CPU, cpu_state, tls_ptr);
+#ifdef GUEST_X86_64
+    OFFSET(CPU, cpu_state, rip);
+    OFFSET(CPU, cpu_state, gs_base);
+    OFFSET(CPU, cpu_state, r8);
+    OFFSET(CPU, cpu_state, r9);
+    OFFSET(CPU, cpu_state, r10);
+    OFFSET(CPU, cpu_state, r11);
+    OFFSET(CPU, cpu_state, r12);
+    OFFSET(CPU, cpu_state, r13);
+    OFFSET(CPU, cpu_state, r14);
+    OFFSET(CPU, cpu_state, r15);
+#endif
 
     OFFSET(CPU, cpu_state, eflags);
     OFFSET(CPU, cpu_state, of);
@@ -125,7 +137,7 @@ void cpu() {
     OFFSET(TLB, tlb, mmu);
     OFFSET(TLB, tlb, dirty_page);
     OFFSET(TLB, tlb, segfault_addr);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     OFFSET(TLB, tlb, stale);
 #endif
     OFFSET(TLB, tlb, block_cache);      // inline indirect-branch target cache
@@ -134,7 +146,7 @@ void cpu() {
     OFFSET(TLB_ENTRY, tlb_entry, page);
     OFFSET(TLB_ENTRY, tlb_entry, page_if_writable);
     OFFSET(TLB_ENTRY, tlb_entry, data_minus_addr);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     OFFSET(TLB_ENTRY, tlb_entry, gen);
     OFFSET(MMU, mmu, changes);
 #endif

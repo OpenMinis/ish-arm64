@@ -126,7 +126,7 @@ struct sigevent_ {
     union sigval_ value;  // offset 0, size 8
     int_t signo;          // offset 8, size 4
     int_t method;         // offset 12, size 4
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     // ARM64: struct sigevent is 64 bytes with additional fields
     // sigev_notify_function, sigev_notify_attributes, padding
     union {
@@ -194,14 +194,18 @@ static inline void sigset_del(sigset_t_ *set, int sig) {
     *set &= ~sig_mask(sig);
 }
 
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 struct stack_t_ {
     uint64_t stack;    // ss_sp: 8 bytes on ARM64
     int32_t flags;     // ss_flags: 4 bytes
     uint32_t _pad;     // padding for alignment
     uint64_t size;     // ss_size: 8 bytes on ARM64
 };
+#ifdef GUEST_X86_64
+#define MINSIGSTKSZ_ 2048
+#else
 #define MINSIGSTKSZ_ 6144
+#endif
 #else
 struct stack_t_ {
     addr_t stack;
@@ -287,6 +291,50 @@ struct rt_sigframe_ {
     };
     struct ucontext_ uc;
     char retcode[8];
+};
+#elif defined(GUEST_X86_64)
+// arch/x86/include/uapi/asm/sigcontext.h (struct sigcontext_64): the order
+// of musl's and glibc's gregs[]
+struct sigcontext_ {
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t di, si, bp, bx, dx, ax, cx, sp, ip;
+    uint64_t flags;
+    uint16_t cs, gs, fs, ss;
+    uint64_t err, trapno, oldmask, cr2;
+    uint64_t fpstate; // the fxsave area below the frame
+    uint64_t reserved1[8];
+};
+static_assert(sizeof(struct sigcontext_) == 256, "x86_64 sigcontext size");
+
+struct ucontext_ {
+    uint64_t flags;
+    uint64_t link;
+    struct stack_t_ stack;
+    struct sigcontext_ mcontext;
+    sigset_t_ sigmask;
+};
+
+// the fxsave image (struct _fpstate_64)
+struct fpstate_ {
+    uint16_t cwd, swd, twd, fop;
+    uint64_t rip, rdp;
+    uint32_t mxcsr, mxcsr_mask;
+    uint32_t st_space[32]; // 8 registers, 16 bytes each
+    uint32_t xmm_space[64]; // 16 registers
+    uint32_t reserved2[12];
+    uint32_t sw_reserved[12];
+};
+static_assert(sizeof(struct fpstate_) == 512, "x86_64 fpstate size");
+
+// There is no non-rt frame on x86_64. The handler returns into restorer
+// (pretcode), so rt_sigreturn finds the frame at rsp - 8.
+struct rt_sigframe_ {
+    addr_t restorer;
+    struct ucontext_ uc;
+    union {
+        struct siginfo_ info;
+        char __pad[128];
+    };
 };
 #else
 struct sigcontext_ {

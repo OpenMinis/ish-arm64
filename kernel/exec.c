@@ -24,7 +24,7 @@
 #define ARGV_MAX 32 * PAGE_SIZE
 
 // Use architecture-appropriate ELF structures
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 typedef struct elf_header64 exec_elf_header;
 typedef struct prg_header64 exec_prg_header;
 #else
@@ -240,7 +240,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
         if (!load_addr_set && header.type == ELF_DYNAMIC) {
             // see giant comment in linux/fs/binfmt_elf.c, around line 950
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
             // ARM64: Always use dynamic placement to avoid conflicts with
             // V8's CodeRange hint at 0x574c0000 (the x86 bias 0x56555000
             // places large binaries like node right on top of it)
@@ -270,7 +270,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
     addr_t entry = bias + header.entry_point;
     addr_t interp_base = 0;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     current->mm->exe_bias = bias;
     current->mm->exe_entry = entry;
 #endif
@@ -302,7 +302,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
         goto beyond_hope;
     mem_pt(current->mem, vdso_page)->data->name = "[vdso]";
     current->mm->vdso = vdso_page << PAGE_BITS;
-#if !defined(GUEST_ARM64)
+#if !defined(GUEST_64BIT)
     addr_t vdso_entry = current->mm->vdso + ((exec_elf_header *) vdso_data)->entry_point;
 #endif
 
@@ -316,7 +316,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
     // STACK TIME!
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     // ARM64: stack near top of 48-bit address space
     if ((err = pt_map_nothing(current->mem, STACK_INIT_PAGE, 1, P_WRITE | P_GROWSDOWN)) < 0)
         goto beyond_hope;
@@ -358,6 +358,8 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
 #if defined(GUEST_ARM64)
     addr_t platform_addr = sp = copy_string(sp, "aarch64");
+#elif defined(GUEST_X86_64)
+    addr_t platform_addr = sp = copy_string(sp, "x86_64");
 #else
     addr_t platform_addr = sp = copy_string(sp, "i686");
 #endif
@@ -376,12 +378,14 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
     // declare elf aux now so we can know how big it is
     struct aux_ent aux[] = {
-#if !defined(GUEST_ARM64)
+#if !defined(GUEST_64BIT)
         {AX_SYSINFO, vdso_entry},
 #endif
         {AX_SYSINFO_EHDR, current->mm->vdso},
 #if defined(GUEST_ARM64)
         {AX_HWCAP, 0x11f}, // FP|ASIMD|EVTSTRM|AES|PMULL|ATOMICS — AES+PMULL enables ring's gcm_ghash_clmul (64-bit CLMUL) path
+#elif defined(GUEST_X86_64)
+        {AX_HWCAP, 0x07808111}, // CPUID.1:EDX, see emu/arch/x86/cpuid.h
 #else
         {AX_HWCAP, 0x00000000}, // suck that
 #endif
@@ -412,7 +416,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     addr_t p = sp;
 
     // argc
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
     {uint64_t argc64 = argv.count; if (user_put(p, argc64)) return _EFAULT;}
 #else
     if (user_put(p, argv.count))
@@ -423,7 +427,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     // argv
     size_t argc = argv.count;
     while (argc-- > 0) {
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
         {uint64_t ptr64 = argv_addr; if (user_put(p, ptr64)) return _EFAULT;}
 #else
         if (user_put(p, argv_addr))
@@ -437,7 +441,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     // envp
     size_t envc = envp.count;
     while (envc-- > 0) {
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
         {uint64_t ptr64 = envp_addr; if (user_put(p, ptr64)) return _EFAULT;}
 #else
         if (user_put(p, envp_addr))
@@ -489,6 +493,16 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
             (void)map_err; // guard pages are best-effort
         }
     }
+#elif defined(GUEST_X86_64)
+    memset(current->cpu.regs, 0, sizeof(current->cpu.regs));
+    current->cpu.rsp = sp;
+    current->cpu.rip = entry;
+    current->cpu.tls_ptr = 0;
+    current->cpu.gs_base = 0;
+    current->cpu.fcw = 0x37f;
+    current->cpu.mxcsr = 0x1f80;
+    collapse_flags(&current->cpu);
+    current->cpu.eflags = 0;
 #else
     current->cpu.esp = sp;
     current->cpu.eip = entry;
@@ -766,7 +780,7 @@ static ssize_t user_read_string_array(addr_t addr, char *buf, size_t max) {
     size_t i = 0;
     size_t p = 0;
     for (;;) {
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
         uint64_t str_addr64;
         if (user_get(addr + i * ELF_PTR_SIZE, str_addr64))
             return _EFAULT;

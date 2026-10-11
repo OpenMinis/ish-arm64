@@ -27,6 +27,9 @@ struct gen_state {
     // The JIT turns this block's gadgets into units of at most two
     // instructions (jit_step_end()): no peephole may fuse more than that.
     bool units;
+#ifdef GUEST_X86_64
+    uint8_t rex; // the current instruction's REX prefix, or 0
+#endif
 };
 
 bool gen_start(addr_t addr, struct gen_state *state);

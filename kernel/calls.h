@@ -53,7 +53,7 @@ addr_t sys_brk(addr_t new_brk);
 #define MMAP_NORESERVE 0x4000
 addr_t sys_mmap(addr_t args_addr);
 addr_t sys_mmap2(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_t fd_no, dword_t offset);
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 addr_t sys_mmap64(addr_t addr, addr_t len, dword_t prot, dword_t flags, fd_t fd_no, qword_t offset);
 #endif
 int_t sys_munmap(addr_t addr, addr_t len);
@@ -66,7 +66,7 @@ int_t sys_msync(addr_t addr, dword_t len, int_t flags);
 int_t sys_membarrier(int_t cmd, uint_t flags, int_t cpu_id);
 dword_t sys_mincore(addr_t addr, dword_t length, addr_t vec_addr);
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ARM64-specific memory management syscalls
 dword_t sys_fadvise64(fd_t f, uint64_t offset, uint64_t len, dword_t advice);
 #else
@@ -85,7 +85,7 @@ struct iovec_ {
     uint_t len;
 };
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ARM64 uses 64-bit pointers and size_t in iovec
 struct iovec64_ {
     uint64_t base;
@@ -179,7 +179,7 @@ dword_t sys_fchown32(fd_t f, dword_t owner, dword_t group);
 dword_t sys_fchownat(fd_t at_f, addr_t path_addr, dword_t owner, dword_t group, int flags);
 dword_t sys_chown32(addr_t path_addr, uid_t_ owner, uid_t_ group);
 dword_t sys_lchown(addr_t path_addr, uid_t_ owner, uid_t_ group);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 dword_t sys_truncate64(addr_t path_addr, off_t_ size);
 dword_t sys_ftruncate64(fd_t f, off_t_ size);
 dword_t sys_fallocate(fd_t f, dword_t mode, off_t_ offset, off_t_ len);
@@ -205,7 +205,7 @@ dword_t sys_statfs(addr_t path_addr, addr_t buf_addr);
 dword_t sys_statfs64(addr_t path_addr, dword_t buf_size, addr_t buf_addr);
 dword_t sys_fstatfs(fd_t f, addr_t buf_addr);
 dword_t sys_fstatfs64(fd_t f, addr_t buf_addr);
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 dword_t sys_statfs_arm64(addr_t path_addr, addr_t buf_addr);
 dword_t sys_fstatfs_arm64(fd_t f, addr_t buf_addr);
 #endif
@@ -280,7 +280,7 @@ dword_t sys_uname(addr_t uts_addr);
 dword_t sys_sethostname(addr_t hostname_addr, dword_t hostname_len);
 
 // sysinfo struct - architecture specific sizes
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 // ARM64: uses 64-bit long types (112 bytes total with padding)
 struct sys_info {
     uint64_t uptime;
@@ -329,7 +329,7 @@ dword_t sys_getrandom(addr_t buf_addr, dword_t len, dword_t flags);
 int_t sys_syslog(int_t type, addr_t buf_addr, int_t len);
 int_t sys_ipc(uint_t call, int_t first, int_t second, int_t third, addr_t ptr, int_t fifth);
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ARM64 syscalls pass 64-bit register values; functions taking dword_t
 // will implicitly truncate, while those taking off_t_/qword_t get full values.
 // Returns int64_t so addr_t-returning syscalls (mmap, brk) can pass 48-bit values.

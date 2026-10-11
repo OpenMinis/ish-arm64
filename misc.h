@@ -124,7 +124,7 @@ typedef int32_t sdword_t;
 typedef uint16_t word_t;
 typedef uint8_t byte_t;
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 typedef uint64_t addr_t;
 #else
 typedef dword_t addr_t;
@@ -136,7 +136,7 @@ typedef sdword_t pid_t_;
 typedef dword_t uid_t_;
 typedef word_t mode_t_;
 typedef sqword_t off_t_;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 typedef sqword_t time_t_;
 #else
 typedef dword_t time_t_;

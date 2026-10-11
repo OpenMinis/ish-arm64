@@ -15,7 +15,7 @@ dword_t sys_clock_gettime(dword_t clock, addr_t tp);
 dword_t sys_clock_settime(dword_t clock, addr_t tp);
 dword_t sys_clock_getres(dword_t clock, addr_t res_addr);
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 struct timeval_ {
     time_t_ sec;
     sqword_t usec;

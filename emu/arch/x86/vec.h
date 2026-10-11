@@ -140,6 +140,14 @@ void vec_single_fcmp32(NO_CPU, const float *src, union xmm_reg *dst, uint8_t typ
 void vec_fcmp_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t type);
 
 void vec_cvtsi2sd32(NO_CPU, const int32_t *src, double *dst);
+#ifdef GUEST_X86_64
+void vec_cvtsi2sdq64(NO_CPU, const int64_t *src, double *dst);
+void vec_cvtsi2ssq64(NO_CPU, const int64_t *src, float *dst);
+void vec_cvttsd2siq64(NO_CPU, const double *src, int64_t *dst);
+void vec_cvttss2siq32(NO_CPU, const float *src, int64_t *dst);
+void vec_cvtsd2siq64(struct cpu_state *cpu, const double *src, int64_t *dst);
+void vec_cvtss2siq32(struct cpu_state *cpu, const float *src, int64_t *dst);
+#endif
 void vec_cvttsd2si64(NO_CPU, const double *src, int32_t *dst);
 void vec_cvtsd2ss64(NO_CPU, const double *src, float *dst);
 void vec_cvtsi2ss32(NO_CPU, const int32_t *src, float *dst);
@@ -249,5 +257,71 @@ void vec_extract_w128(NO_CPU, const union xmm_reg *src, uint32_t *dst, uint8_t i
 
 void vec_avg_b128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
 void vec_avg_w128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+
+
+// SSE3, SSE4.1, SSE4.2 (vec.c)
+void vec_haddps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_hsubps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_haddpd128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_hsubpd128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_addsubps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_addsubpd128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_movddup64(NO_CPU, const uint64_t *src, union xmm_reg *dst);
+void vec_movsldup128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_movshdup128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+#define PMOVX_DECL(name, size) void vec_##name##size(NO_CPU, const void *src, union xmm_reg *dst);
+PMOVX_DECL(pmovsxbw, 64) PMOVX_DECL(pmovsxbd, 32) PMOVX_DECL(pmovsxbq, 16)
+PMOVX_DECL(pmovsxwd, 64) PMOVX_DECL(pmovsxwq, 32) PMOVX_DECL(pmovsxdq, 64)
+PMOVX_DECL(pmovzxbw, 64) PMOVX_DECL(pmovzxbd, 32) PMOVX_DECL(pmovzxbq, 16)
+PMOVX_DECL(pmovzxwd, 64) PMOVX_DECL(pmovzxwq, 32) PMOVX_DECL(pmovzxdq, 64)
+#undef PMOVX_DECL
+void vec_pminsb128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pmaxsb128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pminuw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pmaxuw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pminsd128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pmaxsd128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pminud128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pmaxud128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pmulld128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pmuldq128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pcmpeqq128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_pcmpgtq128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_packusdw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_phminposuw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst);
+void vec_ptest128(struct cpu_state *cpu, const union xmm_reg *src, const union xmm_reg *dst);
+void vec_blendps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_blendpd128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_pblendw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_pblendvb128(struct cpu_state *cpu, const union xmm_reg *src, union xmm_reg *dst);
+void vec_blendvps128(struct cpu_state *cpu, const union xmm_reg *src, union xmm_reg *dst);
+void vec_blendvpd128(struct cpu_state *cpu, const union xmm_reg *src, union xmm_reg *dst);
+void vec_roundps128(struct cpu_state *cpu, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_roundpd128(struct cpu_state *cpu, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_roundss32(struct cpu_state *cpu, const float *src, union xmm_reg *dst, uint8_t imm);
+void vec_roundsd64(struct cpu_state *cpu, const double *src, union xmm_reg *dst, uint8_t imm);
+void vec_dpps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_dppd128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_insertps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_insertps32(NO_CPU, const uint32_t *src, union xmm_reg *dst, uint8_t imm);
+void vec_mpsadbw128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t imm);
+void vec_pextrb64(NO_CPU, const union xmm_reg *src, uint64_t *dst, uint8_t imm);
+void vec_pextrb8(NO_CPU, const union xmm_reg *src, uint8_t *dst, uint8_t imm);
+void vec_pextrw16(NO_CPU, const union xmm_reg *src, uint16_t *dst, uint8_t imm);
+void vec_pextrw64(NO_CPU, const union xmm_reg *src, uint64_t *dst, uint8_t imm);
+void vec_pextrd64(NO_CPU, const union xmm_reg *src, uint64_t *dst, uint8_t imm);
+void vec_pextrd32(NO_CPU, const union xmm_reg *src, uint32_t *dst, uint8_t imm);
+void vec_pextrqq64(NO_CPU, const union xmm_reg *src, uint64_t *dst, uint8_t imm);
+void vec_pinsrb8(NO_CPU, const uint8_t *src, union xmm_reg *dst, uint8_t imm);
+void vec_pinsrd32(NO_CPU, const uint32_t *src, union xmm_reg *dst, uint8_t imm);
+void vec_pinsrq64(NO_CPU, const uint64_t *src, union xmm_reg *dst, uint8_t imm);
+void vec_pcmpestri128(struct cpu_state *cpu, const union xmm_reg *src, const union xmm_reg *dst, uint8_t imm);
+void vec_pcmpestrm128(struct cpu_state *cpu, const union xmm_reg *src, const union xmm_reg *dst, uint8_t imm);
+void vec_pcmpistri128(struct cpu_state *cpu, const union xmm_reg *src, const union xmm_reg *dst, uint8_t imm);
+void vec_pcmpistrm128(struct cpu_state *cpu, const union xmm_reg *src, const union xmm_reg *dst, uint8_t imm);
+void vec_crc32_8(NO_CPU, const void *src, uint64_t *dst);
+void vec_crc32_16(NO_CPU, const void *src, uint64_t *dst);
+void vec_crc32_32(NO_CPU, const void *src, uint64_t *dst);
+void vec_crc32_64(NO_CPU, const void *src, uint64_t *dst);
 
 #endif

@@ -56,6 +56,27 @@ struct stat_arm64 stat_convert_arm64(struct statbuf stat) {
     return arm64stat;
 }
 
+struct stat_x86_64 stat_convert_x86_64(struct statbuf stat) {
+    struct stat_x86_64 out = {};
+    out.dev = stat.dev;
+    out.ino = stat.inode;
+    out.nlink = stat.nlink;
+    out.mode = stat.mode;
+    out.uid = stat.uid;
+    out.gid = stat.gid;
+    out.rdev = stat.rdev;
+    out.size = stat.size;
+    out.blksize = stat.blksize;
+    out.blocks = stat.blocks;
+    out.atime_ = stat.atime;
+    out.atime_nsec = stat.atime_nsec;
+    out.mtime_ = stat.mtime;
+    out.mtime_nsec = stat.mtime_nsec;
+    out.ctime_ = stat.ctime;
+    out.ctime_nsec = stat.ctime_nsec;
+    return out;
+}
+
 int generic_statat(struct fd *at, const char *path_raw, struct statbuf *stat, bool follow_links) {
     char path[MAX_PATH];
     int err = path_normalize(at, path_raw, path, follow_links ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW);
@@ -87,9 +108,13 @@ static dword_t sys_stat_path(fd_t at_f, addr_t path_addr, addr_t statbuf_addr, b
     struct statbuf stat = {};
     if ((err = generic_statat(at, path, &stat, follow_links)) < 0)
         return err;
-#ifdef GUEST_ARM64
+#if defined(GUEST_ARM64)
     struct stat_arm64 arm64stat = stat_convert_arm64(stat);
     if (user_put(statbuf_addr, arm64stat))
+        return _EFAULT;
+#elif defined(GUEST_X86_64)
+    struct stat_x86_64 x64stat = stat_convert_x86_64(stat);
+    if (user_put(statbuf_addr, x64stat))
         return _EFAULT;
 #else
     struct newstat64 newstat = stat_convert_newstat64(stat);
@@ -120,9 +145,13 @@ dword_t sys_fstat64(fd_t fd_no, addr_t statbuf_addr) {
     int err = fd->mount->fs->fstat(fd, &stat);
     if (err < 0)
         return err;
-#ifdef GUEST_ARM64
+#if defined(GUEST_ARM64)
     struct stat_arm64 arm64stat = stat_convert_arm64(stat);
     if (user_put(statbuf_addr, arm64stat))
+        return _EFAULT;
+#elif defined(GUEST_X86_64)
+    struct stat_x86_64 x64stat = stat_convert_x86_64(stat);
+    if (user_put(statbuf_addr, x64stat))
         return _EFAULT;
 #else
     struct newstat64 newstat = stat_convert_newstat64(stat);

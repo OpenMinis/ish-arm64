@@ -37,8 +37,27 @@ int_t sys_prctl(dword_t option, addr_t arg2, addr_t UNUSED(arg3), addr_t UNUSED(
     }
 }
 
+#define ARCH_SET_GS_ 0x1001
+#define ARCH_SET_FS_ 0x1002
+#define ARCH_GET_FS_ 0x1003
+#define ARCH_GET_GS_ 0x1004
+
 int_t sys_arch_prctl(int_t code, addr_t addr) {
-    STRACE("arch_prctl(%#x, %#x)", code, addr);
+    STRACE("arch_prctl(%#x, %#llx)", code, (unsigned long long) addr);
+#ifdef GUEST_X86_64
+    switch (code) {
+        case ARCH_SET_FS_:
+            current->cpu.tls_ptr = addr;
+            return 0;
+        case ARCH_SET_GS_:
+            current->cpu.gs_base = addr;
+            return 0;
+        case ARCH_GET_FS_:
+            return user_put(addr, current->cpu.tls_ptr) ? _EFAULT : 0;
+        case ARCH_GET_GS_:
+            return user_put(addr, current->cpu.gs_base) ? _EFAULT : 0;
+    }
+#endif
     return _EINVAL;
 }
 

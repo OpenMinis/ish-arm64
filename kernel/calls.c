@@ -71,7 +71,77 @@ void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
     if (interrupt == INT_SYSCALL) {
         ISH_SIGNPOST_SCOPE_BEGIN(syscall, "syscall", _sc_spid);
-#if defined(GUEST_X86) || !defined(GUEST_ARM64)
+#if defined(GUEST_X86_64)
+        // x86_64: number in rax, args in rdi, rsi, rdx, r10, r8, r9, result
+        // in rax. `syscall` already advanced rip past itself (2 bytes, the
+        // same rewind as int $0x80).
+        unsigned syscall_num = cpu->rax;
+        current->syscall_restart_num = syscall_num;
+        current->syscall_restart_arg0 = cpu->rdi;
+        current->syscall_restart_pc = cpu->rip;
+        current->syscall_restartable = false;
+        if (syscall_num >= syscall_table_size || syscall_table[syscall_num] == NULL) {
+            printk("%d(%s) missing syscall %d\n", current->pid, current->comm, syscall_num);
+            cpu->rax = (uint64_t) (int64_t) _ENOSYS;
+        } else {
+            if (syscall_table[syscall_num] == (syscall_t) syscall_stub) {
+                printk("%d(%s) stub syscall %d\n", current->pid, current->comm, syscall_num);
+            }
+            STRACE("%d call %-3d ", current->pid, syscall_num);
+            static int systrace = -1;
+            if (systrace == -1) { const char *e = getenv("ISH_SYSTRACE"); systrace = (e && e[0]=='1') ? 1 : 0; }
+            uint64_t _a0=cpu->rdi,_a1=cpu->rsi,_a2=cpu->rdx,_a3=cpu->r10,_a4=cpu->r8,_a5=cpu->r9;
+            struct timespec _t0; if (systrace) clock_gettime(CLOCK_MONOTONIC, &_t0);
+            int64_t result = syscall_table[syscall_num](_a0, _a1, _a2, _a3, _a4, _a5);
+            STRACE(" = 0x%llx\n", (unsigned long long) result);
+            if (systrace)
+                fprintf(stderr, "[sc] %ld.%06ld pid=%d n=%d(%llx,%llx,%llx,%llx,%llx,%llx) = 0x%llx\n",
+                        (long)_t0.tv_sec, _t0.tv_nsec/1000, current->pid, syscall_num,
+                        (unsigned long long)_a0,(unsigned long long)_a1,(unsigned long long)_a2,
+                        (unsigned long long)_a3,(unsigned long long)_a4,(unsigned long long)_a5,
+                        (unsigned long long)result);
+            if ((int32_t) (uint32_t) result == _EINTR) {
+                switch (syscall_num) {
+                    case 202: // futex
+                    case 232: // epoll_wait
+                    case 281: // epoll_pwait
+                    case 0:   // read
+                    case 1:   // write
+                        current->syscall_restartable = true;
+                        break;
+                }
+            }
+            // rt_sigreturn restored rax with the rest of the registers
+            if (syscall_num != 15) {
+                // As on arm64: most syscalls return a 32-bit value, so a
+                // 32-bit errno with a zero top half gets sign-extended.
+                uint32_t low32 = (uint32_t) result;
+                if ((result >> 32) == 0 && (int32_t) low32 >= -4095 && (int32_t) low32 < 0)
+                    cpu->rax = (uint64_t) (int64_t) (int32_t) low32;
+                else
+                    cpu->rax = (uint64_t) result;
+            }
+        }
+        if (current->exiting || current->group == NULL)
+            pthread_exit(NULL);
+        atomic_fetch_add(&current->group->syscall_count, 1);
+        // Blocking calls that return and retry don't count as progress.
+        switch (syscall_num) {
+            case 202: case 232: case 281: case 61: case 35: case 230:
+            case 7: case 271: case 23: case 270: case 34: case 130:
+                break;
+            default: {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+                current->last_unblocked_ns = now;
+                atomic_store_explicit(&current->group->last_progress_ns, now,
+                                      memory_order_relaxed);
+            }
+        }
+        if (current->group->doing_group_exit)
+            do_exit(current->group->group_exit_code);
+#elif defined(GUEST_X86) || !defined(GUEST_ARM64)
         // x86: syscall number in eax, args in ebx, ecx, edx, esi, edi, ebp
         unsigned syscall_num = cpu->eax;
         // Snapshot for SA_RESTART: the return value overwrites eax (the

@@ -701,6 +701,8 @@ suite_compat() {
             "claude -p (no-auth)")          t=30 ;;    # JIT + network diagnostics
             # "claude --version" keeps the 15s default (measured ~3-5s)
         esac
+        # COMPAT_TIMEOUT_SCALE=2 for slow hosts (an x86 guest under Rosetta)
+        t=$((t * ${COMPAT_TIMEOUT_SCALE:-1}))
 
         local xr=SKIP ar=SKIP
         if has_arch x86; then

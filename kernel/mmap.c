@@ -330,7 +330,7 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
         if (PGOFFSET(addr) != 0)
             return _EINVAL;
         page = PAGE(addr);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         // Reject hints that would overlap the stack region in low 4GB
         // or exceed the 48-bit user address limit.
         // Hints within low 4GB (up to the stack) are unchanged — V8
@@ -359,7 +359,7 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
             addr = 0;
     }
     if (addr == 0) {
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         // V8 reserves its heap cage with:
         //     mmap(NULL, chunk_size, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
         //     (typical chunk_size: 128MB, reserved before mprotect'ing
@@ -404,7 +404,7 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
         // PROT_NONE mappings (guard regions) don't consume real memory,
         // so don't count them against the anonymous page limit.
         bool is_prot_none = !(prot & P_READ) && !(prot & P_WRITE) && !(prot & P_EXEC);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         if ((flags & MMAP_NORESERVE) && pages > 0x10000) {
             pages_t align_pages = pages;
             if (align_pages > 0x40000) align_pages = 0x40000;
@@ -476,7 +476,7 @@ addr_t sys_mmap2(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_t fd_
     return mmap_common(addr, len, prot, flags, fd_no, offset << PAGE_BITS);
 }
 
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 // ARM64 mmap syscall: offset is passed directly (not shifted like mmap2)
 // and takes 6 direct arguments (not a pointer to a struct like x86 mmap)
 addr_t sys_mmap64(addr_t addr, addr_t len, dword_t prot, dword_t flags, fd_t fd_no, qword_t offset) {
