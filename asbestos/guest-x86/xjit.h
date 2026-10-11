@@ -20,6 +20,17 @@
 
 struct fiber_block;
 
+#ifdef GUEST_X86_64
+// The x86_64 guest is translated instruction by instruction (guest-x86_64/
+// xlat.c): fiber_block_compile() reports each instruction's gadget range
+// around gen_step(), and the stream's final size before gen_end().
+struct gen_state;
+struct tlb;
+void xjit_insn_begin(struct gen_state *state);
+void xjit_insn_end(struct gen_state *state, struct tlb *tlb);
+void xjit_insns_done(struct gen_state *state);
+#endif
+
 // After gen_end(), before the block is published.
 void xjit_block(struct fiber_block *block);
 // The block is being freed (no thread runs it).

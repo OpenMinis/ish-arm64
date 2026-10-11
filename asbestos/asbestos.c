@@ -602,6 +602,14 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
         jit_step_end(jit_units, &jit_step, &state, more, tlb);
         if (!more)
             break;
+#elif defined(ISH_XJIT) && defined(GUEST_X86_64)
+        // xjit translates instruction by instruction: tell it where each
+        // one's gadgets start and end
+        xjit_insn_begin(&state);
+        bool more = gen_step(&state, tlb);
+        xjit_insn_end(&state, tlb);
+        if (!more)
+            break;
 #else
         if (!gen_step(&state, tlb))
             break;
@@ -631,6 +639,9 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
         ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
         return NULL;
     }
+#if defined(ISH_XJIT) && defined(GUEST_X86_64)
+    xjit_insns_done(&state);
+#endif
     gen_end(&state);
     assert(state.ip - ip <= PAGE_SIZE);
     state.block->used = state.capacity;

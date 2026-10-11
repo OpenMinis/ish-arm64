@@ -280,6 +280,11 @@ static bool decode(const uint8_t *p, struct insn *in) {
 
 static bool xjit_on;
 static bool stats_on;
+static const char *stats_file;
+static FILE *stats_out(void) {
+    FILE *f = stats_file ? fopen(stats_file, "a") : NULL;
+    return f ? f : stderr;
+}
 static _Atomic uint64_t st_blocks, st_runs, st_gadgets, st_bytes, st_nomem;
 static unsigned st_tpls, st_tpls_usable;
 
@@ -373,7 +378,10 @@ static void xjit_init(void) {
     const char *e = getenv("ISH_XJIT");
     xjit_on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
     e = getenv("ISH_XJIT_STATS");
-    stats_on = e && e[0] == '1';
+    stats_on = e && e[0] != '\0' && e[0] != '0';
+    // anything but 1 names a file to write them to
+    if (stats_on && strcmp(e, "1") != 0)
+        stats_file = e;
     if (!xjit_on)
         return;
 
@@ -481,12 +489,20 @@ static void code_free(void *p) {
     pthread_mutex_unlock(&mem_lock);
 }
 
+#ifdef GUEST_X86_64
+#include "asbestos/guest-x86_64/xlat.c"
+#endif
+
 // ---------------------------------------------------------------- blocks
 
 static void xjit_init_all(void) {
     xjit_init();
     if (xjit_on)
         region_init();
+#ifdef GUEST_X86_64
+    if (xjit_on && region != NULL)
+        xlat_init();
+#endif
 }
 
 // A run: stream slots [first, end) holding `count` consecutive gadgets that
@@ -539,6 +555,10 @@ void xjit_block(struct fiber_block *block) {
     pthread_once(&init_once, xjit_init_all);
     if (!xjit_on || region == NULL)
         return;
+#ifdef GUEST_X86_64
+    if (xlat_block(block))
+        return;
+#endif
 
     uintptr_t *code = block->code;
     size_t n = block->used;
@@ -638,9 +658,16 @@ void xjit_block_free(struct fiber_block *block) {
 void xjit_dump_stats(void) {
     if (!stats_on)
         return;
-    fprintf(stderr, "[xjit] templates=%u usable=%u blocks=%llu runs=%llu gadgets=%llu bytes=%llu nomem=%llu region=%p\n",
+    FILE *out = stats_out();
+    fprintf(out, "[xjit] templates=%u usable=%u blocks=%llu runs=%llu gadgets=%llu bytes=%llu nomem=%llu region=%p\n",
             st_tpls, st_tpls_usable,
             (unsigned long long) st_blocks, (unsigned long long) st_runs,
             (unsigned long long) st_gadgets, (unsigned long long) st_bytes,
             (unsigned long long) st_nomem, (void *) region);
+#ifdef GUEST_X86_64
+    if (xlat_on)
+        xlat_dump_stats(out);
+#endif
+    if (out != stderr)
+        fclose(out);
 }
