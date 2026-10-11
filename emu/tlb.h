@@ -53,6 +53,13 @@ struct tlb {
     struct mmu *attached;      // whose tlbs list this is on, while running guest code
     struct list tlbs_link;
 #endif
+#ifdef GUEST_X86_64
+    // The x86_64 translator's guesses of data_minus_addr, one per memory
+    // access site (modulo the size). Per thread: threads touch different
+    // pages from the same code (their stacks), and shared guesses would
+    // overwrite each other's on every access.
+    uint64_t xguess[1 << 13];
+#endif
 };
 
 #ifdef GUEST_X86_64

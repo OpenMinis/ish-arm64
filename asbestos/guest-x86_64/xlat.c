@@ -1512,7 +1512,7 @@ static void e_after(struct xasm *a, const struct body *bd) {
 // state before anything here can fault.
 //
 // The operand is (%r13,%r9) with r9 the data_minus_addr this access found
-// last time (a word next to the slow paths), so the access itself waits
+// last time in this thread (tlb->xguess), so the access itself waits
 // only for its address: the TLB entry is checked in parallel, in program
 // order before it, and the access a wrong guess sends astray is squashed
 // with the mispredicted branch. A wrong guess takes the slow path, which
@@ -1526,8 +1526,10 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
 
     if (keep)
         e_save_flags(a);
-    unsigned guess = x->ndata++;
-    b1(a, 0x4c); b1(a, 0x8b); b1(a, 0x0d); add_fix(a, FIX_DATA, guess); b4(a, 0);  // mov guess(%rip), %r9
+    static _Atomic unsigned next_guess;
+    unsigned n = atomic_fetch_add_explicit(&next_guess, 1, memory_order_relaxed);
+    struct xmem guess = XMEM(H_TLB, TLBREL(xguess) + (int32_t) (n % array_size(((struct tlb *) 0)->xguess)) * 8);
+    e_mov_load(a, R9, guess);
     e_tlb_index(a);
     // the page of the operand's last byte, so that crossing a page misses
     e_lea(a, R15, XMEM(R13, (int32_t) size - 1));
@@ -1551,7 +1553,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     a->cur = SEC_COLD;
     lbind(a, l_wrong);
     e_mov_load(a, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
-    b1(a, 0x4c); b1(a, 0x89); b1(a, 0x0d); add_fix(a, FIX_DATA, guess); b4(a, 0);  // mov %r9, guess(%rip)
+    e_mov_store(a, guess, R9);
     e_jmp_lab(a, l_back);
 
     lbind(a, l_miss);
