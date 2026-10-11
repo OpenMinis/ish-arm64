@@ -2,13 +2,13 @@
 #define EMU_CPU_MEM_H
 
 #include "misc.h"
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 #include "util/list.h"
 #include "util/sync.h"
 #endif
 
 // Page number type: bits of address above PAGE_BITS
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ARM64: 48-bit address space → 36-bit page numbers
 typedef uint64_t page_t;
 typedef uint64_t pages_t;
@@ -36,7 +36,7 @@ struct mmu {
     struct mmu_ops *ops;
     struct asbestos *asbestos;
     uint64_t changes;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     // The TLBs of the threads running guest code in this address space
     // (tlb_attach()); a change to the mappings marks them stale.
     lock_t tlbs_lock;

@@ -16,8 +16,20 @@ static inline void do_cpuid(dword_t *eax, dword_t *ebx, dword_t *ecx, dword_t *e
             *eax = 0x80000006; // highest extended leaf
             *ebx = *ecx = *edx = 0;
             break;
+#ifdef GUEST_X86_64
+        case 0x80000001:
+            *eax = *ebx = 0;
+            *ecx = 0;
+            *edx = (1 << 11) // syscall/sysret
+                | (1 << 20) // nx
+                | (1 << 29) // long mode
+                ;
+            break;
+        case 0x80000002 ... 0x80000005:
+#else
         case 0x80000001:
         case 0x80000002 ... 0x80000005:
+#endif
             *eax = *ebx = *ecx = *edx = 0;
             break;
         case 0x80000006:
@@ -30,8 +42,23 @@ static inline void do_cpuid(dword_t *eax, dword_t *ebx, dword_t *ecx, dword_t *e
         case 1:
             *eax = 0x0; // say nothing about cpu model number
             *ebx = 0x0; // processor number 0, flushes 0 bytes on clflush
+#ifdef GUEST_X86_64
+            // x86-64-v2 (what bun and claude's native build require)
+            *ecx = (1 << 0) // sse3
+                | (1 << 9) // ssse3
+                | (1 << 13) // cmpxchg16b
+                | (1 << 19) // sse4.1
+                | (1 << 20) // sse4.2
+                | (1 << 23) // popcnt
+                ;
+#else
             *ecx = 0; // we support none of the features in ecx
+#endif
             *edx = (1 << 0) // fpu
+#ifdef GUEST_X86_64
+                | (1 << 4) // tsc
+                | (1 << 8) // cmpxchg8b
+#endif
                 | (1 << 15) // cmov
                 | (1 << 23) // mmx
                 | (1 << 24) // fxsr: fxsave/fxrstor, the OS saves SSE state

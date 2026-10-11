@@ -9,7 +9,7 @@ struct tlb_entry {
     page_t page;
     page_t page_if_writable;
     uintptr_t data_minus_addr;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     // Coherence generation: snapshot of mmu->changes when this entry was
     // populated. Used to detect a stale entry whose page was remapped
     // (CoW/mmap/munmap) by another thread while this thread was mid-block.
@@ -26,7 +26,7 @@ struct tlb {
     struct mmu *mmu;
     page_t dirty_page;
     unsigned mem_changes;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     // TLB_STALE once another thread may have changed the mappings since this
     // TLB was last checked against mmu->changes, else 0. The inline lookups OR
     // it into the page they compare, so a stale TLB misses on every page, and
@@ -49,19 +49,19 @@ struct tlb {
     // Persistent fiber_frame (avoids malloc/free + ret_cache zeroing per syscall)
     struct fiber_frame *frame;
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct mmu *attached;      // whose tlbs list this is on, while running guest code
     struct list tlbs_link;
 #endif
 };
 
 #define TLB_INDEX(addr) ((((addr >> PAGE_BITS) ^ (addr >> (PAGE_BITS + TLB_BITS))) & (TLB_SIZE - 1)))
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 #define TLB_PAGE(addr) ((addr) & 0xfffffffffffff000ULL)
 #else
 #define TLB_PAGE(addr) ((addr) & 0xfffff000)
 #endif
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // Not page aligned (no equality check matches it) and above any 48-bit
 // address, so the JIT's `addr - page` range check never matches it either.
 #define TLB_PAGE_EMPTY 0x8000000000000001ull
@@ -69,7 +69,7 @@ struct tlb {
 #define TLB_PAGE_EMPTY 1
 #endif
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 #define TLB_STALE (1ull << 48)   // above every 48-bit page: no entry matches
 // Around running guest code (the thread holds the mm and its lock): an
 // attached TLB is marked stale by mmu_tlbs_stale() when the mappings change.
@@ -84,7 +84,7 @@ void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type);
 forceinline __no_instrument void *__tlb_read_ptr(struct tlb *tlb, addr_t addr) {
     struct tlb_entry entry = tlb->entries[TLB_INDEX(addr)];
     if (entry.page == TLB_PAGE(addr)
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         // Coherence: reject a hit whose page was remapped by another thread
         // since this entry was cached (CoW/mmap advanced mmu->changes). Falling
         // through to tlb_handle_miss re-translates to the current backing.
@@ -128,7 +128,7 @@ forceinline __no_instrument void *__tlb_write_ptr(struct tlb *tlb, addr_t addr) 
 #endif
     struct tlb_entry entry = tlb->entries[TLB_INDEX(addr)];
     if (entry.page_if_writable == TLB_PAGE(addr)
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         && entry.gen == (uintptr_t) __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE)
 #endif
     ) {

@@ -175,7 +175,7 @@ do_helper 2
         .endif
         .ifc \rm,imm
             # src
-            movw 8(%_ip), %si
+            movzwl 8(%_ip), %esi // clang expects the caller to widen a small argument
             # dst
             movw 10(%_ip), %r14w
             leaq (%_cpu,%r14), %rdx

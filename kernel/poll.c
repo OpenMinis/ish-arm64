@@ -229,7 +229,7 @@ dword_t sys_pselect(fd_t nfds, addr_t readfds_addr, addr_t writefds_addr, addr_t
         addr_t mask_addr;
         dword_t mask_size;
     } sigmask;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct {
         uint64_t mask_addr;
         uint64_t mask_size;

@@ -28,6 +28,8 @@ void do_uname(struct uname *uts) {
     snprintf(uts->version, sizeof(uts->version), "%s %s %s", uname_version, __DATE__, __TIME__);
 #if defined(GUEST_ARM64)
     strcpy(uts->arch, "aarch64");
+#elif defined(GUEST_X86_64)
+    strcpy(uts->arch, "x86_64");
 #else
     strcpy(uts->arch, "i686");
 #endif
@@ -61,7 +63,7 @@ static uint64_t get_total_ram() {
 }
 static void sysinfo_specific(struct sys_info *info) {
     uint64_t total_ram = get_total_ram();
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
     // Cap reported RAM to avoid musl/V8 allocating enormous arenas.
     // Must be consistent with MEMINFO_MAX_RAM in fs/proc/root.c.
     // Go runtime needs ~1.1GB for page summaries; 4GB gives headroom.

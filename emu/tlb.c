@@ -23,7 +23,7 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
     tlb_flush(tlb);
 }
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 void tlb_attach(struct tlb *tlb, struct mmu *mmu) {
     lock(&mmu->tlbs_lock);
     list_add(&mmu->tlbs, &tlb->tlbs_link);
@@ -114,7 +114,7 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     // translation (the per-block coherence check will still catch a later
     // change).
     for (int attempt = 0; ; attempt++) {
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         // Clear the stale mark before reading the generation: a change this
         // read misses marks the TLB stale again (mmu_tlbs_stale()).
         __atomic_store_n(&tlb->stale, 0, __ATOMIC_SEQ_CST);
@@ -146,7 +146,7 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
     tlb_ent->page = TLB_PAGE(addr);
     tlb_ent->data_minus_addr = (uintptr_t) ptr - TLB_PAGE(addr);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     // Record the coherence generation this host pointer is valid for. A hit on
     // this entry is only trustworthy while mmu->changes still equals this; if
     // another thread remapped the page (CoW/mmap/munmap) mmu->changes advances

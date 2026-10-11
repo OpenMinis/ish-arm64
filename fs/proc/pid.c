@@ -248,7 +248,7 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
         } else if (data->fd != NULL) {
             generic_getpath(start_pt->data->fd, path);
         }
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         proc_printf(buf, "%012llx-%012llx %c%c%c%c %08lx 00:00 %-10d %s\n",
                 (unsigned long long)(start << PAGE_BITS),
                 (unsigned long long)(end << PAGE_BITS),

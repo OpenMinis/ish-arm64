@@ -248,6 +248,9 @@ __thread int ish_thread_marker;
 #if defined(GUEST_ARM64)
 #define CPU_IP(cpu) ((cpu)->pc)
 #define CPU_HAS_SINGLE_STEP 0
+#elif defined(GUEST_X86_64)
+#define CPU_IP(cpu) ((cpu)->rip)
+#define CPU_HAS_SINGLE_STEP ((cpu)->tf)
 #else
 #define CPU_IP(cpu) ((cpu)->eip)
 #define CPU_HAS_SINGLE_STEP ((cpu)->tf)
@@ -1274,6 +1277,111 @@ uint64_t prebuilt_call(struct cpu_state *cpu, struct tlb *tlb, addr_t target_pc)
 }
 #endif
 
+#ifdef GUEST_X86_64
+// ISH_X64_TRACE=<file>: run one instruction per block and log rip, the
+// registers and the flags before each, for bring-up of the x86_64 guest.
+// ISH_X64_TRACE_RANGE=<lo>-<hi> (hex) logs only rip in [lo, hi). Slow.
+static addr_t x64_trace_lo, x64_trace_hi = ~(addr_t) 0;
+static volatile sig_atomic_t x64_trace_armed = 1;
+static void x64_trace_arm(int sig) {
+    (void) sig;
+    x64_trace_armed = 1;
+}
+static FILE *x64_trace_file(void) {
+    static FILE *f;
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *path = getenv("ISH_X64_TRACE");
+        if (path != NULL)
+            f = fopen(path, "w");
+        const char *on_usr2 = getenv("ISH_X64_TRACE_ON_USR2");
+        if (f != NULL && on_usr2 != NULL && on_usr2[0] == '1') {
+            x64_trace_armed = 0;
+            signal(SIGUSR2, x64_trace_arm);
+        }
+        const char *range = getenv("ISH_X64_TRACE_RANGE");
+        unsigned long long lo, hi;
+        if (range != NULL && sscanf(range, "%llx-%llx", &lo, &hi) == 2) {
+            x64_trace_lo = lo;
+            x64_trace_hi = hi;
+        }
+    }
+    return f;
+}
+
+// ISH_X64_TRACE_RING=<n>: keep only the last n steps (of all threads) in
+// memory and write them to the trace file when ish gets SIGTERM (a hang
+// killed by timeout). With ISH_X64_TRACE_ON_USR2=1 the guest runs at full
+// speed until ish gets SIGUSR2 (ish uses SIGUSR1 itself), and only then starts single-stepping.
+struct x64_trace_rec {
+    int tid;
+    uint64_t rip, regs[16];
+};
+static struct x64_trace_rec *x64_ring;
+static unsigned x64_ring_size;
+static _Atomic unsigned x64_ring_next;
+static FILE *x64_ring_file;
+static void x64_ring_dump(int sig) {
+    unsigned end = x64_ring_next, n = end < x64_ring_size ? end : x64_ring_size;
+    for (unsigned i = end - n; i != end; i++) {
+        struct x64_trace_rec *r = &x64_ring[i % x64_ring_size];
+        fprintf(x64_ring_file, "%d %llx", r->tid, (unsigned long long) r->rip);
+        for (int j = 0; j < 16; j++)
+            fprintf(x64_ring_file, " %llx", (unsigned long long) r->regs[j]);
+        fprintf(x64_ring_file, "\n");
+    }
+    fclose(x64_ring_file);
+    _exit(128 + sig);
+}
+
+static int x64_trace_steps(struct cpu_state *cpu, struct tlb *tlb, FILE *f) {
+    int interrupt;
+    static int ring_init;
+    if (!ring_init) {
+        ring_init = 1;
+        const char *n = getenv("ISH_X64_TRACE_RING");
+        if (n != NULL && atoi(n) > 0) {
+            x64_ring_size = atoi(n);
+            x64_ring = calloc(x64_ring_size, sizeof(*x64_ring));
+            x64_ring_file = f;
+            signal(SIGTERM, x64_ring_dump);
+        }
+    }
+    if (x64_ring != NULL) {
+        do {
+            struct x64_trace_rec *r = &x64_ring[x64_ring_next++ % x64_ring_size];
+            r->tid = current_pid();
+            r->rip = cpu->rip;
+            memcpy(r->regs, cpu->regs, sizeof(r->regs));
+            interrupt = cpu_single_step(cpu, tlb);
+        } while (interrupt == INT_DEBUG && !cpu->tf);
+        return interrupt;
+    }
+    do {
+        if (cpu->rip < x64_trace_lo || cpu->rip >= x64_trace_hi)
+            goto step;
+        struct cpu_state flags = *cpu;
+        collapse_flags(&flags);
+        fprintf(f, "%llx fl=%x a=%llx c=%llx d=%llx b=%llx sp=%llx bp=%llx si=%llx di=%llx"
+                " 8=%llx 9=%llx 10=%llx 11=%llx 12=%llx 13=%llx 14=%llx 15=%llx\n",
+                (unsigned long long) cpu->rip, flags.eflags & 0x8d5,
+                (unsigned long long) cpu->rax, (unsigned long long) cpu->rcx,
+                (unsigned long long) cpu->rdx, (unsigned long long) cpu->rbx,
+                (unsigned long long) cpu->rsp, (unsigned long long) cpu->rbp,
+                (unsigned long long) cpu->rsi, (unsigned long long) cpu->rdi,
+                (unsigned long long) cpu->r8, (unsigned long long) cpu->r9,
+                (unsigned long long) cpu->r10, (unsigned long long) cpu->r11,
+                (unsigned long long) cpu->r12, (unsigned long long) cpu->r13,
+                (unsigned long long) cpu->r14, (unsigned long long) cpu->r15);
+    step:
+        interrupt = cpu_single_step(cpu, tlb);
+    } while (interrupt == INT_DEBUG && !cpu->tf);
+    fflush(f);
+    return interrupt;
+}
+#endif
+
 int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     ish_thread_marker = 1;
     if (cpu->poked_ptr == NULL)
@@ -1290,7 +1398,13 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     struct asbestos *asbestos = cpu->mmu->asbestos;
     __atomic_add_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
     tlb_refresh(tlb, cpu->mmu);
+#ifdef GUEST_X86_64
+    FILE *trace = x64_trace_file();
+    int interrupt = trace != NULL && x64_trace_armed ? x64_trace_steps(cpu, tlb, trace) :
+        (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
+#else
     int interrupt = (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
+#endif
     cpu->trapno = interrupt;
     __atomic_sub_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
 

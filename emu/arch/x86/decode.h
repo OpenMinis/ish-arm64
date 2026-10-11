@@ -10,6 +10,19 @@
 #define reg_dh reg_si
 #define reg_bh reg_di
 
+// Long mode (x86_64 guest). gen_step has already scanned the prefixes: the
+// REX byte is in REX_W/R/X/B and the decoder was picked by operand size
+// (0x66: 16, REX.W: 64, else 32), so prefix bytes only need skipping here.
+// Stack operations and near branches are 64 bits whatever the operand size
+// (STK_Z), immediates stay 32 bits and are sign-extended, and the 0x40-0x4f
+// inc/dec forms are REX prefixes.
+#undef STK_Z
+#ifdef GUEST_X86_64
+#define STK_Z(z) (OP_SIZE == 16 ? 16 : 64)
+#else
+#define STK_Z(z) z
+#endif
+
 #undef DEFAULT_CHANNEL
 #define DEFAULT_CHANNEL instr
 #define TRACEI(msg, ...) TRACE(msg "\t", ##__VA_ARGS__)
@@ -29,7 +42,14 @@ __no_instrument DECODER_RET glue(DECODER_NAME, OP_SIZE)(DECODER_ARGS) {
 // the CPU (OpenBLAS's Pentium III kernels pad with `rep dec`, MPX-era code
 // has `bnd jcc`): put back the n bytes read after it and decode again.
 #define IGNORE_PREFIX(n) do { TRACE("prefix ignored\n"); state->ip -= (n); goto restart; } while (0)
+#ifdef GUEST_X86_64
+#define READIMM READIMM_(imm, (OP_SIZE == 16 ? 16 : 32)); \
+    imm = OP_SIZE == 16 ? (uint64_t) (int16_t) imm : (uint64_t) (int32_t) imm
+#define READIMM64 READIMM
+#define READIMM32 READIMM
+#else
 #define READIMM READIMM_(imm, OP_SIZE)
+#endif
 #define READIMMoz READIMM // there's nothing more permanent than a temporary hack
 #define READIMM8 READIMM_(imm, 8); imm = (int8_t) (uint8_t) imm
 #define READIMM16 READIMM_(imm, 16)
@@ -62,6 +82,9 @@ restart:
             READINSN;
             switch (insn) {
                 case 0x18 ... 0x1f: TRACEI("nop modrm\t"); READMODRM; break;
+#ifdef GUEST_X86_64
+                case 0x05: TRACEI("syscall"); INT(INT_SYSCALL); break;
+#endif
 
                 case 0x28: TRACEI("movaps xmm:modrm, xmm");
                            READMODRM; VMOV(xmm_modrm_val, xmm_modrm_reg,128); break;
@@ -92,6 +115,43 @@ restart:
                                SSSE3(0x1c, "pabsb", pabsb)
                                SSSE3(0x1d, "pabsw", pabsw)
                                SSSE3(0x1e, "pabsd", pabsd)
+#ifdef GUEST_X86_64
+                               SSSE3(0x10, "pblendvb", pblendvb)
+                               SSSE3(0x14, "blendvps", blendvps)
+                               SSSE3(0x15, "blendvpd", blendvpd)
+                               SSSE3(0x17, "ptest", ptest)
+                               SSSE3(0x28, "pmuldq", pmuldq)
+                               SSSE3(0x29, "pcmpeqq", pcmpeqq)
+                               SSSE3(0x2b, "packusdw", packusdw)
+                               SSSE3(0x37, "pcmpgtq", pcmpgtq)
+                               SSSE3(0x38, "pminsb", pminsb)
+                               SSSE3(0x39, "pminsd", pminsd)
+                               SSSE3(0x3a, "pminuw", pminuw)
+                               SSSE3(0x3b, "pminud", pminud)
+                               SSSE3(0x3c, "pmaxsb", pmaxsb)
+                               SSSE3(0x3d, "pmaxsd", pmaxsd)
+                               SSSE3(0x3e, "pmaxuw", pmaxuw)
+                               SSSE3(0x3f, "pmaxud", pmaxud)
+                               SSSE3(0x40, "pmulld", pmulld)
+                               SSSE3(0x41, "phminposuw", phminposuw)
+#define PMOVX(n, name, op, z) case n: TRACEI(name " xmm:modrm, xmm"); \
+                           READMODRM; V_OP(op, xmm_modrm_val, xmm_modrm_reg,z); break;
+                               PMOVX(0x20, "pmovsxbw", pmovsxbw, 64)
+                               PMOVX(0x21, "pmovsxbd", pmovsxbd, 32)
+                               PMOVX(0x22, "pmovsxbq", pmovsxbq, 16)
+                               PMOVX(0x23, "pmovsxwd", pmovsxwd, 64)
+                               PMOVX(0x24, "pmovsxwq", pmovsxwq, 32)
+                               PMOVX(0x25, "pmovsxdq", pmovsxdq, 64)
+                               PMOVX(0x30, "pmovzxbw", pmovzxbw, 64)
+                               PMOVX(0x31, "pmovzxbd", pmovzxbd, 32)
+                               PMOVX(0x32, "pmovzxbq", pmovzxbq, 16)
+                               PMOVX(0x33, "pmovzxwd", pmovzxwd, 64)
+                               PMOVX(0x34, "pmovzxwq", pmovzxwq, 32)
+                               PMOVX(0x35, "pmovzxdq", pmovzxdq, 64)
+#undef PMOVX
+                               case 0x2a: TRACEI("movntdqa modrm, xmm");
+                                          READMODRM_MEM; VMOV(xmm_modrm_val, xmm_modrm_reg,128); break;
+#endif
                                default: TRACE("undefined"); UNDEFINED;
                            }
 #undef SSSE3
@@ -104,6 +164,56 @@ restart:
                            switch (insn) {
                                case 0x0f: TRACEI("palignr xmm:modrm, xmm, imm8");
                                           READMODRM; READIMM8; V_OP_IMM(palignr, xmm_modrm_val, xmm_modrm_reg,128); break;
+#ifdef GUEST_X86_64
+#define SSE4_IMM(n, name, op, z) case n: TRACEI(name " xmm:modrm, xmm, imm8"); \
+                           READMODRM; READIMM8; V_OP_IMM(op, xmm_modrm_val, xmm_modrm_reg,z); break;
+                               SSE4_IMM(0x08, "roundps", roundps, 128)
+                               SSE4_IMM(0x09, "roundpd", roundpd, 128)
+                               SSE4_IMM(0x0a, "roundss", roundss, 32)
+                               SSE4_IMM(0x0b, "roundsd", roundsd, 64)
+                               SSE4_IMM(0x0c, "blendps", blendps, 128)
+                               SSE4_IMM(0x0d, "blendpd", blendpd, 128)
+                               SSE4_IMM(0x0e, "pblendw", pblendw, 128)
+                               SSE4_IMM(0x40, "dpps", dpps, 128)
+                               SSE4_IMM(0x41, "dppd", dppd, 128)
+                               SSE4_IMM(0x42, "mpsadbw", mpsadbw, 128)
+                               SSE4_IMM(0x60, "pcmpestrm", pcmpestrm, 128)
+                               SSE4_IMM(0x61, "pcmpestri", pcmpestri, 128)
+                               SSE4_IMM(0x62, "pcmpistrm", pcmpistrm, 128)
+                               SSE4_IMM(0x63, "pcmpistri", pcmpistri, 128)
+#undef SSE4_IMM
+                               // extraction: a register destination gets the value
+                               // zero-extended, a memory one only its size
+                               case 0x14: TRACEI("pextrb xmm, modrm, imm8");
+                                          READMODRM; READIMM8;
+                                          if (modrm.type == modrm_reg) { V_OP_IMM(pextrb, xmm_modrm_reg, modrm_val,64); }
+                                          else { V_OP_IMM(pextrb, xmm_modrm_reg, modrm_val,8); }
+                                          break;
+                               case 0x15: TRACEI("pextrw xmm, modrm, imm8");
+                                          READMODRM; READIMM8;
+                                          if (modrm.type == modrm_reg) { V_OP_IMM(pextrw, xmm_modrm_reg, modrm_val,64); }
+                                          else { V_OP_IMM(pextrw, xmm_modrm_reg, modrm_val,16); }
+                                          break;
+                               case 0x16: TRACEI("pextrd/q xmm, modrm, imm8");
+                               case 0x17: TRACEI("extractps xmm, modrm, imm8");
+                                          READMODRM; READIMM8;
+                                          if (insn == 0x16 && REX_W) { V_OP_IMM(pextrqq, xmm_modrm_reg, modrm_val,64); }
+                                          else if (modrm.type == modrm_reg) { V_OP_IMM(pextrd, xmm_modrm_reg, modrm_val,64); }
+                                          else { V_OP_IMM(pextrd, xmm_modrm_reg, modrm_val,32); }
+                                          break;
+                               case 0x20: TRACEI("pinsrb modrm, xmm, imm8");
+                                          READMODRM; READIMM8; V_OP_IMM(pinsrb, modrm_val, xmm_modrm_reg,8); break;
+                               case 0x21: TRACEI("insertps xmm:modrm, xmm, imm8");
+                                          READMODRM; READIMM8;
+                                          if (modrm.type == modrm_reg) { V_OP_IMM(insertps, xmm_modrm_val, xmm_modrm_reg,128); }
+                                          else { V_OP_IMM(insertps, xmm_modrm_val, xmm_modrm_reg,32); }
+                                          break;
+                               case 0x22: TRACEI("pinsrd/q modrm, xmm, imm8");
+                                          READMODRM; READIMM8;
+                                          if (REX_W) { V_OP_IMM(pinsrq, modrm_val, xmm_modrm_reg,64); }
+                                          else { V_OP_IMM(pinsrd, modrm_val, xmm_modrm_reg,32); }
+                                          break;
+#endif
                                default: TRACE("undefined"); UNDEFINED;
                            }
 #else
@@ -300,13 +410,21 @@ restart:
                            READMODRM_MEM; MOV(modrm_reg, modrm_val,oz); break;
 
                 case 0xc7: READMODRM_MEM; switch (modrm.opcode) {
+#if defined(GUEST_X86_64) && OP_SIZE == 64
+                               case 1: TRACEI("cmpxchg16b modrm");
+                                       CMPXCHG16B(modrm_val,128); break;
+#else
                                case 1: TRACEI("cmpxchg8b modrm");
                                        CMPXCHG8B(modrm_val,64); break;
+#endif
                                default: UNDEFINED;
                            };
                            break;
 
-#if OP_SIZE != 16
+#ifdef GUEST_X86_64
+                case 0xc8 ... 0xcf: TRACEI("bswap reg");
+                           BSWAP(opreg); break;
+#elif OP_SIZE != 16
                 case 0xc8: TRACEI("bswap eax");
                            BSWAP(reg_a); break;
                 case 0xc9: TRACEI("bswap ecx");
@@ -406,7 +524,18 @@ restart:
                            READMODRM; V_OP(unpackl_qdq, xmm_modrm_val, xmm_modrm_reg,128); break;
                 case 0x6d: TRACEI("punpckhqdq xmm:modrm, xmm");
                            READMODRM; V_OP(unpackh_dq, xmm_modrm_val, xmm_modrm_reg,128); break;
+#ifdef GUEST_X86_64
+                case 0x7c: TRACEI("haddpd xmm:modrm, xmm");
+                           READMODRM; V_OP(haddpd, xmm_modrm_val, xmm_modrm_reg,128); break;
+                case 0x7d: TRACEI("hsubpd xmm:modrm, xmm");
+                           READMODRM; V_OP(hsubpd, xmm_modrm_val, xmm_modrm_reg,128); break;
+                case 0xd0: TRACEI("addsubpd xmm:modrm, xmm");
+                           READMODRM; V_OP(addsubpd, xmm_modrm_val, xmm_modrm_reg,128); break;
+#endif
                 case 0x6e: TRACEI("movd modrm, xmm");
+#ifdef GUEST_X86_64
+                           if (REX_W) { READMODRM; VMOV(modrm_val, xmm_modrm_reg,64); break; }
+#endif
                            READMODRM; VMOV(modrm_val, xmm_modrm_reg,32); break;
 
                 case 0x6f: TRACEI("movdqa xmm:modrm, xmm");
@@ -458,6 +587,9 @@ restart:
                            READMODRM; V_OP(compare_eqd, xmm_modrm_val, xmm_modrm_reg,128); break;
 
                 case 0x7e: TRACEI("movd xmm, modrm");
+#ifdef GUEST_X86_64
+                           if (REX_W) { READMODRM; VMOV(xmm_modrm_reg, modrm_val,64); break; }
+#endif
                            READMODRM; VMOV(xmm_modrm_reg, modrm_val,32); break;
                 case 0x7f: TRACEI("movdqa xmm, xmm:modrm");
                            READMODRM; VMOV(xmm_modrm_reg, xmm_modrm_val,128); break;
@@ -753,6 +885,12 @@ restart:
 
         case 0x3e: TRACEI("segment ds (useless)"); goto restart;
 
+#ifdef GUEST_X86_64
+        case 0x40 ... 0x4f: TRACE("rex "); goto restart;
+        case 0x63: TRACEI("movsxd modrm, reg");
+                   READMODRM; MOVSX(modrm_val, modrm_reg,32,oz); break;
+        case 0x64: TRACE("segment fs\n"); SEG_FS(); goto restart;
+#else
         case 0x40: TRACEI("inc oax"); INC(reg_a,oz); break;
         case 0x41: TRACEI("inc ocx"); INC(reg_c,oz); break;
         case 0x42: TRACEI("inc odx"); INC(reg_d,oz); break;
@@ -769,7 +907,12 @@ restart:
         case 0x4d: TRACEI("dec obp"); DEC(reg_bp,oz); break;
         case 0x4e: TRACEI("dec osi"); DEC(reg_si,oz); break;
         case 0x4f: TRACEI("dec odi"); DEC(reg_di,oz); break;
+#endif
 
+#ifdef GUEST_X86_64
+        case 0x50 ... 0x57: TRACEI("push reg"); PUSH(opreg,STK_Z(oz)); break;
+        case 0x58 ... 0x5f: TRACEI("pop reg"); POP(opreg,STK_Z(oz)); break;
+#else
         case 0x50: TRACEI("push oax"); PUSH(reg_a,oz); break;
         case 0x51: TRACEI("push ocx"); PUSH(reg_c,oz); break;
         case 0x52: TRACEI("push odx"); PUSH(reg_d,oz); break;
@@ -787,9 +930,11 @@ restart:
         case 0x5d: TRACEI("pop obp"); POP(reg_bp,oz); break;
         case 0x5e: TRACEI("pop osi"); POP(reg_si,oz); break;
         case 0x5f: TRACEI("pop odi"); POP(reg_di,oz); break;
+#endif
 
         case 0x65: TRACE("segment gs\n"); SEG_GS(); goto restart;
 
+#ifndef GUEST_X86_64 // invalid in long mode
         case 0x60: TRACE("pusha");
                    PUSH(reg_a,oz); PUSH(reg_c,oz);
                    PUSH(reg_d,oz); PUSH(reg_b,oz);
@@ -803,9 +948,12 @@ restart:
                    POP(reg_b,oz); POP(reg_d,oz);
                    POP(reg_c,oz); POP(reg_a,oz);
                    break;
+#endif
 
         case 0x66:
-#if OP_SIZE == 32
+#ifdef GUEST_X86_64
+            goto restart; // already chose the decoder
+#elif OP_SIZE == 32
             TRACE("entering 16 bit mode\n");
             return glue(DECODER_NAME, 16)(DECODER_PASS_ARGS);
 #else
@@ -816,11 +964,11 @@ restart:
         case 0x67: TRACEI("address size prefix (ignored)"); goto restart;
 
         case 0x68: TRACEI("push imm\t");
-                   READIMM; PUSH(imm,oz); break;
+                   READIMM; PUSH(imm,STK_Z(oz)); break;
         case 0x69: TRACEI("imul imm\t");
                    READMODRM; READIMM; IMUL3(imm, modrm_val, modrm_reg,oz); break;
         case 0x6a: TRACEI("push imm8\t");
-                   READIMM8; PUSH(imm,oz); break;
+                   READIMM8; PUSH(imm,STK_Z(oz)); break;
         case 0x6b: TRACEI("imul imm8\t");
                    READMODRM; READIMM8; IMUL3(imm, modrm_val, modrm_reg,oz); break;
 
@@ -926,8 +1074,15 @@ restart:
             }
 
         case 0x8f: TRACEI("pop modrm");
-                   READMODRM; POP(modrm_val,oz); break;
+                   READMODRM; POP(modrm_val,STK_Z(oz)); break;
 
+#ifdef GUEST_X86_64
+        case 0x90: TRACEI("nop / xchg r8, oax");
+                   if (REX_B) { XCHG(opreg, reg_a,oz); }
+                   break;
+        case 0x91 ... 0x97: TRACEI("xchg reg, oax");
+                   XCHG(opreg, reg_a,oz); break;
+#else
         case 0x90: TRACEI("nop"); break;
         case 0x91: TRACEI("xchg ocx, oax");
                    XCHG(reg_c, reg_a,oz); break;
@@ -943,6 +1098,7 @@ restart:
                    XCHG(reg_si, reg_a,oz); break;
         case 0x97: TRACEI("xchg odi, oax");
                    XCHG(reg_di, reg_a,oz); break;
+#endif
 
         case 0x98: TRACEI("cvte"); CVTE; break;
         case 0x99: TRACEI("cvt"); CVT; break;
@@ -979,6 +1135,17 @@ restart:
         case 0xae: TRACEI("scasb"); STR(scas, 8); break;
         case 0xaf: TRACEI("scas"); STR(scas, oz); break;
 
+#ifdef GUEST_X86_64
+        case 0xb0 ... 0xb7: TRACEI("mov imm8, reg8\t");
+                   READIMM8; MOV(imm, opreg,8); break;
+        case 0xb8 ... 0xbf: TRACEI("mov imm, reg\t");
+#if OP_SIZE == 64
+                   READIMM_(imm, 64);
+#else
+                   READIMM;
+#endif
+                   MOV(imm, opreg,oz); break;
+#else
         case 0xb0: TRACEI("mov imm, al\t");
                    READIMM8; MOV(imm, reg_a,8); break;
         case 0xb1: TRACEI("mov imm, cl\t");
@@ -1012,6 +1179,7 @@ restart:
                    READIMM; MOV(imm, reg_si,oz); break;
         case 0xbf: TRACEI("mov imm, odi\t");
                    READIMM; MOV(imm, reg_di,oz); break;
+#endif
 
 #define GRP2(count, val,z) \
     switch (modrm.opcode) { \
@@ -1036,7 +1204,7 @@ restart:
                    RET_NEAR(0); break;
 
         case 0xc9: TRACEI("leave");
-                   MOV(reg_bp, reg_sp,oz); POP(reg_bp,oz); break;
+                   MOV(reg_bp, reg_sp,STK_Z(oz)); POP(reg_bp,STK_Z(oz)); break;
 
         case 0xcc: TRACEI("int3");
                    INT(INT_BREAKPOINT); break;
@@ -1091,6 +1259,11 @@ restart:
                     case 0xda6: TRACE("fidiv mem32"); FIDIV(mem_addr,32); break;
                     case 0xda7: TRACE("fidivr mem32"); FIDIVR(mem_addr,32); break;
                     case 0xdb0: TRACE("fild mem32"); FILD(mem_addr,32); break;
+#ifdef GUEST_X86_64
+                    case 0xdb1: TRACE("fisttp mem32"); FISTT(mem_addr,32); FPOP; break;
+                    case 0xdd1: TRACE("fisttp mem64"); FISTT(mem_addr,64); FPOP; break;
+                    case 0xdf1: TRACE("fisttp mem16"); FISTT(mem_addr,16); FPOP; break;
+#endif
                     case 0xdb2: TRACE("fist mem32"); FIST(mem_addr,32); break;
                     case 0xdb3: TRACE("fistp mem32"); FIST(mem_addr,32); FPOP; break;
                     case 0xdb5: TRACE("fld mem80"); FLDM(mem_addr_real,80); break;
@@ -1214,10 +1387,16 @@ restart:
             READINSN;
             switch (insn) {
                 case 0x65: TRACE("segment gs\n"); SEG_GS(); goto lockrestart;
+#ifdef GUEST_X86_64
+                case 0x64: TRACE("segment fs\n"); SEG_FS(); goto lockrestart;
+                case 0x40 ... 0x4f: TRACE("rex "); goto lockrestart;
+#endif
 
                 case 0x66:
                     // I didn't think this through
-#if OP_SIZE == 32
+#if defined(GUEST_X86_64)
+                    goto lockrestart; // already chose the decoder
+#elif OP_SIZE == 32
                     TRACE("locked 16-bit mode\n");
                     RESTORE_IP;
                     return glue(DECODER_NAME, 16)(DECODER_PASS_ARGS);
@@ -1296,8 +1475,13 @@ restart:
                                    READMODRM_MEM; ATOMIC_XADD(modrm_reg, modrm_val,oz); break;
 
                         case 0xc7: READMODRM_MEM; switch (modrm.opcode) {
+#if defined(GUEST_X86_64) && OP_SIZE == 64
+                                       case 1: TRACEI("lock cmpxchg16b modrm");
+                                               ATOMIC_CMPXCHG16B(modrm_val,128); break;
+#else
                                        case 1: TRACEI("lock cmpxchg8b modrm");
                                                ATOMIC_CMPXCHG8B(modrm_val,64); break;
+#endif
                                        default: UNDEFINED;
                                    };
                                    break;
@@ -1322,22 +1506,63 @@ restart:
             break;
 
         case 0xf2:
+#ifdef GUEST_X86_64
+            f2restart:
+#endif
             READINSN;
             switch (insn) {
+#ifdef GUEST_X86_64
+                case 0x40 ... 0x4f: TRACE("rex "); goto f2restart;
+                case 0x64: TRACE("segment fs\n"); SEG_FS(); goto f2restart;
+#endif
                 case 0x0f:
                     READINSN;
                     switch (insn) {
                         case 0x10: TRACEI("movsd xmm:modrm, xmm");
                                    READMODRM; VMOV_MERGE_REG(xmm_modrm_val, xmm_modrm_reg,64); break;
+#ifdef GUEST_X86_64
+                        case 0x12: TRACEI("movddup xmm:modrm, xmm");
+                                   READMODRM; V_OP(movddup, xmm_modrm_val, xmm_modrm_reg,64); break;
+                        case 0x7c: TRACEI("haddps xmm:modrm, xmm");
+                                   READMODRM; V_OP(haddps, xmm_modrm_val, xmm_modrm_reg,128); break;
+                        case 0x7d: TRACEI("hsubps xmm:modrm, xmm");
+                                   READMODRM; V_OP(hsubps, xmm_modrm_val, xmm_modrm_reg,128); break;
+                        case 0xd0: TRACEI("addsubps xmm:modrm, xmm");
+                                   READMODRM; V_OP(addsubps, xmm_modrm_val, xmm_modrm_reg,128); break;
+                        case 0xf0: TRACEI("lddqu modrm, xmm");
+                                   READMODRM_MEM; VMOV(xmm_modrm_val, xmm_modrm_reg,128); break;
+                        case 0x38: READINSN;
+                                   switch (insn) {
+                                       case 0xf0: TRACEI("crc32 modrm8, reg");
+                                                  READMODRM; V_OP(crc32_, modrm_val, modrm_reg,8); break;
+                                       case 0xf1: TRACEI("crc32 modrm, reg");
+                                                  READMODRM;
+                                                  if (OP_SIZE == 16) { V_OP(crc32_, modrm_val, modrm_reg,16); }
+                                                  else if (OP_SIZE == 32) { V_OP(crc32_, modrm_val, modrm_reg,32); }
+                                                  else { V_OP(crc32_, modrm_val, modrm_reg,64); }
+                                                  break;
+                                       default: TRACE("undefined"); UNDEFINED;
+                                   }
+                                   break;
+#endif
                         case 0x11: TRACEI("movsd xmm, xmm:modrm");
                                    READMODRM; VMOV_MERGE_REG(xmm_modrm_reg, xmm_modrm_val,64); break;
 
+#if defined(GUEST_X86_64) && OP_SIZE == 64
+                        case 0x2a: TRACEI("cvtsi2sd modrm64, xmm");
+                                   READMODRM; V_OP(cvtsi2sdq, modrm_val, xmm_modrm_reg,64); break;
+                        case 0x2c: TRACEI("cvttsd2si reg64, xmm:modrm");
+                                   READMODRM; V_OP(cvttsd2siq, xmm_modrm_val, modrm_reg,64); break;
+                        case 0x2d: TRACEI("cvtsd2si reg64, xmm:modrm");
+                                   READMODRM; V_OP(cvtsd2siq, xmm_modrm_val, modrm_reg,64); break;
+#else
                         case 0x2a: TRACEI("cvtsi2sd modrm, xmm");
                                    READMODRM; V_OP(cvtsi2sd, modrm_val, xmm_modrm_reg,32); break;
                         case 0x2c: TRACEI("cvttsd2si reg, xmm:modrm");
                                    READMODRM; V_OP(cvttsd2si, xmm_modrm_val, modrm_reg,64); break;
                         case 0x2d: TRACEI("cvtsd2si reg, xmm:modrm");
                                    READMODRM; V_OP(cvtsd2si, xmm_modrm_val, modrm_reg,64); break;
+#endif
                         case 0xe6: TRACEI("cvtpd2dq xmm:modrm, xmm");
                                    READMODRM; V_OP(cvtpd2dq, xmm_modrm_val, xmm_modrm_reg,128); break;
                         case 0x5a: TRACEI("cvtsd2ss xmm:modrm, xmm");
@@ -1380,8 +1605,15 @@ restart:
             break;
 
         case 0xf3:
+#ifdef GUEST_X86_64
+            f3restart:
+#endif
             READINSN;
             switch (insn) {
+#ifdef GUEST_X86_64
+                case 0x40 ... 0x4f: TRACE("rex "); goto f3restart;
+                case 0x64: TRACE("segment fs\n"); SEG_FS(); goto f3restart;
+#endif
                 case 0x0f:
                     // 2-byte opcode prefix
                     // after a rep prefix, means we have sse/mmx insanity
@@ -1389,15 +1621,32 @@ restart:
                     switch (insn) {
                         case 0x10: TRACEI("movss xmm:modrm, xmm");
                                    READMODRM; VMOV_MERGE_REG(xmm_modrm_val, xmm_modrm_reg,32); break;
+#ifdef GUEST_X86_64
+                        case 0x12: TRACEI("movsldup xmm:modrm, xmm");
+                                   READMODRM; V_OP(movsldup, xmm_modrm_val, xmm_modrm_reg,128); break;
+                        case 0x16: TRACEI("movshdup xmm:modrm, xmm");
+                                   READMODRM; V_OP(movshdup, xmm_modrm_val, xmm_modrm_reg,128); break;
+                        case 0xb8: TRACEI("popcnt modrm, reg");
+                                   READMODRM; POPCNT(modrm_val, modrm_reg,oz); break;
+#endif
                         case 0x11: TRACEI("movss xmm, xmm:modrm");
                                    READMODRM; VMOV_MERGE_REG(xmm_modrm_reg, xmm_modrm_val,32); break;
 
+#if defined(GUEST_X86_64) && OP_SIZE == 64
+                        case 0x2a: TRACEI("cvtsi2ss modrm64, xmm");
+                                   READMODRM; V_OP(cvtsi2ssq, modrm_val, xmm_modrm_reg,64); break;
+                        case 0x2c: TRACEI("cvttss2si reg64, xmm:modrm");
+                                   READMODRM; V_OP(cvttss2siq, xmm_modrm_val, modrm_reg,32); break;
+                        case 0x2d: TRACEI("cvtss2si reg64, xmm:modrm");
+                                   READMODRM; V_OP(cvtss2siq, xmm_modrm_val, modrm_reg,32); break;
+#else
                         case 0x2a: TRACEI("cvtsi2ss modrm, xmm");
                                    READMODRM; V_OP(cvtsi2ss, modrm_val, xmm_modrm_reg,32); break;
                         case 0x2c: TRACEI("cvttss2si reg, xmm:modrm");
                                    READMODRM; V_OP(cvttss2si, xmm_modrm_val, modrm_reg,32); break;
                         case 0x2d: TRACEI("cvtss2si reg, xmm:modrm");
                                    READMODRM; V_OP(cvtss2si, xmm_modrm_val, modrm_reg,32); break;
+#endif
                         case 0x52: TRACEI("rsqrtss xmm:modrm, xmm");
                                    READMODRM; V_OP(single_rsqrt, xmm_modrm_val, xmm_modrm_reg,32); break;
                         case 0x53: TRACEI("rcpss xmm:modrm, xmm");
@@ -1518,7 +1767,7 @@ restart:
                 JMP(val); break; \
         case 5: TRACE("jmp indirect far"); UNDEFINED; \
         case 6: TRACE("push"); \
-                PUSH(val,z); break; \
+                PUSH(val,STK_Z(z)); break; \
         case 7: TRACE("undefined"); UNDEFINED; \
     }
 

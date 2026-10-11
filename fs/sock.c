@@ -123,7 +123,7 @@ static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
 // the generic path rejects in sockaddr_read() -> EINVAL. These two shims
 // bypass sockaddr handling entirely and move payload only.
 // The guest's struct iovec: pointer-sized base and len.
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 typedef struct iovec64_ guest_iovec_t;
 #else
 typedef struct iovec_ guest_iovec_t;
@@ -131,7 +131,7 @@ typedef struct iovec_ guest_iovec_t;
 
 static int netlink_stub_sendmsg(struct fd *sock, addr_t msghdr_addr) {
     addr_t iov_addr; uint64_t iovlen;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct msghdr64_ m;
     if (user_get(msghdr_addr, m)) return _EFAULT;
     iov_addr = (addr_t) m.msg_iov; iovlen = m.msg_iovlen;
@@ -155,7 +155,7 @@ static int netlink_stub_sendmsg(struct fd *sock, addr_t msghdr_addr) {
 
 static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr) {
     addr_t iov_addr, name_addr; uint64_t iovlen; uint32_t namelen;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct msghdr64_ m;
     if (user_get(msghdr_addr, m)) return _EFAULT;
     iov_addr = (addr_t) m.msg_iov; iovlen = m.msg_iovlen;
@@ -1268,7 +1268,7 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     // Read the guest msghdr struct into our internal 32-bit representation
     struct msghdr msg;
     struct msghdr_ msg_fake;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct msghdr64_ msg_fake64;
     if (user_get(msghdr_addr, msg_fake64))
         return _EFAULT;
@@ -1297,7 +1297,7 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     }
 
     // msg_iovec
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct iovec64_ msg_iov_fake64[msg_fake.msg_iovlen];
     if (user_read(msg_fake.msg_iov, msg_iov_fake64, sizeof(msg_iov_fake64)))
         return _EFAULT;
@@ -1448,7 +1448,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
 
     // Read the guest msghdr struct into our internal 32-bit representation
     struct msghdr_ msg_fake;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct msghdr64_ msg_fake64;
     if (user_get(msghdr_addr, msg_fake64))
         return _EFAULT;
@@ -1491,7 +1491,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         return _EINVAL;
 
     // msg_iovec (no initial content)
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     struct iovec64_ msg_iov_fake64[msg_fake.msg_iovlen];
     if (user_read(msg_fake.msg_iov, msg_iov_fake64, sizeof(msg_iov_fake64)))
         return _EFAULT;
@@ -1570,7 +1570,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         if (chunk_size > n)
             chunk_size = n;
         if (chunk_size > 0) {
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
             if (user_write(msg_iov_bases[i], msg_iov[i].iov_base, chunk_size))
 #else
             if (user_write(msg_iov_fake[i].base, msg_iov[i].iov_base, chunk_size))
@@ -1631,7 +1631,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     msg_fake.msg_flags = sock_flags_from_real(msg.msg_flags);
 
     // Write back the updated msghdr to guest memory
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     msg_fake64.msg_namelen = msg_fake.msg_namelen;
     msg_fake64.msg_controllen = msg_fake.msg_controllen;
     msg_fake64.msg_flags = msg_fake.msg_flags;
@@ -1649,7 +1649,7 @@ struct mmsghdr_ {
     uint_t len;
 };
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 struct mmsghdr64_ {
     struct msghdr64_ hdr;
     uint32_t len;
@@ -1660,7 +1660,7 @@ struct mmsghdr64_ {
 int_t sys_recvmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, addr_t timeout_addr) {
     STRACE("recvmmsg(%d, %#x, %d, %d)", sock_fd, msg_vec, vec_len, flags);
     int num_recv = 0;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     size_t mmsghdr_size = sizeof(struct mmsghdr64_);
     size_t len_offset = offsetof(struct mmsghdr64_, len);
 #else
@@ -1689,7 +1689,7 @@ int_t sys_recvmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, ad
 
 int_t sys_sendmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags) {
     int num_sent = 0;
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     size_t mmsghdr_size = sizeof(struct mmsghdr64_);
     size_t len_offset = offsetof(struct mmsghdr64_, len);
 #else
@@ -1779,6 +1779,10 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
 }
 
 static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
+    // a netlink request written with write() (busybox ip) gets the same
+    // empty reply as one sent with send/sendmsg, or the reader waits forever
+    if (fd_is_netlink_stub(fd))
+        return netlink_stub_reply(fd, buf, size);
     int err;
     int eintr_count = 0;
     for (;;) {

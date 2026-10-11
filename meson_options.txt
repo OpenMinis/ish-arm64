@@ -6,7 +6,7 @@ option('engine', type: 'combo', choices: ['asbestos', 'unicorn'], value: 'asbest
 option('kernel', type: 'combo', choices: ['ish', 'linux'], value: 'ish')
 option('kconfig', type: 'array', value: [])
 
-option('guest_arch', type: 'combo', choices: ['x86', 'arm64'], value: 'x86',
+option('guest_arch', type: 'combo', choices: ['x86', 'arm64', 'x86_64'], value: 'x86',
        description: 'Guest architecture to emulate')
 
 option('vdso_c_args', type: 'string', value: '')

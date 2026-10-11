@@ -179,7 +179,7 @@ static addr_t sigreturn_trampoline(const char *name) {
 }
 
 int sigset_size_valid(dword_t size) {
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
     return size >= sizeof(sigset_t_) && (size % sizeof(sigset_t_) == 0);
 #else
     return size == sizeof(sigset_t_);
@@ -189,7 +189,7 @@ int sigset_size_valid(dword_t size) {
 int user_get_sigset(addr_t addr, dword_t size, sigset_t_ *out) {
     if (!sigset_size_valid(size))
         return _EINVAL;
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
     uint64_t word = 0;
     if (user_read(addr, &word, sizeof(word)))
         return _EFAULT;
@@ -205,7 +205,7 @@ int user_get_sigset(addr_t addr, dword_t size, sigset_t_ *out) {
 int user_put_sigset(addr_t addr, dword_t size, sigset_t_ set) {
     if (!sigset_size_valid(size))
         return _EINVAL;
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
     uint64_t word = (uint64_t) set;
     if (user_write(addr, &word, sizeof(word)))
         return _EFAULT;
@@ -227,7 +227,7 @@ int user_put_sigset(addr_t addr, dword_t size, sigset_t_ set) {
 #endif
 }
 
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 struct sigaction_arm64_kernel {
     uint64_t handler;
     uint64_t flags;
@@ -307,6 +307,55 @@ static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
     term[0] = 0;  // magic = 0 terminates
     term[1] = 0;  // size = 0
 }
+#elif defined(GUEST_X86_64)
+static void save_fpstate(struct fpstate_ *fp, struct cpu_state *cpu) {
+    memset(fp, 0, sizeof(*fp));
+    fp->cwd = cpu->fcw;
+    fp->swd = cpu->fsw;
+    for (int i = 0; i < 8; i++)
+        memcpy(&fp->st_space[i * 4], &cpu->fp[(cpu->top + i) % 8], 10);
+    fp->mxcsr = cpu->mxcsr;
+    fp->mxcsr_mask = 0xffff;
+    memcpy(fp->xmm_space, cpu->xmm, sizeof(fp->xmm_space));
+}
+
+static void restore_fpstate(struct cpu_state *cpu, const struct fpstate_ *fp) {
+    cpu->fcw = fp->cwd;
+    cpu->fsw = fp->swd;
+    for (int i = 0; i < 8; i++)
+        memcpy(&cpu->fp[(cpu->top + i) % 8], &fp->st_space[i * 4], 10);
+    cpu->mxcsr = fp->mxcsr & 0xffff;
+    memcpy(cpu->xmm, fp->xmm_space, sizeof(fp->xmm_space));
+}
+
+static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
+    memset(sc, 0, sizeof(*sc));
+    sc->r8 = cpu->r8;
+    sc->r9 = cpu->r9;
+    sc->r10 = cpu->r10;
+    sc->r11 = cpu->r11;
+    sc->r12 = cpu->r12;
+    sc->r13 = cpu->r13;
+    sc->r14 = cpu->r14;
+    sc->r15 = cpu->r15;
+    sc->di = cpu->rdi;
+    sc->si = cpu->rsi;
+    sc->bp = cpu->rbp;
+    sc->bx = cpu->rbx;
+    sc->dx = cpu->rdx;
+    sc->ax = cpu->rax;
+    sc->cx = cpu->rcx;
+    sc->sp = cpu->rsp;
+    sc->ip = cpu->rip;
+    collapse_flags(cpu);
+    sc->flags = cpu->eflags;
+    sc->cs = 0x33; // __USER_CS
+    sc->ss = 0x2b; // __USER_DS
+    sc->trapno = cpu->trapno;
+    if (cpu->trapno == INT_GPF)
+        sc->cr2 = cpu->segfault_addr;
+    sc->oldmask = current->blocked;
+}
 #else
 // The x87/MMX/SSE state, saved below the signal frame where sigcontext's
 // fpstate points (as Linux does), and restored by sigreturn. Without it a
@@ -363,6 +412,17 @@ static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
 }
 #endif
 
+#ifdef GUEST_X86_64
+static void setup_rt_sigframe(struct siginfo_ *info, struct rt_sigframe_ *frame) {
+    frame->restorer = sigreturn_trampoline("__kernel_rt_sigreturn");
+    frame->info = *info;
+    frame->uc.flags = 0;
+    frame->uc.link = 0;
+    altstack_to_user(current, &frame->uc.stack);
+    setup_sigcontext(&frame->uc.mcontext, &current->cpu);
+    frame->uc.sigmask = current->blocked;
+}
+#else
 static void setup_sigframe(struct siginfo_ *info, struct sigframe_ *frame) {
     frame->restorer = sigreturn_trampoline("__kernel_sigreturn");
     frame->sig = info->sig;
@@ -403,6 +463,67 @@ static void setup_rt_sigframe(struct siginfo_ *info, struct rt_sigframe_ *frame)
     };
     memcpy(frame->retcode, &rt_retcode, sizeof(rt_retcode));
 }
+#endif
+
+#ifdef GUEST_X86_64
+// Long mode signal delivery (arch/x86/kernel/signal_64.c): the frame goes
+// below the 128-byte red zone (or on the altstack), under the fxsave area,
+// with rsp + 8 16-byte aligned as at a function entry.
+static void setup_frame_x86_64(struct sigaction_ *action, struct siginfo_ *info) {
+    struct cpu_state *cpu = &current->cpu;
+    // SA_RESTART: rewind over `syscall` and put the number back in rax
+    if ((action->flags & SA_RESTART_) && current->syscall_restartable &&
+            cpu->rip == current->syscall_restart_pc) {
+        cpu->rip -= 2;
+        cpu->rax = current->syscall_restart_num;
+        current->syscall_restartable = false;
+    }
+
+    struct rt_sigframe_ frame = {};
+    setup_rt_sigframe(info, &frame);
+
+    addr_t sp = cpu->rsp - 128;
+    if ((action->flags & SA_ONSTACK_) && current->altstack &&
+            !is_on_altstack(cpu->rsp, current))
+        sp = current->altstack + current->altstack_size;
+
+    sp -= sizeof(struct fpstate_);
+    sp &= ~(addr_t) 0x3f;
+    addr_t fpstate_addr = sp;
+    struct fpstate_ fps;
+    save_fpstate(&fps, cpu);
+    if (user_write(fpstate_addr, &fps, sizeof(fps)))
+        fpstate_addr = 0;
+    frame.uc.mcontext.fpstate = fpstate_addr;
+
+    sp -= sizeof(frame);
+    sp = (sp & ~(addr_t) 0xf) - 8;
+
+    if (!(action->flags & SA_NODEFER_))
+        sigset_add(&current->blocked, info->sig);
+    current->blocked |= action->mask;
+
+    if (user_write(sp, &frame, sizeof(frame))) {
+        printk("failed to install frame for %d at %#llx\n", info->sig, (unsigned long long) sp);
+        deliver_signal(current, SIGSEGV_, SIGINFO_NIL);
+    }
+
+    cpu->rsp = sp;
+    cpu->rip = action->handler;
+    cpu->rdi = info->sig;
+    cpu->rsi = sp + offsetof(struct rt_sigframe_, info);
+    cpu->rdx = sp + offsetof(struct rt_sigframe_, uc);
+    cpu->rax = 0;
+    // the handler starts with a clean FPU and DF clear, like on Linux
+    cpu->fcw = 0x37f;
+    cpu->fsw = 0;
+    cpu->mxcsr = 0x1f80;
+    collapse_flags(cpu);
+    cpu->eflags &= ~DF_FLAG;
+    cpu->df_offset = 1;
+    expand_flags(cpu);
+}
+#endif
 
 static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
     int sig = info->sig;
@@ -500,6 +621,9 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
     }
 
     struct sigaction_ *action = &sighand->action[info->sig];
+#ifdef GUEST_X86_64
+    setup_frame_x86_64(action, info);
+#else
     bool need_siginfo = action->flags & SA_SIGINFO_;
 #if defined(GUEST_ARM64)
     // ARM64 only provides __kernel_rt_sigreturn in the VDSO.
@@ -653,6 +777,7 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
     else
         current->cpu.regs[30] = frame.sigframe.restorer;
 #endif
+#endif // GUEST_X86_64
 
     if (action->flags & SA_RESETHAND_)
         *action = (struct sigaction_) {.handler = SIG_DFL_};
@@ -743,7 +868,64 @@ void receive_signals() {
     }
 }
 
-#if defined(GUEST_ARM64)
+#if defined(GUEST_X86_64)
+static void restore_sigcontext(struct sigcontext_ *context, struct cpu_state *cpu) {
+    cpu->r8 = context->r8;
+    cpu->r9 = context->r9;
+    cpu->r10 = context->r10;
+    cpu->r11 = context->r11;
+    cpu->r12 = context->r12;
+    cpu->r13 = context->r13;
+    cpu->r14 = context->r14;
+    cpu->r15 = context->r15;
+    cpu->rdi = context->di;
+    cpu->rsi = context->si;
+    cpu->rbp = context->bp;
+    cpu->rbx = context->bx;
+    cpu->rdx = context->dx;
+    cpu->rax = context->ax;
+    cpu->rcx = context->cx;
+    cpu->rsp = context->sp;
+    cpu->rip = context->ip;
+    collapse_flags(cpu);
+    // AC, RF, OF, DF, TF, SF, ZF, AF, PF, CF, as on i386
+    const dword_t use_flags = 0b1010000110111010101;
+    cpu->eflags = (context->flags & use_flags) | (cpu->eflags & ~use_flags);
+    cpu->df_offset = (cpu->eflags & DF_FLAG) ? -1 : 1;
+    expand_flags(cpu);
+}
+
+int64_t sys_rt_sigreturn() {
+    struct cpu_state *cpu = &current->cpu;
+    struct rt_sigframe_ frame;
+    // the handler's ret popped pretcode
+    addr_t frame_addr = cpu->rsp - 8;
+    if (user_get(frame_addr, frame)) {
+        deliver_signal(current, SIGSEGV_, SIGINFO_NIL);
+        return _EFAULT;
+    }
+    restore_sigcontext(&frame.uc.mcontext, cpu);
+    if (frame.uc.mcontext.fpstate != 0) {
+        struct fpstate_ fps;
+        if (user_get(frame.uc.mcontext.fpstate, fps) == 0)
+            restore_fpstate(cpu, &fps);
+    }
+
+    lock(&current->sighand->lock);
+    if (!is_on_altstack(frame_addr, current) &&
+            frame.uc.stack.size >= MINSIGSTKSZ_) {
+        current->altstack = frame.uc.stack.stack;
+        current->altstack_size = frame.uc.stack.size;
+    }
+    sigmask_set(frame.uc.sigmask);
+    unlock(&current->sighand->lock);
+    return (int64_t) cpu->rax;
+}
+
+int64_t sys_sigreturn() {
+    return _ENOSYS;
+}
+#elif defined(GUEST_ARM64)
 static void restore_sigcontext(struct sigcontext_ *context, struct cpu_state *cpu) {
     memcpy(cpu->regs, context->regs, sizeof(cpu->regs));
     cpu->sp = context->sp;
@@ -785,6 +967,7 @@ static void restore_sigcontext(struct sigcontext_ *context, struct cpu_state *cp
 }
 #endif
 
+#ifndef GUEST_X86_64
 int64_t sys_rt_sigreturn() {
     struct cpu_state *cpu = &current->cpu;
     struct rt_sigframe_ frame;
@@ -876,6 +1059,8 @@ int64_t sys_sigreturn() {
 #endif
 }
 
+#endif // GUEST_X86_64
+
 struct sighand *sighand_new() {
     struct sighand *sighand = malloc(sizeof(struct sighand));
     if (sighand == NULL)
@@ -921,7 +1106,7 @@ dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_ad
         return _EINVAL;
     struct sigaction_ action = {}, oldaction;
     if (action_addr != 0) {
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
         int err = user_get_sigaction_arm64(action_addr, sigset_size, &action);
         if (err)
             return err;
@@ -942,7 +1127,7 @@ dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_ad
 
     if (oldaction_addr != 0)
     {
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
         int err = user_put_sigaction_arm64(oldaction_addr, sigset_size, &oldaction);
         if (err)
             return err;

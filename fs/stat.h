@@ -106,6 +106,29 @@ struct stat_arm64 {
     dword_t __unused5;          // (offset 124)
 };  // Total: 128 bytes
 
+// x86_64 stat struct (144 bytes), arch/x86/include/uapi/asm/stat.h: nlink
+// is 64 bits and comes before mode
+struct stat_x86_64 {
+    qword_t dev;
+    qword_t ino;
+    qword_t nlink;
+    dword_t mode;
+    dword_t uid;
+    dword_t gid;
+    dword_t __pad0;
+    qword_t rdev;
+    sqword_t size;
+    sqword_t blksize;
+    sqword_t blocks;
+    qword_t atime_;
+    qword_t atime_nsec;
+    qword_t mtime_;
+    qword_t mtime_nsec;
+    qword_t ctime_;
+    qword_t ctime_nsec;
+    sqword_t unused_[3];
+};
+
 struct statfsbuf {
     long type;
     long bsize;
@@ -151,7 +174,7 @@ struct statfs64_ {
     uint_t pad[4];
 } __attribute__((packed));
 
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 // ARM64 statfs structure - uses 64-bit fields throughout
 // This matches the kernel's statfs structure for LP64 architectures
 // Note: fsid_t is still { int val[2]; } = 8 bytes, not 16

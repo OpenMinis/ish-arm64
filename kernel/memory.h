@@ -20,7 +20,7 @@ struct mem_reservation {
     struct mem_reservation *next;
 };
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ARM64: 4-level page table for 48-bit address space
 // L0[512] → L1[512] → L2[512] → L3[512 pt_entry]
 // 9+9+9+9 = 36-bit page number + 12-bit offset = 48-bit address
@@ -160,7 +160,7 @@ page_t pt_find_hole(struct mem *mem, pages_t size);
 struct mem_reservation *mem_find_reservation(struct mem *mem, page_t page);
 void mem_remove_reservations(struct mem *mem, page_t start, pages_t pages);
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags);
 // Find a hole for a V8-style large reservation. Prefers addresses
 // above 4GB so heap pointers are non-canonical in low 32 bits.

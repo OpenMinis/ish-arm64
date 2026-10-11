@@ -13,7 +13,7 @@ __asm__(".data\n"
         ".skip "str(VDSO_PAGES)" * (1 << 12) - (. - vdso_data)\n");
 
 int vdso_symbol(const char *name) {
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
     struct elf_header64 *header = (void *) vdso_data;
     struct prg_header64 *ph = (void *) ((char *) header + header->prghead_off);
 

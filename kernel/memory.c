@@ -28,7 +28,7 @@ static struct mmu_ops mem_mmu_ops;
 #include "emu/tlb.h"
 
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ============================================================
 // ARM64: 4-level page table for 48-bit address space
 // ============================================================
@@ -503,7 +503,7 @@ page_t pt_find_hole(struct mem *mem, pages_t size) {
     return BAD_PAGE;
 }
 
-#endif // GUEST_ARM64
+#endif // GUEST_64BIT
 
 // ============================================================
 // Reservation API — shared by x86 and ARM64.
@@ -877,7 +877,7 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
     for (page_t page = start; page < start + pages; page++) {
         struct pt_entry *entry = mem_pt(mem, page);
         if (entry == NULL) {
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
             // Page is reservation-only (V8 heap cage chunk reserved
             // PROT_NONE, guest now mprotect'ing RW). Materialise it
             // via pt_map_nothing with the requested flags — i.e. treat
@@ -1026,7 +1026,7 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 
 static void mem_changed(struct mem *mem) {
     __atomic_add_fetch(&mem->mmu.changes, 1, __ATOMIC_SEQ_CST);
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     mmu_tlbs_stale(&mem->mmu);
 #endif
 }
@@ -1084,7 +1084,7 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
             goto check_reservation;
 
         // Enforce RLIMIT_STACK: don't grow stack beyond the limit.
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
         // Stack top is at STACK_TOP_PAGE (guard page), stack grows down from STACK_INIT_PAGE.
         pages_t guard_page = STACK_TOP_PAGE;
 #else

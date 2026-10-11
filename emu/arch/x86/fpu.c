@@ -80,6 +80,26 @@ void fpu_ist64(struct cpu_state *cpu, int64_t *i) {
     *i = f80_to_int(ST(0));
 }
 
+// fisttp: the integer store that truncates whatever the rounding mode
+void fpu_istt16(struct cpu_state *cpu, int16_t *i) {
+    enum f80_rounding_mode old = f80_rounding_mode;
+    f80_rounding_mode = round_chop;
+    fpu_ist16(cpu, i);
+    f80_rounding_mode = old;
+}
+void fpu_istt32(struct cpu_state *cpu, int32_t *i) {
+    enum f80_rounding_mode old = f80_rounding_mode;
+    f80_rounding_mode = round_chop;
+    fpu_ist32(cpu, i);
+    f80_rounding_mode = old;
+}
+void fpu_istt64(struct cpu_state *cpu, int64_t *i) {
+    enum f80_rounding_mode old = f80_rounding_mode;
+    f80_rounding_mode = round_chop;
+    fpu_ist64(cpu, i);
+    f80_rounding_mode = old;
+}
+
 void fpu_stm32(struct cpu_state *cpu, float32 *f) {
     *f = f80_to_double(ST(0));
 }

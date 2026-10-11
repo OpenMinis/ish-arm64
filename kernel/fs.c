@@ -378,7 +378,7 @@ out:
 // by the inefficiency of the emulator.
 
 static struct iovec_ *read_iovec(addr_t iovec_addr, unsigned iovec_count) {
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
     // ARM64 uses 64-bit iovec structure (16 bytes per entry)
     // We read the 64-bit version and convert to 32-bit for internal use
     size_t iovec64_size = sizeof(struct iovec64_) * iovec_count;
@@ -996,7 +996,7 @@ dword_t sys_fstatfs64(fd_t f, addr_t buf_addr) {
     return statfs64_mount(f_get(f)->mount, buf_addr);
 }
 
-#if defined(GUEST_ARM64)
+#if defined(GUEST_64BIT)
 // ARM64 uses statfs (not statfs64) with a different structure layout
 // The structure uses 64-bit fields throughout (LP64 ABI)
 static int_t statfs_arm64_mount(struct mount *mount, addr_t buf_addr) {
@@ -1210,7 +1210,7 @@ dword_t sys_lchown(addr_t path_addr, uid_t_ owner, uid_t_ group) {
     return sys_fchownat(AT_FDCWD_, path_addr, owner, group, AT_SYMLINK_NOFOLLOW_);
 }
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ARM64: 64-bit values passed in single registers
 dword_t sys_truncate64(addr_t path_addr, off_t_ size) {
     STRACE("truncate64(%#x, %lld [0x%llx])", path_addr, (long long)size, (unsigned long long)size);
@@ -1471,7 +1471,7 @@ dword_t sys_xattr_stub(addr_t UNUSED(path_addr), addr_t UNUSED(name_addr),
     return _ENOTSUP;
 }
 
-#ifdef GUEST_ARM64
+#ifdef GUEST_64BIT
 // ARM64: posix_fadvise64 (syscall 223)
 // Advises the kernel about file access patterns.
 // Since we don't do kernel I/O optimization, we can safely ignore these hints.

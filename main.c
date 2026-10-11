@@ -472,6 +472,13 @@ int main(int argc, char *const argv[]) {
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
+#ifndef _WIN32
+    // Guest job control is emulated. A guest program that sets the terminal
+    // mode with SIGTTOU blocked (node restoring stdin at exit) must not get
+    // ish stopped when ish itself is not in the terminal's foreground group
+    // (as under timeout(1)): with SIGTTOU ignored the host tcsetattr goes ahead.
+    signal(SIGTTOU, SIG_IGN);
+#endif
 #ifdef _WIN32
     px_crash_init();
     px_prof_register();

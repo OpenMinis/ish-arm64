@@ -171,6 +171,9 @@ void vec_movmask_b64(NO_CPU, const union mm_reg *src, uint32_t *dst) {
         if (s.u8[i] & (1 << 7))
             *dst |= 1 << i;
     }
+#ifdef GUEST_X86_64
+    ((uint32_t *) dst)[1] = 0; // a general register
+#endif
 }
 
 void vec_insert_w64(NO_CPU, const uint32_t *src, union mm_reg *dst, uint8_t index) {
