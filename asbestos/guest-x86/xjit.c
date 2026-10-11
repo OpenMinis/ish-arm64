@@ -422,14 +422,23 @@ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 // ---------------------------------------------------------------- code memory
 
 // rel32 calls and rip-relative operands in the copies must still reach the
-// binary, so the code region sits within +-2GB of the templates.
+// binary, so the code region sits within +-2GB of the templates. So does a
+// data region for what translated code writes (xlat.c's guesses): writing
+// to a page that holds code is self-modifying code to the CPU, and makes
+// Rosetta throw its translation of the page away.
 #define REGION_SIZE (256u << 20)
+#define DATA_REGION_SIZE (32u << 20)
 #define CHUNK 64u
 #define NCLASSES 64  // free lists for sizes up to 64 * CHUNK
 
-static uint8_t *region, *region_next, *region_end;
-static void *free_lists[NCLASSES + 1];
-static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
+struct arena {
+    uint8_t *base, *next, *end;
+    void *free_lists[NCLASSES + 1];
+    pthread_mutex_t lock;
+};
+static struct arena code_arena = {.lock = PTHREAD_MUTEX_INITIALIZER};
+static struct arena data_arena = {.lock = PTHREAD_MUTEX_INITIALIZER};
+static uint8_t *region, *region_end;  // the code region
 
 struct code_hdr {
     uint32_t chunks;
@@ -438,56 +447,70 @@ struct code_hdr {
 
 static bool reachable(uintptr_t a, uintptr_t b) {
     uintptr_t d = a > b ? a - b : b - a;
-    return d < (1u << 31) - (REGION_SIZE + (64u << 20));
+    return d < (1u << 31) - (REGION_SIZE + DATA_REGION_SIZE + (64u << 20));
+}
+
+static void *map_near(uintptr_t anchor, size_t size, int prot) {
+    for (int64_t delta = 64ll << 20; delta < (1ll << 31); delta += 64ll << 20) {
+        for (int sign = 1; sign >= -1; sign -= 2) {
+            uintptr_t hint = (anchor + sign * delta) & ~(uintptr_t) 0xfffff;
+            void *p = mmap((void *) hint, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (p == MAP_FAILED)
+                continue;
+            if (reachable((uintptr_t) p, anchor) && reachable((uintptr_t) p + size, anchor))
+                return p;
+            munmap(p, size);
+        }
+    }
+    return NULL;
 }
 
 static void region_init(void) {
     uintptr_t anchor = (uintptr_t) tpl_table_start;
-    for (int64_t delta = 64ll << 20; delta < (1ll << 31); delta += 64ll << 20) {
-        for (int sign = 1; sign >= -1; sign -= 2) {
-            uintptr_t hint = (anchor + sign * delta) & ~(uintptr_t) 0xfffff;
-            void *p = mmap((void *) hint, REGION_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-                           MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (p == MAP_FAILED)
-                continue;
-            if (reachable((uintptr_t) p, anchor) &&
-                    reachable((uintptr_t) p + REGION_SIZE, anchor)) {
-                region = region_next = p;
-                region_end = region + REGION_SIZE;
-                return;
-            }
-            munmap(p, REGION_SIZE);
-        }
+    uint8_t *code = map_near(anchor, REGION_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (code == NULL)
+        return;
+    uint8_t *data = map_near(anchor, DATA_REGION_SIZE, PROT_READ | PROT_WRITE);
+    if (data == NULL) {
+        munmap(code, REGION_SIZE);
+        return;
     }
+    code_arena.base = code_arena.next = region = code;
+    code_arena.end = region_end = code + REGION_SIZE;
+    data_arena.base = data_arena.next = data;
+    data_arena.end = data + DATA_REGION_SIZE;
 }
 
-static void *code_alloc(size_t size) {
+static void *arena_alloc(struct arena *ar, size_t size) {
     size_t chunks = (size + sizeof(struct code_hdr) + CHUNK - 1) / CHUNK;
-    pthread_mutex_lock(&mem_lock);
+    pthread_mutex_lock(&ar->lock);
     struct code_hdr *h = NULL;
-    if (chunks <= NCLASSES && free_lists[chunks] != NULL) {
-        h = free_lists[chunks];
-        free_lists[chunks] = *(void **) h;
-    } else if (region != NULL && region_next + chunks * CHUNK <= region_end) {
-        h = (struct code_hdr *) region_next;
-        region_next += chunks * CHUNK;
+    if (chunks <= NCLASSES && ar->free_lists[chunks] != NULL) {
+        h = ar->free_lists[chunks];
+        ar->free_lists[chunks] = *(void **) h;
+    } else if (ar->base != NULL && ar->next + chunks * CHUNK <= ar->end) {
+        h = (struct code_hdr *) ar->next;
+        ar->next += chunks * CHUNK;
     }
-    pthread_mutex_unlock(&mem_lock);
+    pthread_mutex_unlock(&ar->lock);
     if (h == NULL)
         return NULL;
     h->chunks = (uint32_t) chunks;
     return h + 1;
 }
 
-static void code_free(void *p) {
+static void arena_free(struct arena *ar, void *p) {
     struct code_hdr *h = (struct code_hdr *) p - 1;
     if (h->chunks > NCLASSES)
         return;  // large pieces are rare; leave them
-    pthread_mutex_lock(&mem_lock);
-    *(void **) h = free_lists[h->chunks];
-    free_lists[h->chunks] = h;
-    pthread_mutex_unlock(&mem_lock);
+    pthread_mutex_lock(&ar->lock);
+    *(void **) h = ar->free_lists[h->chunks];
+    ar->free_lists[h->chunks] = h;
+    pthread_mutex_unlock(&ar->lock);
 }
+
+static void *code_alloc(size_t size) { return arena_alloc(&code_arena, size); }
+static void code_free(void *p) { arena_free(&code_arena, p); }
 
 #ifdef GUEST_X86_64
 #include "asbestos/guest-x86_64/xlat.c"
@@ -551,8 +574,11 @@ static uint8_t *emit_run(uint8_t *out, const uintptr_t *code, const struct run *
 }
 
 void xjit_link(struct fiber_block *from, int i, struct fiber_block *to) {
+    static int nolink = -1;
+    if (nolink < 0)
+        nolink = getenv("ISH_XLAT_NOLINK") != NULL;
     uint8_t *field = from->xjit_link[i];
-    if (field == NULL || to->xjit_entry == 0)
+    if (field == NULL || to->xjit_entry == 0 || nolink)
         return;
     int64_t v = (int64_t) to->xjit_entry - (int64_t) (uintptr_t) (field + 4);
     if (v != (int32_t) v)
@@ -570,6 +596,7 @@ void xjit_unlink(struct fiber_block *from, int i) {
 
 void xjit_block(struct fiber_block *block) {
     block->xjit_code = NULL;
+    block->xjit_data = NULL;
     block->xjit_entry = 0;
     block->xjit_link[0] = block->xjit_link[1] = NULL;
     pthread_once(&init_once, xjit_init_all);
@@ -672,6 +699,9 @@ void xjit_block(struct fiber_block *block) {
 void xjit_block_free(struct fiber_block *block) {
     if (block->xjit_code != NULL)
         code_free(block->xjit_code);
+    if (block->xjit_data != NULL)
+        arena_free(&data_arena, block->xjit_data);
+    block->xjit_data = NULL;
     block->xjit_code = NULL;
 }
 

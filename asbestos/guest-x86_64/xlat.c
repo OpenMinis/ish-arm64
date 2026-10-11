@@ -15,7 +15,10 @@
 // stream slot and hands over with _ip pointing back into the stream.
 //
 // ISH_XJIT_STATS=1 also counts how many instructions ran which way, and
-// which opcodes fell back most.
+// which opcodes fell back most. For bisecting a translation bug:
+// ISH_XLAT_KINDS=<mask of K_*>, ISH_XLAT_OPS=lo[:hi] (map * 256 + opcode of
+// generic instructions), ISH_XLAT_NTH=lo[:hi] (only those of them, in
+// translation order; one prints it), ISH_XLAT_NOSUCC, ISH_XLAT_NOLINK.
 
 #include <stddef.h>
 #include "emu/tlb.h"
@@ -124,7 +127,7 @@ struct xfix {
     uint32_t off;      // of the rel32 field
     uintptr_t target;  // address or label number
 };
-enum { FIX_ABS, FIX_LABEL };
+enum { FIX_ABS, FIX_LABEL, FIX_DATA = 3 };  // FIX_DATA: to word n of the block's data
 
 struct xlabel {
     uint8_t sec;
@@ -994,8 +997,9 @@ static void shift_flags(const struct gi *g, const struct xinsn *x, struct cls *c
 // Flags the guest code at addr may read before it writes them: all a block
 // exit to there has to leave in the lazy state. Interrupts in between are
 // fine: the rest a signal handler sees is about to be overwritten anyway.
+static bool dbg_nosucc;
 static uint16_t succ_live(uint64_t addr) {
-    if (xlog_tlb == NULL)
+    if (xlog_tlb == NULL || dbg_nosucc)
         return F_ALL;
     uint16_t live = 0, written = 0;
     for (int k = 0; k < 16; k++) {
@@ -1098,6 +1102,7 @@ struct xctx {
     // the rel32 is in the main section
     struct { unsigned slot; uint32_t field; } links[2];
     unsigned nlinks;
+    unsigned ndata;   // words of data (guesses), in the data region
 };
 
 static void sync_dirty(struct xctx *x) {
@@ -1349,13 +1354,13 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
                        uint16_t keep, bool load_flags) {
     struct xasm *a = x->a;
     unsigned l_miss = new_label(a), l_back = new_label(a), l_cross = new_label(a),
-             l_after = new_label(a), l_orig = new_label(a), l_guess = new_label(a),
-             l_wrong = new_label(a);
+             l_after = new_label(a), l_orig = new_label(a), l_wrong = new_label(a);
     uint16_t sync = keep & x->dirty;
 
     if (keep)
         e_save_flags(a);
-    b1(a, 0x4c); b1(a, 0x8b); b1(a, 0x0d); rel_lab(a, l_guess);  // mov guess(%rip), %r9
+    unsigned guess = x->ndata++;
+    b1(a, 0x4c); b1(a, 0x8b); b1(a, 0x0d); add_fix(a, FIX_DATA, guess); b4(a, 0);  // mov guess(%rip), %r9
     e_tlb_index(a);
     // the page of the operand's last byte, so that crossing a page misses
     e_lea(a, R15, XMEM(R13, (int32_t) size - 1));
@@ -1379,7 +1384,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     a->cur = SEC_COLD;
     lbind(a, l_wrong);
     e_mov_load(a, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
-    b1(a, 0x4c); b1(a, 0x89); b1(a, 0x0d); rel_lab(a, l_guess);  // mov %r9, guess(%rip)
+    b1(a, 0x4c); b1(a, 0x89); b1(a, 0x0d); add_fix(a, FIX_DATA, guess); b4(a, 0);  // mov %r9, guess(%rip)
     e_jmp_lab(a, l_back);
 
     lbind(a, l_miss);
@@ -1429,8 +1434,6 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
         b1(a, 0xcc);
     lbind(a, l_orig);
     b8(a, bd->g->ip);
-    lbind(a, l_guess);
-    b8(a, 0);
     a->cur = SEC_MAIN;
 }
 
@@ -1757,9 +1760,32 @@ static __thread struct xi *xis;
 static __thread unsigned xis_cap;
 static bool xlat_on;
 
+static unsigned dbg_kinds = ~0u;  // ISH_XLAT_KINDS: bit per K_* translated
+static unsigned dbg_op_lo = 0, dbg_op_hi = ~0u;  // ISH_XLAT_OPS=lo:hi
+static bool dbg_nth_on;
+static unsigned dbg_nth_lo, dbg_nth_hi;  // ISH_XLAT_NTH=lo:hi: only those of them
 static bool plan_insn(struct xctx *x, const struct xinsn *in, struct xi *xi, unsigned n_left) {
     if (in->bad || !gdecode(in, &xi->g) || !classify(&xi->g, &xi->c))
         return false;
+    if (!(dbg_kinds & (1u << xi->c.kind)))
+        return false;
+    if (xi->c.kind == K_GENERIC) {
+        unsigned key = xi->g.map * 256u + xi->g.op;
+        if (key < dbg_op_lo || key > dbg_op_hi)
+            return false;
+        if (dbg_nth_on) {
+            static _Atomic unsigned nth;
+            unsigned k = atomic_fetch_add(&nth, 1);
+            if (k < dbg_nth_lo || k > dbg_nth_hi)
+                return false;
+            if (dbg_nth_lo == dbg_nth_hi) {
+                fprintf(stderr, "[xlat] #%u ip=%llx:", k, (unsigned long long) in->ip);
+                for (unsigned i = 0; i < in->len; i++)
+                    fprintf(stderr, " %02x", in->bytes[i]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     shift_flags(&xi->g, in, &xi->c);
     set_rw(&xi->g, &xi->c);
     const struct gi *g = &xi->g;
@@ -1818,6 +1844,16 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
         atomic_fetch_add_explicit(&st_nomem, 1, memory_order_relaxed);
         return false;
     }
+    uint8_t *data = NULL;
+    if (x->ndata > 0) {
+        data = arena_alloc(&data_arena, x->ndata * 8u);
+        if (data == NULL) {
+            code_free(mem);
+            atomic_fetch_add_explicit(&st_nomem, 1, memory_order_relaxed);
+            return false;
+        }
+        memset(data, 0, x->ndata * 8u);
+    }
     uint8_t *sec_base[2] = {mem, mem + cold_off};
     memcpy(mem, a->sec[SEC_MAIN].base, main_len);
     memset(mem + main_len, 0xcc, cold_off - main_len);
@@ -1833,6 +1869,8 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
             v = (int64_t) (intptr_t) (sec_base[l->sec] + l->off) - (int64_t) (intptr_t) (field + 4);
         } else if (f->kind == FIX_ABS) {
             v = (int64_t) f->target - (int64_t) (intptr_t) (field + 4);
+        } else if (f->kind == FIX_DATA) {
+            v = (int64_t) (intptr_t) (data + 8 * f->target) - (int64_t) (intptr_t) (field + 4);
         } else {
             const uint8_t *orig = (const uint8_t *) f->target;
             v = (int64_t) rd32(orig) - ((int64_t) (intptr_t) field - (int64_t) (intptr_t) orig);
@@ -1857,6 +1895,7 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
         }
     }
     block->xjit_code = mem;
+    block->xjit_data = data;
     prof_note(mem, main_len, total, block->addr);
     if (stats_on) {
         atomic_fetch_add_explicit(&st_blocks, 1, memory_order_relaxed);
@@ -1866,6 +1905,8 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
     return true;
 fail:
     code_free(mem);
+    if (data != NULL)
+        arena_free(&data_arena, data);
     return false;
 }
 
@@ -2048,6 +2089,20 @@ static void xlat_init(void) {
     unsigned ra, rb, rc, rd;
     if (__get_cpuid_count(7, 0, &ra, &rb, &rc, &rd))
         have_bmi2 = (rb >> 8) & 1;
+    dbg_nosucc = getenv("ISH_XLAT_NOSUCC") != NULL;
+    if ((e = getenv("ISH_XLAT_OPS")) != NULL) {
+        char *end;
+        dbg_op_lo = (unsigned) strtoul(e, &end, 0);
+        dbg_op_hi = *end == ':' ? (unsigned) strtoul(end + 1, NULL, 0) : dbg_op_lo;
+    }
+    if ((e = getenv("ISH_XLAT_NTH")) != NULL) {
+        char *end;
+        dbg_nth_on = true;
+        dbg_nth_lo = (unsigned) strtoul(e, &end, 0);
+        dbg_nth_hi = *end == ':' ? (unsigned) strtoul(end + 1, NULL, 0) : dbg_nth_lo;
+    }
+    if ((e = getenv("ISH_XLAT_KINDS")) != NULL)
+        dbg_kinds = (unsigned) strtoul(e, NULL, 0);
     e = getenv("ISH_XLAT_BMI2");
     if (e && e[0] == '0')
         have_bmi2 = false;
