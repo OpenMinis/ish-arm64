@@ -364,6 +364,37 @@ guest that dies with its ish.exe):
 Given the numbers, not recommended now: the gain is at most the ~40 ms of process start, the
 costs above are real, and the slowdown in a long-lived ish has to be found first.
 
+### 12. A long-lived ish no longer slows down: freed code is reused lowest address first
+
+The slow-down of section 11 was in guest CPU time, not in syscalls or waits (ISH_SYSCALL_TIMES:
+the same `python3 -c 'import ...'` went from 265-359 ms of guest CPU to 390-453 ms after three
+npm installs, with the same syscalls). It grew with every process when translations were not
+shared (ISH_XCACHE=0: 265 ms rising to 421-515 ms over 16 runs) and after npm install otherwise
+(V8's own code is never shared). Ruled out by that: the fakefs database, fd leaks, the write
+lock. The cause was the code region's allocator: a process frees its blocks in hash order and
+the free lists handed them out again last-in-first-out, so each later process's code was
+scattered over everything ever freed (instruction TLB and cache misses). The free pieces of a
+size are now a heap ordered by address and the lowest is taken first.
+
+| 16 x python import in one ish, guest CPU ms | first 4 | last 4 |
+|---|---|---|
+| before, ISH_XCACHE=0 | 281 312 312 296 | 421 421 359 390 (peak 515) |
+| after, ISH_XCACHE=0 | 281 312 312 312 | 328 281 328 312 |
+| before, default | 359 359 296 296 | 265 312 328 328 |
+| after, default | 296 375 265 296 | 250 312 296 234 |
+
+benchmark/daily/persist.sh, long-lived, 5 rounds, two runs each, ms:
+
+| command | before | after |
+|---|---|---|
+| python import | 361-424, up to 807 | 340-423 |
+| npm install | 18.4-18.6 s first, then 21.7-23.3 s | 18.0-21.2 s, first and later alike |
+| node json | 1009-1366 | 940-1137 |
+| python3 -c pass | 194-275 | 169-232 |
+
+A fresh ish per command is unaffected (geomean 0.992 over 33 cases, outputs identical). Difftest
+in three configurations, agent 18/18 on macOS and Windows, compat on Windows 226/232.
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the

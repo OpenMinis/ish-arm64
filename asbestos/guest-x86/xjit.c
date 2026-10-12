@@ -438,12 +438,58 @@ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 #define NEXACT 64
 #define NCLASSES (NEXACT + 32)
 
+// The free pieces of one size, lowest address first (a binary heap of chunk
+// numbers). Taking the lowest keeps what a new guest process translates
+// packed at the low end, as in a fresh region: a process frees its blocks in
+// hash order, and handing them out again last-in-first-out scattered each
+// later process's code over everything ever freed (a long-lived ish ran
+// the same command 40% slower after a few runs).
+struct free_heap {
+    uint32_t *v;
+    uint32_t n, cap;
+};
+
 struct arena {
     uint8_t *base, *next, *end, *committed;
     int prot;
-    void *free_lists[NCLASSES];
+    struct free_heap free_lists[NCLASSES];
     pthread_mutex_t lock;
 };
+
+static bool heap_push(struct free_heap *h, uint32_t x) {
+    if (h->n == h->cap) {
+        uint32_t cap = h->cap ? h->cap * 2 : 64;
+        uint32_t *v = realloc(h->v, cap * sizeof(*v));
+        if (v == NULL)
+            return false;
+        h->v = v;
+        h->cap = cap;
+    }
+    uint32_t i = h->n++;
+    while (i > 0 && h->v[(i - 1) / 2] > x) {
+        h->v[i] = h->v[(i - 1) / 2];
+        i = (i - 1) / 2;
+    }
+    h->v[i] = x;
+    return true;
+}
+
+static uint32_t heap_pop(struct free_heap *h) {
+    uint32_t top = h->v[0], x = h->v[--h->n], i = 0;
+    for (;;) {
+        uint32_t c = 2 * i + 1;
+        if (c >= h->n)
+            break;
+        if (c + 1 < h->n && h->v[c + 1] < h->v[c])
+            c++;
+        if (h->v[c] >= x)
+            break;
+        h->v[i] = h->v[c];
+        i = c;
+    }
+    h->v[i] = x;
+    return top;
+}
 static struct arena code_arena = {.lock = PTHREAD_MUTEX_INITIALIZER};
 static struct arena data_arena = {.lock = PTHREAD_MUTEX_INITIALIZER};
 static uint8_t *region, *region_end;  // the code region
@@ -536,9 +582,8 @@ static void *arena_alloc(struct arena *ar, size_t size) {
         return NULL;
     pthread_mutex_lock(&ar->lock);
     struct code_hdr *h = NULL;
-    if (ar->free_lists[cls] != NULL) {
-        h = ar->free_lists[cls];
-        ar->free_lists[cls] = *(void **) h;
+    if (ar->free_lists[cls].n > 0) {
+        h = (struct code_hdr *) (ar->base + (size_t) heap_pop(&ar->free_lists[cls]) * CHUNK);
     } else if (ar->base != NULL && ar->next + chunks * CHUNK <= ar->end) {
         uint8_t *end = ar->next + chunks * CHUNK;
         while (end > ar->committed) {
@@ -570,8 +615,8 @@ static void arena_free(struct arena *ar, void *p) {
     size_t chunks = h->chunks;
     unsigned cls = size_class(&chunks);
     pthread_mutex_lock(&ar->lock);
-    *(void **) h = ar->free_lists[cls];
-    ar->free_lists[cls] = h;
+    // (if the heap cannot grow the piece is lost, not the program)
+    heap_push(&ar->free_lists[cls], (uint32_t) (((uint8_t *) h - ar->base) / CHUNK));
     pthread_mutex_unlock(&ar->lock);
 }
 
