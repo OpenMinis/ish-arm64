@@ -947,6 +947,7 @@ struct px_dir {
     bool eof;
     long index;         // entries returned since the start
     size_t off;         // next record in buf, or SIZE_MAX when buf is spent
+    size_t prev;        // record of the last entry returned, or SIZE_MAX
     struct px_dirent ent;
     _Alignas(8) char buf[65536];
 };
@@ -966,7 +967,7 @@ px_DIR *px_fdopendir(int fd) {
     dir->restart = true;
     dir->eof = false;
     dir->index = 0;
-    dir->off = SIZE_MAX;
+    dir->off = dir->prev = SIZE_MAX;
     px_put(d);
     return dir;
 }
@@ -996,9 +997,11 @@ struct px_dirent *px_readdir(px_DIR *dir) {
                 return NULL;
             }
             dir->off = 0;
+            dir->prev = SIZE_MAX;
         }
-        FILE_ID_BOTH_DIR_INFO *info = (FILE_ID_BOTH_DIR_INFO *) (dir->buf + dir->off);
-        dir->off = info->NextEntryOffset ? dir->off + info->NextEntryOffset : SIZE_MAX;
+        size_t at = dir->off;
+        FILE_ID_BOTH_DIR_INFO *info = (FILE_ID_BOTH_DIR_INFO *) (dir->buf + at);
+        dir->off = info->NextEntryOffset ? at + info->NextEntryOffset : SIZE_MAX;
         char *name = px_name_from_w(info->FileName, info->FileNameLength / sizeof(WCHAR));
         size_t len = strlen(name);
         if (len >= sizeof(dir->ent.d_name)) {
@@ -1016,6 +1019,7 @@ struct px_dirent *px_readdir(px_DIR *dir) {
             dir->ent.d_type = 8; // DT_REG
         dir->ent.d_reclen = sizeof(dir->ent);
         dir->ent.d_off = ++dir->index;
+        dir->prev = at;
         return &dir->ent;
     }
 }
@@ -1024,7 +1028,7 @@ void px_rewinddir(px_DIR *dir) {
     dir->restart = true;
     dir->eof = false;
     dir->index = 0;
-    dir->off = SIZE_MAX;
+    dir->off = dir->prev = SIZE_MAX;
 }
 
 long px_telldir(px_DIR *dir) {
@@ -1032,6 +1036,19 @@ long px_telldir(px_DIR *dir) {
 }
 
 void px_seekdir(px_DIR *dir, long pos) {
+    // getdents seeks after every call: to where it stopped, or one entry
+    // back to give up the entry that did not fit. Do those in place. A
+    // rewind counts entries again, which skips some when the directory lost
+    // entries meanwhile (rm -rf deleting as it reads), and costs a rescan.
+    if (pos == dir->index)
+        return;
+    if (pos == dir->index - 1 && dir->prev != SIZE_MAX) {
+        dir->off = dir->prev;
+        dir->prev = SIZE_MAX;
+        dir->index--;
+        dir->eof = false;
+        return;
+    }
     px_rewinddir(dir);
     while (dir->index < pos && px_readdir(dir) != NULL)
         ;
