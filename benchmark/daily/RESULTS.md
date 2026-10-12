@@ -212,6 +212,11 @@ installed.)
   unaligned guest memory with movaps).
 - 5a2caa26: two ish processes binding the same path at once (`-b`) failed with EEXIST, and a
   rebind briefly removed the mount under the other process's running command.
+- `go build` ran, but every program it built threw "fatal error: float32nan" at startup:
+  cvtss2sd/cvtsd2ss went through the float-to-integer conversion helper, whose out-of-range
+  check turned a NaN into -2^31, and Go's compiler folds float32 NaN comparisons through them.
+  build.go now passes (100 s with an empty build cache). The "go version" futex stall of the
+  first baseline no longer happens (0.2 s).
 - 8b26ab2a: `unfakefsify.exe` imported instead of exporting on Windows (the name check missed
   the .exe), with the arguments swapped.
 - 1418c8c0: `rm -rf` left files behind in directories of more than ~50 entries (seekdir after
@@ -223,6 +228,5 @@ installed.)
   through the path hook, the fstat through the open file): `cp` from a bound folder may report
   "file was replaced while being copied". Present before these changes.
 
-- `go build` hangs (futex stall), on Windows and macOS, JIT and gadget builds alike.
 - Results above are from a shared machine; Defender scans every file ish opens for the first
   time, which shows as wall time above cpu time (grep_r, npm_install, git.clone).

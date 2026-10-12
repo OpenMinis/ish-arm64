@@ -427,9 +427,14 @@ void vec_fcmp_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t 
 #endif
 
 VEC_CVT(si2sd32, int32_t, double)
-VEC_CVT(sd2ss64, double, float)
 VEC_CVT(si2ss32, int32_t, float)
-VEC_CVT(ss2sd32, float, double)
+// Between float widths a NaN stays a NaN (a signaling one turns quiet), as
+// the host's own conversion does: VEC_CVT's out-of-range check is for
+// integer results, and made a NaN -2^31. (Go's compiler folds float32 NaN
+// comparisons through this: binaries it built in the guest threw
+// "float32nan" at startup.)
+void vec_cvtsd2ss64(NO_CPU, const double *src, float *dst) { *dst = (float) *src; }
+void vec_cvtss2sd32(NO_CPU, const float *src, double *dst) { *dst = (double) *src; }
 void vec_cvttsd2si64(NO_CPU, const double *src, int32_t *dst) {
     _VEC_CVT(src, dst, double, int32_t, 1);
     gpr_zext(dst);
