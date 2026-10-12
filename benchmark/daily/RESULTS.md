@@ -310,6 +310,60 @@ means either translating cached blocks without decoding them again, or one long-
 session so that later commands find the code already translated (2c9e51ea shares translations
 between the processes of one ish).
 
+### 11. One long-lived ish per session against a fresh ish per command (measurement only)
+
+`benchmark/daily/persist.sh`: five commands, 5 rounds, in one ish.exe (a shell running them in
+sequence) and with a fresh ish.exe for each, as Minis runs commands today. Quiet machine, Defender
+excluded, 040c0aee. Milliseconds:
+
+| command | fresh ish, median of 5 | long-lived: first run | long-lived: runs 2-5 | later / fresh |
+|---|---:|---:|---|---:|
+| node -e 0 | 499 | 383 | 617 493 459 625 | 1.11 |
+| python3 -c pass | 268 | 203 | 284 206 246 307 | 0.99 |
+| python3 -c 'import json,re,os,sys,subprocess' | 374 | 344 | 669 454 469 560 | 1.38 |
+| node js/json.js | 1045 | 1148 | 1699 1110 1173 1303 | 1.18 |
+| npm install (4 local tarballs) | 17638 | 23333 | 26827 24157 22917 31557 | 1.45 |
+
+Two more long-lived runs (with and without the in-process translation sharing) gave node -e 0
+396-562, python3 -c pass 188-273, the imports 366-604, node json 1014-1350, npm install 19.7-27.2 s.
+
+So with the code as it is a long-lived ish does not pay: it saves the 35-60 ms of starting ish
+on the first, trivial commands and nothing after that. Sharing translations between the
+processes of one ish (2c9e51ea) does not show (ISH_XCACHE=0 gives the same times), as section 10
+found for the file cache: reusing a block costs what translating it does. npm install is slower
+in a long-lived ish in every run (1.1-1.5x) and the imports creep up round after round: something
+accumulates in the process. Not found yet; a first check (three light commands, npm install,
+the same three again) shows the imports going from ~370 to 430-460 ms after one npm install.
+
+Memory of the long-lived ish.exe over the 5 rounds (25 commands, 5 npm installs):
+
+| | idle between commands | peak (during npm install) |
+|---|---:|---:|
+| default (translations shared) | 500-540 MB private, 460-490 MB working set | 1.56 GB private, 690 MB working set |
+| ISH_XCACHE=0 | 220-300 MB private, 190-255 MB working set | 1.32 GB private, 450 MB working set |
+
+A fresh ish per command frees everything when the command ends. The test machine has 4 GB.
+
+What a long-lived mode would need from Minis (none of it exists today; each command is a whole
+guest that dies with its ish.exe):
+- per-command environment and cwd: a guest shell or a small supervisor in the guest that execs
+  each command with its own env and cwd, and returns the exit status, stdout and stderr streams
+  per command (today they are the process's);
+- cancelling one command: kill its guest process group, not ish.exe; a command that ignores
+  SIGTERM/SIGKILL semantics in the guest, or wedges the emulator, still needs the whole ish
+  killed, which takes the session's other commands and state with it;
+- crash recovery: an ish crash (or the memory cap of the Job Object) ends every running command
+  of the session; Minis must restart the ish and report the lost commands;
+- background jobs: a command that forks a daemon keeps it alive in the ish after the command
+  returns (today it dies with the command); that changes what "the command is done" means, and
+  leaked processes pile up in the long-lived guest;
+- binds: `-b` mounts are made when ish starts, so a session whose folders change needs a way to
+  rebind in a running ish (the harness has none); read-only is enforced per ish process;
+- memory: one ish per session holds 0.2-0.5 GB between commands instead of nothing.
+
+Given the numbers, not recommended now: the gain is at most the ~40 ms of process start, the
+costs above are real, and the slowdown in a long-lived ish has to be found first.
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the
