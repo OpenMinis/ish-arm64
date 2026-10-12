@@ -55,6 +55,56 @@ static inline void safe_close(int fd) {
 
 // lock order: fd, then poll
 
+// The pipe a wait is woken through. On Windows a pipe is a pair of loopback
+// TCP sockets, hundreds of microseconds to set up, and every poll(),
+// select() and epoll_wait() took a new one: keep a few released ones.
+// Nothing writes to a pipe once its poll gave it up (poll_wakeup checks
+// notify_pipe under poll->lock), so draining it on release is enough.
+#ifdef _WIN32
+#define NOTIFY_POOL 16
+static int notify_pool[NOTIFY_POOL][2];
+static int notify_pooled;
+static pthread_mutex_t notify_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static int notify_pipe_get(int p[2]) {
+#ifdef _WIN32
+    pthread_mutex_lock(&notify_pool_lock);
+    if (notify_pooled > 0) {
+        notify_pooled--;
+        p[0] = notify_pool[notify_pooled][0];
+        p[1] = notify_pool[notify_pooled][1];
+        pthread_mutex_unlock(&notify_pool_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&notify_pool_lock);
+#endif
+    if (pipe(p) < 0)
+        return -1;
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    fcntl(p[1], F_SETFL, O_NONBLOCK);
+    return 0;
+}
+
+static void notify_pipe_put(int p[2]) {
+#ifdef _WIN32
+    char buf[64];
+    while (read(p[0], buf, sizeof(buf)) > 0)
+        ;
+    pthread_mutex_lock(&notify_pool_lock);
+    if (notify_pooled < NOTIFY_POOL) {
+        notify_pool[notify_pooled][0] = p[0];
+        notify_pool[notify_pooled][1] = p[1];
+        notify_pooled++;
+        pthread_mutex_unlock(&notify_pool_lock);
+        return;
+    }
+    pthread_mutex_unlock(&notify_pool_lock);
+#endif
+    safe_close(p[0]);
+    safe_close(p[1]);
+}
+
 struct poll *poll_create() {
     struct poll *poll = malloc(sizeof(struct poll));
     if (poll == NULL)
@@ -281,12 +331,12 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
     // acquire the pipe
     if (poll_->waiters++ == 0) {
         assert(poll_->notify_pipe[0] == -1 && poll_->notify_pipe[1] == -1);
-        if (pipe(poll_->notify_pipe) < 0) {
+        if (notify_pipe_get(poll_->notify_pipe) < 0) {
+            poll_->waiters--;
+            poll_->notify_pipe[0] = poll_->notify_pipe[1] = -1;
             unlock(&poll_->lock);
             return errno_map();
         }
-        fcntl(poll_->notify_pipe[0], F_SETFL, O_NONBLOCK);
-        fcntl(poll_->notify_pipe[1], F_SETFL, O_NONBLOCK);
         real_poll_update(&poll_->real, poll_->notify_pipe[0], POLL_READ, NULL);
     }
 
@@ -488,8 +538,7 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
     // release the pipe
     if (--poll_->waiters == 0) {
         real_poll_update(&poll_->real, poll_->notify_pipe[0], 0, NULL);
-        safe_close(poll_->notify_pipe[0]);
-        safe_close(poll_->notify_pipe[1]);
+        notify_pipe_put(poll_->notify_pipe);
         poll_->notify_pipe[0] = -1;
         poll_->notify_pipe[1] = -1;
     }

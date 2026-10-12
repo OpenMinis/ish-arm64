@@ -239,6 +239,31 @@ keeps a dozen fds registered, so one epoll_pwait is 15-20 WSAPolls, 0.8 ms of CP
 main thread's 23 s. Keep the readiness of the registered fds incrementally (one WSAPoll for the
 whole set, or AFD/IOCP readiness) instead. Then the guest code itself (V8 under the translator).
 
+### 9. Poll notify pipes are reused (Windows)
+
+Every poll(), select() and epoll_wait() made a pipe to be woken through and closed it again; on
+Windows that is a pair of loopback TCP sockets (socket, bind, listen, connect, accept). Released
+pipes now go to a pool of 16, drained. Nothing writes to a pipe after its poll gave it up
+(poll_wakeup checks under poll->lock).
+
+npm install, main thread, with ISH_SYSCALL_TIMES, two interleaved runs each:
+
+| | before | after |
+|---|---:|---:|
+| epoll_pwait CPU | 3.9 s | 0.55-0.78 s |
+| CPU inside syscalls | 6.1-8.1 s | 2.4-3.7 s |
+| wall | 23.1 / 18.4 s | 18.5 / 15.3 s |
+
+benchmark/daily, interleaved: node.npm_install 18.82 s -> 15.95 s (0.853; 0.836 at 5
+repetitions), the other 21 non-net cases within noise (geomean 0.987), outputs identical. Agent
+18/18, compat on Windows 226/232 (the same six missing programs), difftest unchanged.
+
+**Defender.** Until 13:40 on 2026-10-12 Defender scanned C:\src in real time; since then C:\src,
+C:\Users\wsvn5\work and the Minis data folder are excluded. Numbers from before are not directly
+comparable with later ones (npm install: 33-38 s before, 18-23 s after, same build). The host's
+open() in npm install's main thread: 0.3-7.6 s for 1585 opens before, 0.05-0.07 s after (one run
+0.48 s).
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the
