@@ -2965,6 +2965,10 @@ static void *xs_map_file(const char *path, size_t size) {
 #endif
 }
 
+// ISH_XCACHE_FILE is experimental and off unless set: measured on Windows
+// (benchmark/daily/RESULTS.md, sections 10 and 14) a hit costs 4.2 us a
+// block against 2.9 us to translate it, so a warm file makes a start slower
+// (python3 -c pass 238 -> 301 ms). Kept for measuring; not for production.
 static void xs_init(size_t capacity, bool persistent) {
     char path[1024] = "";
     const char *e = getenv("ISH_XCACHE_FILE");

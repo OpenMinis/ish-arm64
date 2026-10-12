@@ -1,5 +1,84 @@
 # Daily workloads: results
 
+## Status and how to use (2026-10-12, 106e1569 + notes)
+
+Everyday commands on the Windows x86_64 ish, each in a fresh ish.exe as Minis runs them. "First
+baseline" is 1418c8c0 before any of this work, with Defender scanning the folders; "now" is
+6ef704f1 with Defender excluding them (since 13:40), so the two columns are not one experiment:
+the sections below give each change's own interleaved before/after. Median of 3, seconds.
+
+| case | first baseline | now |
+|---|---:|---:|
+| boot.true (start ish, /bin/true) | 0.067 | 0.035 |
+| proc.forkexec (200 x /bin/true) | 1.20 | 0.84 |
+| proc.pipe (256 MB through busybox wc) | 14.7 | 2.28 |
+| py.start | 0.31 | 0.22 |
+| py.import (9 stdlib modules) | 1.48 | 0.86 |
+| py.loop | 5.36 | 2.47 |
+| py.script (JSON + regex over a 12 MB log) | 4.53 | 2.72 |
+| py.pip_list | 3.73 | 2.01 |
+| py.pip_install (6 local wheels) | 14.5 | 7.46 |
+| node.start | 0.88 | 0.50 |
+| node.json | 1.72 | 1.41 |
+| node.fs | 2.51 | 1.35 |
+| node.npm_install (4 local tarballs) | 56.2 | 16.0 |
+| sh.ls_r | 1.16 | 0.37 |
+| sh.find (/usr) | 4.42 | 1.53 |
+| sh.grep_r (214 MB) | 28.8 | 10.1 |
+| sh.sed_awk (12 MB) | 2.98 | 1.74 |
+| sh.untar | 0.64 | 0.33 |
+| fs.smallfiles (1000 creates + rm -rf) | 1.12 | 0.75 |
+| fs.stat (ls -lR) | 0.85 | 0.39 |
+| git.clone (local) | 2.44 | 0.75 |
+| build.gcc (hello.c) | crashed ish, then 1.02 | 0.47 |
+| build.make (7 files) | 4.46 | 3.28 |
+| build.go (hello, cached) | built programs crashed | 1.99 |
+
+What changed, by effect (details in the numbered sections):
+- correctness: gcc in the guest crashed ish; rm -rf left files; programs built by `go build`
+  crashed (NaN through cvtss2sd/cvtsd2ss); concurrent `-b` binds failed; stat on a bind mount
+  reported device 0; unfakefsify.exe imported instead of exporting;
+- speed: hashed TLB index (1), stat without a handle (3), SSE translated natively (6, 7), poll
+  notify pipes reused (9), freed code reused lowest address first (12), futex on an event (2);
+- the Defender exclusions alone: npm install 33-38 s -> 18-23 s on the same build.
+
+Tried without a gain and not committed, so that nobody repeats them: check groups across other
+accesses (5), a cheap contended write lock (8, 9), node start-up shortcuts (10), one long-lived
+ish per session (11), a translation image (13, 14: translating a block costs 2.9 us, decoding
+it 0.85 us, a cache hit 4.2 us; the ceiling of a pre-linked image would be 23-30% of a short
+command and about 7% of a long one, for days of work on the fault, invalidation and chaining
+paths).
+
+Open:
+- node start-up has no single hot spot; every start compiles each block twice (gadgets, then
+  native after four runs). Only the pre-linked image would remove that (not planned).
+- Floating point arithmetic ignores the guest's MXCSR rounding mode (always to nearest) and
+  never sets its exception flags, in gadgets and translated code alike. No program needing
+  another mode has turned up.
+- ISH_XCACHE_FILE (translations shared between ish processes through a file) is experimental
+  and slower than translating; leave it unset.
+
+Re-running (MSYS2 bash on the Windows test machine; build with `ninja -j 2`, others use it):
+
+```sh
+benchmark/daily/mkrootfs.sh                      # once: C:/src/rootfs/daily-x86_64 (needs the network)
+/clang64/bin/python3 benchmark/daily/run.py --ish base=C:/src/ish-old.exe \
+    --ish new=build-x86_64-jit/ish.exe --rootfs C:/src/rootfs/daily-x86_64 --reps 3   # interleaved A/B
+ISH_SYSCALL_TIMES=C:/tmp/t.txt build-x86_64-jit/ish.exe -f ... ; python3 benchmark/daily/sctimes.py t.txt
+benchmark/daily/persist.sh                       # long-lived ish against a fresh one per command
+COMPAT_TIMEOUT_SCALE=2 ARCHS=x86 ISH_X86=... FAKEFS_X86=C:/src/rootfs/compat-x86_64 \
+    bash benchmark/run.sh compat                 # 232 cases; 226 pass, 6 need programs the rootfs lacks
+```
+
+Checks every change went through: the x86_64 difftest (19696 lines, JIT default, ISH_XLAT_HOT=1,
+ISH_XLAT_NOGROUP=1, gadgets), tests/xlat/{sse,sse_fp,fp_nan}.c against the same programs built
+natively on the Windows machine, tests/agent (18 cases) on macOS and Windows, the compat suite
+on Windows, and run.py's own comparison of every case's output between the builds. Switches for
+bisecting: ISH_XLAT=0, ISH_XLAT_NOSSE=1, ISH_XLAT_NOGROUP=1, ISH_XLAT_ALLPOKE=1,
+ISH_STAT_BY_HANDLE=1, ISH_XCACHE=0.
+
+## Measurements in the order they were made
+
 Windows x86_64 ish (xlat JIT) on the test machine (i5-13600K VM, 4 vCPU, 4 GB RAM, shared:
 Minis builds and Defender run on it too, so expect ±20% between runs; compare builds only
 inside one interleaved `run.py` call).
