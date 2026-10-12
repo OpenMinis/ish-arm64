@@ -125,6 +125,22 @@ handle; `ISH_STAT_BY_HANDLE=1` forces the old path. The two paths stat 14226 fil
 | py.pip_install | 14.56 | 13.68 | 0.94 |
 | geomean of 21 cases | | | **0.864** |
 
+### 4. File open and the fakefs metadata lookup (measured, mostly left alone)
+
+Host primitives on the test machine (native loop): CreateFile(read)+CloseHandle 11.9 us,
+CreateFile(attributes)+CloseHandle 8.0 us, GetFileInformationByHandle 2.2 us,
+GetFileInformationByHandleEx(FileBasicInfo) 0.57 us, GetFileInformationByName 3.6 us, ReadFile
+256 B 1.25 us. In the guest (after 3): stat 14 us, open+close 27 us, fstat 10 us, independent of
+path depth.
+
+- px_openat only needs the attributes after CreateFile: FileBasicInfo instead of
+  GetFileInformationByHandle, ~1 us per open (within noise in the guest loop).
+- The fakefs meta.db lookup per stat costs ~1-2 us: a profile of 300k stats of a missing file
+  (5.7 us each) is half the Python loop itself and 13% sqlite's WAL shared-memory locks
+  (LockFile/UnlockFile per read transaction). A metadata cache would have to stay coherent with
+  other ish processes writing the same meta.db; not worth ~1 us.
+- The rest of an open is CreateFile+CloseHandle itself (~12 us), which an open cannot avoid.
+
 ## Fixed while building the suite
 
 - d5e234b8: any `gcc` in the guest killed ish with 0xC0000005 (128-bit vector helpers read
