@@ -272,6 +272,44 @@ comparable with later ones (npm install: 33-38 s before, 18-23 s after, same bui
 open() in npm install's main thread: 0.3-7.6 s for 1585 opens before, 0.05-0.07 s after (one run
 0.48 s).
 
+### 10. node startup and V8 under the translator: no single hot spot (nothing committed)
+
+`node -e 0` (0.43-0.50 s) and `node js/json.js` (1.1 s), PX_PROF, share of the samples:
+
+| | node -e 0 | node json.js |
+|---|---:|---:|
+| translated guest code | 19% | 30% |
+| ish C code | 53% | 40% |
+| - native translation (xlat) | 13.5% | 11.8% |
+| - decoding to gadgets (gen) | 11.9% | 7.0% |
+| - memory, TLB, page tables | 7.8% | 3.1% |
+| - gadget execution (cold blocks) | 6.7% | 5.3% |
+| - block cache, invalidation | 3.1% | 6.0% |
+| Windows system calls (ntdll) | 23% | 24% |
+
+One start translates 24121 blocks (122k instructions, 15 MB of code; 60k blocks counted, 24k
+promoted). Inside the translated code the split is the usual one (page checks 27-36%, memory
+accesses 16%, slot registers 11%); indirect dispatch is 1-6%, gadget fallbacks 2% of the
+instructions (calls: `e8` 1766 of 2239). The main thread's syscalls are 78 ms of CPU (munmap 31,
+read 16, mmap 16).
+
+Tried:
+- The cross-process translation cache (ISH_XCACHE_FILE, off by default): 24003 hits, 658
+  instructions left to translate, 37 MB of cache, and the same wall time (450-520 ms against
+  460-500 ms). Loading and linking the cached blocks (xc_link, prefetching the file, TLB misses
+  on its pages) costs what translating them did; every block is still decoded to gadgets first.
+- asbestos_invalidate_range, the largest single C function (7% with the cache on): V8 maps,
+  unmaps and protects ~750 regions while it starts and each large one sweeps every bucket.
+  Returning early when the range lies outside the pages that ever held blocks: correct
+  (difftest, agent), geomean 0.990 over 7 cases at 7 repetitions (node.start 0.953, node.fs
+  0.961, npm 0.984, node.json 1.057), inside the noise. Not committed.
+
+What is left is spread thin: no item above 8% of a start. The structural cost is compiling
+every block twice (gadgets, then native once it has run four times) on every start; removing it
+means either translating cached blocks without decoding them again, or one long-lived ish per
+session so that later commands find the code already translated (2c9e51ea shares translations
+between the processes of one ish).
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the
