@@ -60,6 +60,35 @@ user+kernel time over all threads. A case whose wall time is well above its cpu 
 
 All outputs match across runs (except build.go).
 
+## Optimizations
+
+### 1. Hashed TLB index (x86_64 guest)
+
+The direct-mapped TLB indexed by `addr >> 12` alone: pages 32 MB apart share a slot. busybox
+`wc -c` reading stdin touches its stack (0xffffd000) and its data (0xefffd000, 256 MB lower) for
+every byte, so both missed every time: 26 M misses for 13 MB of input. The index is hashed again
+(`(addr >> 12) ^ (addr >> 25)`, as for the other guests); the translated code's fast path checks
+its per-site page cache and never computes the index, so the hash costs nothing there.
+
+Windows, interleaved, median of 3 (base = 1418c8c0 build):
+
+| case | before (s) | after (s) | after/before |
+|---|---:|---:|---:|
+| proc.pipe (256 MB through busybox wc) | 12.57 | 2.68 | 0.23 |
+| sh.grep_r | 26.91 | 14.89 | 0.69 |
+| sh.find | 4.32 | 3.21 | 0.74 |
+| git.status | 0.21 | 0.11 | 0.42 |
+| git.clone | 1.95 | 1.26 | 0.62 |
+| build.gcc | 0.98 | 0.60 | 0.61 |
+| fs.stat | 0.83 | 0.70 | 0.84 |
+| py.pip_list | 3.79 | 3.38 | 0.89 |
+| node.npm_install | 31.67 | 31.61 | 1.00 |
+| geomean, all 32 non-net cases | | | **0.861** |
+
+Outputs identical for every case. Difftest 19696/19696 (default, ISH_XLAT_HOT=1,
+ISH_XLAT_NOGROUP=1, gadget build), agent 18/18. The macOS compat run had 4 timeouts (ruby, yt-dlp,
+pandas, meitu-cli) under load average 7.5; old and new builds time the same on them.
+
 ## Fixed while building the suite
 
 - d5e234b8: any `gcc` in the guest killed ish with 0xC0000005 (128-bit vector helpers read

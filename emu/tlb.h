@@ -63,13 +63,11 @@ struct tlb {
 #endif
 };
 
-#ifdef GUEST_X86_64
-// The x86_64 guest's translated code (asbestos/guest-x86_64/xlat.c) computes
-// this inline on every memory access: no hashing, it is on the critical path.
-#define TLB_INDEX(addr) (((addr) >> PAGE_BITS) & (TLB_SIZE - 1))
-#else
+// Hashed: the TLB is direct-mapped, and pages 32 MB apart (the stack and a
+// binary's data, say) would otherwise evict each other on every access. The
+// x86_64 guest's gadgets (read_prep) and translated code (xlat.c
+// e_tlb_index) compute the same.
 #define TLB_INDEX(addr) ((((addr >> PAGE_BITS) ^ (addr >> (PAGE_BITS + TLB_BITS))) & (TLB_SIZE - 1)))
-#endif
 #ifdef GUEST_64BIT
 #define TLB_PAGE(addr) ((addr) & 0xfffffffffffff000ULL)
 #else

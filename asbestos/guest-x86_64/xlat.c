@@ -1374,16 +1374,21 @@ static void e_addr(struct xctx *x, const struct gi *g, int dst, bool seg) {
 }
 
 // The TLB index of the address in r13 (TLB_INDEX), times the entry size,
-// into r14.
+// into r14. Clobbers r15. Only the lookup after a site's own page missed
+// computes it.
 static void e_tlb_index(struct xasm *a) {
-    unsigned shift = 12 - 5;
-    if (have_bmi2) {
-        // rorx $shift, %r13, %r14: the bits it rotates in get masked off
-        b1(a, 0xc4); b1(a, 0x43); b1(a, 0xfb); b1(a, 0xf0); b1(a, modrm_b(3, R14, R13)); b1(a, (uint8_t) shift);
-    } else {
-        e_mov_rr(a, R14, R13);
-        e_rex(a, true, -1, -1, R14, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, R14)); b1(a, (uint8_t) shift);
+    static const uint8_t shifts[2][2] = {{R14, 12 + TLB_BITS - 5}, {R15, 12 - 5}};
+    for (int i = 0; i < 2; i++) {
+        unsigned r = shifts[i][0], shift = shifts[i][1];
+        if (have_bmi2) {
+            // rorx $shift, %r13, %rN: the bits it rotates in get masked off
+            b1(a, 0xc4); b1(a, 0x43); b1(a, 0xfb); b1(a, 0xf0); b1(a, modrm_b(3, r, R13)); b1(a, (uint8_t) shift);
+        } else {
+            e_mov_rr(a, r, R13);
+            e_rex(a, true, -1, -1, r, false); b1(a, 0xc1); b1(a, modrm_b(3, 5, r)); b1(a, (uint8_t) shift);
+        }
     }
+    e_rex(a, true, R15, -1, R14, false); b1(a, 0x31); b1(a, modrm_b(3, R15, R14));  // xor %r15, %r14
     e_rex(a, false, -1, -1, R14, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R14));
     b4(a, ((1u << TLB_BITS) - 1) << 5);
 }

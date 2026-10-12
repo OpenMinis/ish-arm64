@@ -176,7 +176,10 @@ tpl_\name\():
     # TLB_INDEX in emu/tlb.h; 32-byte entries (page, page_if_writable,
     # data_minus_addr, gen)
     movq %_addr, %r14
-    shrq $(12 - 5), %r14
+    shrq $(12 + TLB_BITS - 5), %r14
+    movq %_addr, %r15
+    shrq $(12 - 5), %r15
+    xorq %r15, %r14
     andl $(((1 << TLB_BITS) - 1) << 5), %r14d
     movl %_addrd, %r15d
     andl $0xfff, %r15d
