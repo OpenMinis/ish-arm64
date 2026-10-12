@@ -89,10 +89,28 @@ Outputs identical for every case. Difftest 19696/19696 (default, ISH_XLAT_HOT=1,
 ISH_XLAT_NOGROUP=1, gadget build), agent 18/18. The macOS compat run had 4 timeouts (ruby, yt-dlp,
 pandas, meitu-cli) under load average 7.5; old and new builds time the same on them.
 
+### 2. Futex waits on an event (Windows)
+
+A pipe on Windows is two loopback sockets: every guest futex wait was a WSAPoll, every wake a
+send, every thread's first wait a new socket pair (WSAPoll 23% and socket-pair creation 5% of
+ish's CPU in npm install). Tasks now wait on an auto-reset event together with the thread's
+interrupt event.
+
+| case | before (s) | after (s) | cpu before | cpu after |
+|---|---:|---:|---:|---:|
+| node.npm_install | 32.57 | 33.18 | 38.02 | 33.95 |
+| py.pip_install | 10.22 | 10.44 | 9.31 | 9.98 |
+| node.json | 1.37 | 1.35 | 1.36 | 1.25 |
+| geomean of 8 threaded cases | | 0.980 | | |
+
+CPU down, wall unchanged: npm's wall time is not in futex waits (see next steps).
+
 ## Fixed while building the suite
 
 - d5e234b8: any `gcc` in the guest killed ish with 0xC0000005 (128-bit vector helpers read
   unaligned guest memory with movaps).
+- 5a2caa26: two ish processes binding the same path at once (`-b`) failed with EEXIST, and a
+  rebind briefly removed the mount under the other process's running command.
 - 1418c8c0: `rm -rf` left files behind in directories of more than ~50 entries (seekdir after
   getdents recounted entries and skipped past deleted ones).
 
