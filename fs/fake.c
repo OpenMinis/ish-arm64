@@ -838,12 +838,21 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         struct stat real_stat;
         if (stat(host_stat_path, &real_stat) < 0)
             return errno_map();
-        /* Copy basic fields from real stat */
+        /* Everything realfs.stat would fill in (inode, mode and owner come
+         * from meta.db below). dev above all: it must be what fstat reports
+         * for the same file, or coreutils' same-inode check on a file it
+         * just opened says "file was replaced while being copied". */
+        fake_stat->dev = dev_fake_from_real(real_stat.st_dev);
         fake_stat->size = real_stat.st_size;
         fake_stat->nlink = real_stat.st_nlink;
+        fake_stat->blksize = real_stat.st_blksize;
+        fake_stat->blocks = real_stat.st_blocks;
         fake_stat->atime = real_stat.st_atimespec.tv_sec;
+        fake_stat->atime_nsec = real_stat.st_atimespec.tv_nsec;
         fake_stat->mtime = real_stat.st_mtimespec.tv_sec;
+        fake_stat->mtime_nsec = real_stat.st_mtimespec.tv_nsec;
         fake_stat->ctime = real_stat.st_ctimespec.tv_sec;
+        fake_stat->ctime_nsec = real_stat.st_ctimespec.tv_nsec;
         err = 0;
     } else {
         err = realfs.stat(mount, path, fake_stat);

@@ -436,6 +436,10 @@ installed.)
   by an older ish holds the miscompiled packages: clear it once (`go clean -cache`). vec.c is
   built for the x86 guests only: the iOS app, which runs the arm64 guest, never had the bug. The "go version" futex stall of the
   first baseline no longer happens (0.2 s).
+- On a bind mount `stat`/`lstat` reported st_dev 0 (and no block count or nanoseconds) for
+  anything already in meta.db, while `fstat` reported the real device: the branch of fakefs_stat
+  that stats the host path copied five fields only. coreutils compares the two after opening a
+  file ("file was replaced while being copied"). Now all fields, checked on macOS and Windows.
 - 8b26ab2a: `unfakefsify.exe` imported instead of exporting on Windows (the name check missed
   the .exe), with the arguments swapped.
 - 1418c8c0: `rm -rf` left files behind in directories of more than ~50 entries (seekdir after
@@ -443,9 +447,6 @@ installed.)
 
 ## Known issues
 
-- On a bind mount, `stat` and `fstat` of the same file disagree on (st_dev, st_ino) (the stat goes
-  through the path hook, the fstat through the open file): `cp` from a bound folder may report
-  "file was replaced while being copied". Present before these changes.
 
 - Results above are from a shared machine; Defender scans every file ish opens for the first
   time, which shows as wall time above cpu time (grep_r, npm_install, git.clone).
