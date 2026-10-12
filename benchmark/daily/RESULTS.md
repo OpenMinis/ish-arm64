@@ -258,6 +258,14 @@ benchmark/daily, interleaved: node.npm_install 18.82 s -> 15.95 s (0.853; 0.836 
 repetitions), the other 21 non-net cases within noise (geomean 0.987), outputs identical. Agent
 18/18, compat on Windows 226/232 (the same six missing programs), difftest unchanged.
 
+Re-tried after the pipe pool and the Defender exclusions, the cheap contended write lock again:
+one binary, ISH_WRLOCK_MODE switching between the sleep ramp, writers yielding and retrying for
+300 us first, and that plus readers giving way. npm install, 7 interleaved runs on a quiet
+machine: 16.85 s median (15.4-18.4) for the ramp against 15.80 s (15.1-17.7) with yielding
+writers, per-run ratios 0.82-1.14 with median 0.956; the readers giving way added nothing
+(17.5 s against 17.0 s in a noisier 5-run set). A gain of about 4% that the noise does not let
+me claim: not committed.
+
 **Defender.** Until 13:40 on 2026-10-12 Defender scanned C:\src in real time; since then C:\src,
 C:\Users\wsvn5\work and the Minis data folder are excluded. Numbers from before are not directly
 comparable with later ones (npm install: 33-38 s before, 18-23 s after, same build). The host's
