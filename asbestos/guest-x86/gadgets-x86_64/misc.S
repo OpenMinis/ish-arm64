@@ -147,6 +147,16 @@ do_helper 2
         .endifin
         save_regs
         save_c
+        .ifc \size,128
+            # The helpers take union xmm_reg pointers, which C assumes 16-byte
+            # aligned (and clang reads with movaps), but guest memory need not
+            # be: hand them an aligned copy, written back after a write.
+            subq $16, %rsp
+            movq (%_addrq), %r14
+            movq %r14, (%rsp)
+            movq 8(%_addrq), %r14
+            movq %r14, 8(%rsp)
+        .endif
         movq %_cpu, %rdi
         xorq %r14, %r14
 
@@ -162,6 +172,9 @@ do_helper 2
         .ifc \rm,read
             # src
             movq %_addrq, %rsi
+            .ifc \size,128
+                movq %rsp, %rsi
+            .endif
             # dst
             movw 16(%_ip), %r14w
             leaq (%_cpu,%r14), %rdx
@@ -172,6 +185,9 @@ do_helper 2
             leaq (%_cpu,%r14), %rsi
             # dst
             movq %_addrq, %rdx
+            .ifc \size,128
+                movq %rsp, %rdx
+            .endif
         .endif
         .ifc \rm,imm
             # src
@@ -197,6 +213,15 @@ do_helper 2
         .ifin(\rm, reg,imm)
             ccall_indir (%_ip)
         .endifin
+        .ifc \size,128
+            .ifc \rm,write
+                movq (%rsp), %r14
+                movq %r14, (%_addrq)
+                movq 8(%rsp), %r14
+                movq %r14, 8(%_addrq)
+            .endif
+            addq $16, %rsp
+        .endif
 
         restore_c
         load_regs
