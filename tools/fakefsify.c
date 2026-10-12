@@ -13,7 +13,15 @@ enum cmd {
 
 int main(int argc, const char *argv[]) {
     enum cmd cmd = cmd_import;
-    if (strcmp(basename((char *) argv[0]), "unfakefsify") == 0) {
+    const char *name = basename((char *) argv[0]);
+#ifdef _WIN32
+    // unfakefsify.exe: without the extension, or it imports instead
+    size_t len = strlen(name);
+    if (len > 4 && _stricmp(name + len - 4, ".exe") == 0 && len - 4 == strlen("unfakefsify") &&
+            _strnicmp(name, "unfakefsify", len - 4) == 0)
+        cmd = cmd_export;
+#endif
+    if (strcmp(name, "unfakefsify") == 0) {
         cmd = cmd_export;
     }
 
