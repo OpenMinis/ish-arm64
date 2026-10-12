@@ -32,3 +32,4 @@ app/AOTImages.local.xcconfig
 
 # IPA archives and exports (benchmark/aojit/README.md, "Link")
 build-ipa/
+benchmark/daily/results/

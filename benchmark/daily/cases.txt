@@ -1,0 +1,50 @@
+# Daily workloads. One line per case: NAME CATEGORY COMMAND...
+# COMMAND runs as `/bin/sh -c` in /tmp/daily of the bench rootfs, in a fresh
+# ish.exe like Minis runs every command. Its stdout is the correctness check:
+# print counts or checksums, never timings. Cases in category net need the
+# network and are only timed, not compared.
+
+boot.true        process  /bin/true
+boot.sh          process  echo hi
+proc.forkexec    process  i=0; while [ $i -lt 200 ]; do /bin/true; i=$((i+1)); done; echo $i
+proc.pipe        process  dd if=/dev/zero bs=64k count=4000 2>/dev/null | cat | wc -c
+proc.py_subproc  process  python3 -c "import subprocess; print(sum(subprocess.run(['true']).returncode for _ in range(40)))"
+
+py.start         python   python3 -c pass
+py.import        python   python3 -c "import json,re,os,sys,subprocess,urllib.request,ssl,sqlite3,asyncio; print('ok')"
+py.loop          python   python3 py/loop.py
+py.strops        python   python3 py/strops.py
+py.script        python   python3 py/textproc.py data/log.txt data/data.json
+py.pip_list      python   pip list --disable-pip-version-check | wc -l
+py.pip_install   python   rm -rf /tmp/pi; pip install -q --disable-pip-version-check --no-index --find-links wheels --target /tmp/pi idna six packaging attrs click requests && ls /tmp/pi | grep -c dist-info
+py.venv          python   rm -rf /tmp/venv; python3 -m venv --without-pip /tmp/venv && /tmp/venv/bin/python -c "import sys; print(sys.prefix)"
+
+node.start       node     node -e 0
+node.json        node     node js/json.js data/data.json
+node.fs          node     node js/fs.js
+node.npm_install node     rm -rf /tmp/np; mkdir /tmp/np && cd /tmp/np && npm install --offline --no-audit --no-fund --loglevel=error /tmp/daily/npm/*.tgz >/dev/null && ls node_modules | wc -l
+
+sh.ls_r          shell    ls -R /usr/lib/python3.12 | wc -l
+sh.find          shell    find /usr -name '*.py' | wc -l
+sh.grep_r        shell    grep -rl import /usr/lib/python3.12 | wc -l
+sh.sort_uniq     shell    sort data/words.txt | uniq -c | sort -rn | head -20 | md5sum
+sh.sed_awk       shell    sed 's/ERROR/E/' data/log.txt | awk '{c[$3]++; t+=substr($NF,6)} END {for (k in c) printf "%s=%d ", k, c[k]; print t}' | tr ' ' '\n' | sort | md5sum
+sh.tar_gz        shell    tar czf /tmp/t.tgz -C /usr/lib/python3.12 json email && tar tzf /tmp/t.tgz | wc -l
+sh.untar         shell    rm -rf /tmp/ut; mkdir /tmp/ut && tar xzf data/py.tgz -C /tmp/ut && find /tmp/ut -type f | wc -l
+sh.gzip          shell    gzip -c data/big.txt | gunzip | md5sum
+sh.unzip         shell    rm -rf /tmp/uz; unzip -q data/pkg.zip -d /tmp/uz && find /tmp/uz -type f | wc -l
+
+fs.smallfiles    fs       rm -rf /tmp/sf; mkdir /tmp/sf && cd /tmp/sf && i=0; while [ $i -lt 1000 ]; do echo $i > f$i; i=$((i+1)); done; ls | wc -l; cd / && rm -rf /tmp/sf
+fs.stat          fs       ls -lR /usr/lib/python3.12 | wc -l
+
+git.status       git      git -C repo status --porcelain | wc -l
+git.clone        git      rm -rf /tmp/gc; git clone -q repo.git /tmp/gc && git -C /tmp/gc log --oneline | wc -l
+
+build.gcc        build    gcc -O2 -o /tmp/h c/hello.c && /tmp/h
+build.make       build    make -s -C c/proj clean app CC=gcc && c/proj/app
+build.go         build    cd go/hello && go build -o /tmp/gh . && /tmp/gh
+
+net.dns          net      nslookup dl-cdn.alpinelinux.org >/dev/null && echo ok
+net.curl_tls     net      curl -s -o /dev/null -w '%{http_code}\n' https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz
+net.py_https     net      python3 -c "import urllib.request; print(urllib.request.urlopen('https://pypi.org/simple/idna/').status)"
+net.apk_add      net      apk add -q --no-cache zip && apk del -q zip && echo ok
