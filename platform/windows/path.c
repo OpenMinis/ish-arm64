@@ -294,12 +294,80 @@ int px_fstat(int fd, struct px_stat *st) {
     return res;
 }
 
+// GetFileInformationByName(FileStatBasicByNameInfo), Windows 11 24H2+:
+// a stat without opening a handle (CreateFile, a query and CloseHandle each
+// cost a trip through the filter drivers: ~55 us of a 74 us guest stat).
+// Looked up at run time; the struct is declared here because the SDK only
+// declares it for NTDDI_WIN11_ZN.
+struct px_stat_basic {
+    LARGE_INTEGER FileId, CreationTime, LastAccessTime, LastWriteTime, ChangeTime, AllocationSize, EndOfFile;
+    DWORD FileAttributes, ReparseTag, NumberOfLinks, DeviceType, DeviceCharacteristics, Reserved;
+    LARGE_INTEGER VolumeSerialNumber;
+    BYTE FileId128[16];
+};
+typedef BOOL (WINAPI *get_info_by_name_t)(PCWSTR, int, PVOID, ULONG);
+#define PX_FileStatBasicByNameInfo 3
+
+static get_info_by_name_t info_by_name(void) {
+    static get_info_by_name_t fn;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending) {
+        HMODULE k = GetModuleHandleW(L"kernelbase.dll");
+        fn = k ? (get_info_by_name_t) (void *) GetProcAddress(k, "GetFileInformationByName") : NULL;
+        if (getenv("ISH_STAT_BY_HANDLE"))
+            fn = NULL;
+        InitOnceComplete(&once, 0, NULL);
+    }
+    return fn;
+}
+
+// 1 with *st filled, 0 when the caller must stat through a handle (no API,
+// a reparse point, which a handle resolves or not as asked, or an error
+// other than "not there"), -1/errno for a path that does not exist.
+static int stat_by_name(const char *abs, struct px_stat *st) {
+    get_info_by_name_t fn = info_by_name();
+    if (fn == NULL)
+        return 0;
+    wchar_t *w = px_wpath(abs);
+    struct px_stat_basic b;
+    BOOL ok = fn(w, PX_FileStatBasicByNameInfo, &b, sizeof(b));
+    DWORD err = ok ? 0 : GetLastError();
+    free(w);
+    if (!ok)
+        return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? px_fail(px_errno_win(err)) : 0;
+    if (b.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        return 0;
+    BY_HANDLE_FILE_INFORMATION info = {
+        .dwFileAttributes = b.FileAttributes,
+        .ftCreationTime = {b.CreationTime.LowPart, (DWORD) b.CreationTime.HighPart},
+        .ftLastAccessTime = {b.LastAccessTime.LowPart, (DWORD) b.LastAccessTime.HighPart},
+        .ftLastWriteTime = {b.LastWriteTime.LowPart, (DWORD) b.LastWriteTime.HighPart},
+        // GetFileInformationByHandle's 32-bit serial is the low half
+        .dwVolumeSerialNumber = b.VolumeSerialNumber.LowPart,
+        .nFileSizeHigh = (DWORD) b.EndOfFile.HighPart,
+        .nFileSizeLow = b.EndOfFile.LowPart,
+        .nNumberOfLinks = b.NumberOfLinks,
+        .nFileIndexHigh = (DWORD) b.FileId.HighPart,
+        .nFileIndexLow = b.FileId.LowPart,
+    };
+    px_stat_from_info(st, &info, 0);
+    return 1;
+}
+
 int px_fstatat(int dirfd, const char *path, struct px_stat *st, int flags) {
     if (path[0] == '\0' && (flags & 0x1000 /* AT_EMPTY_PATH */))
         return px_fstat(dirfd, st);
     char *abs = px_abspath(dirfd, path);
     if (abs == NULL)
         return -1;
+    int fast = stat_by_name(abs, st);
+    if (fast != 0) {
+        if (fast < 0)
+            px_trace("stat", abs, errno);
+        free(abs);
+        return fast < 0 ? -1 : 0;
+    }
     DWORD f = (flags & PX_AT_SYMLINK_NOFOLLOW) ? FILE_FLAG_OPEN_REPARSE_POINT : 0;
     HANDLE h = px_open_handle(abs, FILE_READ_ATTRIBUTES, OPEN_EXISTING, f);
     if (h == INVALID_HANDLE_VALUE) {

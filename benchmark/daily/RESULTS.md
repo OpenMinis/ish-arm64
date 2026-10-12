@@ -105,6 +105,26 @@ interrupt event.
 
 CPU down, wall unchanged: npm's wall time is not in futex waits (see next steps).
 
+### 3. stat without a handle (Windows 11 24H2+)
+
+A guest stat of an existing file took 74 us, ~55 us of it the host stat: CreateFile, a query and
+CloseHandle, each a trip through the filter drivers. `GetFileInformationByName
+(FileStatBasicByNameInfo)` answers from the path in one call, volume serial included (stat and
+fstat must agree on st_dev). Reparse points and errors other than "not found" still go through a
+handle; `ISH_STAT_BY_HANDLE=1` forces the old path. The two paths stat 14226 files under /usr,
+/etc, /tmp/daily and a bind mount identically. Existing-file stat: 45.5 us -> 20.4 us.
+
+| case | before (s) | after (s) | after/before |
+|---|---:|---:|---:|
+| sh.find (/usr) | 5.33 | 2.25 | 0.42 |
+| sh.ls_r | 1.04 | 0.60 | 0.59 |
+| fs.stat (ls -lR) | 0.87 | 0.54 | 0.62 |
+| node.start | 0.94 | 0.75 | 0.66 |
+| py.import | 1.66 | 1.43 | 0.82 |
+| py.pip_list | 3.50 | 3.20 | 0.94 |
+| py.pip_install | 14.56 | 13.68 | 0.94 |
+| geomean of 21 cases | | | **0.864** |
+
 ## Fixed while building the suite
 
 - d5e234b8: any `gcc` in the guest killed ish with 0xC0000005 (128-bit vector helpers read
@@ -115,6 +135,10 @@ CPU down, wall unchanged: npm's wall time is not in futex waits (see next steps)
   getdents recounted entries and skipped past deleted ones).
 
 ## Known issues
+
+- On a bind mount, `stat` and `fstat` of the same file disagree on (st_dev, st_ino) (the stat goes
+  through the path hook, the fstat through the open file): `cp` from a bound folder may report
+  "file was replaced while being copied". Present before these changes.
 
 - `go build` hangs (futex stall), on Windows and macOS, JIT and gadget builds alike.
 - Results above are from a shared machine; Defender scans every file ish opens for the first
