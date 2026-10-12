@@ -707,8 +707,12 @@ static unsigned osize(const struct gi *g) {
 
 static bool dbg_nosse;     // ISH_XLAT_NOSSE: leave SSE to the gadgets
 
-// The SSE instructions translated natively: moves, and integer and logic
-// operations that touch no flags and depend on no MXCSR state.
+// The SSE instructions translated natively: moves, integer and logic
+// operations, and floating point arithmetic and conversions, none of which
+// touch the flags. The gadgets round those to nearest whatever the guest's
+// MXCSR says and never set its exception bits: the host's own instructions,
+// under the host's default MXCSR, do the same. cvtsd2si/cvtss2si, which
+// honor the guest's rounding control, stay with the gadgets.
 static bool classify_sse(const struct gi *g, struct cls *c) {
     unsigned op = g->op;
     if (dbg_nosse || g->lock || g->map != 1 || !g->has_modrm)
@@ -781,6 +785,32 @@ static bool classify_sse(const struct gi *g, struct cls *c) {
         case 0x70:             // pshufd/pshufhw/pshuflw
             if (pfx == 0) return false;
             c->acc = A_R; c->msize = 16; c->memload = true;
+            c->reg_rw = RW_W; c->rm_rw = RW_R;
+            return true;
+        case 0x58: case 0x59: case 0x5c: case 0x5e: case 0x5d: case 0x5f: case 0x51:
+            // add, mul, sub, div, min, max, sqrt
+            if (pfx >= 0xf2) {   // scalar: the rest of the register stays
+                c->acc = A_R; c->msize = pfx == 0xf2 ? 8 : 4;
+            } else {             // packed
+                c->acc = A_R; c->msize = 16; c->memload = true;
+            }
+            c->reg_rw = op == 0x51 && pfx < 0xf2 ? RW_W : RW_RW; c->rm_rw = RW_R;
+            return true;
+        case 0x5a:             // cvtsd2ss/cvtss2sd
+            if (pfx < 0xf2) return false;
+            c->acc = A_R; c->msize = pfx == 0xf2 ? 8 : 4;
+            c->reg_rw = RW_RW; c->rm_rw = RW_R;
+            return true;
+        case 0x2a:             // cvtsi2sd/cvtsi2ss xmm, r/m32/64
+            if (pfx < 0xf2) return false;
+            c->rm_xmm = false;
+            c->acc = A_R; c->msize = q;
+            c->reg_rw = RW_RW; c->rm_rw = RW_R;
+            return true;
+        case 0x2c:             // cvttsd2si/cvttss2si r32/64, xmm/m64/m32
+            if (pfx < 0xf2) return false;
+            c->reg_xmm = false; c->reg_gpr = true;
+            c->acc = A_R; c->msize = pfx == 0xf2 ? 8 : 4;
             c->reg_rw = RW_W; c->rm_rw = RW_R;
             return true;
         case 0x54: case 0x55: case 0x56: case 0x57:  // and/andn/or/xor ps/pd
@@ -1593,7 +1623,8 @@ static void e_sse_insn(struct xasm *a, const struct body *bd) {
     int reg = c->reg_xmm ? 0 : p->reg.host;
     int rm = regform ? (c->rm_xmm || c->memload ? 1 : p->rm.host) : -1;
     if (c->hpfx) b1(a, c->hpfx);
-    bool w = (g->rex & 8) && (g->op == 0x6e || g->op == 0x7e) && !c->rm_xmm;
+    // REX.W only sizes a general register operand (movq, cvtsi2sd, cvttsd2si)
+    bool w = (g->rex & 8) && (c->reg_gpr || !c->rm_xmm);
     if (regform)
         e_rex(a, w, c->reg_xmm ? -1 : reg, -1, (c->rm_xmm || c->memload) ? -1 : rm, false);
     else

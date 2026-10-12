@@ -22,9 +22,11 @@ typedef struct { uint8_t b[16]; } v16;
     __asm__ volatile("movdqu %2, %%xmm9\n movdqu %3, %%xmm3\n" insn " %%xmm3, %%xmm9\n movdqu %%xmm9, %0\n movdqu %%xmm3, %1" \
         : "=m"(r1), "=m"(r2) : "m"(a), "m"(b) : "xmm9", "xmm3", "memory"); \
     dump(#name " rr", &r1, 16); dump(#name " rr2", &r2, 16); }
-// reg-mem: dst (xmm12) op= unaligned memory
+// reg-mem: dst (xmm12) op= unaligned memory (aligned for what faults on
+// x86 otherwise: the 16-byte operand of an operation that isn't a move)
 #define RM(name, insn, size) static void t_rm_##name(int off) { \
     v16 a, r1; fill(&a, 16); fill(buf, sizeof(buf)); \
+    if (size == 16 && strncmp(#insn, "mov", 3) != 0) off = 32; \
     __asm__ volatile("movdqu %1, %%xmm12\n" insn " %2, %%xmm12\n movdqu %%xmm12, %0" \
         : "=m"(r1) : "m"(a), "m"(*(uint8_t (*)[size]) (buf + off)) : "xmm12", "memory"); \
     dump(#name " rm", &r1, 16); }
@@ -81,7 +83,7 @@ static void t_misc(int off) {
     // pshufd/pshufhw/pshuflw with imm, register and memory
     __asm__ volatile("movdqu %1, %%xmm6\n pshufd $0x1b, %%xmm6, %%xmm10\n movdqu %%xmm10, %0" : "=m"(r) : "m"(a) : "xmm6", "xmm10");
     dump("pshufd rr", &r, 16);
-    __asm__ volatile("pshufd $0x4e, %1, %%xmm10\n movdqu %%xmm10, %0" : "=m"(r) : "m"(*(v16 *) (buf + off)) : "xmm10");
+    __asm__ volatile("pshufd $0x4e, %1, %%xmm10\n movdqu %%xmm10, %0" : "=m"(r) : "m"(*(v16 *) (buf + 48)) : "xmm10");
     dump("pshufd rm", &r, 16);
     __asm__ volatile("movdqu %1, %%xmm6\n pshufhw $0x93, %%xmm6, %%xmm6\n pshuflw $0x39, %%xmm6, %%xmm6\n movdqu %%xmm6, %0" : "=m"(r) : "m"(a) : "xmm6");
     dump("pshufhw/lw", &r, 16);
@@ -92,8 +94,8 @@ static void t_misc(int off) {
     dump("movss/ups", &r, 16);
     // flags must survive: compare, SSE ops, then use the flags
     int lt = 0;
-    __asm__ volatile("cmp %2, %1\n pxor %%xmm0, %%xmm0\n movups %%xmm0, (%3)\n setb %b0" : "=r"(lt) : "r"(g64), "r"(out64), "r"(buf + off) : "xmm0", "memory", "cc");
-    printf("flags kept  %d\n", lt);
+    __asm__ volatile("cmp %2, %1\n pxor %%xmm0, %%xmm0\n movups %%xmm0, (%3)\n setb %b0" : "+r"(lt) : "r"(g64), "r"(out64), "r"(buf + off) : "xmm0", "memory", "cc");
+    printf("flags kept  %d\n", lt & 1);
 }
 
 int main(void) {
@@ -123,7 +125,7 @@ int main(void) {
         v16 r, a; fill(&a, 16);
         __asm__ volatile("movdqu %1, %%xmm9\n movdqu %%xmm9, %0" : "=m"(r) : "m"(*(v16 *) (two + off)) : "xmm9");
         dump("cross ld", &r, 16);
-        __asm__ volatile("movdqu %1, %%xmm9\n pxor %2, %%xmm9\n movups %%xmm9, %0" : "=m"(*(v16 *) (two + off + 3)) : "m"(a), "m"(*(v16 *) (two + off - 16)) : "xmm9");
+        __asm__ volatile("movdqu %1, %%xmm9\n movdqu %2, %%xmm8\n pxor %%xmm8, %%xmm9\n movups %%xmm9, %0" : "=m"(*(v16 *) (two + off + 3)) : "m"(a), "m"(*(v16 *) (two + off - 16)) : "xmm8", "xmm9");
         dump("cross st", two + off - 4, 28);
     }
     return 0;

@@ -333,17 +333,19 @@ void vec_single_fdiv32(NO_CPU, const float *src, float *dst) { *dst /= *src; }
 void vec_single_fsqrt64(NO_CPU, const double *src, double *dst) { *dst = sqrt(*src); }
 void vec_single_fsqrt32(NO_CPU, const float *src, float *dst) { *dst = sqrtf(*src); }
 
+// x86: dst if it compares greater (less), else src, which covers a NaN on
+// either side and +0 against -0 (src)
 void vec_single_fmax64(NO_CPU, const double *src, double *dst) {
-    if (*src > *dst || isnan(*src) || isnan(*dst)) *dst = *src;
+    if (!(*dst > *src)) *dst = *src;
 }
 void vec_single_fmin64(NO_CPU, const double *src, double *dst) {
-    if (*src < *dst || isnan(*src) || isnan(*dst)) *dst = *src;
+    if (!(*dst < *src)) *dst = *src;
 }
 void vec_single_fmax32(NO_CPU, const float *src, float *dst) {
-    if (*src > *dst || isnan(*src) || isnan(*dst)) *dst = *src;
+    if (!(*dst > *src)) *dst = *src;
 }
 void vec_single_fmin32(NO_CPU, const float *src, float *dst) {
-    if (*src < *dst || isnan(*src) || isnan(*dst)) *dst = *src;
+    if (!(*dst < *src)) *dst = *src;
 }
 
 void vec_single_ucomi32(struct cpu_state *cpu, const float *src, const float *dst) {

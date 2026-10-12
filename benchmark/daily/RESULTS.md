@@ -178,6 +178,33 @@ and Windows.
 | build.make | 3.74 | 3.55 | 0.96 |
 | geomean of 31 cases | | | **0.977** |
 
+### 7. SSE floating point translated natively
+
+How ish treats the guest's MXCSR: it is stored (ldmxcsr/stmxcsr, signal frames) and its rounding
+control applies only to the rounding conversions (cvtsd2si/cvtss2si/roundsd); arithmetic always
+rounds to nearest and the exception flags are never set. The host's own instructions under the
+host's default MXCSR do exactly that, so add/sub/mul/div/min/max/sqrt (ss/sd/ps/pd), cvtss2sd/
+cvtsd2ss, cvtsi2sd/ss and cvttsd2si/cvttss2si now run natively; cvtsd2si/cvtss2si stay with the
+gadgets. min/max in the gadgets now follow x86 for +-0 (the second operand), like the hardware.
+
+Checked against the hardware: tests/xlat/sse_fp.c (NaN, inf, +-0, denormals, inexact values,
+scalar and packed, xmm8-15, r8-r15, unaligned scalar operands; packed operands aligned, as x86
+requires) built natively on the Windows test machine and as a guest program:
+
+| test (lines) | JIT vs hardware | gadgets vs hardware |
+|---|---:|---:|
+| sse_fp.c, round to nearest (5856) | 0 | 64 (NaN choice in addps/mulps/addpd/mulpd) |
+| sse_fp.c, the three other rounding modes | differ wherever inexact: ish ignores the mode, as before | same |
+| sse.c (780) | 0 | 0 |
+| fp_nan.c (12) | 0 | 0 |
+
+The 64 gadget lines are an old inaccuracy: the C helpers (`*dst += *src`) let the compiler swap
+the operands, which picks the other NaN when both are NaN. The translated code is right there.
+
+Windows, interleaved, median of 3 (base: the NaN fix build): node.start 0.50 -> 0.47, node.fs 1.73
+-> 1.48, build.gcc 0.49 -> 0.47, py.loop 2.47 -> 2.37; geomean of 18 cases 0.970, outputs
+identical.
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the
@@ -215,7 +242,9 @@ installed.)
 - `go build` ran, but every program it built threw "fatal error: float32nan" at startup:
   cvtss2sd/cvtsd2ss went through the float-to-integer conversion helper, whose out-of-range
   check turned a NaN into -2^31, and Go's compiler folds float32 NaN comparisons through them.
-  build.go now passes (100 s with an empty build cache). The "go version" futex stall of the
+  build.go now passes (100-140 s with an empty build cache, 3 s cached). A Go build cache filled
+  by an older ish holds the miscompiled packages: clear it once (`go clean -cache`). vec.c is
+  built for the x86 guests only: the iOS app, which runs the arm64 guest, never had the bug. The "go version" futex stall of the
   first baseline no longer happens (0.2 s).
 - 8b26ab2a: `unfakefsify.exe` imported instead of exporting on Windows (the name check missed
   the .exe), with the arguments swapped.
