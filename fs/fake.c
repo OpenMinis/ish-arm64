@@ -1215,6 +1215,36 @@ static void remove_tree_at(int dir_fd, const char *path) {
     unlinkat(dir_fd, path, AT_REMOVEDIR);
 }
 
+/* Whether the link at root_fd/host_link already leads to host_path. */
+static bool bind_link_matches(int root_fd, const char *host_link, const char *host_path) {
+    char root_abs[PATH_MAX], link_abs[PATH_MAX], a[PATH_MAX], b[PATH_MAX];
+    if (fcntl(root_fd, F_GETPATH, root_abs) != 0)
+        return false;
+    snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link);
+    return realpath(link_abs, a) != NULL && realpath(host_path, b) != NULL && strcmp(a, b) == 0;
+}
+
+/* Replace whatever is at host_link with a link to host_path. Several ish
+ * processes share one rootfs and may bind the same path at once. A link that
+ * already leads there stays: removing it would pull the mount from under a
+ * command another process is running on it. And one process can create the
+ * link between another's remove and create (EEXIST): fine if it leads to the
+ * same place, else try again. */
+static int bind_replace_link(int root_fd, const char *host_link, const char *host_path) {
+    if (bind_link_matches(root_fd, host_link, host_path))
+        return 0;
+    int err = -1;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        remove_tree_at(root_fd, host_link);
+        err = create_relative_symlink(root_fd, host_link, host_path);
+        if (err == 0 || errno != EEXIST)
+            break;
+        if (bind_link_matches(root_fd, host_link, host_path))
+            return 0;
+    }
+    return err;
+}
+
 int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_only) {
     BIND_LOG("fakefs_bind_mount: ENTER linux_path=\"%s\" (len=%zu) host_path=\"%s\" (len=%zu) read_only=%d\n",
             linux_path, strlen(linux_path), host_path, strlen(host_path), read_only ? 1 : 0);
@@ -1314,9 +1344,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             snprintf(host_link, sizeof(host_link), "%s", fix_path(linux_path));
             BIND_LOG("fakefs_bind_mount: slot[%d] UPDATE symlink: host_link=\"%s\" -> host_path=\"%s\" (root_fd=%d)\n",
                     i, host_link, host_path, g_fakefs_mount->root_fd);
-            /* Remove whatever is at the path (file, symlink, or directory tree) */
-            remove_tree_at(g_fakefs_mount->root_fd, host_link);
-            int err = create_relative_symlink(g_fakefs_mount->root_fd, host_link, host_path);
+            int err = bind_replace_link(g_fakefs_mount->root_fd, host_link, host_path);
             if (err < 0) {
                 fprintf(stderr, "fakefs_bind_mount: FAIL symlink \"%s\" -> \"%s\" (errno=%d)\n", host_link, host_path, errno);
                 g_bind_mounts[i].active = false;
@@ -1347,11 +1375,9 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             BIND_LOG("fakefs_bind_mount: slot[%d] NEW symlink: host_link=\"%s\" -> host_path=\"%s\" (root_fd=%d)\n",
                     i, host_link, host_path, g_fakefs_mount->root_fd);
 
-            /* Remove whatever is at the path (file, symlink, or directory tree) */
-            remove_tree_at(g_fakefs_mount->root_fd, host_link);
-
-            /* Create the symlink (relative path to avoid iOS sandbox issues) */
-            int err = create_relative_symlink(g_fakefs_mount->root_fd, host_link, host_path);
+            /* Replace whatever is at the path (file, symlink, or directory
+             * tree) with the symlink (relative, to avoid iOS sandbox issues) */
+            int err = bind_replace_link(g_fakefs_mount->root_fd, host_link, host_path);
             if (err < 0) {
                 fprintf(stderr, "fakefs_bind_mount: FAIL symlink \"%s\" -> \"%s\" (errno=%d)\n", host_link, host_path, errno);
                 g_bind_mounts[i].active = false;
