@@ -55,6 +55,11 @@ void sctimes_begin(struct sct_mark *m) {
     m->cpu = cpu_ns();
 }
 
+void sctimes_begin_wall(struct sct_mark *m) {
+    m->wall = wall_ns();
+    m->cpu = UINT64_MAX;
+}
+
 void sctimes_end(const struct sct_mark *m, unsigned nr) {
     struct task *t = current;
     if (t == NULL || nr >= SCT_MAX)
@@ -68,7 +73,8 @@ void sctimes_end(const struct sct_mark *m, unsigned nr) {
     }
     s->calls[nr]++;
     s->wall_ns[nr] += wall_ns() - m->wall;
-    s->cpu_ns[nr] += cpu_ns() - m->cpu;
+    if (m->cpu != UINT64_MAX)
+        s->cpu_ns[nr] += cpu_ns() - m->cpu;
 }
 
 void sctimes_task_exit(struct task *t) {

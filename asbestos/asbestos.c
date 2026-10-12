@@ -8,6 +8,7 @@
 #include "asbestos/asbestos.h"
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
+#include "kernel/sctimes.h"
 #ifdef ISH_XJIT
 #include "asbestos/guest-x86/xjit.h"
 #endif
@@ -591,7 +592,11 @@ static void fiber_block_promote(struct fiber_block *block, struct tlb *tlb) {
                 skip[nskip++] = state.jump_ip[i];
         if (state.block_patch_ip != 0)
             skip[nskip++] = state.block_patch_ip;
+        struct sct_mark sct_x;
+        bool sct_on = sctimes_enabled();
+        if (sct_on) sctimes_begin_wall(&sct_x);
         xjit_promote(block, state.block, skip, nskip);
+        if (sct_on) sctimes_end(&sct_x, SCT_JIT_XLAT);
         // blocks chained to it while it had no translation: link them to it now
         if (block->xjit_entry != 0) {
             for (int i = 0; i <= 1; i++) {
@@ -1057,7 +1062,11 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 lock(&asbestos->lock);
                 block = fiber_lookup(asbestos, ip);
                 if (block == NULL) {
+                    struct sct_mark sct_c;
+                    bool sct_on = sctimes_enabled();
+                    if (sct_on) sctimes_begin_wall(&sct_c);
                     block = fiber_block_compile_protected(asbestos, ip, tlb);
+                    if (sct_on) sctimes_end(&sct_c, SCT_JIT_COMPILE);
                     if (block == NULL) {
                         unlock(&asbestos->lock);
                         interrupt = INT_GPF;
@@ -1181,8 +1190,13 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
             struct fiber_block *hot = frame->xjit_promote;
             frame->xjit_promote = NULL;
             lock(&asbestos->lock);
-            if (hot != NULL && !hot->is_jetsam)
+            if (hot != NULL && !hot->is_jetsam) {
+                struct sct_mark sct_p;
+                bool sct_on = sctimes_enabled();
+                if (sct_on) sctimes_begin_wall(&sct_p);
                 fiber_block_promote(hot, tlb);
+                if (sct_on) sctimes_end(&sct_p, SCT_JIT_PROMOTE);
+            }
             unlock(&asbestos->lock);
             interrupt = INT_NONE;
         }

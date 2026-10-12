@@ -24,7 +24,8 @@ def syscall_names():
         if m:
             names[int(m.group(1))] = m.group(3) or m.group(2).replace('sys_', '')
     # the spans of kernel/sctimes.h, nested in (or outside) the syscalls
-    names.update({500: '~fakefs lock', 501: '~db begin', 502: '~db commit', 503: '~host open', 504: '~mem wrlock'})
+    names.update({500: '~fakefs lock', 501: '~db begin', 502: '~db commit', 503: '~host open', 504: '~mem wrlock',
+                  505: '~jit compile', 506: '~jit promote', 507: '~jit xlat'})
     return names
 
 

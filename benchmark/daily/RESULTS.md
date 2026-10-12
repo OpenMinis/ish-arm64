@@ -395,6 +395,25 @@ benchmark/daily/persist.sh, long-lived, 5 rounds, two runs each, ms:
 A fresh ish per command is unaffected (geomean 0.992 over 33 cases, outputs identical). Difftest
 in three configurations, agent 18/18 on macOS and Windows, compat on Windows 226/232.
 
+### 13. Translation image, step 0: how much of a start is compiling (measurement only)
+
+ISH_SYSCALL_TIMES gained wall-only spans around a block's first compile (decoding to gadgets),
+its promotion (decoding again and translating natively once it ran four times) and the
+translation inside that. Windows, median of 3, milliseconds, summed over all threads:
+
+| command | wall | first compile (blocks) | promotion (blocks) | of which translation | both | of wall |
+|---|---:|---:|---:|---:|---:|---:|
+| node -e 0 | 543 | 70 (60064) | 81 (24148) | 65 | 151 | 27.8% |
+| python3 -c pass | 246 | 25 (33510) | 49 (18206) | 40 | 74 | 30.2% |
+| python3 -c 'import json,re,os,sys,subprocess' | 412 | 32 (39282) | 65 (23492) | 52 | 96 | 23.4% |
+| node js/json.js | 1361 | 170 (104879) | 209 (55447) | 166 | 379 | 27.8% |
+| pip list | 2369 | 54 (59340) | 116 (38171) | 92 | 170 | 7.2% |
+| npm install | 19789 | 479 (235644) | 1011 (173695) | 845 | 1490 | 7.5% |
+
+That is the ceiling for an image that makes both free, 23-30% of a short command (the stop
+point was 15%), less what a hit costs and the code that cannot be cached (V8's own), plus the
+runs in gadgets a block needs before it is promoted. Long commands gain 7% at most.
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the
