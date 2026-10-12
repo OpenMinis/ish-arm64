@@ -141,6 +141,18 @@ path depth.
   other ish processes writing the same meta.db; not worth ~1 us.
 - The rest of an open is CreateFile+CloseHandle itself (~12 us), which an open cannot avoid.
 
+### 5. Python interpreter loop (py.loop): tried, no gain, not committed
+
+Profile of py.loop (2547 samples): 87% translated code; of that guest ALU/branches 45%, per-site
+page checks 22%, guest memory accesses 11%, r8-r15 slot traffic 8%, flag syncs 5%, cold/TLB
+lookups 4%, indirect dispatch 1.6%; gadget fallbacks negligible (77k native instructions, 943
+template). Tried: let a check group span accesses with other bases, the members after them
+rechecking with one `bt $63` on the lead's site page (a TLB flush empties every site). Correct
+(difftest also with every recheck forced to its slow path) but no gain: geomean 0.999 over 16
+cases, py.loop 2.91 s -> 2.93 s. The page checks overlap with the guest's own work in the
+out-of-order core; fewer of them does not shorten the critical path. A first, unrepeated A/B had
+shown -15..-24%: machine noise.
+
 ## Fixed while building the suite
 
 - d5e234b8: any `gcc` in the guest killed ish with 0xC0000005 (128-bit vector helpers read
