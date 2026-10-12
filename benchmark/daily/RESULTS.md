@@ -414,6 +414,36 @@ That is the ceiling for an image that makes both free, 23-30% of a short command
 point was 15%), less what a hit costs and the code that cannot be cached (V8's own), plus the
 runs in gadgets a block needs before it is promoted. Long commands gain 7% at most.
 
+### 14. Translation image, step 1: stopped, a cache hit costs more than translating
+
+Before writing a new image format, what the existing file cache (ISH_XCACHE_FILE) already does:
+with it a hit is linked at the block's first compile (xc_eager, the default), so a hit already
+skips the promotion, the second decode and the four runs in gadgets. Same spans as step 0,
+warm cache, Windows, 5 interleaved runs:
+
+| command | no cache: first compile + promotion | warm cache: first compile + promotion | wall median, off -> on |
+|---|---:|---:|---:|
+| python3 -c pass | 28 + 52 = 80 ms | 105 + 0 = 105 ms | 238 -> 301 ms |
+| python3 -c 'import ...' | 30 + 64 = 94 ms | 102 + 0 = 102 ms | 451 -> 529 ms |
+| node -e 0 | 58 + 75 = 133 ms | 126 + 1 = 127 ms | 582 -> 602 ms |
+
+Per block: translating costs 2.9 us (52 ms for 18208 blocks), decoding to gadgets 0.85 us, a
+cache hit 4.2 us. A hit compares the instruction bytes, copies the code into the assembler's
+buffers, rebuilds fixups and labels and then runs xlat_finish like a fresh translation
+(allocate, copy again, resolve, set the entries): the back half of translating plus the check,
+to save a front half that takes 1-2 us. Copy-and-fix-up caching cannot win against this
+translator.
+
+What could: an image whose hit is a table lookup and a byte compare (under 0.3 us), with no
+copy, no fixup and no block to build. Translated code refers to its block's own stream slots
+and to the block (jump patch slots, cross-page fallback entries, last_block), which are
+per-process allocations, so the blocks and their gadget streams would have to be in the image
+too, mapped copy-on-write at a fixed address, with every internal pointer of a stream relocated
+when the image is written. That is a new memory layout for blocks, through the fault-recovery,
+invalidation and chaining paths: days, not the one to two hours this step was given, and
+nothing smaller tests it. Stopped here, as agreed; no code for the image was written. The
+ceiling stays what step 0 measured (23-30% of a short command, 7% of a long one).
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the
