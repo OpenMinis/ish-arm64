@@ -20,6 +20,7 @@
 #include "misc.h"
 #include "kernel/errno.h"
 #include "kernel/calls.h"
+#include "kernel/sctimes.h"
 #include "kernel/fs.h"
 #include "fs/dev.h"
 #include "fs/devices.h"
@@ -101,7 +102,13 @@ static dev_t_ realfs_devnum_for_path(const char *path) {
 
 struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mode) {
     int real_flags = open_flags_real_from_fake(flags);
+    struct sct_mark sct_m;
+    bool sct = sctimes_enabled();
+    if (sct)
+        sctimes_begin(&sct_m);
     int fd_no = openat(mount->root_fd, fix_path(path), real_flags, mode);
+    if (sct)
+        sctimes_end(&sct_m, SCT_HOST_OPEN);
     if (fd_no < 0)
         return ERR_PTR(errno_map());
     struct fd *fd = fd_create(&realfs_fdops);

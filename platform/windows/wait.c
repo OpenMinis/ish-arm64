@@ -194,6 +194,14 @@ static int sleep_ns(int64_t ns, struct timespec *rem) {
     return 0;
 }
 
+uint64_t px_thread_cpu_ns(void) {
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
+        return 0;
+    return (((uint64_t) k.dwHighDateTime << 32 | k.dwLowDateTime) +
+            ((uint64_t) u.dwHighDateTime << 32 | u.dwLowDateTime)) * 100;
+}
+
 void *px_wake_new(void) {
     return CreateEventW(NULL, FALSE, FALSE, NULL);
 }

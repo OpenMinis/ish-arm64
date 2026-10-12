@@ -205,6 +205,40 @@ Windows, interleaved, median of 3 (base: the NaN fix build): node.start 0.50 -> 
 -> 1.48, build.gcc 0.49 -> 0.47, py.loop 2.47 -> 2.37; geomean of 18 cases 0.970, outputs
 identical.
 
+### 8. Where npm install's time goes (ISH_SYSCALL_TIMES)
+
+PX_PROF samples program counters and cannot tell a thread that computes from one that sits in a
+kernel wait. `ISH_SYSCALL_TIMES=<file>` (kernel/sctimes.c) measures instead: per guest thread
+and syscall the calls, wall time and host-thread CPU time, plus spans inside them (fakefs mutex,
+sqlite BEGIN/COMMIT, the host's open, waits for mem->lock as a writer). `sctimes.py <file>` sums
+it up; the main threads (tid == pid) are the critical path. Off: one load and a branch per call
+site (geomean 1.02 over 6 cases at 9 repetitions, inside the noise).
+
+npm install of 4 local tarballs, main thread, quiet machine (three runs, 33-38 s wall):
+
+| where | seconds | |
+|---|---:|---|
+| guest code (node/V8, translated) | 13-15 | |
+| ish's own CPU inside syscalls | 8-9 | epoll_pwait 3.9-4.5 (5200 calls, 0.8 ms each), futex 1.5-1.9, statx 1.0, open 1.0 |
+| waiting for mem->lock as a writer | 1.9-3.5 | 370-440 contended munmap/mmap, ~6 ms each |
+| waiting in epoll_pwait/futex for workers | 2-3 | |
+| the host's open (CreateFile) | 0.3-7.6 | 1585 opens; 4.8 ms each in one run, 0.2 ms in the others: Defender |
+| off-cpu outside syscalls | 2-4 | |
+
+Not the bottleneck: the fakefs mutex and sqlite (0.2 s on the main thread).
+
+Tried and reverted: making the contended write lock cheap (yield-and-retry before the sleep ramp,
+readers giving way for up to 200 us). The writers' waits fell from 9.5-14.4 s to 2.2-3.3 s over
+all threads, but the wall time did not move (33-38 s before, 35-42 s after): the main thread
+spent the difference off-cpu, giving way and waiting out the munmaps. Its CPU is the critical
+path.
+
+Proposed next: epoll_pwait. With no epoll on Windows every wait hands the whole interest set to
+poll() (WSAPoll over every socket, three allocations) after polling each fd on its own; node
+keeps a dozen fds registered, so one epoll_pwait is 15-20 WSAPolls, 0.8 ms of CPU, 4 s of the
+main thread's 23 s. Keep the readiness of the registered fds incrementally (one WSAPoll for the
+whole set, or AFD/IOCP readiness) instead. Then the guest code itself (V8 under the translator).
+
 ## Compatibility suite on Windows (2026-10-12)
 
 The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the

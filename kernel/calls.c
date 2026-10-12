@@ -8,6 +8,7 @@
 #include "kernel/calls.h"
 #include "emu/interrupt.h"
 #include "util/signpost.h"
+#include "kernel/sctimes.h"
 #include "kernel/memory.h"
 #include "kernel/mm.h"
 #include "kernel/signal.h"
@@ -92,7 +93,13 @@ void handle_interrupt(int interrupt) {
             if (systrace == -1) { const char *e = getenv("ISH_SYSTRACE"); systrace = (e && e[0]=='1') ? 1 : 0; }
             uint64_t _a0=cpu->rdi,_a1=cpu->rsi,_a2=cpu->rdx,_a3=cpu->r10,_a4=cpu->r8,_a5=cpu->r9;
             struct timespec _t0; if (systrace) clock_gettime(CLOCK_MONOTONIC, &_t0);
+            struct sct_mark _sct;
+            bool sct = sctimes_enabled();
+            if (sct)
+                sctimes_begin(&_sct);
             int64_t result = syscall_table[syscall_num](_a0, _a1, _a2, _a3, _a4, _a5);
+            if (sct)
+                sctimes_end(&_sct, syscall_num);
             STRACE(" = 0x%llx\n", (unsigned long long) result);
             if (systrace)
                 fprintf(stderr, "[sc] %ld.%06ld pid=%d n=%d(%llx,%llx,%llx,%llx,%llx,%llx) = 0x%llx\n",

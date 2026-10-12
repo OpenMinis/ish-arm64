@@ -6,6 +6,7 @@
 #include "misc.h"
 #include "fs/fake-db.h"
 #include "util/signpost.h"
+#include "kernel/sctimes.h"
 
 static void db_check_error(struct fakefs_db *fs) {
     int errcode = sqlite3_errcode(fs->db);
@@ -144,16 +145,25 @@ void db_exec_reset(struct fakefs_db *fs, sqlite3_stmt *stmt) {
     db_reset(fs, stmt);
 }
 
+// The spans of ISH_SYSCALL_TIMES: waiting for the mutex, BEGIN, COMMIT
+#define SCT_SPAN(nr, stmt) do { \
+        struct sct_mark _m; \
+        bool _on = sctimes_enabled(); \
+        if (_on) sctimes_begin(&_m); \
+        stmt; \
+        if (_on) sctimes_end(&_m, nr); \
+    } while (0)
+
 void db_begin_read(struct fakefs_db *fs) {
-    sqlite3_mutex_enter(fs->lock);
-    db_exec_reset(fs, fs->stmt.begin_deferred);
+    SCT_SPAN(SCT_FAKEFS_LOCK, sqlite3_mutex_enter(fs->lock));
+    SCT_SPAN(SCT_DB_BEGIN, db_exec_reset(fs, fs->stmt.begin_deferred));
 }
 void db_begin_write(struct fakefs_db *fs) {
-    sqlite3_mutex_enter(fs->lock);
-    db_exec_reset(fs, fs->stmt.begin_immediate);
+    SCT_SPAN(SCT_FAKEFS_LOCK, sqlite3_mutex_enter(fs->lock));
+    SCT_SPAN(SCT_DB_BEGIN, db_exec_reset(fs, fs->stmt.begin_immediate));
 }
 void db_commit(struct fakefs_db *fs) {
-    db_exec_reset(fs, fs->stmt.commit);
+    SCT_SPAN(SCT_DB_COMMIT, db_exec_reset(fs, fs->stmt.commit));
     sqlite3_mutex_leave(fs->lock);
 }
 void db_rollback(struct fakefs_db *fs) {

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include "misc.h"
 #include "debug.h"
+#include "kernel/sctimes.h"
 
 // locks, implemented using pthread
 
@@ -219,10 +220,19 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
     // making progress and releasing until the writer wins a trylock. This keeps
     // forward progress for readers guaranteed and the writer non-blocking.
     struct timespec _ts = {0, 1000}; // 1us initial backoff, grows to a steady sleep
-    while (pthread_rwlock_trywrlock(&lock->l) != 0) {
-        nanosleep(&_ts, NULL);
-        if (_ts.tv_nsec < 100000) // ramp up to a 100us steady sleep (yields CPU)
-            _ts.tv_nsec *= 2;
+    if (pthread_rwlock_trywrlock(&lock->l) != 0) {
+        // contended: the wait is a span of ISH_SYSCALL_TIMES (kernel/sctimes.c)
+        struct sct_mark _m;
+        bool _on = sctimes_enabled();
+        if (_on) sctimes_begin(&_m);
+        bool _got = false;
+        while (!_got) {
+            nanosleep(&_ts, NULL);
+            if (_ts.tv_nsec < 100000) // ramp up to a 100us steady sleep (yields CPU)
+                _ts.tv_nsec *= 2;
+            _got = pthread_rwlock_trywrlock(&lock->l) == 0;
+        }
+        if (_on) sctimes_end(&_m, SCT_MEM_WRLOCK);
     }
     assert(lock->val == 0);
     lock->val = -1;

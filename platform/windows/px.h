@@ -242,6 +242,8 @@ int px_nanosleep(const struct timespec *req, struct timespec *rem);
 // loopback sockets there. px_wake_wait returns 1 when set, 0 on timeout
 // (timeout_ms < 0: none), -1/EINTR when the thread is interrupted
 // (px_pthread_kill), like px_wsapoll.
+// CPU time (user + kernel) of the calling thread
+uint64_t px_thread_cpu_ns(void);
 void *px_wake_new(void);
 void px_wake_set(void *w);
 void px_wake_clear(void *w);

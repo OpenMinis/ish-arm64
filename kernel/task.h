@@ -59,6 +59,7 @@ struct task {
     // Per-thread pipe for futex_wait wakeup (reused across calls to avoid
     // pipe creation overhead in Go runtime spin loops)
     int futex_pipe[2]; // [0]=read, [1]=write; -1 if not yet created
+    void *sctimes;     // ISH_SYSCALL_TIMES (kernel/sctimes.c)
 #ifdef _WIN32
     // Windows: an event instead (a pipe there is two loopback sockets, and
     // every wait a WSAPoll); NULL if not yet created
