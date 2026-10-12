@@ -689,6 +689,13 @@ struct cls {
     // what the instruction does with its reg and r/m operands (RW_*; 0:
     // both): decides which slot registers are loaded and stored back
     uint8_t reg_rw, rm_rw;
+    // SSE (classify_sse): modrm.reg / a register modrm.rm name xmm
+    // registers, which live in the cpu struct and pass through the host's
+    // xmm0 / xmm1. The host runs hpfx 0f hop: the guest's instruction, or
+    // its unaligned form. memload: a 16-byte memory operand is loaded into
+    // xmm1 first (legacy SSE arithmetic faults on an unaligned one).
+    bool sse, reg_xmm, rm_xmm, memload;
+    uint8_t hpfx, hop;
 };
 #define RW_R 1
 #define RW_W 2
@@ -696,6 +703,109 @@ struct cls {
 
 static unsigned osize(const struct gi *g) {
     return (g->rex & 8) ? 8 : g->p66 ? 2 : 4;
+}
+
+static bool dbg_nosse;     // ISH_XLAT_NOSSE: leave SSE to the gadgets
+
+// The SSE instructions translated natively: moves, and integer and logic
+// operations that touch no flags and depend on no MXCSR state.
+static bool classify_sse(const struct gi *g, struct cls *c) {
+    unsigned op = g->op;
+    if (dbg_nosse || g->lock || g->map != 1 || !g->has_modrm)
+        return false;
+    unsigned pfx = 0;
+    if (g->p66 + g->pf2 + g->pf3 > 1)
+        return false;
+    if (g->p66) pfx = 0x66;
+    if (g->pf3) pfx = 0xf3;
+    if (g->pf2) pfx = 0xf2;
+    bool mem = g->mod != 3;
+    unsigned q = (g->rex & 8) ? 8 : 4;
+    c->kind = K_GENERIC;
+    c->sse = c->reg_xmm = c->rm_xmm = true;
+    c->hpfx = (uint8_t) pfx;
+    c->hop = (uint8_t) op;
+    // loads: reg written, r/m read
+#define LOAD(size, full) do { c->acc = A_R; c->msize = (size); c->rm_rw = RW_R; c->reg_rw = (full) ? RW_W : RW_RW; } while (0)
+    // stores: reg read, r/m written
+#define STORE(size, full) do { c->acc = A_W; c->msize = (size); c->reg_rw = RW_R; c->rm_rw = (full) ? RW_W : RW_RW; } while (0)
+    switch (op) {
+        case 0x10: case 0x28:  // movups/movupd/movaps/movapd (load), movss/movsd
+            if (op == 0x28 && pfx >= 0xf2) return false;
+            if (pfx == 0xf3) { LOAD(4, mem); return true; }   // a register merges
+            if (pfx == 0xf2) { LOAD(8, mem); return true; }
+            c->hop = 0x10;  // unaligned: the address can't fault on the host
+            LOAD(16, true);
+            return true;
+        case 0x11: case 0x29:  // stores of the same
+            if (op == 0x29 && pfx >= 0xf2) return false;
+            if (pfx == 0xf3) { STORE(4, false); return true; }
+            if (pfx == 0xf2) { STORE(8, false); return true; }
+            c->hop = 0x11;
+            STORE(16, true);
+            return true;
+        case 0x6f: case 0x7f:  // movdqa/movdqu
+            if (pfx != 0x66 && pfx != 0xf3) return false;
+            c->hpfx = 0xf3;
+            if (op == 0x6f) LOAD(16, true); else STORE(16, true);
+            return true;
+        case 0x12: case 0x16:  // movlps/movlpd/movhps/movhpd load, movhlps/movlhps
+            if (pfx != 0 && pfx != 0x66) return false;
+            if (pfx == 0x66 && !mem) return false;
+            LOAD(8, false);
+            return true;
+        case 0x13: case 0x17:  // their stores
+            if ((pfx != 0 && pfx != 0x66) || !mem) return false;
+            STORE(8, true);
+            return true;
+        case 0x6e:             // movd/movq xmm, r/m32/64
+            if (pfx != 0x66) return false;
+            c->rm_xmm = false;
+            LOAD(q, true);
+            return true;
+        case 0x7e:
+            if (pfx == 0xf3) { LOAD(8, true); return true; }   // movq xmm, xmm/m64
+            if (pfx != 0x66) return false;
+            c->rm_xmm = false;                                 // movd/movq r/m, xmm
+            STORE(q, true);
+            return true;
+        case 0xd6:             // movq xmm/m64, xmm
+            if (pfx != 0x66) return false;
+            STORE(8, true);
+            return true;
+        case 0xd7:             // pmovmskb r32, xmm
+            if (pfx != 0x66 || mem) return false;
+            c->reg_xmm = false; c->reg_gpr = true;
+            c->reg_rw = RW_W; c->rm_rw = RW_R;
+            return true;
+        case 0x70:             // pshufd/pshufhw/pshuflw
+            if (pfx == 0) return false;
+            c->acc = A_R; c->msize = 16; c->memload = true;
+            c->reg_rw = RW_W; c->rm_rw = RW_R;
+            return true;
+        case 0x54: case 0x55: case 0x56: case 0x57:  // and/andn/or/xor ps/pd
+        case 0x14: case 0x15:                        // unpckl/unpckh ps/pd
+            if (pfx != 0 && pfx != 0x66) return false;
+            c->acc = A_R; c->msize = 16; c->memload = true;
+            c->reg_rw = RW_RW; c->rm_rw = RW_R;
+            return true;
+    }
+#undef LOAD
+#undef STORE
+    // 66 0f: the integer operations on two xmm registers
+    static const uint8_t ints[] = {
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d,
+        0x74, 0x75, 0x76, 0xd4, 0xd5, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
+        0xe0, 0xe3, 0xe4, 0xe5, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+        0xf4, 0xf5, 0xf6, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe,
+    };
+    if (pfx == 0x66 && memchr(ints, (int) op, sizeof(ints))) {
+        c->acc = A_R; c->msize = 16; c->memload = true;
+        c->reg_rw = RW_RW; c->rm_rw = RW_R;
+        return true;
+    }
+    memset(c, 0, sizeof(*c));
+    return false;
 }
 
 static bool classify(const struct gi *g, struct cls *c) {
@@ -868,6 +978,9 @@ static bool classify(const struct gi *g, struct cls *c) {
     }
 
     if (g->map == 1) {
+        if (classify_sse(g, c))
+            return true;
+        memset(c, 0, sizeof(*c));
         if (g->lock) {
             // lock cmpxchg / xadd / bts... on memory
             if (g->mod == 3) return false;
@@ -959,7 +1072,7 @@ static void set_rw(const struct gi *g, struct cls *c) {
     unsigned op = g->op;
     bool full = osize(g) >= 4;  // a 32/64-bit destination
     uint8_t wr = full ? RW_W : RW_RW;
-    if (c->kind != K_GENERIC)
+    if (c->kind != K_GENERIC || c->sse)
         return;
     if (g->map == 0) {
         if (op < 0x40 && (op & 7) <= 3) {
@@ -1150,7 +1263,9 @@ static bool plan_generic(const struct gi *g, const struct cls *c, struct plan *p
     p->rm.rw = c->rm_rw ? c->rm_rw : RW_RW;
     if (c->reg_gpr)
         map_reg(g, g->reg, c->reg_byte, &p->reg, p, scratch, &nscratch, scratch_for);
-    if (!p->mem)
+    if (!p->mem && c->rm_xmm)
+        p->rm.host = 1;  // xmm1
+    else if (!p->mem)
         map_reg(g, g->rm, c->rm_byte, &p->rm, p, scratch, &nscratch, scratch_for);
     else
         p->rex = true;  // r13
@@ -1453,10 +1568,58 @@ static void e_generic_insn(struct xasm *a, const struct body *bd) {
     bn(a, &bd->in->bytes[g->immoff], g->immlen);
 }
 
+// movdqu between host xmm x and guest xmm n in the cpu struct
+static void e_xmm_move(struct xasm *a, bool store, int x, unsigned n) {
+    b1(a, 0xf3);
+    e_rm2(a, false, 0x0f, store ? 0x7f : 0x6f, x, XMEM(H_CPU, CPU_OFF(xmm) + 16 * (int32_t) n));
+}
+
+static void e_sse_insn(struct xasm *a, const struct body *bd) {
+    const struct gi *g = bd->g;
+    const struct cls *c = bd->c;
+    const struct plan *p = bd->p;
+    struct xmem m = hmem(p);
+    if (c->reg_xmm && (p->reg.rw & RW_R))
+        e_xmm_move(a, false, 0, g->reg);
+    if (c->rm_xmm && !p->mem && (p->rm.rw & RW_R))
+        e_xmm_move(a, false, 1, g->rm);
+    bool regform = !p->mem || c->memload;
+    if (p->mem && c->memload) {
+        // movdqu (%r13,%r9), %xmm1
+        b1(a, 0xf3);
+        e_rm2(a, false, 0x0f, 0x6f, 1, m);
+    }
+    e_slot_loads(a, p);
+    int reg = c->reg_xmm ? 0 : p->reg.host;
+    int rm = regform ? (c->rm_xmm || c->memload ? 1 : p->rm.host) : -1;
+    if (c->hpfx) b1(a, c->hpfx);
+    bool w = (g->rex & 8) && (g->op == 0x6e || g->op == 0x7e) && !c->rm_xmm;
+    if (regform)
+        e_rex(a, w, c->reg_xmm ? -1 : reg, -1, (c->rm_xmm || c->memload) ? -1 : rm, false);
+    else
+        e_rex(a, w, c->reg_xmm ? -1 : reg, m.index, m.base, false);
+    b1(a, 0x0f);
+    b1(a, c->hop);
+    if (regform)
+        b1(a, modrm_b(3, reg, rm));
+    else
+        e_modrm_mem(a, reg, m);
+    bn(a, &bd->in->bytes[g->immoff], g->immlen);
+    e_slot_stores(a, p);
+    if (c->reg_xmm && (p->reg.rw & RW_W))
+        e_xmm_move(a, true, 0, g->reg);
+    if (c->rm_xmm && !p->mem && (p->rm.rw & RW_W))
+        e_xmm_move(a, true, 1, g->rm);
+}
+
 static void e_body(struct xasm *a, const struct body *bd) {
     const struct gi *g = bd->g;
     switch (bd->c->kind) {
         case K_GENERIC:
+            if (bd->c->sse) {
+                e_sse_insn(a, bd);
+                break;
+            }
             e_slot_loads(a, bd->p);
             e_generic_insn(a, bd);
             e_slot_stores(a, bd->p);
@@ -3228,6 +3391,7 @@ static void xlat_init(void) {
     dbg_nosucc = getenv("ISH_XLAT_NOSUCC") != NULL;
     dbg_allpoke = getenv("ISH_XLAT_ALLPOKE") != NULL;
     dbg_nogroup = getenv("ISH_XLAT_NOGROUP") != NULL;
+    dbg_nosse = getenv("ISH_XLAT_NOSSE") != NULL;
     if ((e = getenv("ISH_XLAT_OPS")) != NULL) {
         char *end;
         dbg_op_lo = (unsigned) strtoul(e, &end, 0);

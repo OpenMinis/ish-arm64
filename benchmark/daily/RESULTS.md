@@ -153,6 +153,31 @@ cases, py.loop 2.91 s -> 2.93 s. The page checks overlap with the guest's own wo
 out-of-order core; fewer of them does not shorten the critical path. A first, unrepeated A/B had
 shown -15..-24%: machine noise.
 
+### 6. SSE moves and integer/logic operations translated natively
+
+The translator left every SSE instruction to the gadgets, and their 128-bit helpers are C calls
+with all registers saved: in grep -r 5.5% of the samples were in vec_* helpers alone. gcc -O2
+code is full of a few of them (zeroing a struct: pxor + movups; two fields at once: movq +
+punpcklqdq + movups; copies: movdqu). Now native: movups/movaps/movdqu/movdqa/movss/movsd/
+movlps/movhps/movq/movd loads and stores, pmovmskb, pshufd/hw/lw, and the integer and logic
+operations of 66 0f (no flags, no MXCSR). Guest xmm registers go through host xmm0/xmm1 (the only
+ones free on Windows, where xmm6-15 are callee-saved); aligned moves become unaligned ones and a
+16-byte memory operand of an operation is loaded with movdqu first, so the host never faults on
+alignment. `ISH_XLAT_NOSSE=1` turns it off. tests/xlat/sse.c (every form, register and unaligned
+memory, xmm8-15, r8-r15, page crossing) prints the same 780 lines as the gadget build on macOS
+and Windows.
+
+| case | before (s) | after (s) | after/before |
+|---|---:|---:|---:|
+| sh.grep_r | 12.91 | 10.95 | 0.83 |
+| py.loop | 3.03 | 2.50 | 0.86 |
+| sh.untar | 0.60 | 0.49 | 0.89 |
+| sh.sed_awk | 2.09 | 1.88 | 0.90 |
+| py.script | 3.07 | 2.85 | 0.93 |
+| node.start | 0.46 | 0.45 | 0.92 |
+| build.make | 3.74 | 3.55 | 0.96 |
+| geomean of 31 cases | | | **0.977** |
+
 ## Fixed while building the suite
 
 - d5e234b8: any `gcc` in the guest killed ish with 0xC0000005 (128-bit vector helpers read
