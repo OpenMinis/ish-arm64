@@ -194,6 +194,43 @@ static int sleep_ns(int64_t ns, struct timespec *rem) {
     return 0;
 }
 
+void *px_wake_new(void) {
+    return CreateEventW(NULL, FALSE, FALSE, NULL);
+}
+
+void px_wake_set(void *w) {
+    SetEvent(w);
+}
+
+void px_wake_clear(void *w) {
+    ResetEvent(w);
+}
+
+void px_wake_free(void *w) {
+    CloseHandle(w);
+}
+
+int px_wake_wait(void *w, int timeout_ms) {
+    struct px_thread *t = self();
+    if (px_interrupted())
+        return px_fail(EINTR);
+    HANDLE hs[2] = {w, t->event};
+    DWORD res = WaitForMultipleObjects(2, hs, FALSE, timeout_ms < 0 ? INFINITE : (DWORD) timeout_ms);
+    if (res == WAIT_OBJECT_0 + 1 || px_interrupted()) {
+        atomic_store(&t->pending, false);
+        drain(t);
+        // a wake that raced with the interrupt is not lost: report it
+        if (res == WAIT_OBJECT_0 || WaitForSingleObject(w, 0) == WAIT_OBJECT_0)
+            return 1;
+        return px_fail(EINTR);
+    }
+    if (res == WAIT_TIMEOUT)
+        return 0;
+    if (res == WAIT_OBJECT_0)
+        return 1;
+    return px_fail_win();
+}
+
 int px_nanosleep(const struct timespec *req, struct timespec *rem) {
     if (req->tv_nsec < 0 || req->tv_nsec >= 1000000000 || req->tv_sec < 0)
         return px_fail(EINVAL);

@@ -167,6 +167,13 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
         err = _EAGAIN;
     else {
         // Lazily create per-thread futex pipe (reused across all futex_wait calls)
+#ifdef _WIN32
+        if (current->futex_wake == NULL && (current->futex_wake = px_wake_new()) == NULL) {
+            futex_put(futex);
+            return _ENOMEM;
+        }
+        px_wake_clear(current->futex_wake);
+#else
         if (current->futex_pipe[0] == -1) {
             if (pipe(current->futex_pipe) < 0) {
                 futex_put(futex);
@@ -177,6 +184,7 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
         }
         // Drain any stale bytes from previous wakeups
         { char buf[16]; while (read(current->futex_pipe[0], buf, sizeof(buf)) > 0) {} }
+#endif
 
         struct futex_wait wait;
         wait.cond = COND_INITIALIZER;
@@ -198,7 +206,9 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
 
         current->blocking = true;
         int stall_count = 0;
+#ifndef _WIN32
         struct pollfd pfd = { .fd = current->futex_pipe[0], .events = POLLIN };
+#endif
         for (;;) {
             // Compute poll timeout
             int poll_ms;
@@ -237,6 +247,13 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
                 poll_ms = 100; // 100ms safety-net timeout for signal/stall checks
             }
 
+#ifdef _WIN32
+            int ret = px_wake_wait(current->futex_wake, poll_ms);
+            if (ret > 0) {
+                err = 0;
+                break;
+            }
+#else
             int ret = poll(&pfd, 1, poll_ms);
             if (ret > 0) {
                 // Woken by pipe write — drain it
@@ -245,6 +262,7 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
                 err = 0;
                 break;
             }
+#endif
             // ret == 0 (timeout) or ret < 0 (EINTR from signal) — check conditions
 
             stall_count++;
@@ -355,10 +373,15 @@ static unsigned futex_wake_queue(struct futex *futex, dword_t max) {
         if (woken >= max)
             break;
         // Wake via per-thread pipe write — waiter is blocked on poll(futex_pipe[0])
+#ifdef _WIN32
+        if (wait->task->futex_wake != NULL)
+            px_wake_set(wait->task->futex_wake);
+#else
         if (wait->task->futex_pipe[1] != -1) {
             char c = 1;
             write(wait->task->futex_pipe[1], &c, 1);
         }
+#endif
         list_remove(&wait->queue);
         woken++;
     }

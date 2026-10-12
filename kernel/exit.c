@@ -150,6 +150,12 @@ noreturn void do_exit(int status) {
         close(current->futex_pipe[1]);
         current->futex_pipe[1] = -1;
     }
+#ifdef _WIN32
+    if (current->futex_wake != NULL) {
+        px_wake_free(current->futex_wake);
+        current->futex_wake = NULL;
+    }
+#endif
 
     // sighand must be released below so it can be protected by pids_lock
     // since it can be accessed by other threads

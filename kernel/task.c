@@ -107,6 +107,9 @@ struct task *task_create_(struct task *parent) {
     task->robust_list = 0;
     task->futex_pipe[0] = -1;
     task->futex_pipe[1] = -1;
+#ifdef _WIN32
+    task->futex_wake = NULL;
+#endif
     task->did_exec = false;
     lock_init(&task->general_lock);
 

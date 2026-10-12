@@ -237,6 +237,16 @@ void px_thread_interrupt(pthread_t thread);
 int px_pthread_kill(pthread_t thread, int sig);
 int px_kill(int pid, int sig);
 int px_nanosleep(const struct timespec *req, struct timespec *rem);
+// A wake-up flag one thread waits on and others set (an auto-reset event):
+// what the futex code uses on Windows instead of a pipe, which is a pair of
+// loopback sockets there. px_wake_wait returns 1 when set, 0 on timeout
+// (timeout_ms < 0: none), -1/EINTR when the thread is interrupted
+// (px_pthread_kill), like px_wsapoll.
+void *px_wake_new(void);
+void px_wake_set(void *w);
+void px_wake_clear(void *w);
+int px_wake_wait(void *w, int timeout_ms);
+void px_wake_free(void *w);
 int px_usleep(unsigned usec);
 unsigned px_sleep(unsigned sec);
 // signal(SIGINT) / sigaction(SIGINT): the console's ^C handler.

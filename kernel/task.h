@@ -59,6 +59,11 @@ struct task {
     // Per-thread pipe for futex_wait wakeup (reused across calls to avoid
     // pipe creation overhead in Go runtime spin loops)
     int futex_pipe[2]; // [0]=read, [1]=write; -1 if not yet created
+#ifdef _WIN32
+    // Windows: an event instead (a pipe there is two loopback sockets, and
+    // every wait a WSAPoll); NULL if not yet created
+    void *futex_wake;
+#endif
     // Timestamp (CLOCK_MONOTONIC ns) of last time blocking became false.
     // Used by deadlock detector to check how long ALL threads have been stuck.
     uint64_t last_unblocked_ns;
