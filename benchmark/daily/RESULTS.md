@@ -178,12 +178,42 @@ and Windows.
 | build.make | 3.74 | 3.55 | 0.96 |
 | geomean of 31 cases | | | **0.977** |
 
+## Compatibility suite on Windows (2026-10-12)
+
+The macOS runs had become unusable for this (25 timeouts at load average 10, 4 at 7.5), so the
+232-case suite (`benchmark/run.sh compat`, ARCHS=x86, COMPAT_TIMEOUT_SCALE=2) ran on the Windows
+test machine, on a copy of its package-laden rootfs (C:/src/rootfs/compat-x86_64, made with
+unfakefsify + fakefsify, 861 MB), baseline and current build back to back while no Minis build
+was running.
+
+| build | pass | wrong output / error | timeout | wall |
+|---|---:|---:|---:|---:|
+| baseline: 30afd0f2 (before the SSE translation) | 225 | 6 | 1 | 8 min |
+| current: 8a1a23e4 (SSE translation) | 226 | 6 | 0 | 4 min |
+
+Every failure is the rootfs, not ish, and the same in both runs:
+
+| case | why |
+|---|---|
+| Network / wget | `wget` is busybox's, which has no `--version` |
+| Skill / akshare | the module is not installed |
+| AICLIs / bun lang+stdlib | bun is not installed |
+| AICLIs / claude --version, claude -p | claude is not installed |
+| AICLIs / codex --version | codex is not installed |
+| Skill / mcporter (baseline only) | timeout in `npx -y mcporter` (network download) |
+
+So: every case whose program is installed passes, with no differing output, on both builds; the
+SSE translation adds no failure. (The macOS 232/232 baseline used a rootfs with all of them
+installed.)
+
 ## Fixed while building the suite
 
 - d5e234b8: any `gcc` in the guest killed ish with 0xC0000005 (128-bit vector helpers read
   unaligned guest memory with movaps).
 - 5a2caa26: two ish processes binding the same path at once (`-b`) failed with EEXIST, and a
   rebind briefly removed the mount under the other process's running command.
+- 8b26ab2a: `unfakefsify.exe` imported instead of exporting on Windows (the name check missed
+  the .exe), with the arguments swapped.
 - 1418c8c0: `rm -rf` left files behind in directories of more than ~50 entries (seekdir after
   getdents recounted entries and skipped past deleted ones).
 
