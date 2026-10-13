@@ -39,7 +39,9 @@ What changed, by effect (details in the numbered sections):
   crashed (NaN through cvtss2sd/cvtsd2ss); concurrent `-b` binds failed; stat on a bind mount
   reported device 0; unfakefsify.exe imported instead of exporting;
 - speed: hashed TLB index (1), stat without a handle (3), SSE translated natively (6, 7), poll
-  notify pipes reused (9), freed code reused lowest address first (12), futex on an event (2);
+  notify pipes reused (9), freed code reused lowest address first (12), futex on an event (2),
+  stack accesses checked once per run (16: 1-9% fewer CPU cycles, measured 2026-10-13, after
+  the table above);
 - the Defender exclusions alone: npm install 33-38 s -> 18-23 s on the same build.
 
 Tried without a gain and not committed, so that nobody repeats them: check groups across other
@@ -47,9 +49,18 @@ accesses (5), a cheap contended write lock (8, 9), node start-up shortcuts (10),
 ish per session (11), a translation image (13, 14: translating a block costs 2.9 us, decoding
 it 0.85 us, a cache hit 4.2 us; the ceiling of a pre-linked image would be 23-30% of a short
 command and about 7% of a long one, for days of work on the fault, invalidation and chaining
-paths).
+paths), looking the TLB up instead of predicting the page, for all accesses or by a fixed rule
+(17: a large heap gains 10-15%, tight loops lose as much; an experimental switch), access sites
+that decide that for themselves in their miss path, and a larger site table (18).
+
+Against a native CPython on the same machine everyday Python is 4-7x slower (15); most of that
+is translated code, and the largest part of it that is not the guest's own work is the page
+check before each memory access.
 
 Open:
+- Programs with a large heap would gain 10-15% from accesses that look the TLB up directly where
+  their page keeps changing; that takes re-translating hot blocks with what their miss paths
+  measured (18, last paragraph).
 - node start-up has no single hot spot; every start compiles each block twice (gadgets, then
   native after four runs). Only the pre-linked image would remove that (not planned).
 - Floating point arithmetic ignores the guest's MXCSR rounding mode (always to nearest) and
@@ -65,6 +76,9 @@ benchmark/daily/mkrootfs.sh                      # once: C:/src/rootfs/daily-x86
 /clang64/bin/python3 benchmark/daily/run.py --ish base=C:/src/ish-old.exe \
     --ish new=build-x86_64-jit/ish.exe --rootfs C:/src/rootfs/daily-x86_64 --reps 3   # interleaved A/B
 ISH_SYSCALL_TIMES=C:/tmp/t.txt build-x86_64-jit/ish.exe -f ... ; python3 benchmark/daily/sctimes.py t.txt
+/c/src/tools/python312/tools/python.exe benchmark/daily/ab.py 5 old=@C:/src/ish-old.exe \
+    new=@build-x86_64-jit/ish.exe                # CPU cycles, least of 5: for a machine others are using
+ISH_XLAT_SITEDUMP=C:/tmp/sd.txt build-x86_64-jit/ish.exe -f ... ; python3 benchmark/daily/sitedump.py sd.txt
 benchmark/daily/persist.sh                       # long-lived ish against a fresh one per command
 COMPAT_TIMEOUT_SCALE=2 ARCHS=x86 ISH_X86=... FAKEFS_X86=C:/src/rootfs/compat-x86_64 \
     bash benchmark/run.sh compat                 # 232 cases; 226 pass, 6 need programs the rootfs lacks
@@ -72,9 +86,9 @@ COMPAT_TIMEOUT_SCALE=2 ARCHS=x86 ISH_X86=... FAKEFS_X86=C:/src/rootfs/compat-x86
 
 Checks every change went through: the x86_64 difftest (19696 lines, JIT default, ISH_XLAT_HOT=1,
 ISH_XLAT_NOGROUP=1, gadgets), tests/xlat/{sse,sse_fp,fp_nan}.c against the same programs built
-natively on the Windows machine, tests/agent (18 cases) on macOS and Windows, the compat suite
+natively on the Windows machine, tests/xlat/{spgroup,sites}.c against the gadgets, tests/agent (18 cases) on macOS and Windows, the compat suite
 on Windows, and run.py's own comparison of every case's output between the builds. Switches for
-bisecting: ISH_XLAT=0, ISH_XLAT_NOSSE=1, ISH_XLAT_NOGROUP=1, ISH_XLAT_ALLPOKE=1,
+bisecting: ISH_XLAT=0, ISH_XLAT_NOSSE=1, ISH_XLAT_NOGROUP=1, ISH_XLAT_NOSPGROUP=1, ISH_XLAT_ALLPOKE=1,
 ISH_STAT_BY_HANDLE=1, ISH_XCACHE=0.
 
 ## Measurements in the order they were made
@@ -522,6 +536,159 @@ when the image is written. That is a new memory layout for blocks, through the f
 invalidation and chaining paths: days, not the one to two hours this step was given, and
 nothing smaller tests it. Stopped here, as agreed; no code for the image was written. The
 ceiling stays what step 0 measured (23-30% of a short command, 7% of a long one).
+
+### 15. Where the gap to a native Python is (measurement, 2026-10-13)
+
+Twelve everyday Python chores (start, imports, a pure loop, strings, json, regex over a file,
+sqlite, hashes, subprocess, pip, venv), timed inside the guest (median of 3, seconds), on the
+Windows test machine: python.org's CPython 3.12.10 for Windows against Alpine's 3.12.15 in ish.
+
+| task | native | ish | ish / native |
+|---|---:|---:|---:|
+| `python3 -c pass` | 0.04 | 0.16 | 4x |
+| import of nine stdlib modules | 0.18 | 1.01 | 5.6x |
+| pure Python loop | 0.51 | 2.76 | 5.4x |
+| strings, dicts, sorting | 0.09 | 0.44 | 4.9x |
+| json dumps/loads | 0.29 | 1.36 | 4.7x |
+| regex over a 100k-line file | 0.30 | 1.79 | 6.0x |
+| sqlite in memory | 0.14 | 0.91 | 6.5x |
+| sha256/md5/zlib of 20 MB | 0.20 | 0.98 | 4.9x |
+| `pip --version` | 0.30 | 2.24 | 7.5x |
+| venv without pip | 0.08 | 0.54 | 6.8x |
+
+Not the same binary (MSVC with PGO against gcc with musl), so part of the factor is Alpine's
+build, not ish; there is no Linux on this hardware to tell how much.
+
+Where the time goes (PX_PROF samples; ISH_SYSCALL_TIMES for pip):
+
+| | loop | json | `pip --version` |
+|---|---:|---:|---:|
+| translated code | 90% | 77% | 64% |
+| ish's C code (translating, the run loop, TLB misses) | 7% | 16% | 17% |
+| the host's system calls (files) | 2% | 5% | 19% |
+
+`pip --version` (2.15 s): 0.30 s in guest system calls (1277 stat at 80 us, 648 open at 123 us,
+1160 read), 0.16 s compiling and translating 57k blocks, the rest translated code. So even the
+start of a program is mostly translated code, and inside translated code (loop, by instruction
+sampled): the guest's own arithmetic and branches 43%, the page check before a memory access
+26%, the access itself 11%, r8-r15 living in memory 6%, lookups after a failed check 5%, flags
+4%. The page check is the largest thing that is not the guest's own work.
+
+ISH_XLAT_SITESTATS=1 (counts, printed when a thread exits) and ISH_XLAT_SITEDUMP=<file> with
+benchmark/daily/sitedump.py (per access site) say how those checks behave:
+
+| | loop | json | `pip --version` |
+|---|---:|---:|---:|
+| checks | 2.71e9 | 762e6 | 324e6 |
+| of them on the stack (push, pop, call, ret, rsp-relative) | 38% | 50% | 43% |
+| lookups after a failed check | 3.8% | 7.7% | 18% |
+| TLB flushes (another mapping changed) | 491 | 903 | 2537 |
+| checks at sites that miss under 1% of the time | 83% | 72% | 17% |
+| checks at sites that miss over 20% of the time | 11% | 14% | 32% |
+
+Two populations: sites whose page never changes (the stack, an interpreter's frame) and sites
+that follow pointers into a heap, which miss most of the time. A small heap (the loop) is nearly
+all the first kind, a large one (pip: imports, many objects) a third the second.
+
+### 16. Stack accesses checked once per run (find_sp_groups)
+
+A push, a pop, a call's or a return's own access and an rsp-relative operand each checked their
+page, although a function's prologue touches six adjacent words. Now a run of them is one group,
+as accesses off one unchanged base register already were: rsp may move by constants in between
+(push, pop, `sub $n, %rsp`, `lea n(%rsp), %rsp`), nothing else may touch memory, and the range is
+at most 128 bytes. The first access checks the whole range, the others load the page's
+data_minus_addr and go. A range that crosses a page (128 of 4096 positions) runs that block's
+remainder in gadgets, as before for groups. `ISH_XLAT_NOSPGROUP=1` turns it off.
+
+Checks: loop 2.71e9 -> 2.35e9 (-13%), `pip --version` 324e6 -> 255e6 (-21%); accesses that need
+no check of their own 160e6 -> 520e6 and 19e6 -> 87e6. CPU cycles of the ish process
+(benchmark/daily/ab.py: least of 5 interleaved runs, billions; the machine was busy with
+someone else's work, which is why this is in cycles and not in seconds):
+
+| case | before | after | after/before |
+|---|---:|---:|---:|
+| sh.sed_awk | 10.94 | 9.39 | 0.86 |
+| py.import | 3.21 | 2.93 | 0.91 |
+| py.script | 9.75 | 8.97 | 0.92 |
+| py.strops | 1.68 | 1.58 | 0.94 |
+| node.start | 1.31 | 1.25 | 0.95 |
+| proc.forkexec | 2.79 | 2.67 | 0.96 |
+| node.json | 3.40 | 3.31 | 0.97 |
+| py.pip_list | 6.88 | 6.77 | 0.98 |
+| py.start | 0.65 | 0.64 | 0.99 |
+| proc.pipe | 9.24 | 9.18 | 0.99 |
+| py.loop | 9.07 | 9.37 | 1.03 (0.99 in another run of 5) |
+| geomean of 11 | | | **0.954** |
+
+Fewer checks by 13-21% for 1-9% fewer cycles: as section 5 found, a check that is predicted
+overlaps with the guest's work; what is saved is its instructions, not waiting.
+
+tests/xlat/spgroup.c: a prologue, a frame, calls, `ret $n`, `push %rsp`, pops at every stack
+position around a page boundary and on pages never touched; the same 146 lines as the gadgets
+(ISH_XLAT=0), with ISH_XLAT_HOT=1 and without groups, on macOS and Windows.
+The other checks: difftest in six configurations, sse/sse_fp/fp_nan the same lines as before,
+agent 18/18 on macOS. Compat suite on Windows 225/232: the six known ones and `gh config`, which
+timed out once in the run and then passed 40 of 40 with this build and with the one before (the
+machine was running someone else's GUI tests during the run).
+
+### 17. Looking the TLB up instead of predicting the page (experimental switch, not the default)
+
+A failed check costs a mispredicted branch and then a lookup; a site that fails most of the time
+would do better looking the TLB up at once (ten instructions instead of six, no misprediction,
+and a TLB entry is shared by every site that touches the page, where each site's own entry is
+another cache line). `ISH_XLAT_TLBDIRECT=1` does that for every access, `=2` for those through a
+pointer (not rsp, rbp or a fixed address), `=3` for rbp too. Cycles relative to section 16's
+build (least of 5):
+
+| case | all (=1) | pointers (=2) | pointers and rbp (=3) |
+|---|---:|---:|---:|
+| py.import | 0.85 | 0.91 | 0.90 |
+| py.pip_list | 0.86 | 0.90 | 0.86 |
+| py.script | 1.06 | 0.97 | 0.96 |
+| node.json | 0.97 | 0.98 | 0.98 |
+| py.strops | 1.01 | 0.99 | 0.97 |
+| proc.forkexec | 0.95 | 0.94 | 0.97 |
+| node.start | 1.05 | 0.99 | 0.98 |
+| py.start | 0.95 | 1.09 | 0.92 |
+| sh.sed_awk | 1.25 | 1.13 | 1.05 |
+| proc.pipe | 1.20 | 1.07 | 1.04 |
+| py.loop | 1.25 | 1.01 | 1.06 |
+| geomean of 11 | 1.03 | 0.997 | 0.97 |
+
+(An earlier run in CPU seconds had npm install at 0.80 and pip install at 0.80 with =1.) Programs
+with a large heap gain 10-15%, tight loops over the same few pages lose as much: no fixed rule by
+operand fits both, since the same instruction (`mov 8(%rdi), %rax` in the interpreter) is one
+kind in one program and the other in the next. Left off; the switch stays for whoever picks this
+up.
+
+### 18. Sites that decide for themselves, in the miss path: tried, slower, not committed
+
+The per-site numbers of section 15 ask for a decision per site at run time. Tried without
+re-translating: a site's first 32 accesses all go through its miss path (its page is kept
+empty), which counts how often the page changed; over 5 changes and the site keeps its page
+empty for good, so that its check fails every time, predictably, and the miss path looks the TLB
+up; otherwise it predicts as before; every 256 misses, and every 50 ms for the others, a site
+watches again. With it the site table had to grow from 8192 to 65536 entries (no two sites
+sharing one), flushes emptied only the entries in use (a list), and a group's lead passed
+data_minus_addr through one slot of its own. Correct (difftest in six configurations,
+tests/xlat/sites.c, agent 18/18), and the miss counts were as designed (loop: 15% of the checks
+through the miss path, which is its share of bad sites).
+
+Cycles against the build of section 16 (least of 5): py.loop 1.03, py.import 1.21, py.strops
+1.18, py.pip_list 1.32, py.start 1.18, proc.forkexec 1.14; with the decision switched off (the
+larger table and the list alone) 0.98, 1.01, 1.01, 1.05, 1.05, 1.14 (every new process fills
+its megabyte of table). So the larger table buys nothing by itself, and a site
+that "looks up from its miss path" is the worst of both: it still reads its own entry (a cache
+line per site), jumps to cold code and back, and reads its decision there, to save one
+misprediction. What section 17 gains comes from not touching per-site state at all, and that
+needs the decision compiled in.
+
+What would do it: the miss path only measures (as above, cheap), a site found bad over two
+separate windows is noted, and the run loop re-translates its block with that access looking up
+directly (the block is invalidated like one whose code was written to; requests batched, since
+an invalidation empties every thread's block cache). Hot blocks only, a few thousand per
+program. Not done: it is a second tier with its own failure modes, and the gain is the 10-15%
+of section 17 for programs with a large heap, without its losses.
 
 ## Compatibility suite on Windows (2026-10-12)
 

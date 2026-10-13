@@ -9,6 +9,7 @@
 #endif
 #include "kernel/calls.h"
 #include "kernel/sctimes.h"
+#include "emu/tlb.h"
 #include "kernel/mm.h"
 #include "kernel/futex.h"
 #include "kernel/ptrace.h"
@@ -58,6 +59,9 @@ static struct task *find_new_parent(struct task *task) {
 noreturn void do_exit(int status) {
     if (current && sctimes_enabled())
         sctimes_task_exit(current);
+#ifdef GUEST_X86_64
+    tlb_stats_exit();
+#endif
     /* pid 1 dumps to stderr (the original behaviour). With ISH_PC_HIST_DIR set,
      * EVERY exiting process also dumps its own per-pid histogram file, so a
      * fork'd chain (pip wheel-build subprocesses) is captured whole. */

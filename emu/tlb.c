@@ -5,7 +5,26 @@
 #include "kernel/fs.h"
 #include "util/sync.h"
 
+#ifdef GUEST_X86_64
+_Atomic(unsigned) tlb_xsites;
+// ISH_XLAT_SITESTATS: the calling thread's counts, when it exits
+static __thread struct tlb *stats_tlb;
+void (*tlb_stats_hook)(void);   // the translator's own (ISH_XLAT_SITEDUMP)
+void tlb_stats_exit(void) {
+    if (tlb_stats_hook != NULL)
+        tlb_stats_hook();
+    struct tlb *tlb = stats_tlb;
+    if (tlb != NULL && getenv("ISH_XLAT_SITESTATS"))
+        fprintf(stderr, "[xsite] sites %u flushes %llu misses %llu checks %llu lookups %llu sp-checks %llu members %llu\n", (unsigned) tlb_xsites, (unsigned long long) tlb->xs_flush,
+                (unsigned long long) tlb->xs_miss, (unsigned long long) tlb->xs_check, (unsigned long long) tlb->xs_lookup,
+                (unsigned long long) tlb->xs_check_sp, (unsigned long long) tlb->xs_member);
+}
+#endif
+
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
+#ifdef GUEST_X86_64
+    stats_tlb = tlb;
+#endif
     if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
         return;
     if (tlb->mmu != mmu) {
@@ -62,7 +81,12 @@ void tlb_flush(struct tlb *tlb) {
     for (unsigned i = 0; i < TLB_SIZE; i++)
         tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
 #ifdef GUEST_X86_64
-    for (unsigned i = 0; i < sizeof(tlb->xsite) / sizeof(tlb->xsite[0]); i++)
+    tlb->xs_flush++;
+    unsigned used = tlb_xsites, size = sizeof(tlb->xsite) / sizeof(tlb->xsite[0]);
+    if (used > size || !tlb->xsite_inited)
+        used = size;
+    tlb->xsite_inited = true;
+    for (unsigned i = 0; i < used; i++)
         tlb->xsite[i].page = TLB_PAGE_EMPTY;
 #endif
 }
@@ -111,6 +135,9 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     // so the gen we stamp on the entry truly matches the backing it points at.
     uint64_t gen;
     char *ptr;
+#ifdef GUEST_X86_64
+    tlb->xs_miss++;
+#endif
     // A write miss on a CoW page performs the copy inside mmu_translate, which
     // itself bumps mmu->changes; the retry then sees a stable generation once
     // the page is resolved. Bound the loop so a thread continuously remapping

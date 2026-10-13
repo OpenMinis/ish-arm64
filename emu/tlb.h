@@ -1,6 +1,7 @@
 #ifndef TLB_H
 #define TLB_H
 
+#include <stdatomic.h>
 #include <string.h>
 #include "emu/mmu.h"
 #include "debug.h"
@@ -59,6 +60,9 @@ struct tlb {
     // so that an access to the same page again needs no lookup. Per thread:
     // threads touch different pages from the same code (their stacks).
     // Valid as long as the TLB's entries are: tlb_flush() empties them.
+    // ISH_XLAT_SITESTATS: flushes, C misses, site checks, lookups after a site missed
+    uint64_t xs_flush, xs_miss, xs_check, xs_lookup, xs_check_sp, xs_member;
+    bool xsite_inited;   // every entry was emptied once; later flushes empty the used ones
     struct { uint64_t page, data_minus_addr; } xsite[1 << 13];
 #endif
 };
@@ -90,6 +94,12 @@ void tlb_detach(struct tlb *tlb);
 void mmu_tlbs_stale(struct mmu *mmu);
 #endif
 void tlb_free(struct tlb *tlb);
+#ifdef GUEST_X86_64
+void tlb_stats_exit(void);
+extern void (*tlb_stats_hook)(void);
+// how many sites the translator handed out (they wrap at the table's size)
+extern _Atomic(unsigned) tlb_xsites;
+#endif
 void tlb_flush(struct tlb *tlb);
 void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type);
 

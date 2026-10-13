@@ -1184,6 +1184,31 @@ static void shift_flags(const struct gi *g, const struct xinsn *x, struct cls *c
 // fine: the rest a signal handler sees is about to be overwritten anyway.
 static bool dbg_nosucc;
 static bool dbg_allpoke;   // ISH_XLAT_ALLPOKE: check for interrupts at every exit
+// ISH_XLAT_SITEDUMP=<file>: every access site's checks and lookups, with what it accesses
+struct sitedump { uint64_t checks, lookups, ip; int32_t disp; int8_t kind, base, index, size; bool write, lead; };
+#define SITEDUMP_MAX (1u << 19)
+static struct sitedump *sitedump;
+static _Atomic unsigned sitedump_n;
+static const char *sitedump_path;
+static void xlat_sitedump_exit(void) {
+    if (sitedump == NULL)
+        return;
+    FILE *f = fopen(sitedump_path, "w");
+    if (f == NULL)
+        return;
+    unsigned n = sitedump_n < SITEDUMP_MAX ? sitedump_n : SITEDUMP_MAX;
+    for (unsigned i = 0; i < n; i++) {
+        struct sitedump *d = &sitedump[i];
+        if (d->checks)
+            fprintf(f, "%llx %d %d %d %d %d %d %d %llu %llu\n", (unsigned long long) d->ip, d->kind, d->base, d->index,
+                    d->disp, d->size, d->write, d->lead, (unsigned long long) d->checks, (unsigned long long) d->lookups);
+    }
+    fclose(f);
+}
+// ISH_XLAT_TLBDIRECT (experimental): which accesses look their page up in the TLB instead of
+// checking a site: 1 all, 2 those through a pointer (not rsp, rbp or a fixed address), 3 rbp too
+static int dbg_tlbdirect;
+static bool dbg_sitestats; // ISH_XLAT_SITESTATS: count site checks and lookups (tlb_stats_exit() prints)
 static bool dbg_nogroup;   // ISH_XLAT_NOGROUP: check every memory access on its own
 // Guest bytes outside the block a translation depended on (what succ_live()
 // read): a cached translation is only valid while they are the same.
@@ -1748,8 +1773,7 @@ struct mgrp {
 };
 
 static unsigned new_site(void) {
-    static _Atomic unsigned next_site;
-    return atomic_fetch_add_explicit(&next_site, 1, memory_order_relaxed) %
+    return atomic_fetch_add_explicit(&tlb_xsites, 1, memory_order_relaxed) %
            array_size(((struct tlb *) 0)->xsite);
 }
 #define SITE_PAGE(n) XMEM(H_TLB, TLBREL(xsite) + (int32_t) (n) * 16)
@@ -1758,7 +1782,7 @@ static unsigned new_site(void) {
 // TLB lookup for [r13 + lo, r13 + hi), on one page: on a hit r9 = its
 // data_minus_addr and the site learns the page; else to l_miss.
 static void e_range_lookup(struct xasm *a, int lo, int hi, bool write, struct xmem site_page,
-                           struct xmem site_dma, unsigned l_miss) {
+                           struct xmem site_dma, unsigned l_miss, int learn) {
     int32_t ent = write ? TLBENT(page_if_writable) : TLBENT(page);
     e_tlb_index(a);
     // the page of the range's first byte, when it isn't r13's
@@ -1776,13 +1800,21 @@ static void e_range_lookup(struct xasm *a, int lo, int hi, bool write, struct xm
     e_jcc_lab(a, 5, l_miss);  // jne
     // a hit: r15 is the page; the site learns it
     e_mov_load(a, R9, (struct xmem) {H_TLB, R14, 0, TLBENT(data_minus_addr)});
-    e_mov_store(a, site_page, R15);
-    e_mov_store(a, site_dma, R9);
+    if (learn & 1)
+        e_mov_store(a, site_page, R15);
+    if (learn & 2)
+        e_mov_store(a, site_dma, R9);
 }
 
 // A group's access after the lead's: the lead checked its page.
 static void e_mem_member(struct xctx *x, const struct body *bd, const struct mgrp *mg, bool load_flags) {
     struct xasm *a = x->a;
+    if (dbg_sitestats) {
+        // without touching the flags
+        e_mov_load(a, R9, XMEM(H_TLB, TLBREL(xs_member)));
+        e_lea(a, R9, XMEM(R9, 1));
+        e_mov_store(a, XMEM(H_TLB, TLBREL(xs_member)), R9);
+    }
     e_mov_load(a, R9, SITE_DMA(mg->site));
     if (load_flags)
         e_call_abs(a, load_flags_stub);
@@ -1801,20 +1833,47 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
 
     if (keep)
         e_save_flags(a);
-    unsigned n = new_site();
+    const struct gi *dg = bd->g;
+    bool ptr = bd->c->kind == K_GENERIC && dg->base != BASE_RIP && dg->base != 4 &&
+               (dg->base != 5 || dbg_tlbdirect == 3) && (dg->base >= 0 || dg->index >= 0);
+    bool direct = dbg_tlbdirect == 1 || (dbg_tlbdirect >= 2 && ptr);
+    // A group's members load the lead's data_minus_addr from its site; the page
+    // goes with it, for a site check that shares the entry (sites wrap).
+    int learn = direct ? (mg ? 3 : 0) : 3;
+    unsigned n = learn ? new_site() : 0;
     if (mg)
         mg->site = n;
     struct xmem site_page = SITE_PAGE(n), site_dma = SITE_DMA(n);
-    // mov %r13, %r15 (lea lo(%r13)); sub page, %r15; or stale, %r15; cmp $(4096 - size), %r15; ja lookup
-    if (lo == 0)
-        e_rr(a, true, 0x89, R13, R15);
-    else
-        e_lea(a, R15, XMEM(R13, lo));
-    e_rm(a, true, 0x2b, R15, site_page);
-    e_rm(a, true, 0x0b, R15, XMEM(H_TLB, TLBREL(stale)));
-    e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 7, R15)); b4(a, (uint32_t) (4096 - (hi - lo)));
-    e_jcc_lab(a, 7, l_lookup);  // ja
-    e_mov_load(a, R9, site_dma);
+    struct sitedump *sd = NULL;
+    if (sitedump != NULL) {
+        unsigned k = atomic_fetch_add(&sitedump_n, 1);
+        if (k < SITEDUMP_MAX) {
+            sd = &sitedump[k];
+            *sd = (struct sitedump) {.ip = dg->ip, .disp = (int32_t) dg->disp, .kind = (int8_t) bd->c->kind,
+                .base = (int8_t) (bd->c->kind == K_GENERIC ? dg->base : 4), .index = (int8_t) (bd->c->kind == K_GENERIC ? dg->index : -1),
+                .size = (int8_t) size, .write = write, .lead = mg != NULL};
+            e_movabs(a, R15, (uint64_t) (uintptr_t) &sd->checks);
+            b1(a, 0x49); b1(a, 0xff); b1(a, 0x07);   // incq (%r15)
+        }
+    }
+    if (dbg_sitestats) {
+        e_rm(a, true, 0xff, 0, XMEM(H_TLB, TLBREL(xs_check)));  // incq
+        if (bd->c->kind != K_GENERIC || dg->base == 4)
+            e_rm(a, true, 0xff, 0, XMEM(H_TLB, TLBREL(xs_check_sp)));
+    }
+    if (direct) {
+        e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_miss, learn);
+    } else {
+        if (lo == 0)
+            e_rr(a, true, 0x89, R13, R15);
+        else
+            e_lea(a, R15, XMEM(R13, lo));
+        e_rm(a, true, 0x2b, R15, site_page);
+        e_rm(a, true, 0x0b, R15, XMEM(H_TLB, TLBREL(stale)));
+        e_rex(a, true, -1, -1, R15, false); b1(a, 0x81); b1(a, modrm_b(3, 7, R15)); b4(a, (uint32_t) (4096 - (hi - lo)));
+        e_jcc_lab(a, 7, l_lookup);  // ja
+        e_mov_load(a, R9, site_dma);
+    }
     lbind(a, l_back);
     if (keep)
         e_restore_flags(a);
@@ -1827,8 +1886,16 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     // slow paths
     a->cur = SEC_COLD;
     lbind(a, l_lookup);
-    e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_miss);
-    e_jmp_lab(a, l_back);
+    if (sd != NULL) {
+        e_movabs(a, R14, (uint64_t) (uintptr_t) &sd->lookups);
+        b1(a, 0x49); b1(a, 0xff); b1(a, 0x06);   // incq (%r14)
+    }
+    if (dbg_sitestats)
+        e_rm(a, true, 0xff, 0, XMEM(H_TLB, TLBREL(xs_lookup)));
+    if (!direct) {
+        e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_miss, learn);
+        e_jmp_lab(a, l_back);
+    }
 
     lbind(a, l_miss);
     // lea lo(%r13), %r14; lea hi-1(%r13), %r15; xor %r14, %r15; cmp $0xfff, %r15; ja cross
@@ -1851,8 +1918,18 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     } else {
         // The others need the page too: the address again, and the TLB
         // has its page now, if the page is enough for all of them.
-        e_addr(x, bd->g, R13, true);
-        e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_cross);
+        switch (bd->c->kind) {
+            case K_PUSH: case K_PUSHI:
+                e_lea(a, R13, XMEM(R8, -8));
+                break;
+            case K_POP:
+                e_mov_rr(a, R13, R8);
+                break;
+            default:
+                e_addr(x, bd->g, R13, true);
+                break;
+        }
+        e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_cross, learn);
         e_jmp_lab(a, l_back);
     }
 
@@ -2278,10 +2355,122 @@ static bool grp_writes(const struct xi *xi, int r) {
     }
 }
 
+// What an instruction does to the stack, for a group of stack accesses: its
+// access (addr relative to rsp before it, size) and how far it moves rsp.
+enum { SP_NONE, SP_ACCESS, SP_MOVE, SP_STOP };
+static int sp_effect(const struct xi *xi, const struct xinsn *in, int *addr, int *size, bool *write, int *move) {
+    const struct gi *g = &xi->g;
+    const struct cls *c = &xi->c;
+    *move = 0;
+    if (xi->mode != M_NATIVE)
+        return SP_STOP;
+    switch (c->kind) {
+        case K_PUSH: case K_PUSHI:
+            *addr = -8, *size = 8, *write = true, *move = -8;
+            return SP_ACCESS;
+        case K_POP:
+            if (((g->op & 7) | ((g->rex & 1) ? 8 : 0)) == 4)
+                return SP_STOP;
+            *addr = 0, *size = 8, *write = false, *move = 8;
+            return SP_ACCESS;
+        case K_CALL:
+            *addr = -8, *size = 8, *write = true;
+            return SP_ACCESS;
+        case K_CALLI:
+            if (g->mod != 3)
+                return SP_STOP;   // loads its target first
+            *addr = -8, *size = 8, *write = true;
+            return SP_ACCESS;
+        case K_RET:
+            *addr = 0, *size = 8, *write = false;
+            return SP_ACCESS;
+        case K_NOP:
+            return SP_NONE;
+        case K_LEA:
+            if (g->reg != 4)
+                return SP_NONE;
+            if (g->base != 4 || g->index >= 0 || g->seg || g->a32 || !(g->rex & 8) || g->disp < -4096 || g->disp > 4096)
+                return SP_STOP;
+            *move = (int) g->disp;
+            return SP_MOVE;
+        case K_OPREG:
+            return grp_writes(xi, 4) ? SP_STOP : SP_NONE;
+        case K_GENERIC:
+            if (xi->p.mem) {
+                if (c->msize == 0 || g->seg || g->a32 || g->base != 4 || g->index >= 0 || grp_writes(xi, 4) ||
+                        g->disp < -4096 || g->disp > 4096)
+                    return SP_STOP;
+                *addr = (int) g->disp, *size = c->msize, *write = c->acc == A_W || c->acc == A_RW;
+                return SP_ACCESS;
+            }
+            // add/sub $imm, %rsp
+            if (g->map == 0 && (g->op == 0x83 || g->op == 0x81) && g->mod == 3 && g->rm == 4 && (g->rex & 8) &&
+                    (g->rawreg == 0 || g->rawreg == 5) && !g->lock) {
+                int32_t imm = g->immlen == 1 ? (int8_t) in->bytes[g->immoff] :
+                    (int32_t) (in->bytes[g->immoff] | in->bytes[g->immoff + 1] << 8 |
+                               in->bytes[g->immoff + 2] << 16 | (uint32_t) in->bytes[g->immoff + 3] << 24);
+                if (imm < -4096 || imm > 4096)
+                    return SP_STOP;
+                *move = g->rawreg == 0 ? imm : -imm;
+                return SP_MOVE;
+            }
+            return grp_writes(xi, 4) ? SP_STOP : SP_NONE;
+        default:
+            return SP_STOP;
+    }
+}
+
+static bool dbg_nospgroup;   // ISH_XLAT_NOSPGROUP: no groups of stack accesses
+#define SP_GROUP_SPAN 128
+
+// Groups of stack accesses: pushes, pops, the call's or the return's own, and
+// operands off rsp, while rsp only moves by constants and nothing else touches
+// memory. One check of the whole range (a function's prologue or epilogue).
+static void find_sp_groups(struct xi *xis, unsigned total, const struct xinsn *xlog, unsigned n, const struct xinsn *tail) {
+    for (unsigned i = 0; i < total; i++) {
+        struct xi *l = &xis[i];
+        int addr, size, move;
+        bool write;
+        if (l->lead >= 0 || l->terminal || sp_effect(l, i < n ? &xlog[i] : tail, &addr, &size, &write, &move) != SP_ACCESS)
+            continue;
+        // offsets from the lead's own address
+        int base = addr, sp = move;
+        int lo = 0, hi = size;
+        unsigned members = 0;
+        for (unsigned j = i + 1; j < total && j < i + 32; j++) {
+            struct xi *m = &xis[j];
+            bool mw;
+            int e = sp_effect(m, j < n ? &xlog[j] : tail, &addr, &size, &mw, &move);
+            if (e == SP_STOP || m->lead >= 0)
+                break;
+            if (e == SP_ACCESS) {
+                int rel = sp + addr - base;
+                int nlo = rel < lo ? rel : lo;
+                int nhi = rel + size > hi ? rel + size : hi;
+                if (nhi - nlo > SP_GROUP_SPAN)
+                    break;
+                lo = nlo, hi = nhi;
+                m->lead = (int) i;
+                members++;
+                write |= mw;
+            }
+            sp += move;
+            if (m->terminal)
+                break;
+        }
+        if (members > 0) {
+            l->lead = (int) i;
+            l->grp = (struct mgrp) {lo, hi, write, 0};
+        }
+    }
+}
+
 // Finds the groups of xis[0..total).
-static void find_groups(struct xi *xis, unsigned total) {
+static void find_groups(struct xi *xis, unsigned total, const struct xinsn *xlog, unsigned n, const struct xinsn *tail) {
     for (unsigned i = 0; i < total; i++)
         xis[i].lead = -1;
+    if (!dbg_nospgroup)
+        find_sp_groups(xis, total, xlog, n, tail);
     for (unsigned i = 0; i < total; i++) {
         struct xi *l = &xis[i];
         if (l->lead >= 0 || !grp_access(l))
@@ -2295,6 +2484,8 @@ static void find_groups(struct xi *xis, unsigned total) {
         for (unsigned j = i + 1; j < total && j < i + 32; j++) {
             struct xi *m = &xis[j];
             if (m->mode != M_NATIVE || m->terminal)
+                break;
+            if (m->lead >= 0)
                 break;
             if (grp_access(m) && m->g.base == base && m->g.index == index &&
                     (index < 0 || m->g.scale == l->g.scale)) {
@@ -2374,7 +2565,7 @@ static bool xlat_on;
 
 // call / call through r/m / jmp through r/m / ret. The successor is unknown
 // (or a whole function away): every dirty flag goes to the lazy state first.
-static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct xi *xi) {
+static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct xi *xi, const struct mgrp *mg) {
     struct xasm *a = x->a;
     const struct gi *g = &xi->g;
     unsigned kind = xi->c.kind;
@@ -2401,7 +2592,10 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
         e_lea(a, R13, XMEM(R8, -8));
         bc.kind = K_B_PUSHRET;
         bd.imm = g->next;
-        e_mem_insn(x, &bd, 8, true, 0, false, NULL);
+        if (mg)
+            e_mem_member(x, &bd, mg, false);
+        else
+            e_mem_insn(x, &bd, 8, true, 0, false, NULL);
         // ret_cache[(return address & 0xffff) >> 4] = the call's arguments
         e_movabs_slot(x, R14, xi->fall);
         e_mov_store(a, XMEM(H_CPU, (int32_t) offsetof(struct fiber_frame, ret_cache) +
@@ -2418,7 +2612,10 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
             e_mov_rr(a, R13, R8);
             bc.kind = K_B_POPRET;
             bd.imm = 8 + (g->immlen == 2 ? (uint64_t) (in->bytes[g->immoff] | in->bytes[g->immoff + 1] << 8) : 0);
-            e_mem_insn(x, &bd, 8, false, 0, false, NULL);
+            if (mg)
+                e_mem_member(x, &bd, mg, false);
+            else
+                e_mem_insn(x, &bd, 8, false, 0, false, NULL);
             e_ret_dispatch(x);
             break;
         }
@@ -2699,7 +2896,7 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
     }
 
     if (!dbg_nogroup)
-        find_groups(xis, total);
+        find_groups(xis, total, xlog, n, &tail);
     else
         for (unsigned i = 0; i < total; i++)
             xis[i].lead = -1;
@@ -2772,7 +2969,7 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             continue;
         }
         if (c->kind == K_CALL || c->kind == K_CALLI || c->kind == K_JMPI || c->kind == K_RET) {
-            e_branch_insn(&x, in, xi);
+            e_branch_insn(&x, in, xi, xi->lead >= 0 ? &xis[xi->lead].grp : NULL);
             in_run = false;
             continue;
         }
@@ -3426,6 +3623,14 @@ static void xlat_init(void) {
     dbg_nosucc = getenv("ISH_XLAT_NOSUCC") != NULL;
     dbg_allpoke = getenv("ISH_XLAT_ALLPOKE") != NULL;
     dbg_nogroup = getenv("ISH_XLAT_NOGROUP") != NULL;
+    dbg_nospgroup = getenv("ISH_XLAT_NOSPGROUP") != NULL;
+    dbg_sitestats = getenv("ISH_XLAT_SITESTATS") != NULL;
+    sitedump_path = getenv("ISH_XLAT_SITEDUMP");
+    if (sitedump_path != NULL) {
+        sitedump = calloc(SITEDUMP_MAX, sizeof(*sitedump));
+        tlb_stats_hook = xlat_sitedump_exit;
+    }
+    dbg_tlbdirect = getenv("ISH_XLAT_TLBDIRECT") ? atoi(getenv("ISH_XLAT_TLBDIRECT")) : 0;
     dbg_nosse = getenv("ISH_XLAT_NOSSE") != NULL;
     if ((e = getenv("ISH_XLAT_OPS")) != NULL) {
         char *end;
