@@ -358,9 +358,32 @@ static uint8_t *load_flags_stub;  // lazy flags -> host eflags; clobbers r14, r1
 
 // Writes the flags in mask from the host's eflags to the lazy representation.
 // Clobbers r14, r15 and eflags.
-static void e_sync_flags(struct xasm *a, uint16_t mask) {
+static bool dbg_slowsync;   // ISH_XLAT_SLOWSYNC: always the read-modify-write form
+static void e_sync_flags(struct xasm *a, uint16_t mask, uint16_t valid) {
     if (mask == 0)
         return;
+    // Stores only, when the host has all of PF AF ZF SF (or none is asked
+    // for): eflags' low byte is exactly lahf's (its CF bit is nobody's: CF
+    // lives in cf), and with all four in it none comes from res any more. The
+    // form below reads and rewrites eflags and flags_res, every time the
+    // same two bytes: a chain of store-to-load forwards from each block's
+    // exit to the next one's.
+    uint16_t four = F_PF | F_AF | F_ZF | F_SF;
+    if (!dbg_slowsync && ((mask & four) == 0 || (valid & four) == four)) {
+        if (mask & F_CF)
+            e_rm2(a, false, 0x0f, 0x92, 0, XMEM(H_CPU, CPU_OFF(cf)));    // setc cf(%r11)
+        if (mask & F_OF)
+            e_rm2(a, false, 0x0f, 0x90, 0, XMEM(H_CPU, CPU_OFF(of)));    // seto of(%r11)
+        if (mask & four) {
+            e_mov_rr(a, R15, RAX);
+            b1(a, 0x9f);                                                 // lahf
+            b1(a, 0x0f); b1(a, 0xb6); b1(a, 0xc4);                       // movzbl %ah, %eax (ah has no encoding next to r11)
+            e_rm(a, false, 0x88, RAX, XMEM(H_CPU, CPU_OFF(eflags)));     // mov %al, eflags(%r11)
+            e_mov_rr(a, RAX, R15);
+            e_rm(a, false, 0xc6, 0, XMEM(H_CPU, CPU_OFF(flags_res))); b1(a, 0);   // movb $0, flags_res(%r11)
+        }
+        return;
+    }
     // lahf and seto, not pushfq (microcoded, the slowest part of this):
     // r14 = SF ZF - AF - PF - CF in bits 8-15, OF in bit 0
     e_mov_rr(a, R15, RAX);
@@ -1348,7 +1371,7 @@ struct xctx {
 };
 
 static void sync_dirty(struct xctx *x) {
-    e_sync_flags(x->a, x->dirty);
+    e_sync_flags(x->a, x->dirty, x->valid);
     x->dirty = 0;
 }
 
@@ -1396,7 +1419,7 @@ static void e_exit_slot(struct xctx *x, unsigned s) {
 // is finite.
 static void e_exit_chain(struct xctx *x, unsigned s, uint16_t live, bool poke) {
     struct xasm *a = x->a;
-    e_sync_flags(a, x->dirty & live);
+    e_sync_flags(a, x->dirty & live, x->valid);
     unsigned l_stub = new_label(a);
     // an interrupt pending: leave through the gadgets, which see to it
     if (poke) {
@@ -1906,7 +1929,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     e_jcc_lab(a, 7, l_cross);  // ja
     if (sync) {
         e_restore_flags(a);
-        e_sync_flags(a, sync);
+        e_sync_flags(a, sync, x->valid);
     }
     // lea orig(%rip), %r9
     b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
@@ -1939,7 +1962,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     lbind(a, l_cross);
     if (keep)
         e_restore_flags(a);
-    e_sync_flags(a, sync);
+    e_sync_flags(a, sync, x->valid);
     e_note_block(x);
     e_movabs_slot(x, H_IP, bd->in->s0 + 1);
     e_jmp_abs(a, (const void *) x->plan[bd->in->s0]);
@@ -1977,7 +2000,7 @@ static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
         // Live only for where the block leaves: write them to the lazy state
         // now (leaving would) rather than keep them across this access and
         // the ones after it. Before the address, which may use r14/r15.
-        e_sync_flags(a, x->dirty & held);
+        e_sync_flags(a, x->dirty & held, x->valid);
         x->dirty = 0;
         x->valid = 0;
     }
@@ -3623,6 +3646,7 @@ static void xlat_init(void) {
     dbg_nosucc = getenv("ISH_XLAT_NOSUCC") != NULL;
     dbg_allpoke = getenv("ISH_XLAT_ALLPOKE") != NULL;
     dbg_nogroup = getenv("ISH_XLAT_NOGROUP") != NULL;
+    dbg_slowsync = getenv("ISH_XLAT_SLOWSYNC") != NULL;
     dbg_nospgroup = getenv("ISH_XLAT_NOSPGROUP") != NULL;
     dbg_sitestats = getenv("ISH_XLAT_SITESTATS") != NULL;
     sitedump_path = getenv("ISH_XLAT_SITEDUMP");

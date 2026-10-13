@@ -41,7 +41,8 @@ What changed, by effect (details in the numbered sections):
 - speed: hashed TLB index (1), stat without a handle (3), SSE translated natively (6, 7), poll
   notify pipes reused (9), freed code reused lowest address first (12), futex on an event (2),
   stack accesses checked once per run (16: 1-9% fewer CPU cycles, measured 2026-10-13, after
-  the table above);
+  the table above), flags written back at a block's end with stores only (23: 3% over the
+  suite, 9-12% on the Python loop, sed/awk, grep);
 - the Defender exclusions alone: npm install 33-38 s -> 18-23 s on the same build.
 
 Tried without a gain and not committed, so that nobody repeats them: check groups across other
@@ -54,18 +55,17 @@ paths), looking the TLB up instead of predicting the page, for all accesses or b
 that decide that for themselves in their miss path, and a larger site table (18), a second
 tier that re-translates hot blocks with what the first translation counted (19), sites shared
 by base register (20), another build of the guest's Python (21), an inline indirect dispatch
-with half the instructions (22).
+with half the instructions (22), a return stack on the host's (23).
 
 Against a native CPython on the same machine everyday Python is 4-7x slower (15); most of that
 is translated code, and the largest part of it that is not the guest's own work is the page
 check before each memory access.
 
 Open:
-- The translator is where a block-at-a-time design with checked memory ends up (22): what is
-  left are a taken jump per six-instruction block, returns and indirect jumps the host cannot
-  predict as such, and per-access page checks. Past a few percent each, the next steps are
-  structural: returns through the host's return stack, translating across the fall-through of
-  a branch, guest memory at a fixed offset from the host's.
+- What is left is memory (23, last paragraph): every access is a page check and an address the
+  host cannot rename, 2-6x of native per access; calls are mostly that. Returns through the
+  host's return stack gave nothing, and translating across the fall-through of a branch would
+  give about 2%. The remaining lever is guest memory at a fixed offset from the host's.
 - node start-up has no single hot spot; every start compiles each block twice (gadgets, then
   native after four runs). Only the pre-linked image would remove that (not planned).
 - Floating point arithmetic ignores the guest's MXCSR rounding mode (always to nearest) and
@@ -91,9 +91,9 @@ COMPAT_TIMEOUT_SCALE=2 ARCHS=x86 ISH_X86=... FAKEFS_X86=C:/src/rootfs/compat-x86
 
 Checks every change went through: the x86_64 difftest (19696 lines, JIT default, ISH_XLAT_HOT=1,
 ISH_XLAT_NOGROUP=1, gadgets), tests/xlat/{sse,sse_fp,fp_nan}.c against the same programs built
-natively on the Windows machine, tests/xlat/{spgroup,sites}.c against the gadgets, tests/agent (18 cases) on macOS and Windows, the compat suite
+natively on the Windows machine (tests/xlat/flags.c too), tests/xlat/{spgroup,sites}.c against the gadgets, tests/agent (18 cases) on macOS and Windows, the compat suite
 on Windows, and run.py's own comparison of every case's output between the builds. Switches for
-bisecting: ISH_XLAT=0, ISH_XLAT_NOSSE=1, ISH_XLAT_NOGROUP=1, ISH_XLAT_NOSPGROUP=1, ISH_XLAT_ALLPOKE=1,
+bisecting: ISH_XLAT=0, ISH_XLAT_NOSSE=1, ISH_XLAT_NOGROUP=1, ISH_XLAT_NOSPGROUP=1, ISH_XLAT_SLOWSYNC=1, ISH_XLAT_ALLPOKE=1,
 ISH_STAT_BY_HANDLE=1, ISH_XCACHE=0.
 
 ## Measurements in the order they were made
@@ -789,6 +789,72 @@ a guest branch is a jump to another block), returns and indirect jumps that the 
 as indirect jumps and resolves late (a return is a load from the guest stack, a table lookup, a
 compare and a jump through the block's stream before the host knows where it goes; natively it
 is predicted by the return stack), and an address that every memory access has to add to.
+
+### 23. A return stack: no gain. Flags written back with stores only: 3% over the suite
+
+Returns first, as planned: a translated call pushed {where its return continues, the guest
+return address} on the host stack and was a host call, a return whose top frame had its address
+a host ret (a bottom frame nothing matches, a scan of six frames for returns that ran as
+gadgets, a depth limit; ISH_XLAT_RSTACK). 99.7% of the Python loop's 84e6 returns took the host
+ret. Kernels (benchmark/daily/micro2.c: assembly, so the same machine code native and guest,
+least of 4 interleaved, ns per iteration): call and return 1.67 -> 1.74, indirect call 2.83 ->
+2.76. Daily suite 1.000 over 11 cases, and worse than without it next to the change below
+(py.loop 0.94 against 0.86). The host predicts these returns as indirect jumps well enough;
+what a call and return cost is their fifty instructions, and the frame adds as many as it
+saves. Not kept.
+
+micro2.c is what found the next thing. ns per iteration, native and ish:
+
+| kernel | native | ish | |
+|---|---:|---:|---|
+| `add $1, %rax` (the loop itself) | 0.20 | 0.26 | |
+| `jmp` to the next instruction | 0.23 | 1.60 | one more block per iteration |
+| a conditional jump taken every other time | 0.21 | 0.84 | |
+| a conditional jump never taken | 0.23 | 0.39 | one more block too, but cheap |
+| call an empty function | 0.25 | 1.67 | |
+| push, pop | 0.20 | 0.67 | |
+| `add (%rdi), %rax` | 0.21 | 0.47 | |
+| `addq $1, (%rdi)` | 0.21 | 1.28 | the host renames a [reg+disp] store to its load; not ours |
+| `add %r12, %r13; add %r13, %r12` (registers kept in memory) | 0.41 | 0.63 | as cheap as rbx/rbp (0.59) |
+
+A block boundary costs 0.1 ns when the next block overwrites the flags and 1.3 ns when it might
+read them: then they are written to the lazy flags, and that was fourteen instructions reading
+and rewriting cpu->eflags and cpu->flags_res, the same two bytes at every block's exit, each
+waiting for the store of the one before. The Python loop does it 202e6 times, mostly before
+calls, returns and indirect jumps (which always do).
+
+Now stores only, when the host has all of PF AF ZF SF (it nearly always does): lahf's byte is
+eflags' low byte as it is (its CF bit is nobody's, CF lives in cpu->cf), and with all four in
+eflags flags_res is 0; setc and seto go straight to cf and of. ISH_XLAT_SLOWSYNC=1 is the old
+form. Kernels: `jmp` 1.60 -> 0.70, alternating conditional jump 0.84 -> 0.41, call a leaf
+function 2.69 -> 2.38.
+
+Daily suite, CPU cycles, least of 5 interleaved runs, all 33 cases: **geomean 0.971**.
+
+| case | before (Gcyc) | after | after/before |
+|---|---:|---:|---:|
+| py.strops | 1.70 | 1.48 | 0.875 |
+| sh.sed_awk | 10.07 | 8.83 | 0.877 |
+| sh.grep_r | 34.57 | 31.45 | 0.909 |
+| py.loop | 8.84 | 8.05 | 0.911 (0.858 in a run of nine) |
+| py.start | 0.78 | 0.71 | 0.913 |
+| sh.ls_r | 1.46 | 1.35 | 0.925 |
+| py.script | 9.00 | 8.57 | 0.953 |
+| proc.pipe | 9.60 | 9.21 | 0.959 |
+| py.import, py.pip_list, node.npm_install, build.go | | | 0.964-0.965 |
+| worst: boot.true (0.09 -> 0.10, one tick of the unit), proc.forkexec, sh.gzip | | | 1.107, 1.037, 1.025 |
+
+Checked: tests/xlat/flags.c (1260 lines, the same as the hardware, both forms and the gadgets,
+macOS and Windows), difftest in six configurations and the gadget build, spgroup, sites, sse,
+sse_fp, fp_nan, agent 18/18 on both, compat suite on Windows 226/232 (the six known).
+
+What micro2.c says about the rest. A not-taken conditional jump costs 0.1-0.2 ns more than no
+jump, so translating across the fall-through of a branch (the planned next step) would give
+about 2% on the Python loop for its 1e9 blocks: not worth a new block structure. What is dear
+is memory: 2-3x for a load, 3.5x for push and pop, 6x for a read-modify-write, because every
+access is a check and an address the host cannot rename, and calls (6x) are mostly their two
+stack accesses and fifty instructions. Past this the lever is guest memory at a fixed offset
+from the host's, and nothing smaller.
 
 ## Compatibility suite on Windows (2026-10-12)
 
