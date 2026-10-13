@@ -15,6 +15,7 @@
 // i.e. compiled out unless DEBUG_verbose is set.
 #define DEFAULT_CHANNEL verbose
 #include "fs/sock.h"
+#include "fs/netlink.h"
 #include "debug.h"
 
 #define SOCKET_TYPE_MASK 0xf
@@ -22,23 +23,33 @@
 const struct fd_ops socket_fdops;
 
 // ---------------------------------------------------------------------------
-// [STAGE-0 PROBE] Minimal AF_NETLINK stub -- NOT a netlink implementation.
+// AF_NETLINK stub -- the socket half. fs/netlink.c is the other half: it
+// turns a request into reply datagrams.
 //
-// Purpose: answer the single question "once netlink stops returning
-// EAFNOSUPPORT, where does a netlink-dependent program die next?".
-// Go's netlinkrib() (route ip+net, used by tailscale's netmon) does
-// socket(AF_NETLINK) -> bind -> sendto(RTM_GET*) -> recvfrom until NLMSG_DONE.
-// This stub makes that sequence terminate with an EMPTY dump: every request
-// is answered with a bare NLMSG_DONE carrying the caller's seq/pid, which
-// reads as "the route table / link list / addr list is empty".
+// Darwin has no AF_NETLINK and there is no Linux network stack under the
+// guest, so nothing is forwarded. A netlink fd is a host socketpair whose
+// far end this file writes replies into, which gives poll/epoll/close and
+// refcounting for free. The rules it keeps:
 //
-// Deliberately NOT implemented: any real RTM_* payload, rtattr encoding,
-// multicast group subscription (bind accepts and ignores nl_groups, so no
-// event is ever delivered). Darwin has no AF_NETLINK to forward to, so a real
-// implementation must synthesize messages from getifaddrs()/PF_ROUTE -- out of
-// scope here. See docs: this is throwaway experimental scaffolding.
+//   * Every request is answered when it is SENT -- by write(), writev(),
+//     send(), sendto() or sendmsg() alike -- so a reply is already queued by
+//     the time the guest reads. (The stub used to answer only sendto and
+//     sendmsg: busybox `ip` sends with write() and then waited for ever.)
+//   * What the host can tell us is real: RTM_GETLINK and RTM_GETADDR come
+//     from getifaddrs(). What it cannot (routes, rules, neighbours, any
+//     change, any protocol but NETLINK_ROUTE) is refused with NLMSG_ERROR at
+//     once. Nothing is left unanswered.
+//   * A read never blocks without bound. MSG_PEEK, MSG_TRUNC, MSG_DONTWAIT
+//     and O_NONBLOCK mean what they mean on Linux; an empty queue is EAGAIN
+//     for a non-blocking reader, and a blocking reader waits in bounded
+//     polls so a guest signal always gets through. A socket bound to
+//     multicast groups (ip monitor, Go's netmon) waits the same way: no
+//     event is ever delivered, exactly as on a Linux box where nothing
+//     changes.
 //
-// On by default; ISH_NETLINK_STUB=0 disables it at runtime.
+// On by default; ISH_NETLINK_STUB=0 disables it at runtime (AF_NETLINK is
+// then EAFNOSUPPORT). ISH_NETLINK_ROUTE=empty answers a route dump with an
+// empty dump instead of EOPNOTSUPP.
 // ---------------------------------------------------------------------------
 
 #define AF_NETLINK_ 16
@@ -77,51 +88,71 @@ bool ish_netlink_stub_enabled(void) {
     return cached == 1;
 }
 
-// A netlink fd is backed by a real host socketpair(AF_UNIX, SOCK_DGRAM):
-// fd->real_fd is the guest-facing end, netlink_peer_fd the end this stub
-// writes replies into. That buys working poll/epoll/read/close/refcounting
-// from the existing socket_fdops machinery for free -- only sendto/recvfrom
-// semantics are special-cased.
-static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
-    // Answer every well-formed request with an empty dump: one NLMSG_DONE
-    // echoing the request's seq and pid. A malformed/short request gets the
-    // same treatment (seq=0) rather than an error -- keeps the probe simple.
-    uint32_t seq = 0, pid = 0;
-    if (req != NULL && req_len >= sizeof(struct nlmsghdr_)) {
-        const struct nlmsghdr_ *h = req;
-        seq = h->nlmsg_seq;
-        pid = h->nlmsg_pid;
-    }
-    struct nlmsghdr_ done = {
-        .nlmsg_len = NLMSG_ALIGN_(sizeof(struct nlmsghdr_)),
-        .nlmsg_type = NLMSG_DONE_,
-        .nlmsg_flags = 0,
-        .nlmsg_seq = seq,
-        .nlmsg_pid = pid,
-    };
-    int peer = fd->socket.netlink_peer_fd;
+// One line per kind of event for the life of the process, not one per call:
+// the stub sits on paths Go programs hit in a loop.
+static void netlink_stub_log_once(int *flag, const char *what, unsigned type, unsigned seq) {
+    if (__sync_bool_compare_and_swap(flag, 0, 1))
+        printk("NETLINK_STUB %s (pid=%d comm=%s type=%u seq=%u; logged once)\n",
+               what, current->pid, current->comm, type, seq);
+}
+
+struct netlink_emit_ctx {
+    struct fd *fd;
+    bool overflow;
+    bool refused;
+    unsigned count;
+};
+
+// Queue one reply datagram into the socketpair. The far end is
+// non-blocking: a full queue is recorded, never waited on.
+static int netlink_stub_emit(void *opaque, const void *dgram, size_t len) {
+    struct netlink_emit_ctx *ctx = opaque;
+    int peer = ctx->fd->socket.netlink_peer_fd;
     if (peer < 0)
         return _EINVAL;
-    if (write(peer, &done, sizeof(done)) < 0)
-        return errno_map();
-    {   // [STAGE-0 PROBE] log the request's RTM type so we can see exactly
-        // which netlink queries the guest actually issues.
-        uint16_t rtm = 0;
-        if (req != NULL && req_len >= sizeof(struct nlmsghdr_))
-            rtm = ((const struct nlmsghdr_ *) req)->nlmsg_type;
-        const char *name = rtm == 18 ? "RTM_GETLINK" : rtm == 22 ? "RTM_GETADDR" :
-                           rtm == 26 ? "RTM_GETROUTE" : "other";
-        TRACE("NETLINK_STUB reply NLMSG_DONE seq=%u pid=%u req_type=%u(%s) (empty dump)\n",
-               seq, pid, rtm, name);
+    if (len >= 20 && ((const struct nlmsghdr_ *) dgram)->nlmsg_type == NLMSG_ERROR_ &&
+            ((const int32_t *) dgram)[4] != 0)
+        ctx->refused = true;
+    for (;;) {
+        ssize_t w = send(peer, dgram, len, MSG_DONTWAIT);
+        if (w >= 0) {
+            ctx->count++;
+            return 0;
+        }
+        if (errno == EINTR)
+            continue;
+        ctx->overflow = true;
+        return _ENOBUFS;
     }
+}
+
+// Answer a request the guest just sent (by whatever syscall). Returns
+// req_len: as on Linux, sending a request succeeds whatever its answer is.
+static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
+    static int logged_answer, logged_refuse, logged_overflow;
+    struct netlink_emit_ctx ctx = {.fd = fd};
+    struct netlink_stub_req last = {0};
+    netlink_stub_answer(fd->socket.protocol, req, req_len, netlink_stub_emit, &ctx, &last);
+
+    lock(&fd->lock);
+    // A dump that did not fit the queue still has to end: the reader is
+    // owed an NLMSG_DONE, handed over when it finds the queue empty.
+    fd->socket.netlink_owe_done = ctx.overflow && last.valid;
+    fd->socket.netlink_owe_seq = last.seq;
+    unlock(&fd->lock);
+
+    if (ctx.overflow)
+        netlink_stub_log_once(&logged_overflow, "reply queue full, dump cut short", last.type, last.seq);
+    else if (ctx.refused)
+        netlink_stub_log_once(&logged_refuse, "request refused with NLMSG_ERROR (not available on this host)", last.type, last.seq);
+    else if (ctx.count > 0)
+        netlink_stub_log_once(&logged_answer, "answered from the host's interfaces", last.type, last.seq);
+    TRACE("NETLINK_STUB request type=%u seq=%u flags=%#x -> %u datagram(s)%s%s\n",
+          last.type, last.seq, last.flags, ctx.count,
+          ctx.refused ? " (refused)" : "", ctx.overflow ? " (queue full)" : "");
     return (int) req_len;
 }
 
-
-// [STAGE-0 PROBE] sendmsg/recvmsg on a netlink fd. Go's netlinkrib uses
-// sendmsg/recvmsg (not send/recv) and passes a sockaddr_nl as msg_name, which
-// the generic path rejects in sockaddr_read() -> EINVAL. These two shims
-// bypass sockaddr handling entirely and move payload only.
 static int netlink_stub_sendmsg(struct fd *sock, addr_t msghdr_addr) {
     addr_t iov_addr; uint64_t iovlen;
 #ifdef GUEST_ARM64
@@ -146,7 +177,71 @@ static int netlink_stub_sendmsg(struct fd *sock, addr_t msghdr_addr) {
     return r < 0 ? r : (int) total;
 }
 
-static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr) {
+static long monotonic_ms(void);
+
+// Take (or with MSG_PEEK_, look at) the next reply datagram. Returns its
+// full length, which may exceed `cap`, or a negative errno. Never blocks
+// without bound:
+//   * a queued datagram is returned at once;
+//   * an empty queue with a dump still owed its end yields that NLMSG_DONE;
+//   * an empty queue is _EAGAIN for a non-blocking reader;
+//   * a blocking reader waits in 1 s polls, checking for guest signals
+//     between them (_EINTR), until something is queued or SO_RCVTIMEO runs
+//     out.
+static ssize_t netlink_stub_dequeue(struct fd *sock, int guest_flags, char *buf, size_t cap) {
+    static int logged_owed, logged_wait;
+    int host_flags = MSG_DONTWAIT | ((guest_flags & MSG_PEEK_) ? MSG_PEEK : 0);
+    int fl = fcntl(sock->real_fd, F_GETFL, 0);
+    bool nonblock = (guest_flags & MSG_DONTWAIT_) || (sock->flags & O_NONBLOCK_) ||
+                    (fl >= 0 && (fl & O_NONBLOCK));
+    long timeout_ms = sock->socket.netlink_rcvtimeo_ms;
+    long start_ms = monotonic_ms();
+    for (;;) {
+        ssize_t n = recv(sock->real_fd, buf, cap, host_flags);
+        if (n >= 0)
+            return n;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return errno_map();
+
+        lock(&sock->lock);
+        bool owed = sock->socket.netlink_owe_done;
+        uint32_t seq = sock->socket.netlink_owe_seq;
+        if (owed && !(guest_flags & MSG_PEEK_))
+            sock->socket.netlink_owe_done = false;
+        unlock(&sock->lock);
+        if (owed && cap >= 20) {
+            netlink_stub_log_once(&logged_owed, "empty queue with a dump unfinished: NLMSG_DONE synthesized", NLMSG_DONE_, seq);
+            return (ssize_t) netlink_stub_done(buf, seq);
+        }
+        if (nonblock)
+            return _EAGAIN;
+
+        if (current->sighand != NULL) {
+            lock(&current->sighand->lock);
+            bool pending = !!(current->pending & ~current->blocked);
+            unlock(&current->sighand->lock);
+            if (pending)
+                return _EINTR;
+        }
+        long waited = monotonic_ms() - start_ms;
+        if (timeout_ms > 0 && waited >= timeout_ms)
+            return _EAGAIN;
+        if (waited >= 3000)
+            netlink_stub_log_once(&logged_wait, "blocking read with nothing queued for 3s (no event is ever delivered)",
+                                  0, sock->socket.netlink_groups);
+        int poll_ms = 1000;
+        if (timeout_ms > 0 && timeout_ms - waited < poll_ms)
+            poll_ms = (int) (timeout_ms - waited);
+        struct pollfd pfd = {.fd = sock->real_fd, .events = POLLIN};
+        current->blocking = true;
+        poll(&pfd, 1, poll_ms);
+        current->blocking = false;
+    }
+}
+
+static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr, int flags) {
     addr_t iov_addr, name_addr; uint64_t iovlen; uint32_t namelen;
 #ifdef GUEST_ARM64
     struct msghdr64_ m;
@@ -159,15 +254,16 @@ static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr) {
     iov_addr = m.msg_iov; iovlen = m.msg_iovlen;
     name_addr = m.msg_name; namelen = m.msg_namelen;
 #endif
-    char buf[4096];
-    ssize_t n = read(sock->real_fd, buf, sizeof(buf));
-    if (n < 0) return errno_map();
+    char buf[NETLINK_STUB_DGRAM_MAX * 2];
+    ssize_t n = netlink_stub_dequeue(sock, flags, buf, sizeof(buf));
+    if (n < 0) return (int) n;
+    size_t have_total = (size_t) n < sizeof(buf) ? (size_t) n : sizeof(buf);
 
     size_t off = 0;
-    for (uint64_t i = 0; i < iovlen && off < (size_t) n; i++) {
+    for (uint64_t i = 0; i < iovlen && off < have_total; i++) {
         struct iovec64_ iv;
         if (user_get(iov_addr + i * sizeof(iv), iv)) return _EFAULT;
-        size_t want = (size_t) iv.len, have = (size_t) n - off;
+        size_t want = (size_t) iv.len, have = have_total - off;
         if (want > have) want = have;
         if (want && user_write((addr_t) iv.base, buf + off, want)) return _EFAULT;
         off += want;
@@ -176,9 +272,18 @@ static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr) {
         struct sockaddr_nl_ nl = { .nl_family = AF_NETLINK_, .nl_pad = 0,
                                    .nl_pid = 0, .nl_groups = 0 };
         if (user_write(name_addr, &nl, sizeof(nl))) return _EFAULT;
+        m.msg_namelen = sizeof(nl);
+    } else {
+        m.msg_namelen = 0;
     }
-    TRACE("NETLINK_STUB recvmsg -> %zd bytes\n", n);
-    return (int) off;
+    // Written back as Linux does: who it came from, no ancillary data, and
+    // MSG_TRUNC when the datagram did not fit.
+    m.msg_controllen = 0;
+    m.msg_flags = off < (size_t) n ? MSG_TRUNC_ : 0;
+    if (user_put(msghdr_addr, m)) return _EFAULT;
+    TRACE("NETLINK_STUB recvmsg flags=%#x -> %zd bytes (%zu copied)\n", flags, n, off);
+    // With MSG_TRUNC the caller asks for the real length of the datagram.
+    return (flags & MSG_TRUNC_) ? (int) n : (int) off;
 }
 
 static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
@@ -197,6 +302,17 @@ static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
     fd->socket.type = type & SOCKET_TYPE_MASK;
     fd->socket.protocol = protocol;
     fd->socket.netlink_peer_fd = sv[1];
+    fd->socket.netlink_groups = 0;
+    fd->socket.netlink_owe_done = false;
+    fd->socket.netlink_owe_seq = 0;
+    fd->socket.netlink_rcvtimeo_ms = 0;
+    // A full link + address dump is queued in one go, one message per
+    // datagram, and a host AF_UNIX datagram socket holds only a few
+    // kilobytes by default. Give the queue room; if the host refuses, the
+    // dump is cut short and ended properly (netlink_owe_done).
+    int space = 512 * 1024;
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &space, sizeof(space));
+    setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &space, sizeof(space));
     TRACE("NETLINK_STUB socket(AF_NETLINK, %d, %d) -> stub fd\n", type, protocol);
     fd_t f = f_install(fd, type & ~SOCKET_TYPE_MASK);
     if (f < 0) {
@@ -535,11 +651,14 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
-    // [STAGE-0 PROBE] netlink bind: accept and ignore. A real implementation
-    // would record nl_groups to decide which events to multicast; this stub
-    // never delivers events, so there is nothing to record.
+    // netlink bind: accepted. nl_groups is remembered for the log only: no
+    // event is ever multicast, so a subscribed reader simply waits (in
+    // bounded polls, see netlink_stub_dequeue).
     if (fd_is_netlink_stub(sock)) {
-        TRACE("NETLINK_STUB bind() accepted (nl_groups ignored, no events)\n");
+        struct sockaddr_nl_ nl = {0};
+        if (sockaddr_len >= sizeof(nl) && user_read(sockaddr_addr, &nl, sizeof(nl)) == 0)
+            sock->socket.netlink_groups = nl.nl_groups;
+        TRACE("NETLINK_STUB bind() accepted (nl_groups=%#x, no events are delivered)\n", sock->socket.netlink_groups);
         return 0;
     }
     struct sockaddr_max_ sockaddr;
@@ -851,9 +970,8 @@ int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, a
         return _EFAULT;
     buffer[len] = '\0';
     STRACE("sendto(%d, \"%.100s\", %d, %d, 0x%x, %d)", sock_fd, buffer, len, flags, sockaddr_addr, sockaddr_len);
-    // [STAGE-0 PROBE] a netlink request is answered synchronously with an
-    // empty dump; the reply is queued into the backing socketpair so the
-    // guest's following recvfrom/recvmsg picks it up through the normal path.
+    // A netlink request is answered as it is sent; the replies are queued
+    // for the guest's following read.
     if (fd_is_netlink_stub(sock)) {
         int nl = netlink_stub_reply(sock, buffer, len);
         free(buffer);
@@ -973,6 +1091,30 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
         if (user_get(sockaddr_len_addr, sockaddr_len))
             return _EFAULT;
 
+    // recv()/recvfrom() on a netlink fd: the same bounded read as recvmsg,
+    // and the peer is reported as a sockaddr_nl (the generic path would
+    // hand back the host socketpair's AF_UNIX address).
+    if (fd_is_netlink_stub(sock)) {
+        char nlbuf[NETLINK_STUB_DGRAM_MAX * 2];
+        ssize_t n = netlink_stub_dequeue(sock, flags, nlbuf, sizeof(nlbuf));
+        if (n < 0)
+            return (int) n;
+        size_t copy = (size_t) n < sizeof(nlbuf) ? (size_t) n : sizeof(nlbuf);
+        if (copy > len)
+            copy = len;
+        if (copy && user_write(buffer_addr, nlbuf, copy))
+            return _EFAULT;
+        if (sockaddr_addr != 0 && sockaddr_len_addr != 0) {
+            struct sockaddr_nl_ nl = { .nl_family = AF_NETLINK_ };
+            if (sockaddr_len >= sizeof(nl) && user_write(sockaddr_addr, &nl, sizeof(nl)))
+                return _EFAULT;
+            uint_t out_len = sizeof(nl);
+            if (user_put(sockaddr_len_addr, out_len))
+                return _EFAULT;
+        }
+        return (flags & MSG_TRUNC_) ? (int) n : (int) copy;
+    }
+
     char *buffer = malloc(len);
     char sockaddr[sockaddr_len];
 
@@ -1079,6 +1221,27 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     char value[value_len];
     if (user_read(value_addr, value, value_len))
         return _EFAULT;
+
+    // A netlink fd is a host socketpair: buffer sizes and SOL_NETLINK
+    // options (iproute2 sets SO_SNDBUF/SO_RCVBUF and gives up if they fail)
+    // mean nothing to it, so they are accepted and dropped. The receive
+    // timeout is kept, for the bounded read to honour (netlink_stub_dequeue).
+    // Both of Linux's numbers for it are taken: 20 is what a 64-bit guest's
+    // libc uses, 66 the newer 64-bit-time one.
+    if (fd_is_netlink_stub(sock)) {
+        if (level == SOL_SOCKET_ && (option == 20 || option == SO_RCVTIMEO_) && value_len >= 16) {
+            int64_t sec, usec;
+            memcpy(&sec, value, 8);
+            memcpy(&usec, value + 8, 8);
+            if (sec < 0 || usec < 0 || usec >= 1000000)
+                return _EDOM;
+            sock->socket.netlink_rcvtimeo_ms = (long) (sec * 1000 + usec / 1000);
+            // A timeout below a millisecond is still a timeout.
+            if (sock->socket.netlink_rcvtimeo_ms == 0 && (sec != 0 || usec != 0))
+                sock->socket.netlink_rcvtimeo_ms = 1;
+        }
+        return 0;
+    }
 
     // ICMP6_FILTER can only be set on real SOCK_RAW
     if (level == IPPROTO_ICMPV6 && option == ICMP6_FILTER_)
@@ -1436,7 +1599,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     if (sock == NULL)
         return _EBADF;
     if (fd_is_netlink_stub(sock))
-        return netlink_stub_recvmsg(sock, msghdr_addr);
+        return netlink_stub_recvmsg(sock, msghdr_addr, flags);
 
     // Read the guest msghdr struct into our internal 32-bit representation
     struct msghdr_ msg_fake;
@@ -1744,6 +1907,19 @@ static void sock_translate_err(struct fd *fd, int *err) {
 // except "host syscall got EINTR AND guest has a pending signal", which is
 // precisely the bug we need to fix.
 static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
+    // read() on a netlink fd is recv() with no flags: bounded, never a bare
+    // blocking read() of the backing socketpair.
+    if (fd_is_netlink_stub(fd)) {
+        char nlbuf[NETLINK_STUB_DGRAM_MAX * 2];
+        ssize_t n = netlink_stub_dequeue(fd, 0, nlbuf, sizeof(nlbuf));
+        if (n < 0)
+            return n;
+        size_t copy = (size_t) n < sizeof(nlbuf) ? (size_t) n : sizeof(nlbuf);
+        if (copy > size)
+            copy = size;
+        memcpy(buf, nlbuf, copy);
+        return (ssize_t) copy;
+    }
     int err;
     int eintr_count = 0;
     for (;;) {
@@ -1771,6 +1947,11 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
 }
 
 static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
+    // write()/writev() on a netlink fd is a request like any other (busybox
+    // `ip` sends its dump requests this way): answer it, do not push the
+    // bytes into the socketpair where nobody reads them.
+    if (fd_is_netlink_stub(fd))
+        return netlink_stub_reply(fd, buf, size);
     int err;
     int eintr_count = 0;
     for (;;) {

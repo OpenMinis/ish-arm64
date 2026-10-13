@@ -118,6 +118,25 @@ else
         echo "failed to build regress_fmov_imm" >&2
         status=1
     fi
+
+    # AF_NETLINK stub: no read blocks without bound; links and addresses are
+    # the host's; everything else is refused at once. The second run pins
+    # the ISH_NETLINK_ROUTE=empty switch (read from the host environment).
+    echo
+    echo "########## netlink stub ##########"
+    if "$CC_GUEST" -static -O0 -Wall -o "$GUEST_ROOT/tmp/regress_netlink_stub" \
+            tests/regress/regress_netlink_stub.c; then
+        out=$("$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_netlink_stub 2>/dev/null)
+        echo "$out"
+        echo "$out" | grep -Eq '^[0-9]+ passed, 0 failed$|^SKIP' || status=1
+        out=$(ISH_NETLINK_ROUTE=empty "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_netlink_stub route-empty "(d)" 2>/dev/null)
+        echo "$out"
+        echo "$out" | grep -Eq '^[0-9]+ passed, 0 failed$|^SKIP' || status=1
+        rm -f "$GUEST_ROOT/tmp/regress_netlink_stub"
+    else
+        echo "failed to build regress_netlink_stub" >&2
+        status=1
+    fi
 fi
 
 echo

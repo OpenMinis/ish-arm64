@@ -62,9 +62,16 @@ struct fd {
             uint8_t unix_name_len;
             char unix_name[108];
             struct fd *unix_peer; // locked by peer_lock, for simplicity
-            // [STAGE-0 PROBE] AF_NETLINK stub: the write end of the backing
-            // socketpair. -1 for every non-netlink socket. See fs/sock.c.
+            // AF_NETLINK stub: the write end of the backing socketpair
+            // (-1 for every non-netlink socket), the groups bind() asked
+            // for, and whether a dump whose replies did not all fit the
+            // queue is still owed its NLMSG_DONE, and the receive timeout.
+            // See fs/sock.c.
             int netlink_peer_fd;
+            uint32_t netlink_groups;
+            uint32_t netlink_owe_seq;
+            bool netlink_owe_done;
+            long netlink_rcvtimeo_ms; // SO_RCVTIMEO; 0 = wait
             cond_t unix_got_peer;
             // Queue of struct scm for sending file descriptors
             // locked by fd->lock

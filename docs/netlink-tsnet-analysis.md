@@ -794,3 +794,69 @@ ISH_NETLINK_STUB=1 ./build-arm64-release/ish -r alpine-arm64-321 /tmp/tsnetdemo
 
 原型代码在本分支 `fs/sock.c` / `fs/sock.h` / `fs/fd.h`，全部标了 `[STAGE-0 PROBE]`，
 **是实验脚手架，不是可合并的实现**。
+
+---
+
+## 8. 阶段 2 实施记录（2026-10-13）：真实接口 + 永不阻塞
+
+第 3.6 节的「阶段 2」已落地，同时修掉了桩默认开启（`2952b439`）之后的一个回归：
+`ip addr` 一类命令卡死。
+
+### 8.1 回归是什么
+
+桩只在 `sendto`/`sendmsg` 时生成回复，读端是对后备 socketpair 的裸阻塞 `read()`，
+忽略 `MSG_PEEK`/`MSG_DONTWAIT`/`O_NONBLOCK`。实测 busybox `ip addr` 的序列是：
+
+```
+socket(16, 3, 0) = 3
+bind(3, ..., 12) = 0
+getsockname(3, ...) = 0
+write(3, ..., 20) = 20        ← 用 write() 发请求，桩不应答
+recvmsg(3, ...)               ← 永远阻塞
+```
+
+第 5.5 节的风险评估写的是「默认关闭 → 低风险」，默认开启后没有重评；compat 套件里的
+`ip link ...; true` 只能靠宿主侧超时发现它。
+
+### 8.2 现在的行为
+
+| 请求 | 应答 |
+|---|---|
+| `RTM_GETLINK`（dump，或按 index / `IFLA_IFNAME` 取单个） | 宿主 `getifaddrs()` 的真实接口：名字（`lo0` 显示为 `lo`，其余原样）、flags、MTU、类型、硬件地址（宿主给什么报什么）、operstate |
+| `RTM_GETADDR`（dump，按 family 过滤） | 真实 IPv4/IPv6 地址、前缀长度、scope、broadcast/peer |
+| `RTM_GETROUTE` | `NLMSG_ERROR -EOPNOTSUPP`；`ISH_NETLINK_ROUTE=empty` 时恢复为空 dump |
+| 其它 `RTM_*`（neigh / rule / qdisc / 任何修改）、非 `NETLINK_ROUTE` 协议 | `NLMSG_ERROR -EOPNOTSUPP` |
+| 不带 `NLM_F_REQUEST` 的消息、控制消息 | 忽略（与 Linux 一致） |
+
+- 请求在**发送时**应答，`write`/`writev`/`send`/`sendto`/`sendmsg` 一视同仁。
+- 读端支持 `MSG_PEEK`、`MSG_TRUNC`、`MSG_DONTWAIT`、`O_NONBLOCK`、`SO_RCVTIMEO`，
+  回写 `msg_namelen`/`msg_flags`/`sockaddr_nl`；阻塞读是 1 s 一轮的有界 poll，
+  guest 信号随时可达。回复队列写满时 dump 以合成的 `NLMSG_DONE` 收尾，不会悬挂。
+- `/proc/net/dev` 与新增的 `/proc/net/if_inet6` 用同一份快照；仍然没有 `/proc/net/route`
+  （拿不到真实路由，不造假）。
+
+### 8.3 `RTM_GETROUTE` 为什么默认报错
+
+第 2.1 节「tsnet 不发 `RTM_GETROUTE`」只对 `tsnet.Server.Start()` 成立。实测
+**tailscaled v1.102.4 启动时会发一次 `RTM_GETROUTE` dump**（找默认路由）。对照
+（`--tun=userspace-networking --state=mem: --socket=@x`，同一二进制）：
+
+| | 修复前 | 修复后 route=error（默认） | 修复后 route=empty |
+|---|---|---|---|
+| `Engine created` / `got LocalBackend` | ✅ | ✅ | ✅ |
+| `link state` | `ifs={}` | 真实接口，`v4=true v6=true` | 同左 |
+| `control: ... awaiting unpause`（7.1 节的永久 pause） | 出现 | **不再出现** | **不再出现** |
+
+报错与空 dump 对 tailscaled 的启动没有可见差别（两者 `defaultRoute=` 都为空），
+而空 dump 会让 `ip route` 静默成功、被读成「没有路由」，所以默认取报错。
+登录流程（需要外网与账号）这次没有实测。
+
+### 8.4 没做的
+
+- `SIOCGIFCONF`/`SIOCGIFINDEX`/`SIOCGIFFLAGS` 等接口 ioctl 仍是 `ENOTTY`，所以
+  `ifconfig` 以及 busybox 的 `ip addr show dev <name>` 仍然失败（都是立即失败，不卡）。
+- 多播事件（`nl_groups`）不投递；订阅者等到信号或超时为止。
+- 真实路由表（`PF_ROUTE`）。
+
+回归测试：`tests/regress/regress_netlink_stub.c`（`tests/regress/run.sh` 会构建并运行），
+compat 套件里的 `Network|ip ...` 各行。

@@ -410,6 +410,25 @@ COMPAT_TESTS=(
     "Network|socat|socat -V >/dev/null 2>&1"
     "Network|ip|ip link 2>&1 | head -1 >/dev/null; true"
     "Network|ifconfig|ifconfig -a 2>&1 | head -1 >/dev/null; true"
+    # AF_NETLINK stub (fs/sock.c, fs/netlink.c). `ip` must answer from the
+    # host's real interfaces and must never hang: busybox ip sends its dump
+    # request with write(), which once got no reply at all, so `ip addr`
+    # blocked until the tool timeout. What the host cannot tell us (routes)
+    # must fail at once with an error, so `ip route || fallback` moves on.
+    # How a row fails here: this suite judges a row by its host-side timeout
+    # (the command-line iSH does not pass the guest's exit status on), so a
+    # hang is caught as it is, and a wrong answer ends in `sleep 30` to
+    # overrun the timeout too. No guest-side `timeout`: busybox's, run as the
+    # last command of the command-line iSH, takes the whole emulator down
+    # with SIGTERM two seconds later, whatever it ran.
+    "Network|ip addr (real, no hang)|ip addr 2>/dev/null | grep -q 'lo:.*LOOPBACK' || { sleep 30; false; }"
+    "Network|ip link (real, no hang)|ip link 2>/dev/null | grep -q 'link/loopback' || { sleep 30; false; }"
+    "Network|ip -4 addr has 127.0.0.1|ip -4 addr 2>/dev/null | grep -q 'inet 127.0.0.1/8' || { sleep 30; false; }"
+    "Network|ip route fails fast|ip route >/dev/null 2>&1; [ \$? -ne 0 ] || { sleep 30; false; }"
+    "Network|ip route error text|ip route 2>&1 | grep -qi 'RTNETLINK answers' || { sleep 30; false; }"
+    "Network|ip addr, then fallback|{ ip addr || echo FALLBACK; } 2>/dev/null | grep -q 'lo:' || { sleep 30; false; }"
+    "Network|ip route, then fallback|{ ip route 2>/dev/null || echo FALLBACK; } | grep -q FALLBACK || { sleep 30; false; }"
+    "Network|/proc/net/dev has lo|grep -q '^ *lo:' /proc/net/dev || { sleep 30; false; }"
     "Network|openssl|openssl version >/dev/null 2>&1"
     # 9. Version Control (5)
     "VCS|git|git --version >/dev/null 2>&1"
