@@ -3,6 +3,22 @@
 
 #define REP_LIST once,rep,repnz
 
+// CF is in cpu->cf (collapse_flags() puts it into eflags)
+.gadget cmc
+    ldrb w8, [_cpu, #CPU_cf]
+    eor w8, w8, #1
+    strb w8, [_cpu, #CPU_cf]
+    gret
+
+.gadget clc
+    strb wzr, [_cpu, #CPU_cf]
+    gret
+
+.gadget stc
+    mov w8, #1
+    strb w8, [_cpu, #CPU_cf]
+    gret
+
 .gadget cld
     ldr w8, [_cpu, #CPU_eflags]
     bic w8, w8, #DF_FLAG

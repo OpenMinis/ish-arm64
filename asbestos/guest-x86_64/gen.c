@@ -393,6 +393,9 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
 #define PUSHF() g(pushf)
 #define POPF() g(popf)
 #define SAHF g(sahf)
+#define CMC g(cmc)
+#define CLC g(clc)
+#define STC g(stc)
 #define CLD g(cld)
 #define STD g(std)
 

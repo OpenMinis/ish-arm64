@@ -2,6 +2,19 @@
 
 #define REP_LIST once,rep,repnz
 
+// CF is in cpu->cf (collapse_flags() puts it into eflags)
+.gadget cmc
+    xorb $1, CPU_cf(%_cpu)
+    gret
+
+.gadget clc
+    movb $0, CPU_cf(%_cpu)
+    gret
+
+.gadget stc
+    movb $1, CPU_cf(%_cpu)
+    gret
+
 .gadget cld
     andl $~DF_FLAG, CPU_eflags(%_cpu)
     gret
