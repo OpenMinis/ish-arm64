@@ -55,7 +55,8 @@ paths), looking the TLB up instead of predicting the page, for all accesses or b
 that decide that for themselves in their miss path, and a larger site table (18), a second
 tier that re-translates hot blocks with what the first translation counted (19), sites shared
 by base register (20), another build of the guest's Python (21), an inline indirect dispatch
-with half the instructions (22), a return stack on the host's (23).
+with half the instructions (22), a return stack on the host's (23), guest memory in a host
+window checked through a software page map (24).
 
 Against a native CPython on the same machine everyday Python is 4-7x slower (15); most of that
 is translated code, and the largest part of it that is not the guest's own work is the page
@@ -65,7 +66,8 @@ Open:
 - What is left is memory (23, last paragraph): every access is a page check and an address the
   host cannot rename, 2-6x of native per access; calls are mostly that. Returns through the
   host's return stack gave nothing, and translating across the fall-through of a branch would
-  give about 2%. The remaining lever is guest memory at a fixed offset from the host's.
+  give about 2%. The remaining lever is guest memory at a fixed offset from the host's, with
+  the host's page protection instead of any check (24: what was measured for it, and its size).
 - node start-up has no single hot spot; every start compiles each block twice (gadgets, then
   native after four runs). Only the pre-linked image would remove that (not planned).
 - Floating point arithmetic ignores the guest's MXCSR rounding mode (always to nearest) and
@@ -855,6 +857,54 @@ is memory: 2-3x for a load, 3.5x for push and pop, 6x for a read-modify-write, b
 access is a check and an address the host cannot rename, and calls (6x) are mostly their two
 stack accesses and fifty instructions. Past this the lever is guest memory at a fixed offset
 from the host's, and nothing smaller.
+
+### 24. Guest memory at a fixed offset, phase 0: a software page map is slower; what is not (2026-10-13)
+
+The guest's address space is already in the low 4 GB (stack at 0xffffe000, mmap below it), so a
+window is cheap: ISH_LINEAR=1 reserved 4 GB of host address space per address space and put
+private memory at window + guest address (anonymous memory there directly, private file
+mappings copied in; after a fork the parent's window froze, since the child has its pages).
+Translated code tried the window first: a byte per page said "this page and the next are in the
+window, readable / writable" (filled as the TLB is, emptied when mappings change), and on a set
+bit the access added the window's base without touching a site or the TLB; otherwise the site
+check as before. Correct (difftest, sites, spgroup, flags, Python, pip, subprocesses), and
+nearly every access took the window (pip: lookups after a failed site check 50e6 -> 0.8e6).
+
+Cycles against 63d52337 (least of 5): py.pip_list 0.84, py.import 0.91, py.script 1.00, py.loop
+1.03, py.start 1.10, node.json 1.18, sh.sed_awk 1.21, build.gcc 1.24, proc.pipe 1.25, sh.grep_r
+1.35, node.start 1.38, proc.forkexec 1.54; geomean of 14: 1.14. Kernels (micro2.c): load 0.47 ->
+0.64 ns, push and pop 0.65 -> 1.05. The large heap gains what it gains from anything that stops
+using a table entry per site; everything else pays for the check and for the prototype's
+copies at exec. Not kept.
+
+Why the check is slow, and what is not: benchmark/daily/checklab.c, native on the test machine,
+the same load and the same push/pop pair behind each kind of check (ns per iteration):
+
+| check before the access | load | push + pop |
+|---|---:|---:|
+| none: the native instruction | 0.205 | 0.204 |
+| none, but through base + address | 0.203 | 0.252 |
+| is the address under 4 GB (`mov %r13d, %r15d; cmp; jne`, or `test` with a mask) | 0.208 | 0.33-0.42 |
+| the same with `shr $32` | 0.41 | 0.72 |
+| the site check, as now | 0.303 | 0.638 (0.495 as a group) |
+| the page map: shift, compare, byte test | 0.51-0.81 | 0.96-1.27 |
+
+Any check that shifts the address to index a table costs a cycle or more here; the site check
+costs half a cycle; a bare range test costs nothing. So the window pays only if nothing is
+looked up at all: the host's own page protection does the checking, and an access to a page
+that is not there (or not writable, or not in the window) is a host fault that goes to the slow
+path. Measured on this machine for that: a handled access violation takes 1.2 us; Windows maps
+a view of a section into a placeholder at 4K granularity (VirtualAlloc2 / MapViewOfFile3: a 4K
+view at a 4K offset worked), and a second, copy-on-write view of the same pages behaves as a
+fork needs.
+
+That is the design that is left, and its size: guest memory as views of sections in a
+placeholder window (anonymous memory on the page file, files directly), fork as copy-on-write
+views in the child's window, mprotect mirrored on the host, a vectored handler that takes a
+fault in translated code to that access's slow path, and translated accesses with only the
+range test. Per access it saves 0.1 ns on a load and 0.3 ns on a push/pop pair against today,
+on 2.4e9 accesses in the Python loop's 2.3 s: an estimated 10-20% for code like that, more
+where the stack dominates, plus what a large heap gains (16% above).
 
 ## Compatibility suite on Windows (2026-10-12)
 
