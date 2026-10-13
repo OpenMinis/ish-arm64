@@ -51,16 +51,21 @@ it 0.85 us, a cache hit 4.2 us; the ceiling of a pre-linked image would be 23-30
 command and about 7% of a long one, for days of work on the fault, invalidation and chaining
 paths), looking the TLB up instead of predicting the page, for all accesses or by a fixed rule
 (17: a large heap gains 10-15%, tight loops lose as much; an experimental switch), access sites
-that decide that for themselves in their miss path, and a larger site table (18).
+that decide that for themselves in their miss path, and a larger site table (18), a second
+tier that re-translates hot blocks with what the first translation counted (19), sites shared
+by base register (20), another build of the guest's Python (21), an inline indirect dispatch
+with half the instructions (22).
 
 Against a native CPython on the same machine everyday Python is 4-7x slower (15); most of that
 is translated code, and the largest part of it that is not the guest's own work is the page
 check before each memory access.
 
 Open:
-- Programs with a large heap would gain 10-15% from accesses that look the TLB up directly where
-  their page keeps changing; that takes re-translating hot blocks with what their miss paths
-  measured (18, last paragraph).
+- The translator is where a block-at-a-time design with checked memory ends up (22): what is
+  left are a taken jump per six-instruction block, returns and indirect jumps the host cannot
+  predict as such, and per-access page checks. Past a few percent each, the next steps are
+  structural: returns through the host's return stack, translating across the fall-through of
+  a branch, guest memory at a fixed offset from the host's.
 - node start-up has no single hot spot; every start compiles each block twice (gadgets, then
   native after four runs). Only the pre-linked image would remove that (not planned).
 - Floating point arithmetic ignores the guest's MXCSR rounding mode (always to nearest) and
@@ -689,6 +694,101 @@ directly (the block is invalidated like one whose code was written to; requests 
 an invalidation empties every thread's block cache). Hot blocks only, a few thousand per
 program. Not done: it is a second tier with its own failure modes, and the gain is the 10-15%
 of section 17 for programs with a large heap, without its losses.
+
+### 19. A second tier, three ways: correct, no gain, not committed (2026-10-13)
+
+Built what the last paragraph of 18 asked for. A block's first translation counts its runs at
+its entry (a word in its data that wraps after 1024) and, in every access's miss path, its
+misses; then INT_XJIT_TIER2 takes it to the run loop, which either moves the entry past the
+count or translates the block again (the old code stays until the block is freed, unlinked so
+that it leaves through the stream; callers are linked to the new entry). Correct: difftest in
+six configurations, spgroup, sites, sse, agent 18/18.
+
+- Accesses that missed in 15% of the runs or more look the TLB up inline in the second
+  translation. Lookups after a failed check fell as designed (loop 175e6 -> 14e6, `pip --version`
+  50e6 -> 14e6; python -c pass translates 446 blocks again and lets 929 stop counting). Cycles
+  (least of 5): geomean 1.00-1.02 over 11 cases, py.import 1.02-1.04, py.pip_list 1.00-1.06,
+  py.loop 0.97-1.00. Removing 70-90% of the mispredicted checks buys nothing.
+- The other way round: every access looks up directly in the first translation and gets its
+  site once the block has run 1024 times. py.pip_list 1.05, py.import 1.03, py.loop 0.94:
+  nothing of the 0.80-0.86 that direct lookups everywhere give those two.
+
+So what 17 gains on a large heap is neither the mispredictions nor the cold blocks. The next
+experiment says what it is.
+
+### 20. Sites shared by base register: the site table's cache footprint (not committed)
+
+`pip` runs tens of thousands of sites, 16 bytes of per-thread table each, and the page's
+data_minus_addr that the access adds to its address is loaded from there: the table does not fit
+the first-level cache, and every access waits for its entry. A TLB entry is per page, and the
+pages in use are few. To see it: all rsp-relative accesses share one site entry (s1), or all
+accesses through the same base register do (s2). Lookups after a failed check, `pip --version`:
+51e6, 56e6, 74e6; loop: 165e6, 195e6, 544e6. Cycles (least of 5):
+
+| case | stack shares (s1) | every base register shares (s2) |
+|---|---:|---:|
+| py.pip_list | 0.94 | 0.90 |
+| py.import | 0.95 | 0.95 |
+| py.start | 0.97 | 0.98 |
+| py.loop | 0.97 | 1.16 |
+| py.script | 1.02 | 1.09 |
+| node.json | 1.04 | 1.05 |
+| proc.pipe | 1.05 | 1.05 |
+| sh.sed_awk | 1.00 | 0.98 |
+| geomean of 8 | 0.99 | 1.02 |
+
+More misses and still faster where there are many sites: the footprint is the cost there. But a
+shared entry misses more, and where the sites are few (a loop) that is all it does. Within
+this scheme (a predicted page per site, checked) the two pull against each other, and nothing
+tried gets both; s1 alone is 1% over the suite. Left out.
+
+### 21. Is it Alpine's Python? No
+
+python-build-standalone's CPython 3.12.15 for x86_64 musl (clang, PGO and LTO), unpacked beside
+Alpine's 3.12.15 (gcc) in the rootfs, both under ish, cycles (least of 5): loop 7.60 against
+8.52 (0.89), nine imports 2.43 against 2.77 (0.88), strings 1.53 against 1.61, the JSON and
+regex script 9.62 against 8.87 (1.08), `-c pass` 0.56 against 0.61. Another build of the guest
+Python moves things by ten percent either way; the factor to native is ish's.
+
+### 22. What costs how much: micro kernels, and a leaner indirect dispatch (not committed)
+
+benchmark/daily/micro.c, the same source built natively (clang -O2) and as a guest (gcc -O2),
+seconds on the Windows test machine:
+
+| kernel | native | ish | ish / native |
+|---|---:|---:|---:|
+| registers only | 0.744 | 0.771 | 1.04 |
+| pointer chase on one page | 0.316 | 0.330 | 1.04 |
+| pointer chase, another page every step (cache misses) | 4.84 | 7.21 | 1.5 |
+| switch in a loop (a jump through a table) | 1.18 | 1.85 | 1.6 |
+| fields of a stack frame and a heap object | 0.180 | 0.324 | 1.8 |
+| calls through a table of four functions | 0.640 | 2.48 | 3.9 |
+| recursive fib (clang turns half the calls into a loop) | 0.079 | 0.298 | 3.8 |
+| a loop over an array (clang vectorizes it, gcc -O2 does not) | 0.050 | 0.266 | 5.3 |
+
+Arithmetic and a predicted memory access cost nothing. Calls, returns and indirect jumps cost a
+factor of four each, memory accesses that cannot be grouped about 1.5-2. And the Python loop
+(ISH_XLAT_SITESTATS, with counters per branch kind for this): 5.9e9 guest instructions in 0.98e9
+block runs (six instructions a block), 2.36e9 page checks, 109e6 indirect jumps, 50e6 indirect
+calls, 34e6 direct calls, 84e6 returns, 8.5e9 cycles: 1.4 cycles per guest instruction.
+
+Tried on that: the inline lookup of an indirect jump, call or uncached return was 26
+instructions (a pending-interrupt check, the timer tick's count, the block cache's generation
+through three pointers, a hash, the block, its address, its stream). Made 13: a count-down in
+the frame for the tick, the generation through one pointer, and a per-thread table of {guest
+address, stream} in one cache line that fiber_ret_lookup fills. Kernels: switch 1.99 -> 1.73 s,
+calls through a table 2.29 -> 2.14 s. The daily cases, nine interleaved runs, cycles: pipe 1.006,
+py.loop 1.008, py.script 0.998, py.pip_list 1.001, node.json 0.985, sed/awk 0.963, with the same
+build against itself at 0.991-0.997. Nothing in the Python cases for half the instructions of
+159e6 dispatches.
+
+That, 16's 13% fewer checks for 1% and 19 say the same thing: in these programs the host is not
+short of instruction throughput. What is left is what a block-at-a-time translator with checked
+memory is made of: a taken jump at the end of every six-instruction block (the fall-through of
+a guest branch is a jump to another block), returns and indirect jumps that the host predicts
+as indirect jumps and resolves late (a return is a load from the guest stack, a table lookup, a
+compare and a jump through the block's stream before the host knows where it goes; natively it
+is predicted by the return stack), and an address that every memory access has to add to.
 
 ## Compatibility suite on Windows (2026-10-12)
 
