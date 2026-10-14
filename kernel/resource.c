@@ -245,6 +245,19 @@ dword_t sys_getrusage(dword_t who, addr_t rusage_addr) {
     return 0;
 }
 
+// Which CPU and NUMA node the caller runs on: guest threads are not pinned,
+// so the first of each. (Without the call the JVM, for one, falls back to
+// the vsyscall page at 0xffffffffff600800, which is not there.)
+int_t sys_getcpu(addr_t cpu_addr, addr_t node_addr, addr_t tcache_addr) {
+    (void) tcache_addr;
+    dword_t zero = 0;
+    if (cpu_addr != 0 && user_put(cpu_addr, zero))
+        return _EFAULT;
+    if (node_addr != 0 && user_put(node_addr, zero))
+        return _EFAULT;
+    return 0;
+}
+
 int_t sys_sched_getaffinity(pid_t_ pid, dword_t cpusetsize, addr_t cpuset_addr) {
     STRACE("sched_getaffinity(%d, %d, %#x)", pid, cpusetsize, cpuset_addr);
     if (pid != 0) {

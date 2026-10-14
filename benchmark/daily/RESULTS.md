@@ -956,6 +956,26 @@ installed.)
 - 1418c8c0: `rm -rf` left files behind in directories of more than ~50 entries (seekdir after
   getdents recounted entries and skipped past deleted ones).
 
+## Java (2026-10-14)
+
+`java` did not start in the x86_64 guest: OpenJDK 17 (Alpine's openjdk17-jdk) died in three
+places, one after the other.
+
+- getcpu (syscall 309) was a stub; HotSpot then calls the vsyscall page at 0xffffffffff600800,
+  which is not mapped: SIGSEGV. Now implemented (CPU 0, node 0).
+- CPUID leaf 1 said family 0. HotSpot reads feature bits only of family 5 and later, so "SSE2
+  not supported". The x86_64 guest now reports family 6 model 0x2c (Westmere, the generation
+  that has the advertised features and no AVX).
+- No clflush bit: HotSpot's guarantee fails. The instruction was decoded already (as nothing:
+  writes to code are noticed anyway); the bit and the line size are reported now.
+
+With those: `java -version` 1.2 s, `javac Hello.java` 19.8 s, a small program (streams, a
+HashMap, a thread) 6.5 s with the JVM's compilers and 25.7 s with -Xint, same output, 5 runs of
+5. Checks: difftest in six configurations and the gadget build, agent 18/18, compat suite on
+Windows 226/232 as before. Cost: with the family and clflush both reported, py.pip_list takes
+4% more cycles (7 interleaved runs in one binary: 1.043; either alone 1.00), node.start 1%:
+some library takes another path for the CPU it now sees; the other cases are within noise.
+
 ## Known issues
 
 

@@ -43,6 +43,12 @@ static inline void do_cpuid(dword_t *eax, dword_t *ebx, dword_t *ecx, dword_t *e
             *eax = 0x0; // say nothing about cpu model number
             *ebx = 0x0; // processor number 0, flushes 0 bytes on clflush
 #ifdef GUEST_X86_64
+            // Family 6, model 0x2c, stepping 2 (Westmere: the generation with
+            // the features below and no AVX). Family 0 is "older than a
+            // Pentium" to software that looks: the JVM reads no feature bit
+            // of such a CPU and gives up ("SSE2 not supported").
+            *eax = 0x000206c2;
+            *ebx = 8 << 8; // clflush works on 64 bytes
             // x86-64-v2 (what bun and claude's native build require)
             *ecx = (1 << 0) // sse3
                 | (1 << 9) // ssse3
@@ -58,6 +64,7 @@ static inline void do_cpuid(dword_t *eax, dword_t *ebx, dword_t *ecx, dword_t *e
 #ifdef GUEST_X86_64
                 | (1 << 4) // tsc
                 | (1 << 8) // cmpxchg8b
+                | (1 << 19) // clflush (decoded, does nothing: writes to code are noticed anyway)
 #endif
                 | (1 << 15) // cmov
                 | (1 << 23) // mmx
