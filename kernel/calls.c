@@ -248,6 +248,8 @@ void handle_interrupt(int interrupt) {
         }
         // Update deadlock detection state.
         atomic_fetch_add(&current->group->syscall_count, 1);
+        // [T-ish-freeze-watch] Process-wide, readable without pids_lock.
+        atomic_fetch_add_explicit(&ish_guest_syscalls, 1, memory_order_relaxed);
         // Update last_unblocked_ns for non-blocking syscalls only.
         // Blocking calls (futex, epoll, ppoll, waitid, nanosleep) that
         // return and retry should NOT refresh the timestamp, as they

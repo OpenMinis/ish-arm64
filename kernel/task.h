@@ -265,6 +265,13 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 // [T-ish-cpu-top] Successful fork/clone count (kernel/fork.c), for host diagnostics.
 extern _Atomic uint64_t ish_guest_forks;
 
+// [T-ish-freeze-watch] Lock-free progress counters for the host's freeze
+// detector (kernel/freeze_watch.h): every completed syscall, and guest
+// processes (thread groups) created and not yet reaped. Relaxed atomics only;
+// readers must never need a kernel lock to see them.
+extern _Atomic uint64_t ish_guest_syscalls;
+extern _Atomic int64_t ish_live_guest_procs;
+
 // [T-ish-fork-rate] Global fork-rate governor: a token bucket that every
 // non-thread clone() draws from. When it is empty, heavy forkers sleep until
 // their token arrives (never denied, only delayed); light forkers (see

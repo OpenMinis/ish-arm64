@@ -551,6 +551,7 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
     task_leave_session(task);
     list_remove(&task->group->pgroup);
     free(task->group);
+    atomic_fetch_sub_explicit(&ish_live_guest_procs, 1, memory_order_relaxed);   // [T-ish-freeze-watch]
 
     task_destroy(task);
     return true;
