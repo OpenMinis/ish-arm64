@@ -522,6 +522,21 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
             saved_errno = errno;  // save immediately before anything clobbers it
         } while (saved_errno == EINTR && sockrestart_should_restart_listen_wait());
         current->blocking = false;
+        // [T-ish-leaked-thread-poll] If do_exit_group's safety valve leaked
+        // this thread while it slept, its group is torn down (NULL, or freed
+        // memory): every branch below dereferences current->group, and the
+        // idle check does so holding pids_lock. A fault there parks the thread
+        // in jit_crash_handler with pids_lock held and no fork ever completes
+        // again (2026-10-14, gh's netpoller in epoll_pwait). Leave now; the
+        // post-syscall guard ends the thread.
+        if (task_orphaned(current)) {
+            lock(&poll_->lock);
+            list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
+                sockrestart_end_listen_wait(poll_fd->fd);
+            }
+            res = _EINTR;
+            break;
+        }
         // Only update last_unblocked_ns when actual events were received.
         // Timeout returns (err==0) don't count as real progress — the poll_wait
         // loop is just cycling. This prevents the deadlock detector from being

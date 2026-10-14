@@ -714,6 +714,13 @@ retry:
         }
     }
     current->blocking = false;
+    // [T-ish-leaked-thread-poll] Same hazard as poll_wait: a thread leaked by
+    // do_exit_group's safety valve while it slept here would go on to rescan
+    // current->group (freed) with pids_lock held. Bail out; `error` unlocks.
+    if (task_orphaned(current)) {
+        err = _EINTR;
+        goto error;
+    }
     {
         // Update last_progress_ns: waitpid is actively polling for a child,
         // this is real work (not a stuck thread). Prevents the poll_wait

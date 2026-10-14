@@ -246,6 +246,17 @@ static inline bool task_is_leader(struct task *task) {
     return task->group->leader == task;
 }
 
+// [T-ish-leaked-thread-poll] True once do_exit_group's safety valve has given
+// up on this thread (it sets `exiting` and unlinks it from the group), or once
+// task_destroy has zeroed the struct under it (group == NULL). Such a thread's
+// group, sighand and files are gone or about to be freed, so a wait loop that
+// wakes up must leave before touching any of them: return to the syscall
+// dispatcher, whose post-syscall guard (calls.c) pthread_exits the thread.
+// Only valid for `current`: no other thread may be leaked while it runs.
+static inline bool task_orphaned(struct task *task) {
+    return task->exiting || task->group == NULL;
+}
+
 struct pid {
     dword_t id;
     struct task *task;

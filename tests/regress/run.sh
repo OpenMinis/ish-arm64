@@ -137,6 +137,23 @@ else
         echo "failed to build regress_netlink_stub" >&2
         status=1
     fi
+
+    # A process exiting while its other threads wait in epoll_wait must leave
+    # the kernel able to fork. On a fast idle host the safety valve rarely
+    # leaks anything, so this passing here is necessary, not sufficient; the
+    # leak path itself is exercised on a loaded device (see README).
+    echo
+    echo "########## leaked thread exit ##########"
+    if "$CC_GUEST" -static -O0 -Wall -pthread -o "$GUEST_ROOT/tmp/regress_leaked_thread_exit" \
+            tests/regress/regress_leaked_thread_exit.c; then
+        out=$(timeout 300 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_leaked_thread_exit 10 8 16 2>/dev/null | tail -1)
+        echo "$out"
+        echo "$out" | grep -q '^PASS' || status=1
+        rm -f "$GUEST_ROOT/tmp/regress_leaked_thread_exit"
+    else
+        echo "failed to build regress_leaked_thread_exit" >&2
+        status=1
+    fi
 fi
 
 echo
