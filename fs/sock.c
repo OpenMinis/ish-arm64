@@ -314,12 +314,9 @@ static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
     setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &space, sizeof(space));
     setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &space, sizeof(space));
     TRACE("NETLINK_STUB socket(AF_NETLINK, %d, %d) -> stub fd\n", type, protocol);
-    fd_t f = f_install(fd, type & ~SOCKET_TYPE_MASK);
-    if (f < 0) {
-        close(sv[0]);
-        close(sv[1]);
-    }
-    return f;
+    // [T-ish-host-fd-double-close] A failed f_install() has closed fd, and
+    // sock_close() with it both sv[0] (real_fd) and sv[1] (netlink_peer_fd).
+    return f_install(fd, type & ~SOCKET_TYPE_MASK);
 }
 
 static bool fd_is_netlink_stub(struct fd *fd) {
@@ -329,10 +326,16 @@ static bool fd_is_netlink_stub(struct fd *fd) {
 
 static lock_t peer_lock = LOCK_INITIALIZER;
 
+// [T-ish-host-fd-double-close] Owns sock_fd from here on: on any failure it is
+// already closed (f_install() closes the fd it could not install, and with it
+// real_fd). Callers used to close() it again, which closes whatever the app
+// opened under that number in between.
 static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     struct fd *fd = adhoc_fd_create(&socket_fdops);
-    if (fd == NULL)
+    if (fd == NULL) {
+        close(sock_fd);
         return _ENOMEM;
+    }
     fd->stat.mode = S_IFSOCK | 0666;
     fd->real_fd = sock_fd;
     fd->socket.domain = domain;
@@ -377,10 +380,7 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     }
 #endif
 
-    fd_t f = sock_fd_create(sock, domain, type, protocol);
-    if (f < 0)
-        close(sock);
-    return f;
+    return sock_fd_create(sock, domain, type, protocol);
 }
 
 static void inode_release_if_exist(struct inode_data *inode) {
@@ -774,17 +774,24 @@ int_t sys_accept(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
         return errno_map();
 
     if (sockaddr_addr != 0) {
+        // [T-ish-host-fd-double-close] Neither failure may leak the accepted
+        // host socket, and the first used to hand the HOST fd number to the
+        // guest as if it were the result.
         int err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
-        if (err < 0)
-            return client;
-        if (user_put(sockaddr_len_addr, sockaddr_len))
-            return _EFAULT;
+        if (err >= 0 && user_put(sockaddr_len_addr, sockaddr_len))
+            err = _EFAULT;
+        if (err < 0) {
+            close(client);
+            return err;
+        }
     }
 
     fd_t client_f = sock_fd_create(client,
             sock->socket.domain, sock->socket.type, sock->socket.protocol);
+    // [T-ish-host-fd-double-close] client is closed already; going on used to
+    // f_get() the negative number below and write through the NULL fd.
     if (client_f < 0)
-        close(client);
+        return client_f;
 
     if (sock->socket.domain == AF_LOCAL_) {
         lock(&peer_lock);
@@ -928,10 +935,14 @@ int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sock
 
     lock(&peer_lock);
     int fake_sockets[2];
+    // [T-ish-host-fd-double-close] Each host end is closed exactly once: by
+    // sock_fd_create() when it fails, by sys_close() once it is installed,
+    // and here only while it has no guest fd yet.
     err = fake_sockets[0] = sock_fd_create(sockets[0], domain, type, protocol);
     if (fake_sockets[0] < 0) {
         unlock(&peer_lock);
-        goto close_sockets;
+        close(sockets[1]);
+        return err;
     }
     err = fake_sockets[1] = sock_fd_create(sockets[1], domain, type, protocol);
     if (fake_sockets[1] < 0) {
@@ -955,9 +966,6 @@ close_fake_1:
     sys_close(fake_sockets[1]);
 close_fake_0:
     sys_close(fake_sockets[0]);
-close_sockets:
-    close(sockets[0]);
-    close(sockets[1]);
     return err;
 }
 

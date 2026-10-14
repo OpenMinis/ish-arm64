@@ -1,6 +1,7 @@
 #include "kernel/task.h"
 #include <string.h>
 #include <poll.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <time.h>
@@ -267,8 +268,14 @@ void poll_cleanup_fd(struct fd *fd) {
             real_poll_update(&poll_fd->poll->real, fd->real_fd, 0, poll_fd);
         list_remove(&poll_fd->polls);
         list_remove(&poll_fd->fds);
-        unlock(&poll_fd->poll->lock);
+        // [T-ish-poll-member-race] poll_fd_free() links it onto the poll's
+        // freelist: that list belongs to poll->lock like every other one.
+        // Freed after the unlock, two member fds closing at once (or a
+        // concurrent poll_add_fd taking from the freelist) rewrote the same
+        // list without a lock.
+        struct poll *poll = poll_fd->poll;
         poll_fd_free(poll_fd);
+        unlock(&poll->lock);
     }
     unlock(&fd->poll_lock);
 }
@@ -683,13 +690,32 @@ int poll_spin_control(const char *cmd, size_t len) {
 }
 
 void poll_destroy(struct poll *poll) {
+    // [T-ish-poll-member-race] A member fd's last close can run at the same
+    // time: poll_cleanup_fd() holds fd->poll_lock, takes poll->lock, unlinks
+    // its poll_fd and moves it to the freelist. Walking the members without
+    // poll->lock raced it - both sides unlinked the same poll_fd (one of them
+    // through the 0xba fill) and it was freed twice, once per list, which is
+    // host heap corruption. Hold poll->lock; the usual order is fd->poll_lock
+    // first, so take each member's with trylock and back off on contention.
+    // A poll_fd still on poll_fds under poll->lock means its fd has not
+    // finished poll_cleanup_fd(), so poll_fd->fd is still alive here.
     struct poll_fd *poll_fd;
     struct poll_fd *tmp;
-    list_for_each_entry_safe(&poll->poll_fds, poll_fd, tmp, fds) {
-        lock(&poll_fd->fd->poll_lock);
+    for (;;) {
+        lock(&poll->lock);
+        if (list_empty(&poll->poll_fds))
+            break;
+        poll_fd = list_first_entry(&poll->poll_fds, struct poll_fd, fds);
+        struct fd *fd = poll_fd->fd;
+        if (trylock(&fd->poll_lock) != 0) {
+            unlock(&poll->lock);
+            sched_yield();
+            continue;
+        }
         list_remove(&poll_fd->polls);
         list_remove(&poll_fd->fds);
-        unlock(&poll_fd->fd->poll_lock);
+        unlock(&fd->poll_lock);
+        unlock(&poll->lock);
         free(poll_fd);
     }
 
@@ -697,6 +723,7 @@ void poll_destroy(struct poll *poll) {
         list_remove(&poll_fd->fds);
         free(poll_fd);
     }
+    unlock(&poll->lock);
 
     real_poll_close(&poll->real);
     free(poll);

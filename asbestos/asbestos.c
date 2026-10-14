@@ -31,6 +31,12 @@
 // total execution time). The signal handler writes crash info directly
 // to cpu_state via the _cpu pointer (x1) from ucontext.
 __thread volatile sig_atomic_t in_jit;
+// [T-ish-jit-recovery-frame-check] The frame fiber_enter() runs on while
+// in_jit is set. Gadgets keep it in x1 (_cpu), but the C helpers they call
+// (tlb_handle_miss, mem_ptr, malloc below them) reuse x1 for arguments: a
+// host fault there must not be "recovered" by writing through x1. The app's
+// signal handler recovers only when x1 equals this.
+__thread void *volatile jit_frame;
 _Atomic uint64_t s_dispatch_iterations = 0;
 _Atomic uint64_t st_block_cache_miss = 0, st_block_compile = 0, st_chain_attempts = 0;
 _Atomic uint64_t st_int_poke = 0, st_int_poke_foreign = 0, st_int_cycle = 0, st_poke_calls = 0;
@@ -1090,12 +1096,14 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 atomic_fetch_add_explicit(&s_dispatch_iterations, 1, memory_order_relaxed);
         }
 
+        jit_frame = frame;
         in_jit = 1;
 #ifdef ISH_JIT
         jit_exec_ready();
 #endif
         interrupt = fiber_enter(block, frame, tlb);
         in_jit = 0;
+        jit_frame = NULL;
 #ifdef GUEST_ARM64
         frame->cpu.segfault_precise_pc = 0;
         if (interrupt == INT_GPF)

@@ -156,6 +156,18 @@ struct fd *f_get(fd_t f) {
     return fd;
 }
 
+// [T-ish-poll-member-race] f_get() plus a reference taken while files->lock
+// is still held, so a concurrent close() of the number cannot free the fd
+// while the caller uses it. Release with fd_close().
+struct fd *f_get_retained(fd_t f) {
+    lock(&current->files->lock);
+    struct fd *fd = fdtable_get(current->files, f);
+    if (fd != NULL)
+        fd_retain(fd);
+    unlock(&current->files->lock);
+    return fd;
+}
+
 static fd_t f_install_start(struct fd *fd, fd_t start) {
     assert(start >= 0);
     struct fdtable *table = current->files;
