@@ -94,6 +94,11 @@ int err_map(int err) {
         ERRCASE(EDQUOT)
     }
 #undef ERRCASE
+#if EWOULDBLOCK != EAGAIN
+    // Windows: Winsock's WSAEWOULDBLOCK becomes EWOULDBLOCK (140), not EAGAIN
+    if (err == EWOULDBLOCK)
+        return _EAGAIN;
+#endif
     printk("unknown error %d\n", err);
     return -(err | 0x1000);
 }

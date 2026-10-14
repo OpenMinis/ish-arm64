@@ -298,7 +298,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     if (vdso_page == BAD_PAGE)
         goto beyond_hope;
     vdso_page += 1;
-    if ((err = pt_map(current->mem, vdso_page, vdso_pages, (void *) vdso_data, 0, 0)) < 0)
+    if ((err = pt_map(current->mem, vdso_page, vdso_pages, (void *) vdso_data, 0, P_READ | P_EXEC)) < 0)
         goto beyond_hope;
     mem_pt(current->mem, vdso_page)->data->name = "[vdso]";
     current->mm->vdso = vdso_page << PAGE_BITS;
@@ -310,7 +310,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     page_t vvar_page = pt_find_hole(current->mem, VVAR_PAGES);
     if (vvar_page == BAD_PAGE)
         goto beyond_hope;
-    if ((err = pt_map_nothing(current->mem, vvar_page, VVAR_PAGES, 0)) < 0)
+    if ((err = pt_map_nothing(current->mem, vvar_page, VVAR_PAGES, P_READ)) < 0)
         goto beyond_hope;
     mem_pt(current->mem, vvar_page)->data->name = "[vvar]";
 

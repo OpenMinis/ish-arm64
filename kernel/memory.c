@@ -1319,6 +1319,16 @@ check_reservation: ;
     }
 
 have_entry:
+#ifdef GUEST_X86_64
+    // A page with no access must fault on a read as well. The JVM puts its
+    // heap after a PROT_NONE page and loads from it as an implicit null
+    // check, expecting the SIGSEGV; given the host pointer instead, the read
+    // hit the host's no-access page and killed ish on Windows (and read zeros
+    // elsewhere). x86 has no write- or execute-only pages, so either of those
+    // makes the page readable.
+    if (entry != NULL && type == MEM_READ && !(entry->flags & (P_READ | P_WRITE | P_EXEC)))
+        return NULL;
+#endif
     // Diagnostic write watchpoint: host-side write acquisitions (user_write,
     // madvise zeroing, CoW) bypass the guest store gadgets — record them too.
     if (type == MEM_WRITE || type == MEM_WRITE_PTRACE) {
