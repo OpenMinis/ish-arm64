@@ -933,27 +933,35 @@ int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sock
     if (err < 0)
         return errno_map();
 
-    lock(&peer_lock);
-    int fake_sockets[2];
     // [T-ish-host-fd-double-close] Each host end is closed exactly once: by
     // sock_fd_create() when it fails, by sys_close() once it is installed,
     // and here only while it has no guest fd yet.
+    // [T-ish-socketpair-emfile-deadlock] peer_lock is taken only to link the
+    // two ends. It used to be held across sock_fd_create(), whose failure
+    // path (f_install() -> fd_close() -> sock_close()) takes peer_lock again:
+    // a socketpair() at RLIMIT_NOFILE hung its thread forever on a
+    // non-recursive mutex, and with it every later unix socket call.
+    int fake_sockets[2];
     err = fake_sockets[0] = sock_fd_create(sockets[0], domain, type, protocol);
     if (fake_sockets[0] < 0) {
-        unlock(&peer_lock);
         close(sockets[1]);
         return err;
     }
     err = fake_sockets[1] = sock_fd_create(sockets[1], domain, type, protocol);
-    if (fake_sockets[1] < 0) {
-        unlock(&peer_lock);
+    if (fake_sockets[1] < 0)
         goto close_fake_0;
+    struct fd *sock1 = f_get_retained(fake_sockets[0]);
+    struct fd *sock2 = f_get_retained(fake_sockets[1]);
+    if (sock1 != NULL && sock2 != NULL) {
+        lock(&peer_lock);
+        sock1->socket.unix_peer = sock2;
+        sock2->socket.unix_peer = sock1;
+        unlock(&peer_lock);
     }
-    struct fd *sock1 = f_get(fake_sockets[0]);
-    struct fd *sock2 = f_get(fake_sockets[1]);
-    sock1->socket.unix_peer = sock2;
-    sock2->socket.unix_peer = sock1;
-    unlock(&peer_lock);
+    if (sock1 != NULL)
+        fd_close(sock1);
+    if (sock2 != NULL)
+        fd_close(sock2);
 
     err = _EFAULT;
     if (user_put(sockets_addr, fake_sockets))
