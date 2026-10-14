@@ -159,6 +159,12 @@ typedef struct {
     const char *file;
     int line;
     int pid;
+    // Writers that are waiting for the readers to go; and what to do once
+    // when one starts waiting (an address space's lock pokes the threads
+    // that hold it while they run guest code: kernel/memory.c)
+    atomic_int writers_waiting;
+    void (*writer_waits)(void *);
+    void *writer_waits_arg;
 } wrlock_t;
 static inline void wrlock_init(wrlock_t *lock) {
     pthread_rwlockattr_t *pattr = NULL;
@@ -171,6 +177,9 @@ static inline void wrlock_init(wrlock_t *lock) {
     if (pthread_rwlock_init(&lock->l, pattr)) __builtin_trap();
     lock->val = lock->line = lock->pid = 0;
     lock->file = NULL;
+    lock->writers_waiting = 0;
+    lock->writer_waits = NULL;
+    lock->writer_waits_arg = NULL;
 }
 
 extern int current_pid(void);
@@ -226,12 +235,19 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
         bool _on = sctimes_enabled();
         if (_on) sctimes_begin(&_m);
         bool _got = false;
+        atomic_fetch_add(&lock->writers_waiting, 1);
+        if (lock->writer_waits != NULL)
+            lock->writer_waits(lock->writer_waits_arg);
         while (!_got) {
             nanosleep(&_ts, NULL);
             if (_ts.tv_nsec < 100000) // ramp up to a 100us steady sleep (yields CPU)
                 _ts.tv_nsec *= 2;
             _got = pthread_rwlock_trywrlock(&lock->l) == 0;
+            // readers that went on running guest code since: again
+            if (!_got && _ts.tv_nsec >= 100000 && lock->writer_waits != NULL)
+                lock->writer_waits(lock->writer_waits_arg);
         }
+        atomic_fetch_sub(&lock->writers_waiting, 1);
         if (_on) sctimes_end(&_m, SCT_MEM_WRLOCK);
     }
     assert(lock->val == 0);

@@ -12,6 +12,7 @@
 #include "debug.h"
 #include "kernel/errno.h"
 #include "kernel/signal.h"
+#include "asbestos/frame.h"
 #include "kernel/memory.h"
 #include "util/verbosetrace.h"
 #include "asbestos/asbestos.h"
@@ -33,6 +34,17 @@ static struct mmu_ops mem_mmu_ops;
 // ARM64: 4-level page table for 48-bit address space
 // ============================================================
 
+static void mem_poke_readers(void *arg) {
+    struct mmu *mmu = &((struct mem *) arg)->mmu;
+    lock(&mmu->tlbs_lock);
+    struct tlb *tlb;
+    list_for_each_entry(&mmu->tlbs, tlb, tlbs_link) {
+        if (tlb->frame != NULL && tlb->frame->cpu.poked_ptr != NULL)
+            __atomic_store_n(tlb->frame->cpu.poked_ptr, true, __ATOMIC_SEQ_CST);
+    }
+    unlock(&mmu->tlbs_lock);
+}
+
 void mem_init(struct mem *mem) {
     mem->pgdir = calloc(1, sizeof(struct pt_node));
     mem->pgdir_used = 0;
@@ -44,7 +56,14 @@ void mem_init(struct mem *mem) {
     lock_init(&mem->mmu.tlbs_lock);
     list_init(&mem->mmu.tlbs);
     wrlock_init(&mem->lock);
-    lock_init(&mem->cow_lock);
+    lock_init(&mem->cow_lock);    // The threads running guest code hold mem->lock as readers, for as long
+    // as they run without a syscall or a tick (a loop of chained blocks: as
+    // long as it loops). A writer (mmap, munmap, mprotect) asks them to
+    // stop and let go, and they wait for it before they take it again
+    // (task_run_current): else it waits until it happens to find no reader,
+    // which with a dozen threads can be never.
+    mem->lock.writer_waits = mem_poke_readers;
+    mem->lock.writer_waits_arg = mem;
 }
 
 int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags) {

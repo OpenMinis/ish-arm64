@@ -227,6 +227,13 @@ void task_run_current() {
         if (self->mem == NULL) {
             pthread_exit(NULL);
         }
+#ifdef GUEST_64BIT
+        // a writer waits for this lock: let it have it first (memory.c mem_poke_readers)
+        for (int spins = 0; atomic_load(&self->mem->lock.writers_waiting) > 0 && spins < 20000; spins++) {
+            struct timespec ts = {0, spins < 100 ? 0 : 20000};
+            if (spins < 100) sched_yield(); else nanosleep(&ts, NULL);
+        }
+#endif
         read_wrlock(&self->mem->lock);
 #ifdef GUEST_64BIT
         tlb_attach(tlb, &self->mem->mmu);
