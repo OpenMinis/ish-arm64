@@ -393,6 +393,8 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
 #define PUSHF() g(pushf)
 #define POPF() g(popf)
 #define SAHF g(sahf)
+#define FXSAVE do { g_addr(); g(fxsave); } while (0)
+#define FXRSTOR do { g_addr(); g(fxrstor); } while (0)
 #define CMC g(cmc)
 #define CLC g(clc)
 #define STC g(stc)

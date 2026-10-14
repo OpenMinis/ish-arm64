@@ -1,5 +1,23 @@
 #include "gadgets.h"
 
+.gadget fxsave
+    save_c
+    movq %_cpu, %rdi
+    leaq -TLB_entries(%_tlb), %rsi
+    movq %_addr, %rdx
+    ccall NAME(helper_fxsave)
+    restore_c
+    gret
+
+.gadget fxrstor
+    save_c
+    movq %_cpu, %rdi
+    leaq -TLB_entries(%_tlb), %rsi
+    movq %_addr, %rdx
+    ccall NAME(helper_fxrstor)
+    restore_c
+    gret
+
 .gadget cpuid
     # regrettable
     push %rsi

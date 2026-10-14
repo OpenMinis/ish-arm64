@@ -347,9 +347,10 @@ restart:
                            switch (modrm.opcode) {
                                case 2: TRACEI("ldmxcsr mem32"); LDMXCSR(32); break;
                                case 3: TRACEI("stmxcsr mem32"); STMXCSR(32); break;
-                               // fxsave/fxrstor (512 bytes, may span pages)
-                               // and clflush: still no-ops
-                               default: TRACEI("fxsave/fxrstor/clflush (ignored)"); break;
+                               case 0: TRACEI("fxsave mem"); FXSAVE; break;
+                               case 1: TRACEI("fxrstor mem"); FXRSTOR; break;
+                               // clflush, xsave and the like: no-ops
+                               default: TRACEI("clflush (ignored)"); break;
                            }
                            break;
 
