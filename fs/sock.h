@@ -219,6 +219,12 @@ static inline int sock_flags_from_real(int real) {
 #define IP_MTU_DISCOVER_ 10
 #define IP_RECVTTL_ 12
 #define IP_RECVTOS_ 13
+#define IP_MULTICAST_IF_ 32
+#define IP_MULTICAST_TTL_ 33
+#define IP_MULTICAST_LOOP_ 34
+#define IP_ADD_MEMBERSHIP_ 35
+#define IP_DROP_MEMBERSHIP_ 36
+#define IP_MULTICAST_ALL_ 49
 #define TCP_NODELAY_ 1
 #define TCP_KEEPIDLE_ 4
 #define TCP_KEEPINTVL_ 5

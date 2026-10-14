@@ -15,10 +15,11 @@ struct cpu_usage get_cpu_usage(void) {
 struct mem_usage get_mem_usage(void) {
     uint64_t total, avail;
     px_mem_info(&total, &avail);
+    // bytes, as on the other hosts (/proc/meminfo and sysinfo divide)
     return (struct mem_usage) {
-        .total = total / 1024,
-        .free = avail / 1024,
-        .active = (total - avail) / 1024,
+        .total = total,
+        .free = avail,
+        .active = total - avail,
         .inactive = 0,
     };
 }

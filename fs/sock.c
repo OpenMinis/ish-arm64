@@ -1094,6 +1094,31 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     // IP_MTU_DISCOVER has no equivalent on Darwin
     if (level == IPPROTO_IP && option == IP_MTU_DISCOVER_)
         return 0;
+    // Multicast. IP_MULTICAST_ALL is Linux's alone, and JDK 17 sets it on every
+    // datagram socket and gives up when that fails (no DatagramSocket at
+    // all, so no Gradle daemon). The default it changes (deliver to every
+    // socket on the group) only matters with several groups on one port:
+    // accepted and ignored. Loop, TTL and the interface take each host's own
+    // types and are left at its defaults (loop on, TTL 1, any interface).
+    // Joining and leaving a group: struct ip_mreq is the same everywhere
+    // (Linux's ip_mreqn begins with it).
+    if (level == IPPROTO_IP) {
+        switch (option) {
+            case IP_MULTICAST_ALL_:
+            case IP_MULTICAST_LOOP_:
+            case IP_MULTICAST_TTL_:
+            case IP_MULTICAST_IF_:
+                return 0;
+            case IP_ADD_MEMBERSHIP_:
+            case IP_DROP_MEMBERSHIP_:
+                if (value_len < 8)
+                    return _EINVAL;
+                if (setsockopt(sock->real_fd, IPPROTO_IP,
+                               option == IP_ADD_MEMBERSHIP_ ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP, value, 8) < 0)
+                    return errno_map();
+                return 0;
+        }
+    }
     // [STAGE-0 PROBE] SO_BINDTODEVICE: bind this socket to a named interface.
     // iSH has no interface model at all (/proc/net/dev is hardcoded dummy
     // data), and Darwin's nearest equivalent is IP_BOUND_IF, which takes an
@@ -1833,6 +1858,86 @@ static int sock_close(struct fd *fd) {
     return realfs_close(fd);
 }
 
+// Interfaces through ioctl (SIOCGIFCONF and friends): there is one, lo,
+// 127.0.0.1/8, up. Programs that list interfaces before they do anything
+// (the JDK's NetworkInterface, ifconfig) otherwise fail at the first call.
+#define SIOCGIFCONF_ 0x8912
+#define SIOCGIFFLAGS_ 0x8913
+#define SIOCGIFADDR_ 0x8915
+#define SIOCGIFBRDADDR_ 0x8919
+#define SIOCGIFNETMASK_ 0x891b
+#define SIOCGIFMTU_ 0x8921
+#define SIOCGIFHWADDR_ 0x8927
+#define SIOCGIFINDEX_ 0x8933
+struct ifreq_ {
+    char name[16];
+    union {
+        struct sockaddr_ addr;
+        uint16_t flags;
+        int32_t ivalue;
+        char pad[24];
+    };
+};
+struct ifconf_ {
+    int32_t len;
+    int32_t pad;
+    addr_t buf;
+};
+// struct sockaddr_in: family, port, then the address in network order
+static void sock_lo_addr(struct sockaddr_ *sa, uint32_t addr) {
+    memset(sa, 0, sizeof(*sa));
+    sa->family = AF_INET_;
+    uint32_t net = htonl(addr);
+    memcpy(sa->data + 2, &net, 4);
+}
+
+static ssize_t sock_ioctl_size(int cmd) {
+    switch (cmd) {
+        case SIOCGIFCONF_: return sizeof(struct ifconf_);
+        case SIOCGIFFLAGS_: case SIOCGIFADDR_: case SIOCGIFBRDADDR_: case SIOCGIFNETMASK_:
+        case SIOCGIFMTU_: case SIOCGIFHWADDR_: case SIOCGIFINDEX_:
+            return sizeof(struct ifreq_);
+    }
+    return realfs_ioctl_size(cmd);
+}
+
+static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
+    if (cmd == SIOCGIFCONF_) {
+        struct ifconf_ *conf = arg;
+        struct ifreq_ lo = {.name = "lo"};
+        sock_lo_addr(&lo.addr, 0x7f000001);
+        if (conf->buf == 0) {
+            conf->len = sizeof(lo);
+            return 0;
+        }
+        if (conf->len < (int32_t) sizeof(lo)) {
+            conf->len = 0;
+            return 0;
+        }
+        if (user_write(conf->buf, &lo, sizeof(lo)))
+            return _EFAULT;
+        conf->len = sizeof(lo);
+        return 0;
+    }
+    if (sock_ioctl_size(cmd) == sizeof(struct ifreq_) && realfs_ioctl_size(cmd) < 0) {
+        struct ifreq_ *req = arg;
+        if (strncmp(req->name, "lo", sizeof(req->name)) != 0)
+            return _ENODEV;
+        memset(req->pad, 0, sizeof(req->pad));
+        switch (cmd) {
+            case SIOCGIFFLAGS_: req->flags = 0x1 | 0x8 | 0x40; break;   // IFF_UP, IFF_LOOPBACK, IFF_RUNNING
+            case SIOCGIFADDR_: sock_lo_addr(&req->addr, 0x7f000001); break;
+            case SIOCGIFBRDADDR_: sock_lo_addr(&req->addr, 0); break;
+            case SIOCGIFNETMASK_: sock_lo_addr(&req->addr, 0xff000000); break;
+            case SIOCGIFMTU_: req->ivalue = 65536; break;
+            case SIOCGIFHWADDR_: req->addr.family = 772; break;   // ARPHRD_LOOPBACK, all zeroes
+            case SIOCGIFINDEX_: req->ivalue = 1; break;
+        }
+        return 0;
+    }
+    return realfs_ioctl(fd, cmd, arg);
+}
+
 const struct fd_ops socket_fdops = {
     .read = sock_read,
     .write = sock_write,
@@ -1840,8 +1945,8 @@ const struct fd_ops socket_fdops = {
     .poll = realfs_poll,
     .getflags = realfs_getflags,
     .setflags = realfs_setflags,
-    .ioctl_size = realfs_ioctl_size,
-    .ioctl = realfs_ioctl,
+    .ioctl_size = sock_ioctl_size,
+    .ioctl = sock_ioctl,
 };
 
 #if defined(__GNUC__) && __GNUC__ >= 8
