@@ -29,6 +29,12 @@
 #define ISH_FREEZE_REMIND_S 300
 /// A spawn pending for less than this is not yet evidence.
 #define ISH_FREEZE_SPAWN_MIN_S 30
+/// Consecutive samples with no progress needed as well as the time. A
+/// suspended app takes no samples, so the first one after it resumes can
+/// see minutes of "no progress" that the guest simply was not allowed to
+/// make; requiring several observed samples (about a minute at the 10 s
+/// cadence) keeps that from reading as a freeze.
+#define ISH_FREEZE_MIN_QUIET_SAMPLES 6
 
 struct ish_freeze_sample {
     uint64_t now_ns;                 // monotonic
@@ -49,6 +55,7 @@ struct ish_freeze_watch {
     int have_prev;
     uint64_t prev_forks, prev_syscalls;
     uint64_t last_progress_ns;
+    unsigned quiet_samples;
     int frozen;
     uint64_t last_report_ns;
 };
@@ -72,12 +79,14 @@ static inline enum ish_freeze_event ish_freeze_watch_step(struct ish_freeze_watc
     w->prev_syscalls = s.syscalls;
     if (progressed) {
         w->last_progress_ns = s.now_ns;
+        w->quiet_samples = 0;
         if (w->frozen) {
             w->frozen = 0;
             return ISH_FREEZE_RECOVERED;
         }
         return ISH_FREEZE_NONE;
     }
+    w->quiet_samples++;
     if (w->frozen) {
         if (s.now_ns - w->last_report_ns >= (uint64_t)ISH_FREEZE_REMIND_S * 1000000000ULL) {
             w->last_report_ns = s.now_ns;
@@ -88,7 +97,8 @@ static inline enum ish_freeze_event ish_freeze_watch_step(struct ish_freeze_watc
     uint64_t quiet_ns = s.now_ns - w->last_progress_ns;
     int spawn_waiting = s.spawn_pending_since_ns != 0 && s.now_ns > s.spawn_pending_since_ns
         && s.now_ns - s.spawn_pending_since_ns >= (uint64_t)ISH_FREEZE_SPAWN_MIN_S * 1000000000ULL;
-    if (quiet_ns >= (uint64_t)ISH_FREEZE_ENTER_S * 1000000000ULL && spawn_waiting) {
+    if (quiet_ns >= (uint64_t)ISH_FREEZE_ENTER_S * 1000000000ULL && spawn_waiting
+        && w->quiet_samples >= ISH_FREEZE_MIN_QUIET_SAMPLES) {
         w->frozen = 1;
         w->last_report_ns = s.now_ns;
         return ISH_FREEZE_ENTERED;

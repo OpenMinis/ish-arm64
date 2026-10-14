@@ -118,6 +118,25 @@ int main(void) {
           ish_freeze_watch_step(&w, stuck(10, 5, 5, 1)) == ISH_FREEZE_NONE
           && ish_freeze_watch_frozen_for_s(&w, T(10)) == 0);
 
+    printf("i. one sample after a long gap (app suspended) is not a freeze\n");
+    ish_freeze_watch_init(&w);
+    ish_freeze_watch_step(&w, busy(0, 10, 10));
+    // The app was suspended for 20 minutes with a spawn already waiting; the
+    // first sample after resuming sees no change yet.
+    CHECK("a single quiet sample after a 1200 s gap does not enter",
+          ish_freeze_watch_step(&w, stuck(1200, 10, 10, 5)) == ISH_FREEZE_NONE);
+    CHECK("…and progress on the next sample keeps it quiet",
+          ish_freeze_watch_step(&w, busy(1210, 11, 12)) == ISH_FREEZE_NONE);
+    // A real freeze after the gap still needs ISH_FREEZE_MIN_QUIET_SAMPLES samples.
+    ish_freeze_watch_init(&w);
+    ish_freeze_watch_step(&w, busy(0, 10, 10));
+    int at = -1;
+    for (int t = 1200, n = 0; n < 20; t += 10, n++) {
+        if (ish_freeze_watch_step(&w, stuck(t, 10, 10, 5)) == ISH_FREEZE_ENTERED) { at = n + 1; break; }
+    }
+    CHECK("after a gap it enters only once enough quiet samples were seen",
+          at == ISH_FREEZE_MIN_QUIET_SAMPLES);
+
     printf(failures == 0 ? "ALL PASSED\n" : "%d FAILED\n", failures);
     return failures == 0 ? 0 : 1;
 }
