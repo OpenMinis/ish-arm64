@@ -297,6 +297,15 @@ noreturn void do_exit_group(int status) {
         // Poll the thread count until only current thread remains
         int max_wait_ms = 500 + thread_count * 10;  // Scale with thread count
         if (max_wait_ms > 5000) max_wait_ms = 5000;  // Cap at 5s
+        // [T-ish-exit-valve-poll-floor] A thread waiting in poll_wait/epoll
+        // notices doing_group_exit at the latest on its next bounded host
+        // wakeup, which is up to 1 s away (fs/poll.c bounded_timeout) when the
+        // SIGUSR1 kick is missed. A budget under that orphans healthy threads:
+        // on an iPhone 11 stress run, 12418 of 12447 "stuck" threads the valve
+        // leaked went on to exit by themselves - each leak still costing a pid
+        // slot (a leaked task is never removed from the pid table) and racing
+        // the valve's fdtable_release (sys_epoll_ctl faults on freed members).
+        if (max_wait_ms < 1500) max_wait_ms = 1500;
         int wait_interval_ms = 10;  // Check every 10ms
         int waited_ms = 0;
         int last_remaining = -1;
