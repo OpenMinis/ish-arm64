@@ -3709,8 +3709,8 @@ msub_store:
     b .Lmrs_store
 
 .Lmrs_dczid_el0:
-    // DC ZVA is prohibited (DZP bit 4 = 1), block size = 4 (64 bytes)
-    mov x10, #0x14
+    // DC ZVA allowed (DZP bit 4 = 0), block size = 4 (2^4 words = 64 bytes)
+    mov x10, #0x4
     b .Lmrs_store
 
 .Lmrs_fpcr:
@@ -4344,6 +4344,38 @@ msub_store:
  * elem_size: 0=B, 1=H, 2=S, 3=D
  * index: element index within 128-bit vector
  */
+/*
+ * SMOV Wd/Xd, Vn.<T>[index] - sign-extend a B/H/S element into a GPR.
+ * Code stream: [gadget addr][rd | rn<<8 | elem_size<<16 | index<<20 | Q<<24]
+ * Q=0 writes Wd (sign-extended to 32 bits, upper half zero), Q=1 writes Xd.
+ */
+.gadget smov_vec_to_gpr
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f       // rd
+    ubfx x10, x8, #8, #5    // rn
+    ubfx x11, x8, #16, #2   // elem_size
+    ubfx x12, x8, #20, #4   // index
+    ubfx x13, x8, #24, #1   // Q
+    add x14, _cpu, #CPU_fp
+    add x14, x14, x10, lsl #4   // &Vn
+    lsl x12, x12, x11           // byte offset of the element
+    cmp x11, #1
+    b.eq 1f
+    b.hi 2f
+    ldrsb x3, [x14, x12]
+    b 3f
+1:  ldrsh x3, [x14, x12]
+    b 3f
+2:  ldrsw x3, [x14, x12]
+3:  cbnz x13, 4f
+    mov w3, w3
+4:  cmp x9, #31
+    b.eq 5f
+    add x14, _cpu, #CPU_x0
+    str x3, [x14, x9, lsl #3]
+5:  gret
+
 .gadget umov_vec_to_gpr
     ldr x8, [_pc]
     add _pc, _pc, #8
@@ -7541,247 +7573,30 @@ movi_really_zero:
     ubfx x12, x8, #24, #2   // size (0=8b, 1=16b, 2=32b, 3=64b)
     ubfx x17, x8, #26, #1   // Q (0=64-bit vec, 1=128-bit vec)
 
-    // Get vector register base addresses
     add x13, _cpu, #CPU_fp
-    lsl x14, x9, #4         // Vd offset
-    add x14, x13, x14       // &Vd
-    lsl x15, x10, #4        // Vn offset
-    add x15, x13, x15       // &Vn
-    lsl x16, x11, #4        // Vm offset
-    add x16, x13, x16       // &Vm
-
-    // Branch based on element size
-    cmp x12, #3
-    b.eq .Lushl_64
-    cmp x12, #2
-    b.eq .Lushl_32
+    add x14, x13, x9, lsl #4    // &Vd
+    add x15, x13, x10, lsl #4   // &Vn
+    add x16, x13, x11, lsl #4   // &Vm
+    ldr q0, [x15]
+    ldr q1, [x16]
+    // The host's USHL: lanes are independent, so a 128-bit op is right for Q=0 too
+    // once the upper half is dropped.
     cmp x12, #1
-    b.eq .Lushl_16
-    b .Lushl_8
-
-.Lushl_8:
-    // 8-bit elements: 8 or 16 elements
-    ldr x20, [x15]           // Vn low 64 bits
-    ldr x21, [x16]           // Vm low 64 bits
-    mov x22, #0              // result low
-    mov x23, #8              // loop count
-    mov x24, #0              // bit position
-
-.Lushl_8_loop:
-    lsr x25, x20, x24          // shift to get element at bit position x24
-    and x25, x25, #0xff       // extract byte from Vn
-    lsr x26, x21, x24
-    sbfx x26, x26, #0, #8     // extract signed shift amount from Vm
-    cmp x26, #0
-    b.lt .Lushl_8_right
-    lsl x25, x25, x26          // left shift
-    and x25, x25, #0xff
-    b .Lushl_8_store
-.Lushl_8_right:
-    neg x26, x26
-    lsr x25, x25, x26          // right shift
-.Lushl_8_store:
-    lsl x25, x25, x24          // position in result
-    orr x22, x22, x25
-    add x24, x24, #8
-    subs x23, x23, #1
-    b.ne .Lushl_8_loop
-
-    str x22, [x14]           // store low result
-    cbz x17, .Lushl_clear_high
-
-    // Process high 64 bits if Q=1
-    ldr x20, [x15, #8]
-    ldr x21, [x16, #8]
-    mov x22, #0
-    mov x23, #8
-    mov x24, #0
-
-.Lushl_8_hi_loop:
-    lsr x25, x20, x24
-    and x25, x25, #0xff
-    lsr x26, x21, x24
-    sbfx x26, x26, #0, #8
-    cmp x26, #0
-    b.lt .Lushl_8_hi_right
-    lsl x25, x25, x26
-    and x25, x25, #0xff
-    b .Lushl_8_hi_store
-.Lushl_8_hi_right:
-    neg x26, x26
-    lsr x25, x25, x26
-.Lushl_8_hi_store:
-    lsl x25, x25, x24
-    orr x22, x22, x25
-    add x24, x24, #8
-    subs x23, x23, #1
-    b.ne .Lushl_8_hi_loop
-
-    str x22, [x14, #8]
-    gret
-
-.Lushl_16:
-    // 16-bit elements: 4 or 8 elements
-    ldr x20, [x15]
-    ldr x21, [x16]
-    mov x22, #0
-    mov x23, #4
-    mov x24, #0
-
-.Lushl_16_loop:
-    lsr x25, x20, x24
-    and x25, x25, #0xffff
-    lsr x26, x21, x24
-    sbfx x26, x26, #0, #16
-    cmp x26, #0
-    b.lt .Lushl_16_right
-    lsl x25, x25, x26
-    and x25, x25, #0xffff
-    b .Lushl_16_store
-.Lushl_16_right:
-    neg x26, x26
-    lsr x25, x25, x26
-.Lushl_16_store:
-    lsl x25, x25, x24
-    orr x22, x22, x25
-    add x24, x24, #16
-    subs x23, x23, #1
-    b.ne .Lushl_16_loop
-
-    str x22, [x14]
-    cbz x17, .Lushl_clear_high
-
-    ldr x20, [x15, #8]
-    ldr x21, [x16, #8]
-    mov x22, #0
-    mov x23, #4
-    mov x24, #0
-
-.Lushl_16_hi_loop:
-    lsr x25, x20, x24
-    and x25, x25, #0xffff
-    lsr x26, x21, x24
-    sbfx x26, x26, #0, #16
-    cmp x26, #0
-    b.lt .Lushl_16_hi_right
-    lsl x25, x25, x26
-    and x25, x25, #0xffff
-    b .Lushl_16_hi_store
-.Lushl_16_hi_right:
-    neg x26, x26
-    lsr x25, x25, x26
-.Lushl_16_hi_store:
-    lsl x25, x25, x24
-    orr x22, x22, x25
-    add x24, x24, #16
-    subs x23, x23, #1
-    b.ne .Lushl_16_hi_loop
-
-    str x22, [x14, #8]
-    gret
-
-.Lushl_32:
-    // 32-bit elements: 2 or 4 elements
-    ldr x20, [x15]
-    ldr x21, [x16]
-
-    // First 32-bit element
-    and x25, x20, #0xffffffff
-    sbfx x26, x21, #0, #32
-    cmp x26, #0
-    b.lt .Lushl_32_0_right
-    lsl x25, x25, x26
-    and x25, x25, #0xffffffff
-    b .Lushl_32_0_done
-.Lushl_32_0_right:
-    neg x26, x26
-    lsr x25, x25, x26
-.Lushl_32_0_done:
-    mov x22, x25
-
-    // Second 32-bit element
-    lsr x25, x20, #32
-    sbfx x26, x21, #32, #32
-    cmp x26, #0
-    b.lt .Lushl_32_1_right
-    lsl x25, x25, x26
-    and x25, x25, #0xffffffff
-    b .Lushl_32_1_done
-.Lushl_32_1_right:
-    neg x26, x26
-    lsr x25, x25, x26
-.Lushl_32_1_done:
-    orr x22, x22, x25, lsl #32
-
-    str x22, [x14]
-    cbz x17, .Lushl_clear_high
-
-    // High 64 bits if Q=1
-    ldr x20, [x15, #8]
-    ldr x21, [x16, #8]
-
-    and x25, x20, #0xffffffff
-    sbfx x26, x21, #0, #32
-    cmp x26, #0
-    b.lt .Lushl_32_2_right
-    lsl x25, x25, x26
-    and x25, x25, #0xffffffff
-    b .Lushl_32_2_done
-.Lushl_32_2_right:
-    neg x26, x26
-    lsr x25, x25, x26
-.Lushl_32_2_done:
-    mov x22, x25
-
-    lsr x25, x20, #32
-    sbfx x26, x21, #32, #32
-    cmp x26, #0
-    b.lt .Lushl_32_3_right
-    lsl x25, x25, x26
-    and x25, x25, #0xffffffff
-    b .Lushl_32_3_done
-.Lushl_32_3_right:
-    neg x26, x26
-    lsr x25, x25, x26
-.Lushl_32_3_done:
-    orr x22, x22, x25, lsl #32
-
-    str x22, [x14, #8]
-    gret
-
-.Lushl_64:
-    // 64-bit elements: 1 or 2 elements
-    ldr x20, [x15]
-    ldr x21, [x16]
-    sbfx x26, x21, #0, #8     // shift amount (signed, only 8 bits matter)
-    cmp x26, #0
-    b.lt .Lushl_64_right
-    lsl x22, x20, x26
-    b .Lushl_64_done
-.Lushl_64_right:
-    neg x26, x26
-    lsr x22, x20, x26
-.Lushl_64_done:
-    str x22, [x14]
-    cbz x17, .Lushl_clear_high
-
-    ldr x20, [x15, #8]
-    ldr x21, [x16, #8]
-    sbfx x26, x21, #0, #8
-    cmp x26, #0
-    b.lt .Lushl_64_hi_right
-    lsl x22, x20, x26
-    b .Lushl_64_hi_done
-.Lushl_64_hi_right:
-    neg x26, x26
-    lsr x22, x20, x26
-.Lushl_64_hi_done:
-    str x22, [x14, #8]
-    gret
-
-.Lushl_clear_high:
+    b.lo 1f
+    b.eq 2f
+    cmp x12, #2
+    b.eq 3f
+    ushl v0.2d, v0.2d, v1.2d
+    b 4f
+1:  ushl v0.16b, v0.16b, v1.16b
+    b 4f
+2:  ushl v0.8h, v0.8h, v1.8h
+    b 4f
+3:  ushl v0.4s, v0.4s, v1.4s
+4:  str q0, [x14]
+    cbnz x17, 5f
     str xzr, [x14, #8]
-    gret
+5:  gret
 
 /*
  * Macro for NEON three-same register shift instructions.
@@ -11841,49 +11656,6 @@ make_rounding_sra ursra, "urshl v3.8b, v0.8b, v1.8b", "urshl v3.16b, v0.16b, v1.
     str xzr, [x15, #8]
     gret
 
-/*
- * FCVTZU - Floating-point to unsigned integer (round toward zero)
- */
-.gadget fcvtzu_scalar
-    ldr x8, [_pc]
-    add _pc, _pc, #8
-
-    and x9, x8, #0x1f       // rd (gpr)
-    ubfx x10, x8, #8, #5    // rn (fp reg)
-    ubfx x11, x8, #16, #2   // type
-    ubfx x12, x8, #18, #1   // sf
-
-    // Load FP value
-    add x13, _cpu, #CPU_fp
-    lsl x14, x10, #4
-    add x13, x13, x14
-
-    cbz x11, .Lfcvtzu_single
-    // type=1: double
-    ldr d0, [x13]
-    b .Lfcvtzu_convert
-
-.Lfcvtzu_single:
-    ldr s0, [x13]
-    fcvt d0, s0             // convert to double for uniform handling
-
-.Lfcvtzu_convert:
-    fcvtzu x14, d0          // convert to unsigned 64-bit
-
-    cbz x12, .Lfcvtzu_32bit
-    b .Lfcvtzu_store
-
-.Lfcvtzu_32bit:
-    and x14, x14, #0xffffffff
-
-.Lfcvtzu_store:
-    cmp x9, #31
-    b.eq .Lfcvtzu_done      // XZR - discard
-    add x15, _cpu, #CPU_x0
-    str x14, [x15, x9, lsl #3]
-.Lfcvtzu_done:
-    gret
-
 // Macro for FCVT (FP->int) with different rounding modes
 // \name: gadget name suffix, \cvt_x_d: 64-bit convert insn, \cvt_w_d: 32-bit convert insn
 .macro make_fcvt_to_int name, cvt_x_d, cvt_w_d, cvt_x_s, cvt_w_s
@@ -11936,49 +11708,8 @@ make_fcvt_to_int fcvtpu, fcvtpu, fcvtpu, fcvtpu, fcvtpu
 make_fcvt_to_int fcvtmu, fcvtmu, fcvtmu, fcvtmu, fcvtmu
 make_fcvt_to_int fcvtas, fcvtas, fcvtas, fcvtas, fcvtas
 make_fcvt_to_int fcvtau, fcvtau, fcvtau, fcvtau, fcvtau
-
-/*
- * FCVTZS - Floating-point to signed integer (round toward zero)
- * (kept for backward compatibility — same as make_fcvt_to_int but uses fcvtzs)
- */
-.gadget fcvtzs_scalar
-    ldr x8, [_pc]
-    add _pc, _pc, #8
-
-    and x9, x8, #0x1f       // rd (gpr)
-    ubfx x10, x8, #8, #5    // rn (fp reg)
-    ubfx x11, x8, #16, #2   // type
-    ubfx x12, x8, #18, #1   // sf
-
-    add x13, _cpu, #CPU_fp
-    lsl x14, x10, #4
-    add x13, x13, x14
-
-    cbz x11, .Lfcvtzs_single
-    ldr d0, [x13]
-    b .Lfcvtzs_convert
-
-.Lfcvtzs_single:
-    ldr s0, [x13]
-    fcvt d0, s0
-
-.Lfcvtzs_convert:
-    fcvtzs x14, d0
-
-    cbz x12, .Lfcvtzs_32bit
-    b .Lfcvtzs_store
-
-.Lfcvtzs_32bit:
-    // Truncate to 32-bit signed
-    sxtw x14, w14
-
-.Lfcvtzs_store:
-    cmp x9, #31
-    b.eq .Lfcvtzs_done
-    add x15, _cpu, #CPU_x0
-    str x14, [x15, x9, lsl #3]
-.Lfcvtzs_done:
-    gret
+make_fcvt_to_int fcvtzs, fcvtzs, fcvtzs, fcvtzs, fcvtzs
+make_fcvt_to_int fcvtzu, fcvtzu, fcvtzu, fcvtzu, fcvtzu
 
 /*
  * FCVTZS (GPR, fixed-point) - FP to signed int with scale factor (result in GPR)
@@ -12024,7 +11755,6 @@ make_fcvt_to_int fcvtau, fcvtau, fcvtau, fcvtau, fcvtau
     b .Lfcvtzs_fg_store
 .Lfcvtzs_fg_32bit:
     fcvtzs w14, d0
-    sxtw x14, w14
 
 .Lfcvtzs_fg_store:
     cmp x9, #31

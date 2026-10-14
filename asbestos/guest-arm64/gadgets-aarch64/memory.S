@@ -1431,6 +1431,22 @@ atomic_cas_segfault:
     gret
 
 /*
+ * DC ZVA — zero the 64-byte block holding _addr (the block size DCZID_EL0
+ * reports). Aligned to its own size, so it never crosses a page.
+ * Code stream: [gadget addr]
+ */
+.gadget dc_zva
+    and _addr, _addr, #0xffffffffffffffc0
+    write_prep 512, dc_zva_1
+    stp xzr, xzr, [_addr]
+    stp xzr, xzr, [_addr, #16]
+    stp xzr, xzr, [_addr, #32]
+    stp xzr, xzr, [_addr, #48]
+    write_done 512, dc_zva_1
+    gret
+    write_bullshit 512, dc_zva_1
+
+/*
  * Base register update gadget for post/pre-indexed addressing
  * Code stream: [gadget addr][rn | offset<<8]
  * Updates: Rn = Rn + offset

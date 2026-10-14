@@ -278,6 +278,7 @@ extern void gadget_dup_elem_vec(void);     // DUP Vd.<T>, Vn.<Ts>[idx] (element 
 extern void gadget_dup_elem_scalar(void);  // DUP <V>d, Vn.<T>[idx] (element to scalar)
 extern void gadget_ins_elem_vec(void);     // INS Vd.<T>[idx1], Vn.<T>[idx2] (element to element)
 extern void gadget_mov_v_to_gpr(void);     // MOV Xd, Vn.D[0]
+extern void gadget_smov_vec_to_gpr(void);  // SMOV Wd/Xd, Vn.<T>[idx]
 extern void gadget_umov_vec_to_gpr(void);  // UMOV/MOV Wd, Vn.<T>[idx]
 extern void gadget_ins_gpr_to_vec_s(void); // MOV Vd.S[idx], Wn (INS from GPR)
 extern void gadget_ins_gpr_to_vec_d(void); // MOV Vd.D[idx], Xn (INS from GPR)
@@ -826,6 +827,7 @@ extern void gadget_atomic_casp32(void);
 
 // Memory barrier (DMB ISH) for acquire/release semantics
 extern void gadget_dmb(void);
+extern void gadget_dc_zva(void);          // DC ZVA: zero a 64-byte block
 extern void gadget_ic_ivau(void);          // IC IVAU: invalidate translated code for a page (SMC)
 
 // Load/store pair gadgets
@@ -915,6 +917,13 @@ static void gen_interrupt(struct gen_state *state, int interrupt_type) {
     gen(state, state->orig_ip);
     gen(state, (unsigned long) gadget_interrupt);
     gen(state, interrupt_type);
+}
+
+static void gen_sxtw_in_place(struct gen_state *state, uint32_t r) {
+    if (r == 31)
+        return;  // XZR: the load discarded it
+    gen(state, (unsigned long) gadget_sbfm_fused);  // SXTW Xr, Wr = SBFM Xr, Xr, #0, #31
+    gen(state, 0 | (31 << 8) | (1ull << 16) | ((uint64_t) r << 20) | ((uint64_t) r << 28));
 }
 
 bool gen_start(addr_t addr, struct gen_state *state) {
@@ -2098,6 +2107,16 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
             return 1;
         }
 
+        // DC ZVA (zero 64 bytes, the size DCZID_EL0 reports): d50b742x.
+        // Advertised because HotSpot can't run without it: it takes a DZP
+        // DCZID_EL0 as "enabled, block size 0" and fails generating stubs.
+        if ((insn & 0xffffffe0) == 0xd50b7420 && (insn & 0x1f) != 31) {
+            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, insn & 0x1f);
+            gen(state, (unsigned long) gadget_dc_zva);
+            return 1;
+        }
+
         // Data-cache maintenance (DC) — NOP in emulation (host memory is
         // coherent; only the *instruction* side needs retranslation, which
         // IC IVAU above handles).
@@ -2828,6 +2847,9 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
+        // LDPSW (opc=01, L=1): the 32-bit pair load, then sign-extend both.
+        bool ldpsw = L && opc == 1;
+
         // Fused path for signed-offset mode (most common LDP/STP encoding)
         if (is_offset) {
             int16_t off16 = (int16_t)offset;
@@ -2845,6 +2867,10 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                                    : (is64 ? gadget_stp64_imm : gadget_stp32_imm);
             gen(state, (unsigned long) gadget);
             gen(state, param);
+            if (ldpsw) {
+                gen_sxtw_in_place(state, rt);
+                gen_sxtw_in_place(state, rt2);
+            }
             return 1;
         }
 
@@ -2916,6 +2942,10 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             // Pre-indexed: writeback calculated address
             gen(state, (unsigned long) gadget_writeback_addr);
             gen(state, rn);
+        }
+        if (ldpsw) {
+            gen_sxtw_in_place(state, rt);
+            gen_sxtw_in_place(state, rt2);
         }
 
         return 1;
@@ -4794,6 +4824,27 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         return 1;
     }
 
+    // SMOV (to general) - sign-extend a vector element into a GPR
+    // Pattern: 0Q001110 000 imm5 0 01011 Rn Rd. B/H for Wd and Xd, S only for Xd.
+    if ((insn & 0xbfe0fc00) == 0x0e002c00) {
+        uint32_t Q = (insn >> 30) & 1;
+        uint32_t imm5 = (insn >> 16) & 0x1f;
+        uint32_t rn = (insn >> 5) & 0x1f;
+        uint32_t rd = insn & 0x1f;
+        int elem_size = -1;
+        if (imm5 & 0x1) elem_size = 0;
+        else if (imm5 & 0x2) elem_size = 1;
+        else if ((imm5 & 0x4) && Q) elem_size = 2;
+        if (elem_size < 0) {
+            gen_interrupt(state, INT_UNDEFINED);
+            return 0;
+        }
+        uint32_t index = imm5 >> (elem_size + 1);
+        gen(state, (unsigned long) gadget_smov_vec_to_gpr);
+        gen(state, rd | (rn << 8) | (elem_size << 16) | (index << 20) | (Q << 24));
+        return 1;
+    }
+
     // UMOV/MOV (to general) - extract vector element to GPR
     // Matches: 0Q001110 0imm5 0 01111 Rn Rd (UMOV/MOV scalar from vector)
     if ((insn & 0xbfe0fc00) == 0x0e003c00) {
@@ -5530,7 +5581,7 @@ skip_three_different:
     // NOT/RBIT (vector) - AdvSIMD two-register misc (bytes only)
     // NOT:  0 Q 1 01110 00 10000 00101 10 Rn Rd  (U=1, size=00, opcode=0x05)
     // RBIT: 0 Q 1 01110 01 10000 00101 10 Rn Rd  (U=1, size=01, opcode=0x05)
-    if ((insn & 0xbf3ffc00) == 0x2e205800) {   // NOT (size=00)
+    if ((insn & 0xbffffc00) == 0x2e205800) {   // NOT (size=00)
         uint32_t Q = (insn >> 30) & 1;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
@@ -5538,7 +5589,7 @@ skip_three_different:
         gen(state, rd | (rn << 8) | (Q << 16));
         return 1;
     }
-    if ((insn & 0xbf3ffc00) == 0x2e605800) {   // RBIT (size=01)
+    if ((insn & 0xbffffc00) == 0x2e605800) {   // RBIT (size=01)
         uint32_t Q = (insn >> 30) & 1;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
@@ -5740,9 +5791,8 @@ skip_three_different:
 
     // RBIT (vector) - reverse bits in each byte
     // 0 Q 1 01110 sz 10000 00101 10 Rn Rd
-    // Mask 0xbf3ffc00 checks fixed bits, ignores Q, sz, Rn, Rd
-    // Value: sz must be 00 for .8B/.16B
-    if ((insn & 0xbf3ffc00) == 0x2e205800) {
+    // (size=01; NOT, size=00, shares the opcode and is decoded above)
+    if ((insn & 0xbffffc00) == 0x2e605800) {
         uint32_t Q = (insn >> 30) & 1;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
