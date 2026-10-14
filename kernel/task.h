@@ -106,6 +106,11 @@ struct task {
     // (whole guest address space) from leaking forever when the thread never
     // re-enters do_exit(). Cleared once released so it never double-frees.
     bool mm_release_deferred;
+    // [T-ish-exit-valve-progress] Set by the thread itself on entering
+    // do_exit, before it queues for pids_lock. do_exit_group's safety valve
+    // reads it to tell a thread that is already exiting (merely waiting its
+    // turn for the lock) from one stuck elsewhere.
+    _Atomic bool exit_started;
 
     // this structure is allocated on the stack of the parent's clone() call
     struct vfork_info {

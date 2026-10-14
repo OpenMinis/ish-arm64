@@ -75,6 +75,10 @@ noreturn void do_exit(int status) {
         current = NULL;
         pthread_exit(NULL);
     }
+    // [T-ish-exit-valve-progress] From here on this thread is leaving; tell
+    // do_exit_group's safety valve not to give up on it while it waits for
+    // pids_lock below.
+    atomic_store(&current->exit_started, true);
 
     // Block SIGSEGV during exit to prevent cosmetic crashes from host
     // pthread stack unwinding (especially with many threads exiting at once).
@@ -297,15 +301,30 @@ noreturn void do_exit_group(int status) {
         int waited_ms = 0;
         int last_remaining = -1;
 
-        while (waited_ms < max_wait_ms) {
+        // [T-ish-exit-valve-progress] Threads that have already entered
+        // do_exit are not stuck: they leave the group as soon as they get
+        // pids_lock, which many processes exiting at once (several agent
+        // shells, a Go program's dozen threads each) can keep busy for well
+        // over max_wait_ms. Leaking them there - unlinking a thread from its
+        // group and freeing its sighand/files while it is mid-do_exit and
+        // about to touch both - is what set up the 2026-10-14 pids_lock wedge
+        // (an iPhone 11 stress run leaked every thread of every child: "12
+        // stuck threads"). So keep waiting while every remaining thread is
+        // exiting, up to EXIT_PROGRESS_CAP_MS.
+        const int EXIT_PROGRESS_CAP_MS = 30000;
+        while (true) {
             lock(&pids_lock);
             lock(&group->lock);
 
-            // Count threads still in the group (excluding current)
+            // Count threads still in the group (excluding current), and how
+            // many of them are already on their way out.
             int remaining = 0;
+            int exiting_now = 0;
             list_for_each_entry(&group->threads, task, group_links) {
                 if (task != current) {
                     remaining++;
+                    if (atomic_load(&task->exit_started))
+                        exiting_now++;
                 }
             }
 
@@ -317,6 +336,10 @@ noreturn void do_exit_group(int status) {
             if (remaining == 0) {
                 break;
             }
+            if (waited_ms >= max_wait_ms &&
+                    (exiting_now < remaining || waited_ms >= EXIT_PROGRESS_CAP_MS)) {
+                break;
+            }
 
             // Sleep a bit to let threads exit
             struct timespec ts = {0, wait_interval_ms * 1000000L};
@@ -324,7 +347,9 @@ noreturn void do_exit_group(int status) {
             waited_ms += wait_interval_ms;
         }
 
-        if (waited_ms >= max_wait_ms) {
+        // Some thread is still in the group after the wait: either stuck
+        // outside do_exit, or still exiting when EXIT_PROGRESS_CAP_MS ran out.
+        if (last_remaining > 0) {
             // Threads are stuck in blocking syscalls and won't exit.
             if (ish_exec_trace())
                 printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still stuck → force kill\n",
@@ -361,7 +386,11 @@ noreturn void do_exit_group(int status) {
             int leaked = 0;
             struct task *task_tmp;
             list_for_each_entry_safe(&group->threads, task, task_tmp, group_links) {
-                if (task != current && !task->exiting) {
+                // [T-ish-exit-valve-progress] Never orphan a thread that is
+                // already inside do_exit unless it outlasted the cap: it is
+                // about to touch its group and sighand, which must stay alive.
+                if (task != current && !task->exiting &&
+                        (!atomic_load(&task->exit_started) || waited_ms >= EXIT_PROGRESS_CAP_MS)) {
                     task->exiting = true;
                     list_remove(&task->group_links);
                     // Release resources so pipes get EOF and memory is freed.

@@ -72,6 +72,8 @@ struct task *task_create_(struct task *parent) {
         *task = *parent;
     task->pid = pid->id;
     pid->task = task;
+    // Copied from the parent above; a new task has not begun exiting.
+    atomic_store(&task->exit_started, false);
 
 #ifdef GUEST_ARM64
     // Invalidate exclusive monitor after copying parent state.
