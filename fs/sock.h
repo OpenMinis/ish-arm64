@@ -219,6 +219,8 @@ static inline int sock_flags_from_real(int real) {
 #define IP_MTU_DISCOVER_ 10
 #define IP_RECVTTL_ 12
 #define IP_RECVTOS_ 13
+#define IP_MULTICAST_TTL_ 33
+#define IP_MULTICAST_LOOP_ 34
 #define TCP_NODELAY_ 1
 #define TCP_KEEPIDLE_ 4
 #define TCP_KEEPINTVL_ 5
@@ -227,6 +229,9 @@ static inline int sock_flags_from_real(int real) {
 #define TCP_INFO_ 11
 #define TCP_CONGESTION_ 13
 #define IPV6_UNICAST_HOPS_ 16
+#define IPV6_MULTICAST_IF_ 17
+#define IPV6_MULTICAST_HOPS_ 18
+#define IPV6_MULTICAST_LOOP_ 19
 #define IPV6_V6ONLY_ 26
 #define IPV6_TCLASS_ 67
 #define ICMP6_FILTER_ 1
@@ -269,11 +274,18 @@ static inline int sock_opt_to_real(int fake, int level) {
             case IP_RETOPTS_: return IP_RETOPTS;
             case IP_RECVTTL_: return IP_RECVTTL;
             case IP_RECVTOS_: return IP_RECVTOS;
+            case IP_MULTICAST_TTL_: return IP_MULTICAST_TTL;
+            case IP_MULTICAST_LOOP_: return IP_MULTICAST_LOOP;
         } break;
         case IPPROTO_IPV6: switch (fake) {
             case IPV6_UNICAST_HOPS_: return IPV6_UNICAST_HOPS;
             case IPV6_TCLASS_: return IPV6_TCLASS;
             case IPV6_V6ONLY_: return IPV6_V6ONLY;
+            // ints (an interface index, a hop limit, a flag) on both sides;
+            // the JDK sets IPV6_MULTICAST_HOPS on every IPv6 datagram socket
+            case IPV6_MULTICAST_IF_: return IPV6_MULTICAST_IF;
+            case IPV6_MULTICAST_HOPS_: return IPV6_MULTICAST_HOPS;
+            case IPV6_MULTICAST_LOOP_: return IPV6_MULTICAST_LOOP;
         } break;
     }
     return -1;

@@ -5,6 +5,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <net/if_dl.h>
 #include "kernel/calls.h"
 #include "fs/fd.h"
 #include "fs/inode.h"
@@ -1314,9 +1317,13 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     }
 #endif
 
+    // An option we do not know is ENOPROTOOPT, as on Linux: callers probe
+    // with it (the JDK opens every datagram socket by setting
+    // IP_MULTICAST_ALL and tolerates only ENOPROTOOPT; EINVAL broke
+    // java.net.DatagramSocket).
     int real_opt = sock_opt_to_real(option, level);
     if (real_opt < 0)
-        return _EINVAL;
+        return _ENOPROTOOPT;
     int real_level = sock_level_to_real(level);
     if (real_level < 0)
         return _EINVAL;
@@ -1429,7 +1436,7 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     } else {
         int real_opt = sock_opt_to_real(option, level);
         if (real_opt < 0)
-            return _EINVAL;
+            return _ENOPROTOOPT;
         int real_level = sock_level_to_real(level);
         if (real_level < 0)
             return _EINVAL;
@@ -2046,6 +2053,166 @@ static int sock_close(struct fd *fd) {
     return realfs_close(fd);
 }
 
+// Interface ioctls (SIOCGIF*), answered from the host's getifaddrs(). Java's
+// NetworkInterface enumerates IPv4 interfaces with SIOCGIFCONF and then asks
+// for each one's flags, netmask, broadcast and index; failing them made Gradle
+// stop at "Could not determine a usable wildcard IP for this machine".
+#define SIOCGIFCONF_ 0x8912
+#define SIOCGIFFLAGS_ 0x8913
+#define SIOCGIFADDR_ 0x8915
+#define SIOCGIFBRDADDR_ 0x8919
+#define SIOCGIFNETMASK_ 0x891b
+#define SIOCGIFMTU_ 0x8921
+#define SIOCGIFHWADDR_ 0x8927
+#define SIOCGIFINDEX_ 0x8933
+#define SIOCGIFTXQLEN_ 0x8942
+struct ifreq_ {
+    char name[16];
+    union {
+        struct sockaddr_ addr;
+        int16_t flags;
+        int32_t ivalue;
+        struct { addr_t mem_start, mem_end; uint16_t base_addr; uint8_t irq, dma, port; } map;
+    };
+};
+struct ifconf_ {
+    int32_t len;
+    addr_t buf;
+};
+
+static int ifflags_from_host(unsigned host) {
+    static const struct { unsigned host; int linux_; } map[] = {
+        {IFF_UP, 0x1}, {IFF_BROADCAST, 0x2}, {IFF_DEBUG, 0x4}, {IFF_LOOPBACK, 0x8},
+        {IFF_POINTOPOINT, 0x10}, {IFF_NOTRAILERS, 0x20}, {IFF_RUNNING, 0x40}, {IFF_NOARP, 0x80},
+        {IFF_PROMISC, 0x100}, {IFF_ALLMULTI, 0x200}, {IFF_MULTICAST, 0x1000},
+    };
+    int flags = 0;
+    for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (host & map[i].host)
+            flags |= map[i].linux_;
+    return flags;
+}
+
+static void sockaddr_in_to_guest(struct sockaddr_ *out, const struct sockaddr *in) {
+    memset(out, 0, sizeof(*out));
+    out->family = AF_INET_;
+    if (in != NULL && in->sa_family == AF_INET)
+        memcpy(out->data, in->sa_data, sizeof(out->data));   // port, then address
+}
+
+static int sock_ifconf(struct ifconf_ *ifc) {
+    struct ifaddrs *ifas;
+    if (getifaddrs(&ifas) < 0)
+        return errno_map();
+    int32_t used = 0;
+    int err = 0;
+    for (struct ifaddrs *ifa = ifas; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (ifc->buf != 0) {
+            if (used + (int32_t) sizeof(struct ifreq_) > ifc->len)
+                break;
+            struct ifreq_ req = {};
+            // the loopback is "lo" to the guest, as in netlink and /proc/net
+            strncpy(req.name, strcmp(ifa->ifa_name, "lo0") == 0 ? "lo" : ifa->ifa_name, sizeof(req.name) - 1);
+            sockaddr_in_to_guest(&req.addr, ifa->ifa_addr);
+            if (user_write(ifc->buf + used, &req, sizeof(req))) {
+                err = _EFAULT;
+                break;
+            }
+        }
+        used += sizeof(struct ifreq_);
+    }
+    freeifaddrs(ifas);
+    if (err < 0)
+        return err;
+    ifc->len = used;
+    return 0;
+}
+
+static int sock_ifreq(int cmd, struct ifreq_ *req) {
+    char name[sizeof(req->name) + 1] = {};
+    memcpy(name, req->name, sizeof(req->name));
+    if (strcmp(name, "lo") == 0)
+        strcpy(name, "lo0");
+    if (cmd == SIOCGIFINDEX_) {
+        unsigned index = if_nametoindex(name);
+        if (index == 0)
+            return _ENODEV;
+        req->ivalue = index;
+        return 0;
+    }
+    struct ifaddrs *ifas;
+    if (getifaddrs(&ifas) < 0)
+        return errno_map();
+    int err = _ENODEV;
+    for (struct ifaddrs *ifa = ifas; ifa != NULL; ifa = ifa->ifa_next) {
+        if (strcmp(ifa->ifa_name, name) != 0 || ifa->ifa_addr == NULL)
+            continue;
+        int family = ifa->ifa_addr->sa_family;
+        if (cmd == SIOCGIFFLAGS_) {   // on every entry; not every interface has an AF_LINK one
+            req->flags = ifflags_from_host(ifa->ifa_flags);
+            err = 0;
+        } else if (family == AF_LINK) {
+            struct sockaddr_dl *dl = (struct sockaddr_dl *) ifa->ifa_addr;
+            struct if_data *data = ifa->ifa_data;
+            if (cmd == SIOCGIFMTU_ && data != NULL) {
+                req->ivalue = data->ifi_mtu;
+                err = 0;
+            } else if (cmd == SIOCGIFTXQLEN_) {
+                req->ivalue = 1000;
+                err = 0;
+            } else if (cmd == SIOCGIFHWADDR_) {
+                memset(&req->addr, 0, sizeof(req->addr));
+                req->addr.family = (ifa->ifa_flags & IFF_LOOPBACK) ? 772 : 1;   // ARPHRD_LOOPBACK, ARPHRD_ETHER
+                if (dl->sdl_alen == 6)
+                    memcpy(req->addr.data, LLADDR(dl), 6);
+                err = 0;
+            }
+        } else if (family == AF_INET) {
+            const struct sockaddr *sa = NULL;
+            if (cmd == SIOCGIFADDR_)
+                sa = ifa->ifa_addr;
+            else if (cmd == SIOCGIFNETMASK_)
+                sa = ifa->ifa_netmask;
+            else if (cmd == SIOCGIFBRDADDR_ && (ifa->ifa_flags & IFF_BROADCAST))
+                sa = ifa->ifa_broadaddr;
+            if (sa != NULL) {
+                sockaddr_in_to_guest(&req->addr, sa);
+                err = 0;
+            } else if (cmd == SIOCGIFADDR_ || cmd == SIOCGIFNETMASK_ || cmd == SIOCGIFBRDADDR_) {
+                err = _EADDRNOTAVAIL;
+            }
+        }
+        if (err == 0)
+            break;
+    }
+    freeifaddrs(ifas);
+    return err;
+}
+
+static ssize_t sock_ioctl_size(int cmd) {
+    switch (cmd) {
+        case SIOCGIFCONF_:
+            return sizeof(struct ifconf_);
+        case SIOCGIFFLAGS_: case SIOCGIFADDR_: case SIOCGIFBRDADDR_: case SIOCGIFNETMASK_:
+        case SIOCGIFMTU_: case SIOCGIFHWADDR_: case SIOCGIFINDEX_: case SIOCGIFTXQLEN_:
+            return sizeof(struct ifreq_);
+    }
+    return realfs_ioctl_size(cmd);
+}
+
+static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
+    switch (cmd) {
+        case SIOCGIFCONF_:
+            return sock_ifconf(arg);
+        case SIOCGIFFLAGS_: case SIOCGIFADDR_: case SIOCGIFBRDADDR_: case SIOCGIFNETMASK_:
+        case SIOCGIFMTU_: case SIOCGIFHWADDR_: case SIOCGIFINDEX_: case SIOCGIFTXQLEN_:
+            return sock_ifreq(cmd, arg);
+    }
+    return realfs_ioctl(fd, cmd, arg);
+}
+
 const struct fd_ops socket_fdops = {
     .read = sock_read,
     .write = sock_write,
@@ -2053,8 +2220,8 @@ const struct fd_ops socket_fdops = {
     .poll = realfs_poll,
     .getflags = realfs_getflags,
     .setflags = realfs_setflags,
-    .ioctl_size = realfs_ioctl_size,
-    .ioctl = realfs_ioctl,
+    .ioctl_size = sock_ioctl_size,
+    .ioctl = sock_ioctl,
 };
 
 #if defined(__GNUC__) && __GNUC__ >= 8
