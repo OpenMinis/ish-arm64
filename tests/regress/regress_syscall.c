@@ -505,6 +505,25 @@ static void test_posix_timer_sigev_signal(void) {
     sigaction(SIGALRM, &old, NULL);
 }
 
+// unlink() on a directory: Linux says EISDIR (the macOS host says EPERM).
+// musl's remove() falls back to rmdir() only on EISDIR, so this is what
+// decides whether remove() - and Java's File.delete() - can delete a directory.
+static void test_unlink_directory(void) {
+    const char *d = "/tmp/regress_unlink_dir";
+    rmdir(d);
+    if (mkdir(d, 0755) != 0) {
+        check(0, "setup: mkdir for the unlink test");
+        return;
+    }
+    errno = 0;
+    int r = unlink(d);
+    check(r < 0 && errno == EISDIR, "unlink(directory) -> EISDIR");
+    check(remove(d) == 0, "remove(empty directory) succeeds");
+    struct stat st;
+    check(stat(d, &st) < 0 && errno == ENOENT, "the directory is gone after remove()");
+    rmdir(d);
+}
+
 int main(int argc, char **argv) {
     // Optional extra path to check stat/fstat on, e.g. a fakefs mount point.
     const char *extra_path = argc > 1 ? argv[1] : NULL;
@@ -537,6 +556,7 @@ int main(int argc, char **argv) {
     test_signal_still_interrupts();
     test_waitid_siginfo();
     test_posix_timer_sigev_signal();
+    test_unlink_directory();
 
     printf("\n================ RESULT ================\n");
     printf("  PASS: %d    FAIL: %d\n", pass, fail);

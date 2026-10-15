@@ -202,6 +202,16 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->unlink)
         err = mount->fs->unlink(mount, path);
+    // Linux answers unlink() on a directory with EISDIR; the macOS host says
+    // EPERM. musl's remove() falls back to rmdir only on EISDIR, so with EPERM
+    // remove() - and Java's File.delete() - never deletes a directory (AGP's
+    // mergeDebugJavaResource failed with "Failed to delete /tmp/tempdir_...").
+    // Checked only on failure, so a successful unlink costs nothing extra.
+    if (err == _EPERM) {
+        struct statbuf stat = {};
+        if (mount->fs->stat(mount, path, &stat) == 0 && S_ISDIR(stat.mode))
+            err = _EISDIR;
+    }
     path_cache_invalidate();
     mount_release(mount);
     return err;
