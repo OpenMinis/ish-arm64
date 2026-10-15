@@ -1395,12 +1395,14 @@ static inline int fast_read(struct cpu_state *cpu) {
     if (fd == NULL || fd->ops != &realfs_fdops)
         return -1;
 
-    // Direct host read (with EINTR retry)
+    // Direct host read (EINTR retried unless a guest signal is pending)
     char buf[4096];
     ssize_t res;
     do {
         res = read(fd->real_fd, buf, size);
-    } while (res < 0 && errno == EINTR);
+    } while (res < 0 && errno == EINTR && realfs_eintr_retry());
+    if (res < 0 && errno == EINTR)
+        current->syscall_restartable = true;
 
     if (res < 0)
         return errno_map();
@@ -1431,11 +1433,13 @@ static inline int fast_write(struct cpu_state *cpu) {
     if (user_read(buf_addr, buf, size))
         return _EFAULT;
 
-    // Direct host write (with EINTR retry)
+    // Direct host write (EINTR retried unless a guest signal is pending)
     ssize_t res;
     do {
         res = write(fd->real_fd, buf, size);
-    } while (res < 0 && errno == EINTR);
+    } while (res < 0 && errno == EINTR && realfs_eintr_retry());
+    if (res < 0 && errno == EINTR)
+        current->syscall_restartable = true;
 
     if (res < 0)
         return errno_map();

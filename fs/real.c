@@ -177,11 +177,27 @@ int realfs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     return 0;
 }
 
+// The SIGUSR1 that delivers a guest signal interrupts a blocking host read
+// or write with EINTR. Retrying then swallows the signal: a reader blocked on
+// an idle pipe ignored SIGKILL, and every .NET process exit waited out the
+// exit_group safety valve for its debugger thread. Give up when a guest
+// signal is pending (read/write restart under SA_RESTART); retry otherwise.
+bool realfs_eintr_retry(void) {
+    if (current == NULL || current->sighand == NULL)
+        return true;
+    int saved_errno = errno;   // callers still test and map errno
+    lock(&current->sighand->lock);
+    bool pending = !!(current->pending & ~current->blocked);
+    unlock(&current->sighand->lock);
+    errno = saved_errno;
+    return !pending;
+}
+
 ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
     ssize_t res;
     do {
         res = read(fd->real_fd, buf, bufsize);
-    } while (res < 0 && errno == EINTR);
+    } while (res < 0 && errno == EINTR && realfs_eintr_retry());
     if (res < 0)
         return errno_map();
     return res;
@@ -191,7 +207,7 @@ ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
     ssize_t res;
     do {
         res = write(fd->real_fd, buf, bufsize);
-    } while (res < 0 && errno == EINTR);
+    } while (res < 0 && errno == EINTR && realfs_eintr_retry());
     if (res < 0)
         return errno_map();
     return res;
