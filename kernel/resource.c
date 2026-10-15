@@ -271,6 +271,17 @@ int_t sys_sched_setaffinity(pid_t_ UNUSED(pid), dword_t UNUSED(cpusetsize), addr
     return 0;
 }
 
+int_t sys_getcpu(addr_t cpu_addr, addr_t node_addr, addr_t UNUSED(tcache)) {
+    STRACE("getcpu(%#x, %#x)", cpu_addr, node_addr);
+    // The host doesn't say which core a thread is on; one node, CPU 0 is a valid answer.
+    dword_t zero = 0;
+    if (cpu_addr && user_put(cpu_addr, zero))
+        return _EFAULT;
+    if (node_addr && user_put(node_addr, zero))
+        return _EFAULT;
+    return 0;
+}
+
 int_t sys_getpriority(int_t which, pid_t_ who) {
     STRACE("getpriority(%d, %d)", which, who);
     return 20;

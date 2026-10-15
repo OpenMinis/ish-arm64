@@ -17,6 +17,12 @@
 #include "fs/dev.h"
 #include "fs/real.h"
 
+// Linux never maps below vm.mmap_min_addr (64KB by default), so a read there
+// always faults natively. The read-fault recoveries below emulate reads that
+// land on a neighbouring mapping; they must not swallow null-page reads, which
+// runtimes like HotSpot rely on to raise SIGSEGV (implicit null checks).
+#define NULL_GUARD_END 0x10000
+
 dword_t syscall_stub(void) {
     return _ENOSYS;
 }
@@ -394,7 +400,7 @@ void handle_interrupt(int interrupt) {
                 cpu->segfault_addr >= 0x100000000ULL)
                 in_v8_cage = true;
 #endif
-            bool allow_demand_map = !cpu->segfault_was_write;
+            bool allow_demand_map = !cpu->segfault_was_write && cpu->segfault_addr >= NULL_GUARD_END;
             if (cpu->segfault_was_write && in_v8_cage)
                 allow_demand_map = true;
 
@@ -1008,7 +1014,7 @@ void handle_interrupt(int interrupt) {
             // mapped) but crash in iSH (because we have unmapped gaps).
             // Rate-limited to prevent infinite loops on true null-pointer derefs.
 #ifdef GUEST_ARM64
-            if (!cpu->segfault_was_write) {
+            if (!cpu->segfault_was_write && cpu->segfault_addr >= NULL_GUARD_END) {
                 static _Thread_local int read_recovery_count = 0;
                 static _Thread_local addr_t last_recovery_addr = 0;
                 // Reset counter when faulting address changes (scanner moving through memory)
@@ -1019,10 +1025,13 @@ void handle_interrupt(int interrupt) {
                 }
                 if (read_recovery_count < 8) {
                     read_recovery_count++;
-                    // The JIT reports cpu->pc as the block start, not the faulting
-                    // insn. Scan forward up to 8 insns to find the first load —
-                    // intermediate non-memory ops (SUB/ADD/MOV) can't fault, so
-                    // the first load is the culprit.
+                    // Start at the faulting instruction when the JIT recorded it:
+                    // from the block start, the first load found can be one that
+                    // already succeeded, and zeroing that skips the wrong insn.
+                    gpf_use_precise_pc(cpu);
+                    // Otherwise cpu->pc is the block start. Scan forward up to 8
+                    // insns to find the first load — intermediate non-memory ops
+                    // (SUB/ADD/MOV) can't fault, so the first load is the culprit.
                     for (int scan = 0; scan < 8; scan++) {
                         addr_t insn_pc = cpu->pc + scan * 4;
                         uint32_t insn = 0;

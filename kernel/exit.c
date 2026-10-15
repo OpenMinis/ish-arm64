@@ -191,7 +191,11 @@ noreturn void do_exit(int status) {
 
         // notify parent that we died
         struct task *parent = leader->parent;
-        if (parent == NULL && current->pid != 1) {
+        // A process is its leader: the last thread out of init's group need
+        // not be init's first thread (java runs main on another thread), and
+        // "reparenting" that group to pid 1 made init its own parent, so the
+        // system never halted.
+        if (parent == NULL && leader->pid != 1) {
             // Non-init process with no parent - try to find one
             // This can happen during reparenting or if parent exited first
             parent = pid_get_task(1); // Reparent to init
@@ -482,7 +486,8 @@ static void halt_system(void) {
         int tasks_found = 0;
         for (int i = 2; i < MAX_PID; i++) {
             struct task *task = pid_get_task(i);
-            if (task != NULL) {
+            // The caller can be any thread of init's group, not only pid 1.
+            if (task != NULL && task != current) {
                 tasks_found++;
                 switch (state) {
                 case 0:

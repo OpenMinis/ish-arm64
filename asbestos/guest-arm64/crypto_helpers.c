@@ -1032,6 +1032,8 @@ void usra_imm_helper(uint8_t *rd, uint8_t *rn, int shift, int esize, int Q) {
             dst[i] = dst[i] + (src[i] >> shift);
         }
     }
+    if (!Q)
+        memset(rd + 8, 0, 8);  // 64-bit forms zero the upper half
 }
 
 /*
@@ -1072,6 +1074,8 @@ void ssra_imm_helper(uint8_t *rd, uint8_t *rn, int shift, int esize, int Q) {
             dst[i] = dst[i] + (src[i] >> shift);
         }
     }
+    if (!Q)
+        memset(rd + 8, 0, 8);  // 64-bit forms zero the upper half
 }
 
 /*
@@ -1134,6 +1138,8 @@ void sri_imm_helper(uint8_t *rd, uint8_t *rn, int shift, int esize, int Q) {
             dst[i] = (dst[i] & ~mask) | (shifted & mask);
         }
     }
+    if (!Q)
+        memset(rd + 8, 0, 8);  // 64-bit forms zero the upper half
 }
 
 /*
@@ -1182,6 +1188,8 @@ void sli_imm_helper(uint8_t *rd, uint8_t *rn, int shift, int esize, int Q) {
             dst[i] = (dst[i] & ~mask) | (shifted & mask);
         }
     }
+    if (!Q)
+        memset(rd + 8, 0, 8);  // 64-bit forms zero the upper half
 }
 
 /*
