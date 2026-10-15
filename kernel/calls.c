@@ -1436,6 +1436,8 @@ static inline int fast_read(struct cpu_state *cpu) {
         res = read(fd->real_fd, buf, size);
     } while (res < 0 && errno == EINTR && realfs_eintr_retry());
     if (res < 0 && errno == EINTR)
+        res = realfs_read_ready(fd->real_fd, buf, size);
+    if (res < 0 && errno == EINTR)
         current->syscall_restartable = true;
 
     if (res < 0)

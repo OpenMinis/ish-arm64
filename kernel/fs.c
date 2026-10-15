@@ -1404,6 +1404,8 @@ dword_t sys_copy_file_range(fd_t in_fd, addr_t in_off_addr, fd_t out_fd,
             return _EFAULT;
     }
 
+    // An _EINTR is retried only when no guest signal is behind it: retrying
+    // a pending one forever kept a SIGKILLed copy from ever returning.
     char buf[4096];
     dword_t remaining = len, total = 0;
     while (remaining > 0) {
@@ -1411,16 +1413,16 @@ dword_t sys_copy_file_range(fd_t in_fd, addr_t in_off_addr, fd_t out_fd,
         ssize_t nread;
         if (in_off >= 0) {
             if (in->ops->pread) {
-                do { nread = in->ops->pread(in, buf, chunk, in_off); } while (nread == _EINTR);
+                do { nread = in->ops->pread(in, buf, chunk, in_off); } while (nread == _EINTR && realfs_eintr_retry());
             } else {
-                do { nread = in->ops->read(in, buf, chunk); } while (nread == _EINTR);
+                do { nread = in->ops->read(in, buf, chunk); } while (nread == _EINTR && realfs_eintr_retry());
             }
             if (nread > 0) in_off += nread;
         } else {
             if (in->ops->read) {
-                do { nread = in->ops->read(in, buf, chunk); } while (nread == _EINTR);
+                do { nread = in->ops->read(in, buf, chunk); } while (nread == _EINTR && realfs_eintr_retry());
             } else {
-                do { nread = in->ops->pread(in, buf, chunk, in->offset); } while (nread == _EINTR);
+                do { nread = in->ops->pread(in, buf, chunk, in->offset); } while (nread == _EINTR && realfs_eintr_retry());
                 if (nread > 0) in->offset += nread;
             }
         }
@@ -1432,16 +1434,16 @@ dword_t sys_copy_file_range(fd_t in_fd, addr_t in_off_addr, fd_t out_fd,
         ssize_t nwritten;
         if (out_off >= 0) {
             if (out->ops->pwrite) {
-                do { nwritten = out->ops->pwrite(out, buf, nread, out_off); } while (nwritten == _EINTR);
+                do { nwritten = out->ops->pwrite(out, buf, nread, out_off); } while (nwritten == _EINTR && realfs_eintr_retry());
             } else {
-                do { nwritten = out->ops->write(out, buf, nread); } while (nwritten == _EINTR);
+                do { nwritten = out->ops->write(out, buf, nread); } while (nwritten == _EINTR && realfs_eintr_retry());
             }
             if (nwritten > 0) out_off += nwritten;
         } else {
             if (out->ops->write) {
-                do { nwritten = out->ops->write(out, buf, nread); } while (nwritten == _EINTR);
+                do { nwritten = out->ops->write(out, buf, nread); } while (nwritten == _EINTR && realfs_eintr_retry());
             } else {
-                do { nwritten = out->ops->pwrite(out, buf, nread, out->offset); } while (nwritten == _EINTR);
+                do { nwritten = out->ops->pwrite(out, buf, nread, out->offset); } while (nwritten == _EINTR && realfs_eintr_retry());
                 if (nwritten > 0) out->offset += nwritten;
             }
         }

@@ -1978,12 +1978,17 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
         eintr_count++;
         // EINTR: only surface to guest if there is actually a pending signal
         // that the guest wants to handle. Otherwise retry (matches the
-        // original realfs_read behavior for spurious EINTR).
+        // original realfs_read behavior for spurious EINTR). Data that is
+        // already there still wins, as on Linux (realfs_read_ready).
         if (current->sighand != NULL) {
             lock(&current->sighand->lock);
             bool pending = !!(current->pending & ~current->blocked);
             unlock(&current->sighand->lock);
-            if (pending) { err = _EINTR; break; }
+            if (pending) {
+                ssize_t ready = realfs_read_ready(fd->real_fd, buf, size);
+                err = ready >= 0 ? (int) ready : _EINTR;
+                break;
+            }
         }
         // no guest signal — retry the host read
     }

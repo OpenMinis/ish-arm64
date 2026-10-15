@@ -193,11 +193,30 @@ bool realfs_eintr_retry(void) {
     return !pending;
 }
 
+// A host read cut short by EINTR with a guest signal pending. Linux looks
+// for data before it looks for signals, so a pipe or socket that already has
+// bytes (or its EOF) returns them: a writer that writes and then exits must
+// not have its SIGCHLD turn the reader's read into EINTR. Only reads that
+// cannot block are tried. Returns the read's result, or -1 with errno EINTR
+// when nothing is ready.
+ssize_t realfs_read_ready(int real_fd, void *buf, size_t bufsize) {
+    int avail = 0;
+    if (ioctl(real_fd, FIONREAD, &avail) == 0 && avail > 0)
+        return read(real_fd, buf, bufsize < (size_t) avail ? bufsize : (size_t) avail);
+    struct pollfd p = {.fd = real_fd, .events = POLLIN};
+    if (avail == 0 && poll(&p, 1, 0) == 1 && (p.revents & POLLHUP))
+        return 0;
+    errno = EINTR;
+    return -1;
+}
+
 ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
     ssize_t res;
     do {
         res = read(fd->real_fd, buf, bufsize);
     } while (res < 0 && errno == EINTR && realfs_eintr_retry());
+    if (res < 0 && errno == EINTR)
+        res = realfs_read_ready(fd->real_fd, buf, bufsize);
     if (res < 0)
         return errno_map();
     return res;
@@ -686,7 +705,14 @@ int realfs_flock(struct fd *fd, int operation) {
     int pfd = flock_proxy_fd(fd);
     if (pfd < 0)
         return errno_map();
-    if (flock(pfd, real_op) < 0)
+    // A blocking LOCK_EX/LOCK_SH waits in the host: the SIGUSR1 that
+    // delivers a guest signal ends it with EINTR, which the guest gets only
+    // if a signal is really pending.
+    int res;
+    do {
+        res = flock(pfd, real_op);
+    } while (res < 0 && errno == EINTR && realfs_eintr_retry());
+    if (res < 0)
         return errno_map();
     return 0;
 }
