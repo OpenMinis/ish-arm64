@@ -183,23 +183,31 @@ void handle_interrupt(int interrupt) {
                             (unsigned long long)_a0,(unsigned long long)_a1,(unsigned long long)_a2,
                             (unsigned long long)_a3,(unsigned long long)_a4,(unsigned long long)_a5,
                             (unsigned long long)result);
-                // SA_RESTART: mark this syscall restartable if it was
-                // interrupted (EINTR). receive_signals will rewind PC if the
-                // delivered signal's handler has SA_RESTART. Restricted to
-                // syscalls that re-execute correctly by simply re-running with
-                // the same args (futex, poll/epoll, read/write, recv/send,
-                // accept, connect, wait). Timer syscalls (nanosleep,
-                // clock_nanosleep, ppoll/pselect with timeout) must NOT use
-                // naive PC-rewind restart: it would restart the FULL duration
-                // rather than the remaining time, so a `timeout N` wrapper's
-                // sleep would never end. Those keep returning EINTR (userspace
-                // handles their own restart with an adjusted timeout).
+                // Mark an interrupted (EINTR) syscall restartable when Linux
+                // would return -ERESTARTSYS from it: receive_signals() then
+                // re-executes it if the signal ran a SA_RESTART handler or ran
+                // no handler at all (ignored, stop/continue). The rest are
+                // -ERESTARTNOHAND or timed on Linux and surface EINTR to any
+                // handler: poll/select/epoll_wait, nanosleep, sigsuspend, and
+                // a futex wait with a timeout. (Re-running those would also
+                // restart their full timeout: a `timeout N` sleep never ends.)
                 if ((int32_t)(uint32_t)result == -EINTR) {
                     switch (syscall_num) {
-                        case 98:  // futex
-                        case 22:  // epoll_pwait
+                        case 98:  // futex: only an untimed wait
+                            current->syscall_restartable = _a3 == 0;
+                            break;
                         case 63:  // read
                         case 64:  // write
+                        case 65:  // readv
+                        case 66:  // writev
+                        case 95:  // waitid
+                        case 260: // wait4
+                        case 202: // accept
+                        case 242: // accept4
+                        case 206: // sendto
+                        case 207: // recvfrom
+                        case 211: // sendmsg
+                        case 212: // recvmsg
                             current->syscall_restartable = true;
                             break;
                         default:

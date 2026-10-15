@@ -491,8 +491,10 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
             current->cpu.pc == current->syscall_restart_pc) {
         current->cpu.pc -= 4;
         current->cpu.regs[0] = current->syscall_restart_arg0;
-        current->syscall_restartable = false;
     }
+    // Either way a handler ran: without SA_RESTART it sees EINTR, and the
+    // no-handler restart in receive_signals() must not fire as well.
+    current->syscall_restartable = false;
 #endif
 
     // setup the frame
@@ -644,12 +646,14 @@ void receive_signals() {
     }
 
     struct sigqueue *sigqueue, *tmp;
+    bool received = false;
     list_for_each_entry_safe(&current->queue, sigqueue, tmp, queue) {
         int sig = sigqueue->info.sig;
         if (sigset_has(blocked, sig))
             continue;
         list_remove(&sigqueue->queue);
         sigset_del(&current->pending, sig);
+        received = true;
 
         if (current->ptrace.traced && sig != SIGKILL_) {
             // This notifies the parent, goes to sleep, and waits for the
@@ -662,6 +666,20 @@ void receive_signals() {
         }
         free(sigqueue);
     }
+
+#if defined(GUEST_ARM64)
+    // The signals that interrupted a restartable syscall ran no handler (they
+    // were ignored, or stopped and continued us): Linux restarts the syscall
+    // transparently, so the caller never sees this EINTR. A handler, if one
+    // ran, has already settled it and cleared the flag.
+    if (received && current->syscall_restartable &&
+            current->cpu.pc == current->syscall_restart_pc &&
+            current->cpu.regs[0] == (uint64_t) (int64_t) _EINTR) {
+        current->cpu.pc -= 4;
+        current->cpu.regs[0] = current->syscall_restart_arg0;
+        current->syscall_restartable = false;
+    }
+#endif
 
     unlock(&sighand->lock);
 
