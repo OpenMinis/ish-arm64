@@ -155,6 +155,8 @@ bool try_self_signal(int sig) {
     return can_send;
 }
 
+static struct task *process_signal_target(struct task *task, int sig);
+
 int send_group_signal(dword_t pgid, int sig, struct siginfo_ info) {
     lock(&pids_lock);
     struct pid *pid = pid_get(pgid);
@@ -164,7 +166,7 @@ int send_group_signal(dword_t pgid, int sig, struct siginfo_ info) {
     }
     struct tgroup *tgroup;
     list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
-        send_signal(tgroup->leader, sig, info);
+        send_signal(process_signal_target(tgroup->leader, sig), sig, info);
     }
     unlock(&pids_lock);
     return 0;
@@ -1110,6 +1112,34 @@ int_t sys_rt_sigtimedwait(addr_t set_addr, addr_t info_addr, addr_t timeout_addr
     return info.sig;
 }
 
+// A signal sent to a process goes to one of its threads that does not block
+// it, the leader when it can take it (Linux's complete_signal()); with every
+// thread blocking it, it stays pending on the leader. It used to always go
+// to the leader, so a process whose main thread blocks a signal that another
+// thread waits for (the usual signal-handling-thread pattern) never ran the
+// handler. Called with pids_lock held.
+static struct task *process_signal_target(struct task *task, int sig) {
+    struct tgroup *group = task->group;
+    struct task *leader = group->leader;
+    if (sig == SIGKILL_ || sig == SIGSTOP_)
+        return leader;
+    lock(&group->lock);
+    struct task *target = leader;
+    if (leader->exiting || leader->zombie || leader->sighand == NULL ||
+            sigset_has(leader->blocked & ~leader->waiting, sig)) {
+        struct task *t;
+        list_for_each_entry(&group->threads, t, group_links) {
+            if (!t->exiting && !t->zombie && t->sighand != NULL &&
+                    !sigset_has(t->blocked & ~t->waiting, sig)) {
+                target = t;
+                break;
+            }
+        }
+    }
+    unlock(&group->lock);
+    return target;
+}
+
 static int kill_task(struct task *task, dword_t sig) {
     if (!superuser() &&
             current->uid != task->uid &&
@@ -1126,6 +1156,11 @@ static int kill_task(struct task *task, dword_t sig) {
     return 0;
 }
 
+// kill() and friends address the process the task belongs to.
+static int kill_process(struct task *task, dword_t sig) {
+    return kill_task(sig == 0 ? task : process_signal_target(task, sig), sig);
+}
+
 static int kill_group(pid_t_ pgid, dword_t sig) {
     struct pid *pid = pid_get(pgid);
     if (pid == NULL) {
@@ -1135,7 +1170,7 @@ static int kill_group(pid_t_ pgid, dword_t sig) {
     struct tgroup *tgroup;
     int err = _EPERM;
     list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
-        int kill_err = kill_task(tgroup->leader, sig);
+        int kill_err = kill_process(tgroup->leader, sig);
         // killing a group should return an error only if no process can be signaled
         if (err == _EPERM)
             err = kill_err;
@@ -1149,14 +1184,14 @@ static int kill_everything(dword_t sig) {
         struct task *task = pid_get_task(i);
         if (task == NULL || task == current || !task_is_leader(task))
             continue;
-        int kill_err = kill_task(task, sig);
+        int kill_err = kill_process(task, sig);
         if (err == _EPERM)
             err = kill_err;
     }
     return err;
 }
 
-static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid) {
+static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid, bool thread) {
     STRACE("kill(%d, %d)", pid, sig);
     if (sig >= NUM_SIGS)
         return _EINVAL;
@@ -1183,7 +1218,7 @@ static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid) {
             return _ESRCH;
         }
 
-        err = kill_task(task, sig);
+        err = thread ? kill_task(task, sig) : kill_process(task, sig);
     }
 
     unlock(&pids_lock);
@@ -1191,15 +1226,15 @@ static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid) {
 }
 
 dword_t sys_kill(pid_t_ pid, dword_t sig) {
-    return do_kill(pid, sig, 0);
+    return do_kill(pid, sig, 0, false);
 }
 dword_t sys_tgkill(pid_t_ tgid, pid_t_ tid, dword_t sig) {
     if (tid <= 0 || tgid <= 0)
         return _EINVAL;
-    return do_kill(tid, sig, tgid);
+    return do_kill(tid, sig, tgid, true);
 }
 dword_t sys_tkill(pid_t_ tid, dword_t sig) {
     if (tid <= 0)
         return _EINVAL;
-    return do_kill(tid, sig, 0);
+    return do_kill(tid, sig, 0, true);
 }
