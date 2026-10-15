@@ -324,4 +324,51 @@ void vec_crc32_16(NO_CPU, const void *src, uint64_t *dst);
 void vec_crc32_32(NO_CPU, const void *src, uint64_t *dst);
 void vec_crc32_64(NO_CPU, const void *src, uint64_t *dst);
 
+#ifdef GUEST_X86_64
+// MMX forms
+void vec_unpackl_bw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_unpackl_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_packss_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_packsu_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_packss_d64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_subus_b64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_subus_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_min_ub64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_addus_b64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_addus_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_max_ub64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_andn64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_avg_b64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_avg_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_muluu64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_subss_b64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_subss_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_mins_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_addss_b64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_addss_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_maxs_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_madd_d64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_sumabs_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_phaddw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_phaddd64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_phaddsw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_phsubw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_phsubd64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_phsubsw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_pmaddubsw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_psignb64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_psignw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_psignd64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_pmulhrsw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_pabsb64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_pabsw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_pabsd64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_unpackh_bw64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_unpackh_w64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_unpackh_d64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_pshufb64(NO_CPU, const union mm_reg *src, union mm_reg *dst);
+void vec_palignr64(NO_CPU, const union mm_reg *src, union mm_reg *dst, uint8_t imm);
+void vec_extract_w64(NO_CPU, const union mm_reg *src, uint32_t *dst, uint8_t index);
+#endif
+
 #endif

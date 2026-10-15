@@ -637,7 +637,7 @@ void vec_avg_w128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
 
 void vec_mull128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
     for (int i = 0; i < 8; i++) {
-        dst->u16[i] = (uint16_t)(dst->u16[i] * src->u16[i]);
+        dst->u16[i] = (uint16_t) ((uint32_t) dst->u16[i] * src->u16[i]);
     }
 }
 
@@ -649,7 +649,8 @@ void vec_mulu128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
 }
 void vec_muluu128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
     for (int i = 0; i < 8; i++) {
-        uint32_t res = dst->u16[i] * src->u16[i];
+        // in uint32_t: the operands would be promoted to int and overflow
+        uint32_t res = (uint32_t) dst->u16[i] * src->u16[i];
         dst->u16[i] = ((res >> 16) & 0xffff);
     }
 }
@@ -1272,5 +1273,94 @@ void vec_pcmpistrm128(struct cpu_state *cpu, const union xmm_reg *src, const uni
     union xmm_reg a = *dst, b = *src;
     PCMPSTR_LENS_I
     pcmpstr_mask(cpu, pcmpstr(cpu, &a, &b, imm, la, lb), imm);
+}
+#endif
+
+#ifdef GUEST_X86_64
+// MMX forms of SSE2/SSSE3 integer operations. Most work lane by lane, and
+// the MMX result is the low half of the 128-bit one on the operands in the
+// low halves. Those that pair the destination's elements with the source's
+// (packs, horizontal adds) get the destination in the low half and the
+// source in the high half of one register, which they read whole.
+#define VEC_MMX_LANES(op) \
+void vec_##op##64(struct cpu_state *cpu, const union mm_reg *src, union mm_reg *dst) { \
+    union xmm_reg s = {.qw = {src->qw, 0}}, d = {.qw = {dst->qw, 0}}; \
+    vec_##op##128(cpu, &s, &d); \
+    dst->qw = d.qw[0]; \
+}
+#define VEC_MMX_PAIRS(op) \
+void vec_##op##64(struct cpu_state *cpu, const union mm_reg *src, union mm_reg *dst) { \
+    union xmm_reg d = {.qw = {dst->qw, src->qw}}; \
+    vec_##op##128(cpu, &d, &d); \
+    dst->qw = d.qw[0]; \
+}
+VEC_MMX_LANES(unpackl_bw)
+VEC_MMX_LANES(unpackl_w)
+VEC_MMX_PAIRS(packss_w)
+VEC_MMX_PAIRS(packsu_w)
+VEC_MMX_PAIRS(packss_d)
+VEC_MMX_LANES(subus_b)
+VEC_MMX_LANES(subus_w)
+VEC_MMX_LANES(min_ub)
+VEC_MMX_LANES(addus_b)
+VEC_MMX_LANES(addus_w)
+VEC_MMX_LANES(max_ub)
+VEC_MMX_LANES(andn)
+VEC_MMX_LANES(avg_b)
+VEC_MMX_LANES(avg_w)
+VEC_MMX_LANES(muluu)
+VEC_MMX_LANES(subss_b)
+VEC_MMX_LANES(subss_w)
+VEC_MMX_LANES(mins_w)
+VEC_MMX_LANES(addss_b)
+VEC_MMX_LANES(addss_w)
+VEC_MMX_LANES(maxs_w)
+VEC_MMX_LANES(madd_d)
+VEC_MMX_LANES(sumabs_w)
+VEC_MMX_PAIRS(phaddw)
+VEC_MMX_PAIRS(phaddd)
+VEC_MMX_PAIRS(phaddsw)
+VEC_MMX_PAIRS(phsubw)
+VEC_MMX_PAIRS(phsubd)
+VEC_MMX_PAIRS(phsubsw)
+VEC_MMX_LANES(pmaddubsw)
+VEC_MMX_LANES(psignb)
+VEC_MMX_LANES(psignw)
+VEC_MMX_LANES(psignd)
+VEC_MMX_LANES(pmulhrsw)
+VEC_MMX_LANES(pabsb)
+VEC_MMX_LANES(pabsw)
+VEC_MMX_LANES(pabsd)
+#undef VEC_MMX_LANES
+#undef VEC_MMX_PAIRS
+
+// the high halves interleaved are the low halves of the high halves interleaved
+#define VEC_MMX_UNPACKH(op, lo) \
+void vec_##op##64(struct cpu_state *cpu, const union mm_reg *src, union mm_reg *dst) { \
+    union mm_reg s = {.qw = src->qw >> 32}; \
+    dst->qw >>= 32; \
+    vec_##lo##64(cpu, &s, dst); \
+}
+VEC_MMX_UNPACKH(unpackh_bw, unpackl_bw)
+VEC_MMX_UNPACKH(unpackh_w, unpackl_w)
+VEC_MMX_UNPACKH(unpackh_d, unpackl_dq)
+#undef VEC_MMX_UNPACKH
+
+void vec_pshufb64(NO_CPU, const union mm_reg *src, union mm_reg *dst) {
+    union mm_reg d = *dst;
+    for (unsigned i = 0; i < 8; i++) {
+        uint8_t sel = (uint8_t) (src->qw >> (i * 8));
+        uint64_t byte = sel & 0x80 ? 0 : (uint8_t) (d.qw >> ((sel & 7) * 8));
+        dst->qw = (dst->qw & ~(0xffull << (i * 8))) | byte << (i * 8);
+    }
+}
+void vec_palignr64(NO_CPU, const union mm_reg *src, union mm_reg *dst, uint8_t imm) {
+    // dst:src shifted right by imm bytes
+    unsigned __int128 both = (unsigned __int128) dst->qw << 64 | src->qw;
+    dst->qw = imm >= 16 ? 0 : (uint64_t) (both >> (imm * 8));
+}
+void vec_extract_w64(NO_CPU, const union mm_reg *src, uint32_t *dst, uint8_t index) {
+    *dst = (uint16_t) (src->qw >> (index % 4 * 16));
+    gpr_zext(dst);
 }
 #endif
