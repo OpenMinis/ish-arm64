@@ -3495,7 +3495,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             lane = (Q << 3) | (S << 2) | size;
         } else if (base_opcode == 2) {
             elem_size = 2;
-            lane = (Q << 2) | (S << 1) | (size & 1);
+            lane = (Q << 2) | (S << 1) | (size >> 1);   // H index is Q:S:size<1>
         } else if (base_opcode == 4 && size == 0) {
             elem_size = 4;
             lane = (Q << 1) | S;
@@ -3602,7 +3602,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             lane = (Q << 3) | (S << 2) | size;
         } else if (base_opcode == 2) {
             elem_size = 2;
-            lane = (Q << 2) | (S << 1) | (size & 1);
+            lane = (Q << 2) | (S << 1) | (size >> 1);   // H index is Q:S:size<1>
         } else if (base_opcode == 4 && size == 0) {
             elem_size = 4;
             lane = (Q << 1) | S;
