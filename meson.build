@@ -29,6 +29,21 @@ if get_option('no_crlf')
     add_project_arguments('-DNO_CRLF', language: 'c')
 endif
 
+# Native JIT for the ARM64 guest (asbestos/guest-arm64/jit.h). Off by default;
+# without it the build is the plain gadget engine.
+ish_jit = get_option('jit')
+if ish_jit
+    if guest_arch != 'arm64' or host_machine.system() != 'darwin' or host_machine.cpu_family() != 'aarch64'
+        error('-Djit=true needs guest_arch=arm64 on an Apple arm64 host')
+    endif
+    add_project_arguments('-DISH_JIT=1', language: 'c')
+    if not get_option('jit_emit')
+        # Run only AOT images a target links in (asbestos/guest-arm64/aot.h);
+        # never map executable memory (iOS release builds).
+        add_project_arguments('-DISH_JIT_NO_EMIT=1', language: 'c')
+    endif
+endif
+
 add_project_arguments('-Wno-switch', language: 'c')
 
 # ISH_GADGET_PROFILE: enable gadget call ring-buffer + atexit dump.
@@ -115,6 +130,9 @@ elif guest_arch == 'arm64'
         gadgets+'/crypto.S',
         offsets,
     ]
+    if ish_jit
+        emu_src += 'asbestos/guest-arm64/jit.c'
+    endif
 endif
 
 libish_emu = library('ish_emu', emu_src, include_directories: includes)
@@ -1742,6 +1760,7 @@ if get_option('kernel') == 'ish'
 
         'fs/adhoc.c',
         'fs/sock.c',
+        'fs/netlink.c',
         'fs/pipe.c',
         'fs/sockrestart.c',
         'fs/lock.c',
@@ -1771,6 +1790,10 @@ if get_option('kernel') == 'ish'
         include_directories: includes)
     ish = declare_dependency(
         link_with: [libish, libish_emu, libfakefs],
+        # cpu-offsets.h is generated, and main.c includes it: every target
+        # using ish waits for it before compiling (else a fresh build dir can
+        # compile main.c before the header exists or while it is written).
+        sources: offsets,
         # link_whole so the offload test handlers' self-registering constructors
         # survive dead-strip (empty unless -Doffload_test_*=true).
         link_whole: offload_test_libs,
@@ -1778,7 +1801,13 @@ if get_option('kernel') == 'ish'
         include_directories: includes)
 
     if not meson.is_cross_build()
-        executable('ish', ['main.c'], dependencies: ish)
+        # AOT images are not part of ish: the CLI links them in only when
+        # given (-Dcli_aot=aot_<name>.S from tools/jit_aot/gen.py).
+        cli_aot = get_option('cli_aot')
+        if cli_aot.length() > 0 and not ish_jit
+            error('-Dcli_aot needs -Djit=true (the images register with the JIT runtime)')
+        endif
+        executable('ish', ['main.c'] + files(cli_aot), dependencies: ish)
     endif
 
 elif get_option('kernel') == 'linux'

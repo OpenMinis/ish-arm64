@@ -24,6 +24,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "asbestos/gen.h"
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+#endif
 #include "emu/arch/arm64/decode.h"
 #include "emu/interrupt.h"
 
@@ -921,6 +924,7 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     state->last_insn = 0;
     state->b_follow_depth = 0;
     state->oom = false;
+    state->units = false;
     for (int i = 0; i <= 1; i++) {
         state->jump_ip[i] = 0;
     }
@@ -931,6 +935,9 @@ bool gen_start(addr_t addr, struct gen_state *state) {
         return false;
     state->block = block;
     block->addr = addr;
+#ifdef ISH_JIT
+    jit_block_init(block);
+#endif
     return true;
 }
 
@@ -1010,7 +1017,9 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     //   cbnz Xr, skip             ; still referenced → skip
     // On match, emit one gadget_decref and consume all five instructions. This is
     // the single hottest inlined pattern in _PyEval_EvalFrameDefault.
-    if ((insn & 0xffc00000) == 0xf9400000u &&         // LDR Xr, [Xobj, #imm]
+    // Not for the JIT, whose units take at most two instructions.
+    if (!state->units &&
+        (insn & 0xffc00000) == 0xf9400000u &&         // LDR Xr, [Xobj, #imm]
         ((insn >> 10) & 0xfff) == 0) {                // imm offset == 0
         uint32_t r   = insn & 0x1f;
         uint32_t obj = (insn >> 5) & 0x1f;
@@ -1052,7 +1061,9 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     // The b.eq target is the instruction right after the str, so BOTH paths fall
     // through to the next opcode — no branch out of the block. This is the LOAD_FAST
     // / dup-ref hot path, dual of DECREF but with no dealloc branch (always fast).
-    if ((insn & 0xffc00000) == 0xb9400000u &&         // LDR Wr, [Xobj, #imm]
+    // Not for the JIT, whose units take at most two instructions.
+    if (!state->units &&
+        (insn & 0xffc00000) == 0xb9400000u &&         // LDR Wr, [Xobj, #imm]
         ((insn >> 10) & 0xfff) == 0) {                // imm offset == 0
         uint32_t r   = insn & 0x1f;
         uint32_t obj = (insn >> 5) & 0x1f;
@@ -1609,7 +1620,8 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         // Most common pair across CPython workloads (~4.5% of dispatches).
         // Conditions: 32-bit (sf=0), opc=0, rn!=31, rd!=31, follow-up CMP wd,#imm12
         // (sf=0, op=1, S=1, rd=31), follow-up B.cond with cond ∈ supported set.
-        if (opc == 0 && !sf && rn != 31 && rd != 31) {
+        // Not for the JIT, whose units take at most two instructions.
+        if (opc == 0 && !sf && rn != 31 && rd != 31 && !state->units) {
             uint32_t cmp_insn, br_insn;
             if (gen_peek_next_insn(state, &cmp_insn)) {
                 // CMP Wn, #imm12: SUBS WZR, Wn, #imm12  (32-bit, op=1, S=1, sh=0, rd=31, rn=rd_of_AND)
@@ -2010,9 +2022,22 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
                 gen(state, rn);
                 break;
             case 1:  // BLR
+#ifdef ISH_JIT
+                // [gadget][block_self_ptr][return_addr][return_cont][rn]: the
+                // first words match BL so an indirect call fills ret_cache too
+                // and its RET (gadget or native) stays out of the run loop.
+                gen(state, (unsigned long) gadget_branch_link_reg);
+                gen(state, 0);                                        // block self-pointer (gen_end)
+                gen(state, state->ip);                                // return address
+                gen(state, (unsigned long) state->ip | (1UL << 63));  // return continuation (chained)
+                gen(state, rn);
+                state->block_patch_ip = state->size - 4;
+                state->jump_ip[0] = state->size - 2;
+#else
                 gen(state, (unsigned long) gadget_branch_link_reg);
                 gen(state, rn);
                 gen(state, state->ip);  // return address
+#endif
                 break;
             case 2:  // RET
                 gen(state, (unsigned long) gadget_ret);

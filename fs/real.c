@@ -5,6 +5,9 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <sys/mman.h>
@@ -118,6 +121,9 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
 int realfs_close(struct fd *fd) {
     if (fd->dir != NULL)
         closedir(fd->dir);
+    int proxy = atomic_load(&fd->flock_proxy);
+    if (proxy != 0)
+        close(proxy - 1);   // drops this description's flock, like closing the file would
     int err = close(fd->real_fd);
     if (err < 0)
         return errno_map();
@@ -593,13 +599,69 @@ int realfs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     return 0;
 }
 
+// [T-ish-flock-proxy] A guest flock() must not lock the real file: on iOS
+// the rootfs lives in the App Group container, and runningboard kills a
+// suspended app that still holds a lock outside its own data container
+// (0xdead10cc "locked files not in allowed directories"). codex holds a flock
+// on ~/.codex/tmp/arg0/*/.lock for its whole run, so iSH died every time it
+// went to the background during `codex login`. Lock a stand-in file in the
+// app's private temp directory instead, one per real (dev, inode), opened once
+// per open file description: host flock() semantics between descriptions,
+// processes, fork and close stay exactly the same.
+static char flock_dir[PATH_MAX];
+
+static void flock_proxy_dir_init(void) {
+    const char *tmp = getenv("TMPDIR");
+    char buf[PATH_MAX];
+#if defined(__APPLE__)
+    if (tmp == NULL && confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf)) > 0)
+        tmp = buf;
+#endif
+    if (tmp == NULL)
+        tmp = "/tmp";
+    snprintf(flock_dir, sizeof(flock_dir), "%s/ish-flock", tmp);
+    mkdir(flock_dir, 0700);
+}
+
+static const char *flock_proxy_dir(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, flock_proxy_dir_init);
+    return flock_dir;
+}
+
+static int flock_proxy_fd(struct fd *fd) {
+    int have = atomic_load(&fd->flock_proxy);
+    if (have != 0)
+        return have - 1;
+    struct stat st;
+    if (fstat(fd->real_fd, &st) < 0)
+        return -1;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%llx-%llx", flock_proxy_dir(),
+             (unsigned long long) st.st_dev, (unsigned long long) st.st_ino);
+    int pfd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (pfd < 0)
+        return -1;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&fd->flock_proxy, &expected, pfd + 1)) {
+        close(pfd);   // another thread of this description got there first
+        return expected - 1;
+    }
+    return pfd;
+}
+
 int realfs_flock(struct fd *fd, int operation) {
     int real_op = 0;
     if (operation & LOCK_SH_) real_op |= LOCK_SH;
     if (operation & LOCK_EX_) real_op |= LOCK_EX;
     if (operation & LOCK_UN_) real_op |= LOCK_UN;
     if (operation & LOCK_NB_) real_op |= LOCK_NB;
-    return flock(fd->real_fd, real_op);
+    int pfd = flock_proxy_fd(fd);
+    if (pfd < 0)
+        return errno_map();
+    if (flock(pfd, real_op) < 0)
+        return errno_map();
+    return 0;
 }
 
 int realfs_statfs(struct mount *mount, struct statfsbuf *stat) {

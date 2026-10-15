@@ -32,6 +32,7 @@ struct task {
     uid_t_ groups[MAX_GROUPS];
     char comm[16] __strncpy_safe; // locked by general_lock
     bool did_exec; // for that one annoying setsid edge case
+    bool undumpable; // prctl(PR_SET_DUMPABLE, 0); inherited by fork, cleared by exec
 
     struct fdtable *files;
     struct fs_info *fs;
@@ -105,6 +106,11 @@ struct task {
     // (whole guest address space) from leaking forever when the thread never
     // re-enters do_exit(). Cleared once released so it never double-frees.
     bool mm_release_deferred;
+    // [T-ish-exit-valve-progress] Set by the thread itself on entering
+    // do_exit, before it queues for pids_lock. do_exit_group's safety valve
+    // reads it to tell a thread that is already exiting (merely waiting its
+    // turn for the lock) from one stuck elsewhere.
+    _Atomic bool exit_started;
 
     // this structure is allocated on the stack of the parent's clone() call
     struct vfork_info {
@@ -245,6 +251,17 @@ static inline bool task_is_leader(struct task *task) {
     return task->group->leader == task;
 }
 
+// [T-ish-leaked-thread-poll] True once do_exit_group's safety valve has given
+// up on this thread (it sets `exiting` and unlinks it from the group), or once
+// task_destroy has zeroed the struct under it (group == NULL). Such a thread's
+// group, sighand and files are gone or about to be freed, so a wait loop that
+// wakes up must leave before touching any of them: return to the syscall
+// dispatcher, whose post-syscall guard (calls.c) pthread_exits the thread.
+// Only valid for `current`: no other thread may be leaked while it runs.
+static inline bool task_orphaned(struct task *task) {
+    return task->exiting || task->group == NULL;
+}
+
 struct pid {
     dword_t id;
     struct task *task;
@@ -263,6 +280,13 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 
 // [T-ish-cpu-top] Successful fork/clone count (kernel/fork.c), for host diagnostics.
 extern _Atomic uint64_t ish_guest_forks;
+
+// [T-ish-freeze-watch] Lock-free progress counters for the host's freeze
+// detector (kernel/freeze_watch.h): every completed syscall, and guest
+// processes (thread groups) created and not yet reaped. Relaxed atomics only;
+// readers must never need a kernel lock to see them.
+extern _Atomic uint64_t ish_guest_syscalls;
+extern _Atomic int64_t ish_live_guest_procs;
 
 // [T-ish-fork-rate] Global fork-rate governor: a token bucket that every
 // non-thread clone() draws from. When it is empty, heavy forkers sleep until

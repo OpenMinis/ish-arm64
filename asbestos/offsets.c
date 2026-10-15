@@ -109,6 +109,7 @@ void cpu() {
     OFFSET(LOCAL, fiber_frame, value_addr);
     OFFSET(LOCAL, fiber_frame, last_block);
     OFFSET(LOCAL, fiber_frame, jit_exit_sp);
+    OFFSET(LOCAL, fiber_frame, fault_stream);
     OFFSET(LOCAL, fiber_frame, ret_cache);
     OFFSET(CPU, cpu_state, segfault_addr);
     OFFSET(CPU, cpu_state, segfault_was_write);
@@ -124,6 +125,9 @@ void cpu() {
     OFFSET(TLB, tlb, mmu);
     OFFSET(TLB, tlb, dirty_page);
     OFFSET(TLB, tlb, segfault_addr);
+#ifdef GUEST_ARM64
+    OFFSET(TLB, tlb, stale);
+#endif
     OFFSET(TLB, tlb, block_cache);      // inline indirect-branch target cache
     OFFSET(TLB, tlb, block_cache_gen);
     OFFSET(TLB_ENTRY, tlb_entry, page);

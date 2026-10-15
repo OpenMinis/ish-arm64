@@ -247,16 +247,16 @@ struct sigcontext_ {
     uint64_t sp;
     uint64_t pc;
     uint64_t pstate;
-    // Extension area for FPSIMD state
-    // NOTE: Do NOT use __attribute__((aligned(16))) here — it forces the
-    // entire sigcontext_ struct to 16-byte alignment, which inserts 8 bytes
-    // of padding before mcontext in ucontext_, shifting mcontext from the
-    // Linux-standard offset 168 to 176. Go's runtime reads mcontext at a
-    // fixed offset (168) from the ucontext pointer, so this misalignment
-    // causes Go's async preemption (SIGURG) to corrupt the signal frame.
-    // The field is naturally 16-byte aligned in practice (offset 448 from
-    // the start of ucontext).
-    uint8_t __reserved[4096];
+    // Extension area for FPSIMD state. [T-ish-sigframe-mcontext-176] Linux
+    // declares it __aligned__(16), which makes the whole sigcontext 16-byte
+    // aligned: __reserved sits at offset 288 and uc_mcontext at offset 176 of
+    // the ucontext. musl's mcontext_t and Go's runtime (defs_linux_arm64.go:
+    // `_pad2 [8]byte // sigcontext must be aligned to 16-byte`) both read it
+    // there. Commit 6cb58825 dropped the attribute believing Go reads 168;
+    // with mcontext at 168 every register a handler reads or writes through
+    // the ucontext is off by one slot (Go's nil-pointer panics could not be
+    // recovered, and async preemption hung).
+    uint8_t __reserved[4096] __attribute__((aligned(16)));
 };
 
 struct ucontext_ {
@@ -267,6 +267,8 @@ struct ucontext_ {
     uint8_t __padding[128 - sizeof(sigset_t_)];  // Pad to fixed offset
     struct sigcontext_ mcontext;
 };
+_Static_assert(offsetof(struct sigcontext_, __reserved) == 288, "arm64 sigcontext.__reserved offset");
+_Static_assert(offsetof(struct ucontext_, mcontext) == 176, "arm64 ucontext.uc_mcontext offset");
 
 struct sigframe_ {
     addr_t restorer;

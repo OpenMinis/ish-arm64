@@ -116,6 +116,9 @@ struct data {
     struct fd *fd;
     size_t file_offset;
     const char *name;
+    // Guest module id + 1 for the ARM64 JIT (asbestos/guest-arm64/jit.c), 0
+    // until looked up. Not under ISH_JIT: app code sees this struct too.
+    int jit_mod;
 #if LEAK_DEBUG
     int pid;
     addr_t dest;

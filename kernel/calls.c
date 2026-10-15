@@ -56,6 +56,17 @@ void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook) {
     atomic_store_explicit(&g_timer_tick_hook, hook, memory_order_release);
 }
 
+#ifdef GUEST_ARM64
+// [T-ish-precise-fault-pc] Deliver / resume a data fault at the faulting
+// instruction instead of the start of its block, unless a recovery heuristic
+// above already moved pc somewhere else.
+static void gpf_use_precise_pc(struct cpu_state *cpu) {
+    if (cpu->segfault_precise_pc != 0 && cpu->pc == cpu->segfault_block_pc)
+        cpu->pc = cpu->segfault_precise_pc;
+    cpu->segfault_precise_pc = 0;
+}
+#endif
+
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
     if (interrupt == INT_SYSCALL) {
@@ -237,6 +248,8 @@ void handle_interrupt(int interrupt) {
         }
         // Update deadlock detection state.
         atomic_fetch_add(&current->group->syscall_count, 1);
+        // [T-ish-freeze-watch] Process-wide, readable without pids_lock.
+        atomic_fetch_add_explicit(&ish_guest_syscalls, 1, memory_order_relaxed);
         // Update last_unblocked_ns for non-blocking syscalls only.
         // Blocking calls (futex, epoll, ppoll, waitid, nanosleep) that
         // return and retry should NOT refresh the timestamp, as they
@@ -1092,10 +1105,14 @@ void handle_interrupt(int interrupt) {
                 dump_stack(8);
                 dump_maps();
             }
+#ifdef GUEST_ARM64
+            gpf_use_precise_pc(cpu);
+#endif
             deliver_signal(current, SIGSEGV_, info);
         }
 #ifdef GUEST_ARM64
         gpf_handled:;
+        gpf_use_precise_pc(cpu);
 #endif
     } else if (interrupt == INT_UNDEFINED) {
 #if defined(GUEST_X86) || !defined(GUEST_ARM64)

@@ -1,0 +1,1 @@
+for i in $(seq 1 5); do python3 -c "import json,base64; s=json.dumps({'code': base64.b64encode(open('/tmp/aojit/py/blob.bin','rb').read()).decode()}); print(len(s), len(base64.b64decode(json.loads(s)['code'])))"; done

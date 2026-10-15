@@ -13,6 +13,8 @@ reintroduces one of them fails here instead of in a user's shell.
 | `waitid` siginfo | `sys_waitid` returned the raw wait status instead of decoding it: `si_status` was `7936` for `exit(31)` and `si_code` was always 0, so a killed child looked like an exited one. `si_uid` was never set at all. | `regress_syscall.c` |
 | POSIX timer `SIGEV_SIGNAL` | `sys_timer_create`'s `SIGEV_SIGNAL` branch left `timer->thread_pid` at 0, and `posix_timer_callback` resolves its target with `pid_get_task(thread_pid)`. Pid 0 is never a live task, so the lookup returned NULL and the callback dropped the signal — both syscalls reported success, the clock expired on time, and nothing was delivered. GNU coreutils `timeout` schedules its deadline this way, so `timeout 3 sleep 300` ran the full 300s and exited 0, which reads from the outside as "processes cannot be killed". busybox's `timeout` was unaffected: it polls with `kill(pid, 0)` from a watchdog grandchild and arms no timer, which is why the same command worked in one rootfs and hung in another. | `regress_syscall.c` |
 | JIT gadget-buffer OOM | `gen()` called `abort()` when `realloc()` could not grow the gadget buffer, so one guest process outgrowing memory (a `python3` thread pool backgrounded on a phone) killed the whole app — every other guest thread plus the UI — with SIGABRT in `gen_ldst`/`gen_step`. It also advanced `capacity` before the `realloc`, leaving it describing memory that was never allocated. | `regress_jit_oom.c` |
+| AF_NETLINK stub hang | The stub answered a request only when it was sent with `sendto()`/`sendmsg()`, and its read was a bare blocking `read()` of the backing socketpair that ignored `MSG_PEEK`, `MSG_DONTWAIT` and `O_NONBLOCK`. busybox `ip` sends with `write()`, so `ip addr` waited for a reply that was never produced until the 900 s tool timeout or a manual stop (exit 143); iproute2 peeks first, and the peek consumed the only reply. Since the stub was switched on by default (`2952b439`) this hit every `ip addr \|\| ifconfig`. Now every send path is answered, links and addresses come from the host's `getifaddrs()`, what the host cannot tell us (routes, rules, neighbours) is `NLMSG_ERROR EOPNOTSUPP` at once, and no read blocks without bound. | `regress_netlink_stub.c` |
+| Leaked thread wedges every fork | `do_exit_group`'s safety valve gives up on a thread that has not left the group within 500 + 10*N ms, unlinks it and releases its sighand/files, but leaves the host thread running. A thread parked in `epoll_wait` then woke from `poll_wait`'s bounded 1 s host wait and dereferenced its torn-down `current->group`; in the idle check it did so holding `pids_lock`, faulted, and `jit_crash_handler` parked it forever with the lock held, so no `fork()` ever completed again (Minis 1.16(1), 2026-10-14, `gh` netpoller). `poll_wait` and `do_wait` now leave as soon as they wake up orphaned (`task_orphaned()`), and the post-syscall guard ends the thread. On an idle host the valve seldom leaks anything, so the test passing locally is necessary but not sufficient: the leak itself reproduces on a loaded iPhone. | `regress_leaked_thread_exit.c` |
 
 ## Running
 
@@ -68,3 +70,15 @@ aarch64-linux-musl-gcc -static -O0 -o <rootfs>/tmp/regress_syscall \
 
 All four run from `tests/regress/run_fs_perf.sh -i build-native/ish -r <fakefs rootfs> [-b]`,
 which works on a COPY of the rootfs so the meta.db orphan check is reproducible.
+
+## poll waits woken for nothing (2026-10-08)
+
+| Fix | What broke before it | Covered by |
+| --- | --- | --- |
+| poll spin guards (T-ish-poll-spin-guard) | A guest poll that wants only hangups (`events=0`, as the Rust runtime probes fds 0-2 before `main()`) registered the fd with kqueue `EVFILT_READ` + `NOTE_LOWAT=INT_MAX`. xnu ignores that low-water mark for regular files and clamps it to the buffer size for pipes, so a full pipe or a file with unread bytes fired forever while the guest check found nothing. With timeout 0 `poll_wait` never returned; otherwise it spun at 100% of a host core. `head -n 7604 big.py \| rg ...` hung (rg never read, head stayed blocked) and, backgrounded, got the app killed for its CPU budget. | `regress_poll_spurious.c` |
+
+`regress_poll_spurious.c` runs each case in a child under a 3 s watchdog and
+also checks CPU time inside timed waits. `/proc/ish/poll_spin` switches the four
+guards (`regfile`, `hupedge`, `deadline`, `backoff`) off one by one, e.g.
+`echo hupedge 0 > /proc/ish/poll_spin`; with all four off the test must fail
+(5 of 7 cases hang), which proves it catches the bug.

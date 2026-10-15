@@ -28,6 +28,9 @@ void ish_set_fork_guard(ish_fork_guard_t guard) {
 
 // [T-ish-cpu-top] Successful clone()/fork() count, read by the host [CPUTop] sampler.
 _Atomic uint64_t ish_guest_forks;
+// [T-ish-freeze-watch] See kernel/task.h.
+_Atomic uint64_t ish_guest_syscalls;
+_Atomic int64_t ish_live_guest_procs;
 
 // [T-ish-fork-rate] Fork-rate governor.
 //
@@ -165,6 +168,7 @@ static void fork_rate_wait(struct task *task) {
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
     *group = *old_group;
+    atomic_fetch_add_explicit(&ish_live_guest_procs, 1, memory_order_relaxed);   // [T-ish-freeze-watch]
     list_init(&group->threads);
     list_add(&old_group->pgroup, &group->pgroup);
     list_add(&old_group->session, &group->session);

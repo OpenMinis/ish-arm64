@@ -77,6 +77,13 @@ struct cpu_state {
     // For the page fault handler
     addr_t segfault_addr;
     bool segfault_was_write;
+    // [T-ish-precise-fault-pc] pc tracks block starts only. On an INT_GPF the
+    // run loop decodes the faulting instruction's address into
+    // segfault_precise_pc (0 if unknown) and keeps pc == segfault_block_pc, so
+    // the kernel's fault heuristics see what they always saw; the SIGSEGV and
+    // any resume use the precise pc.
+    addr_t segfault_block_pc;
+    addr_t segfault_precise_pc;
 
     dword_t trapno;
 

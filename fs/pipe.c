@@ -5,10 +5,16 @@
 #include "fs/real.h"
 #include "debug.h"
 
+// [T-ish-host-fd-double-close] Owns pipe_fd from here on: on any failure it
+// is already closed (f_install() closes the fd it could not install, and with
+// it real_fd), so a caller must never close() it again - by then the number
+// may belong to another thread of the app (CFNetwork, boringssl, AVAudio).
 static fd_t pipe_f_create(int pipe_fd, int flags) {
     struct fd *fd = adhoc_fd_create(&realfs_fdops);
-    if (fd == NULL)
+    if (fd == NULL) {
+        close(pipe_fd);
         return _ENOMEM;
+    }
     fd->real_fd = pipe_fd;
     fd->stat.mode = S_IFIFO | 0660;
     fd->stat.uid = current->uid;
@@ -28,10 +34,15 @@ int_t sys_pipe2(addr_t pipe_addr, int_t flags) {
     if (err < 0)
         return err;
 
+    // [T-ish-host-fd-double-close] Each host end is closed exactly once:
+    // by pipe_f_create() when it fails, by f_close() once it is installed,
+    // and here only while it has no guest fd yet.
     int fp[2];
     err = fp[0] = pipe_f_create(p[0], flags);
-    if (fp[0] < 0)
-        goto close_pipe;
+    if (fp[0] < 0) {
+        close(p[1]);
+        return err;
+    }
     err = fp[1] = pipe_f_create(p[1], flags);
     if (fp[1] < 0)
         goto close_fake_0;
@@ -46,9 +57,6 @@ close_fake_1:
     f_close(fp[1]);
 close_fake_0:
     f_close(fp[0]);
-close_pipe:
-    close(p[0]);
-    close(p[1]);
     return err;
 }
 

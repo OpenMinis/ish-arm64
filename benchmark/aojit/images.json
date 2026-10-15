@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "AOT images the AOJIT cases are measured against. module: substring of the guest path",
+    "(ISH_JIT_RECORD_MOD); workload: guest script (under /tmp/aojit) recorded in one ish run.",
+    "Recorded on a rootfs with the packages below (apk; pip for python-pptx; npm, installed with npm i -g,",
+    "for what the node workload runs: cf and MCP servers). Held out of the node workload, for measuring with",
+    "guest/node/mcp_probe.py: @modelcontextprotocol/server-sequential-thinking @wonderwhy-er/desktop-commander",
+    "@notionhq/notion-mcp-server @playwright/mcp.",
+    "node is recorded in the mode kernel/exec.c gives it by default (ISH_NODE_MODE=jitless is the",
+    "fallback); an image fits the mode it was recorded in.",
+    "ssh, scp: need the sshd of guest/ssh/server.sh running in another ish (AOJIT_SSH=host:port, default 127.0.0.1:2222)."
+  ],
+  "packages": {
+    "apk": ["musl", "busybox", "python3", "py3-pip", "zlib", "nodejs", "bzip2", "openssl", "sqlite-libs",
+            "py3-numpy", "py3-pandas", "py3-matplotlib", "py3-pillow", "py3-reportlab", "py3-lxml",
+            "py3-requests", "py3-httpx", "py3-jwt", "py3-cryptography", "py3-beautifulsoup4",
+            "openssh-client-default", "ripgrep", "github-cli"],
+    "pip": ["python-pptx"],
+    "npm": ["cf@1.0.0-beta.6", "@modelcontextprotocol/server-filesystem", "@modelcontextprotocol/server-memory",
+            "@modelcontextprotocol/server-everything", "@upstash/context7-mcp", "mcp-remote", "firecrawl-mcp",
+            "@modelcontextprotocol/server-github"]
+  },
+  "images": {
+    "musl":    {"module": "ld-musl",               "workload": "shell/musl_train.sh"},
+    "busybox": {"module": "/bin/busybox",          "workload": "busybox/busybox_train.sh"},
+    "zlib":    {"module": "libz.so",               "workload": "zlib/zlib_train.sh"},
+    "python":  {"module": "libpython3.12",         "workload": "py/python_train.sh"},
+    "node":    {"module": "/usr/bin/node",         "workload": "node/node_train.sh"},
+    "crypto":  {"module": "libcrypto.so",          "workload": "net/tls_train.sh"},
+    "ssl":     {"module": "libssl.so",             "workload": "net/tls_train.sh"},
+    "sqlite":  {"module": "libsqlite3.so",         "workload": "net/sqlite_train.sh"},
+    "imaging": {"module": "PIL/_imaging.cpython",  "workload": "pil/pil_train.sh"},
+    "webp":    {"module": "libwebp.so",            "workload": "pil/pil_train.sh"},
+    "jpeg":    {"module": "libjpeg.so",            "workload": "pil/pil_train.sh"},
+    "numpy":   {"module": "_multiarray_umath",     "workload": "doc/numpy_train.sh"},
+    "ssh":     {"module": "/usr/bin/ssh",          "workload": "ssh/ssh_train.sh"},
+    "scp":     {"module": "/usr/bin/scp",          "workload": "ssh/ssh_train.sh"},
+    "rg":      {"module": "/usr/bin/rg",           "workload": "rg/rg_train.sh"},
+    "gh":      {"module": "/usr/bin/gh",           "workload": "gh/gh_train.sh"},
+    "pyjson": {"module": "lib-dynload/_json.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyhashlib": {"module": "lib-dynload/_hashlib.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyblake2": {"module": "lib-dynload/_blake2.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pystruct": {"module": "lib-dynload/_struct.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pydatetime": {"module": "lib-dynload/_datetime.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pybinascii": {"module": "lib-dynload/binascii.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pymath": {"module": "lib-dynload/math.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyzlib": {"module": "lib-dynload/zlib.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pysocket": {"module": "lib-dynload/_socket.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyselect": {"module": "lib-dynload/select.cpython-312", "workload": "pyext/pyext_train.sh"},
+    "pyssl": {"module": "lib-dynload/_ssl.cpython-312", "workload": "pyext/pyext_train.sh"}
+  }
+}

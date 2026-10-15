@@ -193,10 +193,19 @@ static int flock_from_file_lock(struct file_lock *lock, struct flock_ *flock) {
     return 0;
 }
 
+// Descriptors ish makes without a filesystem inode -- the terminal of a
+// session, pipes, sockets -- have fd->inode == NULL. Nothing else can hold a
+// record lock on them through an inode, so a lock is always granted and
+// F_GETLK always finds none. (Dereferencing the NULL inode crashed the whole
+// app: sudo locks its terminal with F_SETLKW.)
 int fcntl_getlk(struct fd *fd, struct flock_ *flock) {
     if (flock->type != F_RDLCK_ && flock->type != F_WRLCK_)
         return _EINVAL;
     struct inode_data *inode = fd->inode;
+    if (inode == NULL) {
+        flock->type = F_UNLCK_;
+        return 0;
+    }
     lock(&inode->lock);
 
     struct file_lock request;
@@ -224,6 +233,8 @@ int fcntl_setlk(struct fd *fd, struct flock_ *flock, bool blocking) {
         return _EBADF;
 
     struct inode_data *inode = fd->inode;
+    if (inode == NULL)
+        return 0;   // see fcntl_getlk
     lock(&inode->lock);
 
     struct file_lock request;
@@ -244,6 +255,8 @@ out:
 
 void file_lock_remove_owned_by(struct fd *fd, void *owner) {
     struct inode_data *inode = fd->inode;
+    if (inode == NULL)
+        return;
     lock(&inode->lock);
     struct file_lock *lock, *tmp;
     list_for_each_entry_safe(&inode->posix_locks, lock, tmp, locks) {

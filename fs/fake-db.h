@@ -23,6 +23,8 @@ struct fakefs_db {
         sqlite3_stmt *path_rename;
         sqlite3_stmt *path_from_inode;
         sqlite3_stmt *try_cleanup_inode;
+        sqlite3_stmt *orphan_note;
+        sqlite3_stmt *orphan_clear;
     } stmt;
     sqlite3_mutex *lock;
 };
@@ -58,6 +60,11 @@ void inode_write_stat(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat
 
 void path_link(struct fakefs_db *fs, const char *src, const char *dst);
 inode_t path_unlink(struct fakefs_db *fs, const char *path);
+// Inside a write transaction: remember that `inode` may just have lost its
+// last path, so a crash before its cleanup is caught at the next mount.
+void inode_note_orphan(struct fakefs_db *fs, inode_t inode);
+// After the cleanup of `inode` ran (whether or not it deleted the stats row).
+void inode_clear_orphan(struct fakefs_db *fs, inode_t inode);
 void path_rename(struct fakefs_db *fs, const char *src, const char *dst);
 
 #endif

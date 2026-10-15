@@ -8,6 +8,9 @@
 #include "asbestos/asbestos.h"
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+#endif
 #include "emu/cpu.h"
 #include "emu/interrupt.h"
 #include "emu/tlb.h"
@@ -28,6 +31,12 @@
 // total execution time). The signal handler writes crash info directly
 // to cpu_state via the _cpu pointer (x1) from ucontext.
 __thread volatile sig_atomic_t in_jit;
+// [T-ish-jit-recovery-frame-check] The frame fiber_enter() runs on while
+// in_jit is set. Gadgets keep it in x1 (_cpu), but the C helpers they call
+// (tlb_handle_miss, mem_ptr, malloc below them) reuse x1 for arguments: a
+// host fault there must not be "recovered" by writing through x1. The app's
+// signal handler recovers only when x1 equals this.
+__thread void *volatile jit_frame;
 _Atomic uint64_t s_dispatch_iterations = 0;
 _Atomic uint64_t st_block_cache_miss = 0, st_block_compile = 0, st_chain_attempts = 0;
 _Atomic uint64_t st_int_poke = 0, st_int_poke_foreign = 0, st_int_cycle = 0, st_poke_calls = 0;
@@ -154,9 +163,11 @@ void dump_pc_hist(void) {
     fflush(stderr);
 }
 // --- Block execution profile (ISH_BLOCK_PROF_FILE=/path) ---
-// Records exact per-block dispatch counts + insn length for trace-AOT
-// feasibility study. Build with -DDISABLE_BLOCK_CHAINING for exact counts
-// (otherwise chained transitions bypass the dispatch loop and are missed).
+// Records exact per-block dispatch counts + insn length (tools/jit_aot/hotblocks.py
+// picks an AOT image's translations by them). For exact counts run with
+// ISH_JIT=0 ISH_NO_CHAIN=1: chained transitions bypass the dispatch loop, and
+// unchained, a return-cache hit goes through it too (ISH_NO_RETCACHE=1, which
+// clears the 32 KB cache at every dispatch, is not needed and 10x slower).
 // Open-addressing hash, fixed size; dump at pid-1 exit.
 #define BLK_PROF_SZ (1 << 21)   // 2M entries * 16B = 32MB
 static struct { _Atomic uint64_t addr; _Atomic uint64_t cnt_len; } *blk_prof; // cnt_len = count<<8 | insns
@@ -192,6 +203,20 @@ static inline void blk_prof_record(uint64_t addr, uint64_t insns) {
         }
     }
 }
+// With the JIT the key is the block's module and file offset (BLK_PROF_MOD |
+// module << 40 | offset), the same in every process: dumped as
+// "<module path> <offset> <insns> <count>".
+#define BLK_PROF_MOD (1ull << 63)
+static inline uint64_t blk_prof_key(struct tlb *tlb, uint64_t addr) {
+#ifdef ISH_JIT
+    uint64_t off;
+    int mod = jit_prof_locate(tlb, addr, &off);
+    if (mod >= 0 && mod < (1 << 22) && off < (1ull << 40))
+        return BLK_PROF_MOD | (uint64_t) mod << 40 | off;
+#endif
+    (void) tlb;
+    return addr;
+}
 void dump_block_prof(void) {
     const char *path = getenv("ISH_BLOCK_PROF_FILE");
     if (!path || !blk_prof) return;
@@ -202,6 +227,16 @@ void dump_block_prof(void) {
         uint64_t a = blk_prof[i].addr;
         if (!a) continue;
         uint64_t cl = blk_prof[i].cnt_len;
+#ifdef ISH_JIT
+        if (a & BLK_PROF_MOD) {
+            char mod[1024];
+            jit_module_path((int) (a >> 40 & ((1 << 22) - 1)), mod, sizeof(mod));
+            fprintf(f, "%s %llx %llu %llu\n", mod, (unsigned long long)(a & ((1ull << 40) - 1)),
+                    (unsigned long long)(cl & 0xff), (unsigned long long)(cl >> 8));
+            n++;
+            continue;
+        }
+#endif
         fprintf(f, "%llx %llu %llu\n", (unsigned long long)a,
                 (unsigned long long)(cl & 0xff), (unsigned long long)(cl >> 8));
         n++;
@@ -369,6 +404,9 @@ void asbestos_free(struct asbestos *asbestos) {
         }
     }
     fiber_free_jetsam(asbestos);
+#ifdef ISH_JIT
+    jit_asbestos_free(asbestos);
+#endif
     free(asbestos->page_hash);
     free(asbestos->hash);
     free(asbestos);
@@ -388,12 +426,43 @@ void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t e
     lock(&absestos->lock);
     bool did_invalidate = false;
     struct fiber_block *block, *tmp;
+    if (end - start >= FIBER_PAGE_HASH_SIZE) {
+        // Every page of a large range maps onto some bucket, and each bucket
+        // holds the blocks of *all* pages congruent to it: walking page by
+        // page would rescan each bucket (end - start) / FIBER_PAGE_HASH_SIZE
+        // times. Sweep every bucket once and keep the blocks whose page is in
+        // range instead.
+        for (size_t b = 0; b < FIBER_PAGE_HASH_SIZE; b++) {
+            for (int i = 0; i <= 1; i++) {
+                struct list *blocks = &absestos->page_hash[b].blocks[i];
+                if (list_null(blocks))
+                    continue;
+                list_for_each_entry_safe(blocks, block, tmp, page[i]) {
+                    page_t owner = i == 0 ? PAGE(block->addr) : PAGE(block->end_addr);
+                    if (owner < start || owner >= end)
+                        continue;
+                    fiber_block_disconnect(absestos, block);
+                    block->is_jetsam = true;
+                    list_add(&absestos->jetsam, &block->jetsam);
+                    did_invalidate = true;
+                }
+            }
+        }
+        start = end;  // nothing left for the per-page walk
+    }
     for (page_t page = start; page < end; page++) {
         for (int i = 0; i <= 1; i++) {
             struct list *blocks = blocks_list(absestos, page, i);
             if (list_null(blocks))
                 continue;
             list_for_each_entry_safe(blocks, block, tmp, page[i]) {
+                // blocks_list() is a hash bucket shared by every page with the
+                // same page % FIBER_PAGE_HASH_SIZE. Only drop the blocks that
+                // live on this page: invalidating a heap page must not throw
+                // away unrelated code that happens to share its bucket.
+                page_t owner = i == 0 ? PAGE(block->addr) : PAGE(block->end_addr);
+                if (owner != page)
+                    continue;
                 fiber_block_disconnect(absestos, block);
                 block->is_jetsam = true;
                 list_add(&absestos->jetsam, &block->jetsam);
@@ -448,6 +517,13 @@ void asbestos_invalidate_all(struct asbestos *asbestos) {
     unlock(&asbestos->lock);
 }
 
+// hash_size is a power of two. ARM64 code addresses are 4-byte aligned, so
+// `addr % hash_size` left 3 of every 4 buckets empty; fold the address so the
+// low bucket bits come from bits 2+ (x86 keeps its byte-granular low bits).
+static inline size_t fiber_hash(addr_t addr, size_t size) {
+    return (size_t) (addr ^ (addr >> 2) ^ (addr >> 19)) & (size - 1);
+}
+
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
     TRACE_(verbose, "%d resizing hash to %lu, using %lu bytes for gadgets\n", current_pid(), new_size, asbestos->mem_used);
     struct list *new_hash = calloc(new_size, sizeof(struct list));
@@ -457,7 +533,7 @@ static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
         struct fiber_block *block, *tmp;
         list_for_each_entry_safe(&asbestos->hash[i], block, tmp, chain) {
             list_remove(&block->chain);
-            list_init_add(&new_hash[block->addr % new_size], &block->chain);
+            list_init_add(&new_hash[fiber_hash(block->addr, new_size)], &block->chain);
         }
     }
     free(asbestos->hash);
@@ -472,14 +548,14 @@ static void fiber_insert(struct asbestos *asbestos, struct fiber_block *block) {
     if (asbestos->num_blocks >= asbestos->hash_size * 2)
         fiber_resize_hash(asbestos, asbestos->hash_size * 2);
 
-    list_init_add(&asbestos->hash[block->addr % asbestos->hash_size], &block->chain);
+    list_init_add(&asbestos->hash[fiber_hash(block->addr, asbestos->hash_size)], &block->chain);
     list_init_add(blocks_list(asbestos, PAGE(block->addr), 0), &block->page[0]);
     if (PAGE(block->addr) != PAGE(block->end_addr))
         list_init_add(blocks_list(asbestos, PAGE(block->end_addr), 1), &block->page[1]);
 }
 
 static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr) {
-    struct list *bucket = &asbestos->hash[addr % asbestos->hash_size];
+    struct list *bucket = &asbestos->hash[fiber_hash(addr, asbestos->hash_size)];
     if (list_null(bucket))
         return NULL;
     struct fiber_block *block;
@@ -517,9 +593,21 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
         }
     }
 #endif
+#ifdef ISH_JIT
+    struct jit_units *jit_units = jit_units_begin();
+    state.units = jit_units != NULL;
+#endif
     while (true) {
+#ifdef ISH_JIT
+        struct jit_step jit_step = jit_step_begin(&state);
+        bool more = gen_step(&state, tlb);
+        jit_step_end(jit_units, &jit_step, &state, more, tlb);
+        if (!more)
+            break;
+#else
         if (!gen_step(&state, tlb))
             break;
+#endif
         if (state.oom)  // buffer is stuck; decoding the rest of the page is wasted work
             break;
         // no block should span more than 2 pages
@@ -548,11 +636,62 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     gen_end(&state);
     assert(state.ip - ip <= PAGE_SIZE);
     state.block->used = state.capacity;
+#ifdef ISH_JIT
+    jit_block(state.block, jit_units);
+#endif
     ISH_SIGNPOST_SCOPE_END(jit, "block_compile", _bc_spid);
     return state.block;
 }
 
 #ifdef GUEST_ARM64
+// [T-ish-precise-fault-pc] cpu->pc only follows block boundaries: a gadget
+// that faults leaves it at the start of the current block. A signal handler
+// then saw the wrong pc (Go could not turn a nil dereference into a panic),
+// and resuming -- after the handler, or after the kernel demand-maps a
+// growsdown stack or heap page -- re-ran every instruction of the block
+// before the fault (`sub sp, sp, #0x1000; str xzr, [sp]` dropped sp twice).
+// fiber_exit records the code-stream pointer; decode the block again (same
+// guest bytes, same gadget stream) to find the unit it points into. Only runs
+// on a fault, so the stream needs no per-instruction pc table.
+static void fiber_fix_fault_pc(struct asbestos *asbestos, struct fiber_frame *frame, struct tlb *tlb) {
+    unsigned long *stream = (unsigned long *) frame->fault_stream;
+    addr_t block_addr = frame->cpu.pc;
+    size_t pos;
+    lock(&asbestos->lock);
+    struct fiber_block *block = fiber_lookup(asbestos, block_addr);
+    bool inside = block != NULL && stream > block->code && stream <= block->code + block->used;
+    pos = inside ? (size_t) (stream - block->code) : 0;
+    unlock(&asbestos->lock);
+    if (!inside)
+        return;
+
+    // The faulting gadget's pointer is at code[pos - 1] or before it (a gadget
+    // may have consumed some of its arguments); its unit spans the first unit
+    // whose end reaches pos.
+    struct gen_state state;
+    if (!gen_start(block_addr, &state))
+        return;
+    addr_t fault_pc = 0;
+    while (true) {
+        size_t before = state.size;
+        addr_t unit_pc = state.ip;
+        bool more = gen_step(&state, tlb);
+        if (state.oom)
+            break;
+        if (state.size > before && state.size >= pos) {
+            // A two-instruction unit (adrp+ldr, cmp+b.cond) restarts at its
+            // first instruction, which is side-effect free.
+            fault_pc = unit_pc;
+            break;
+        }
+        if (!more || state.ip - block_addr >= PAGE_SIZE - 15)
+            break;
+    }
+    free(state.block);
+    frame->cpu.segfault_block_pc = block_addr;
+    frame->cpu.segfault_precise_pc = fault_pc;
+}
+
 // W^X compile wrapper. Guest JITs (bun/JSC) patch their code pages in place
 // (inline caches, repatched branches). Without protection, a block compiled
 // while such a patch is mid-flight caches torn bytes and keeps executing them
@@ -625,6 +764,9 @@ static void fiber_block_disconnect(struct asbestos *asbestos, struct fiber_block
         list_for_each_entry_safe(&block->jumps_from[i], prev_block, tmp, jumps_from_links[i]) {
             if (prev_block->jump_ip[i] != NULL)
                 *prev_block->jump_ip[i] = prev_block->old_jump_ip[i];
+#ifdef ISH_JIT
+            jit_unlink(prev_block, i);
+#endif
             list_remove(&prev_block->jumps_from_links[i]);
         }
     }
@@ -632,6 +774,9 @@ static void fiber_block_disconnect(struct asbestos *asbestos, struct fiber_block
 
 static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *block) {
     fiber_block_disconnect(asbestos, block);
+#ifdef ISH_JIT
+    jit_block_free(block);
+#endif
     free(block);
 }
 
@@ -639,6 +784,9 @@ static void fiber_free_jetsam(struct asbestos *asbestos) {
     struct fiber_block *block, *tmp;
     list_for_each_entry_safe(&asbestos->jetsam, block, tmp, jetsam) {
         list_remove(&block->jetsam);
+#ifdef ISH_JIT
+        jit_block_free(block);
+#endif
         free(block);
     }
 }
@@ -896,11 +1044,26 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 // and is thus assumed to have no pointers left
                 if (!last_block->is_jetsam && !block->is_jetsam) {
                     for (int i = 0; i <= 1; i++) {
-                        if (last_block->jump_ip[i] != NULL &&
-                                (*last_block->jump_ip[i] & 0xffffffff) == block->addr) {
-                            *last_block->jump_ip[i] = (unsigned long) block->code;
-                            list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
+                        if (last_block->jump_ip[i] == NULL ||
+                                (*last_block->jump_ip[i] & 0xffffffff) != block->addr)
+                            continue;
+#ifdef ISH_JIT
+                        if (!jit_chain_ok(last_block, i, block)) {
+                            // still unchained, but its native code may enter block
+                            // directly; block leaving the cache undoes that
+                            if (jit_chain_refused(last_block, i, block)) {
+                                list_remove_safe(&last_block->jumps_from_links[i]);
+                                list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
+                            }
+                            continue;
                         }
+                        list_remove_safe(&last_block->jumps_from_links[i]);
+#endif
+                        *last_block->jump_ip[i] = (unsigned long) block->code;
+                        list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
+#ifdef ISH_JIT
+                        jit_link(last_block, i, block);
+#endif
                     }
                 }
                 unlock(&asbestos->lock);
@@ -918,7 +1081,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         jit_saved_pc = frame->cpu.pc;
 
         if (blk_prof_on() && block != NULL)
-            blk_prof_record(block->addr, (block->end_addr - block->addr) >> 2);
+            blk_prof_record(blk_prof_key(tlb, block->addr), (block->end_addr - block->addr) >> 2);
 
         // Count dispatch-loop iterations (gated). Cached env check.
         {
@@ -933,9 +1096,19 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 atomic_fetch_add_explicit(&s_dispatch_iterations, 1, memory_order_relaxed);
         }
 
+        jit_frame = frame;
         in_jit = 1;
+#ifdef ISH_JIT
+        jit_exec_ready();
+#endif
         interrupt = fiber_enter(block, frame, tlb);
         in_jit = 0;
+        jit_frame = NULL;
+#ifdef GUEST_ARM64
+        frame->cpu.segfault_precise_pc = 0;
+        if (interrupt == INT_GPF)
+            fiber_fix_fault_pc(asbestos, frame, tlb);
+#endif
 
 
         // Check if fiber_enter returned due to a JIT crash (signal handler
@@ -1040,6 +1213,9 @@ static int cpu_single_step(struct cpu_state *cpu, struct tlb *tlb) {
 
     struct fiber_block *block = state.block;
     struct fiber_frame frame = {.cpu = *cpu};
+#ifdef ISH_JIT
+    jit_exec_ready();
+#endif
     int interrupt = fiber_enter(block, &frame, tlb);
     *cpu = frame.cpu;
     fiber_block_free(NULL, block);
