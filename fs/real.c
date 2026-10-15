@@ -306,6 +306,17 @@ int realfs_poll(struct fd *fd) {
     // https://github.com/apple/darwin-xnu/blob/a449c6a3b8014d9406c2ddbdc81795da24aa7443/bsd/kern/sys_generic.c#L1856
     if (p.revents & POLLHUP)
         p.revents |= POLLOUT;
+    // An empty pipe whose writers are gone is POLLIN|POLLHUP here but only
+    // POLLHUP on Linux. CoreCLR's PAL worker waits for exactly that bare
+    // POLLHUP at shutdown; given POLLIN it spun in ppoll until the 2 s
+    // shutdown timeout, on every .NET process exit.
+    if ((p.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP)) {
+        struct stat st;
+        int avail;
+        if (fstat(fd->real_fd, &st) == 0 && S_ISFIFO(st.st_mode) &&
+                ioctl(fd->real_fd, FIONREAD, &avail) == 0 && avail == 0)
+            p.revents &= ~POLLIN;
+    }
     // apparently you can sometimes get POLLPRI on a pipe??? please ignore how much of a mess this condition is
     if (is_adhoc_fd(fd) && S_ISFIFO(fd->stat.mode))
         p.revents &= ~POLLPRI;
