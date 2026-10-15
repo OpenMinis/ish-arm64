@@ -181,6 +181,16 @@ fi
 # in-process while the host bombards iSH with SIGUSR1 (iSH's guest-signal
 # wake-up), so its blocking read takes host EINTRs with no guest signal
 # behind them and must retry without the caller noticing.
+#
+# Both guest-signal tests run twice: as is, and with SIGUSR1 blocked in iSH's
+# initial mask (host_block_sigusr1), which is how an app that starts guest
+# processes from a GCD worker runs them. A guest thread must be woken either
+# way, or kill -9 cannot end a thread blocked in a host read or write.
+host_mask=$(mktemp -t host_block_sigusr1)
+if ! cc -O1 -o "$host_mask" tests/regress/host_block_sigusr1.c; then
+    echo "failed to build host_block_sigusr1" >&2
+    status=1
+fi
 echo
 echo "########## signals vs blocking calls ##########"
 sig_bin=$(mktemp -t regress_signal_eintr)
@@ -188,19 +198,22 @@ if "$CC_GUEST" -static -O1 -Wall -pthread -o "$sig_bin" tests/regress/regress_si
         "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_signal_eintr status=none < "$sig_bin" &&
         "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_signal_eintr; then
     expected=$(cat tests/regress/regress_signal_eintr.expected)
-    out=$(timeout 900 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_signal_eintr 2>/dev/null)
     if [ "$MOUNT_FLAG" != "-f" ]; then
         echo "  SKIP  5a-5d (^C on a pty): no /dev/ptmx without a fakefs (-m -f)"
         expected=$(echo "$expected" | grep -v '^5')
-        out=$(echo "$out" | grep -v '^5')
     fi
-    if [ "$out" = "$expected" ]; then
-        echo "PASS: every case matches arm64 Linux"
-    else
-        echo "FAIL: differs from arm64 Linux:"
-        diff <(echo "$expected") <(echo "$out")
-        status=1
-    fi
+    for mask in "" "$host_mask"; do
+        out=$(timeout 900 $mask "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_signal_eintr 2>/dev/null)
+        [ "$MOUNT_FLAG" != "-f" ] && out=$(echo "$out" | grep -v '^5')
+        label=${mask:+" (SIGUSR1 blocked in iSH)"}
+        if [ "$out" = "$expected" ]; then
+            echo "PASS: every case matches arm64 Linux$label"
+        else
+            echo "FAIL: differs from arm64 Linux$label:"
+            diff <(echo "$expected") <(echo "$out")
+            status=1
+        fi
+    done
     sig_out=$(mktemp -t regress_9f)
     "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_signal_eintr -n 9f > "$sig_out" 2>/dev/null &
     ish_pid=$!
@@ -221,6 +234,33 @@ else
     status=1
 fi
 rm -f "$sig_bin"
+
+# Threads blocked in a host write, read, accept or flock must not survive
+# kill -9 or a sibling's _exit, with or without SIGUSR1 in iSH's mask.
+echo
+echo "########## kill threads blocked in host calls ##########"
+kill_bin=$(mktemp -t regress_kill_blocked)
+if "$CC_GUEST" -static -O1 -Wall -pthread -o "$kill_bin" tests/regress/regress_kill_blocked.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_kill_blocked status=none < "$kill_bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_kill_blocked; then
+    expected=$(cat tests/regress/regress_kill_blocked.expected)
+    for mask in "" "$host_mask"; do
+        out=$(timeout 300 $mask "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_kill_blocked 2>/dev/null)
+        label=${mask:+" (SIGUSR1 blocked in iSH)"}
+        if [ "$out" = "$expected" ]; then
+            echo "PASS: every case matches arm64 Linux$label"
+        else
+            echo "FAIL: differs from arm64 Linux$label:"
+            diff <(echo "$expected") <(echo "$out")
+            status=1
+        fi
+    done
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_kill_blocked
+else
+    echo "failed to build or stage regress_kill_blocked" >&2
+    status=1
+fi
+rm -f "$kill_bin" "$host_mask"
 
 echo
 echo "########## cp regressions ##########"

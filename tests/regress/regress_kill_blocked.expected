@@ -1,0 +1,10 @@
+write to a full pipe     SIGKILL  signal 9, under 1.4s yes, 0 of 3 threads left
+write to a full pipe     _exit    exit 3, under 1.4s yes, 0 of 3 threads left
+read an empty pipe       SIGKILL  signal 9, under 1.4s yes, 0 of 3 threads left
+read an empty pipe       _exit    exit 3, under 1.4s yes, 0 of 3 threads left
+read a quiet socketpair  SIGKILL  signal 9, under 1.4s yes, 0 of 3 threads left
+read a quiet socketpair  _exit    exit 3, under 1.4s yes, 0 of 3 threads left
+accept with no client    SIGKILL  signal 9, under 1.4s yes, 0 of 3 threads left
+accept with no client    _exit    exit 3, under 1.4s yes, 0 of 3 threads left
+flock a held lock        SIGKILL  signal 9, under 1.4s yes, 0 of 3 threads left
+flock a held lock        _exit    exit 3, under 1.4s yes, 0 of 3 threads left

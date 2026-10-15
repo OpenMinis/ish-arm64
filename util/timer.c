@@ -32,6 +32,12 @@ void timer_free(struct timer *timer) {
 
 static void *timer_thread(void *param) {
     struct timer *timer = param;
+    // Rearming and freeing a timer interrupt its nanosleep with SIGUSR1,
+    // which the creating thread may have had blocked (see task_thread).
+    sigset_t wake;
+    sigemptyset(&wake);
+    sigaddset(&wake, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &wake, NULL);
     lock(&timer->lock);
     while (true) {
         struct timespec remaining = timespec_subtract(timer->end, timespec_now(timer->clockid));

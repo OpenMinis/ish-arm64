@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -245,6 +246,18 @@ void task_run_current() {
 
 static void *task_thread(void *vtask) {
     current = vtask;
+    // A new thread inherits the signal mask of the thread that created it.
+    // An app that starts guest processes from a GCD worker (Minis does) hands
+    // every guest thread a mask with SIGUSR1 blocked - Darwin workqueue
+    // threads block all asynchronous signals - and fork() passes it on. Then
+    // the SIGUSR1 that delivers a guest signal never interrupts a blocking
+    // host read, write, accept or flock: such a thread ignores SIGKILL and
+    // the exit safety valve leaks it, with its whole address space. Unblock
+    // it here so every guest thread can be woken, whoever started it.
+    sigset_t wake;
+    sigemptyset(&wake);
+    sigaddset(&wake, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &wake, NULL);
     update_thread_name();
     task_run_current();
     die("task_thread returned"); // above function call should never return
