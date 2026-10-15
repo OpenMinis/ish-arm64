@@ -80,6 +80,11 @@ struct offload_entry {
 };
 
 static struct offload_entry offload_entries[NATIVE_OFFLOAD_MAX];
+
+static bool is_guest_target(const struct offload_entry *e) {
+    return e->native_path != NULL && strncmp(e->native_path, NATIVE_OFFLOAD_GUEST_PREFIX,
+                                             strlen(NATIVE_OFFLOAD_GUEST_PREFIX)) == 0;
+}
 static int offload_count = 0;
 
 #ifdef HAS_POSIX_SPAWN
@@ -135,7 +140,11 @@ int native_offload_add(const char *spec) {
     const char *eq = strchr(spec, '=');
     char *guest_name, *native_path;
 
-    if (eq) {
+    if (eq && strncmp(eq + 1, NATIVE_OFFLOAD_GUEST_PREFIX, strlen(NATIVE_OFFLOAD_GUEST_PREFIX)) == 0) {
+        // another guest program: exec.c runs it in place of this one
+        guest_name = strndup(spec, eq - spec);
+        native_path = strdup(eq + 1);
+    } else if (eq) {
         guest_name = strndup(spec, eq - spec);
         const char *path = eq + 1;
         if (access(path, X_OK) != 0) {
@@ -157,7 +166,11 @@ int native_offload_add(const char *spec) {
     struct offload_entry *e = &offload_entries[offload_count++];
     e->guest_name = guest_name;
     e->native_path = native_path;
-    fprintf(stderr, "native_offload: %s → %s\n", guest_name, native_path);
+    // A guest target stays quiet, here and at exec: on Windows ish's stderr
+    // is the guest command's, and the redirect should no more show than a
+    // symlink would.
+    if (!is_guest_target(e))
+        fprintf(stderr, "native_offload: %s → %s\n", guest_name, native_path);
     return 0;
 }
 #else
@@ -220,12 +233,14 @@ const char *native_offload_lookup_exec(const char *guest_path, const char *envp,
     bool generic = native_offload_name_is_generic(e->guest_name);
     if (generic_out) *generic_out = generic;
     if (!native_offload_path_allowed(e->guest_name, guest_path)) {
-        fprintf(stderr, "native_offload: %s: not a system path, running the guest's own file\n",
+        if (!is_guest_target(e))
+            fprintf(stderr, "native_offload: %s: not a system path, running the guest's own file\n",
                 guest_path);
         return NULL;
     }
     if (native_offload_env_disabled(e->guest_name, envp)) {
-        fprintf(stderr, "native_offload: %s: disabled by environment, running the guest's own file\n",
+        if (!is_guest_target(e))
+            fprintf(stderr, "native_offload: %s: disabled by environment, running the guest's own file\n",
                 guest_path);
         return NULL;
     }

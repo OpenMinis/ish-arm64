@@ -96,6 +96,14 @@ int native_offload_set_abort_handler(const char *guest_name, native_abort_func a
 
 // Register a host binary offload (macOS CLI only, uses posix_spawn).
 // spec is "name" or "name=/host/path". Returns 0 on success.
+//
+// "name=guest:/guest/path" runs another guest program instead, with the same
+// argv and envp: on Windows the host runs ffmpeg for the guest through a
+// guest-side client (Minis' /usr/local/bin/minis-offload, which talks to the
+// app through files in a bound folder), and this sends /usr/bin/ffmpeg and
+// /bin/ffmpeg there too. The path policy and the env switch apply as for any
+// offload; a target that does not exist leaves the original to be emulated.
+#define NATIVE_OFFLOAD_GUEST_PREFIX "guest:"
 int native_offload_add(const char *spec);
 
 // Check if a guest binary should be offloaded.

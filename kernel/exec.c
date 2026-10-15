@@ -1116,8 +1116,21 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     // (/usr/local/bin/ffmpeg) is routinely absent, and offloading it is how a
     // bare `ffmpeg` reaches the native build at all.
     if (native_path && offload_is_generic && guest_file_is_shebang_script(filename)) {
-        printk("native_offload: %s is a #! script, running it as one\n", filename);
+        // a guest target is usually that script itself (/usr/local/bin/ffmpeg)
+        if (strncmp(native_path, NATIVE_OFFLOAD_GUEST_PREFIX, strlen(NATIVE_OFFLOAD_GUEST_PREFIX)) != 0)
+            printk("native_offload: %s is a #! script, running it as one\n", filename);
         native_path = NULL;
+    }
+    if (native_path && strncmp(native_path, NATIVE_OFFLOAD_GUEST_PREFIX,
+                               strlen(NATIVE_OFFLOAD_GUEST_PREFIX)) == 0) {
+        const char *target = native_path + strlen(NATIVE_OFFLOAD_GUEST_PREFIX);
+        native_path = NULL;
+        if (strcmp(target, filename) != 0) {
+            err = do_execve(target, argc, argv, envp);
+            if (err != _ENOENT)
+                goto err_free_envp;
+            printk("native_offload: %s: no %s, running the guest's own file\n", filename, target);
+        }
     }
     if (native_path) {
         // native_offload_exec calls do_exit() on success, which unwinds via
