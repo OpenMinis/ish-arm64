@@ -142,6 +142,23 @@ else
     # the kernel able to fork. On a fast idle host the safety valve rarely
     # leaks anything, so this passing here is necessary, not sufficient; the
     # leak path itself is exercised on a loaded device (see README).
+    # A SIGSEGV handled by the guest at the same pc must keep being delivered
+    # (HotSpot null checks): 258+ used to kill the process.
+    echo
+    echo "########## SIGSEGV handled at the same site ##########"
+    if "$CC_GUEST" -static -O1 -Wall -pthread -o "$GUEST_ROOT/tmp/regress_segv_handler_loop" \
+            tests/regress/regress_segv_handler_loop.c; then
+        for mode in "" "onstack" "x thread"; do
+            out=$("$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_segv_handler_loop 10000 $mode 2>/dev/null | tail -1)
+            echo "[$mode] $out"
+            echo "$out" | grep -q ' OK$' || status=1
+        done
+        rm -f "$GUEST_ROOT/tmp/regress_segv_handler_loop"
+    else
+        echo "failed to build regress_segv_handler_loop" >&2
+        status=1
+    fi
+
     echo
     echo "########## leaked thread exit ##########"
     if "$CC_GUEST" -static -O0 -Wall -pthread -o "$GUEST_ROOT/tmp/regress_leaked_thread_exit" \

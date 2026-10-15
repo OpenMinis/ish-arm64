@@ -73,6 +73,17 @@ static void gpf_use_precise_pc(struct cpu_state *cpu) {
 }
 #endif
 
+#ifdef GUEST_ARM64
+// Per-thread state of the "stuck at the same fault" guard in the INT_GPF
+// branch of handle_interrupt. File scope (not block scope) because the
+// SIGSEGV delivery at the end of that branch resets the count.
+static _Thread_local uint64_t last_stuck_pc_task = 0;
+static _Thread_local uint64_t last_stuck_pc = 0;
+static _Thread_local uint64_t last_stuck_fault = 0;
+static _Thread_local int last_stuck_write = 0;
+static _Thread_local int stuck_pc_count = 0;
+#endif
+
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
     if (interrupt == INT_SYSCALL) {
@@ -309,11 +320,6 @@ void handle_interrupt(int interrupt) {
         // is stuck on an un-recoverable fault. Legitimate recovery
         // cycles (stack growsdown, V8 heap demand-map) change the
         // fault address each iteration so the counter resets.
-        static _Thread_local uint64_t last_stuck_pc_task = 0;
-        static _Thread_local uint64_t last_stuck_pc = 0;
-        static _Thread_local uint64_t last_stuck_fault = 0;
-        static _Thread_local int last_stuck_write = 0;
-        static _Thread_local int stuck_pc_count = 0;
         if (last_stuck_pc == cpu->pc &&
             last_stuck_pc_task == (uint64_t)current->pid &&
             last_stuck_fault == cpu->segfault_addr &&
@@ -1116,6 +1122,26 @@ void handle_interrupt(int interrupt) {
             }
 #ifdef GUEST_ARM64
             gpf_use_precise_pc(cpu);
+            // [T-ish-stuck-pc-guest-handler] This fault is going to a SIGSEGV
+            // handler the guest installed: the guest decides what happens
+            // next, as on Linux, so it is not "stuck" from the kernel's point
+            // of view. Runtimes depend on faulting at the same place over and
+            // over: HotSpot's interpreter and C1 implement null checks as a
+            // read of [null + offset] whose SIGSEGV becomes a
+            // NullPointerException, so a hot site throwing NPEs faults at the
+            // same pc and address every time. Counted, the 257th such NPE
+            // killed the JVM with SIGSEGV (found running Java 21 on the
+            // compat/suite-more build). The guard keeps covering what it is
+            // for: a fault that loops without ever reaching a guest handler
+            // (SIG_DFL, ignored or blocked SIGSEGV, or a kernel-side recovery
+            // that keeps re-faulting).
+            if (current->sighand != NULL) {
+                lock(&current->sighand->lock);
+                addr_t handler = current->sighand->action[SIGSEGV_].handler;
+                unlock(&current->sighand->lock);
+                if (handler != SIG_DFL_ && handler != SIG_IGN_ && !sigset_has(current->blocked, SIGSEGV_))
+                    stuck_pc_count = 0;
+            }
 #endif
             deliver_signal(current, SIGSEGV_, info);
         }
