@@ -372,6 +372,19 @@ int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off
             // mmap failed — fall through to anonymous path
         }
 
+#ifdef _WIN32
+        // Ending in the file's last page (any file whose size is not a page
+        // multiple) is no reason for a copy: the host maps that page whole,
+        // zeros past the end. On Windows a copy is committed memory, all of
+        // it: lib/modules made every JVM pay 124MB.
+        if (!((mmap_flags & MAP_SHARED) && (mmap_prot & PROT_WRITE)) &&
+                real_offset + (off_t) map_size <=
+                (st.st_size + real_page_size - 1) / real_page_size * real_page_size) {
+            char *memory = mmap(NULL, map_size, mmap_prot, mmap_flags, fd->real_fd, real_offset);
+            if (memory != MAP_FAILED)
+                return pt_map(mem, start, pages, memory, correction, prot);
+        }
+#endif
         // Create anonymous backing for the full range (zeros for BSS)
         char *memory = mmap(NULL, map_size,
                 PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

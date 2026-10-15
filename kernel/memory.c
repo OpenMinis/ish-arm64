@@ -985,8 +985,14 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
             data = (void *) ((uintptr_t) data & ~(real_page_size - 1));
             int prot = PROT_READ;
             if (flags & P_WRITE) prot |= PROT_WRITE;
-            if (mprotect(data, real_page_size, prot) < 0)
-                return errno_map();
+            if (mprotect(data, real_page_size, prot) < 0) {
+                // A private file page the host maps read-only (a read view on
+                // Windows) cannot be made writable in place; copy it on the
+                // first write, as a private mapping should.
+                if (!(flags & P_WRITE) || (old_flags & P_ANONYMOUS))
+                    return errno_map();
+                entry->flags |= P_COW;
+            }
         }
     }
     mem_changed(mem);

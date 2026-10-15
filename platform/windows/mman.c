@@ -195,15 +195,28 @@ void *px_mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off) 
         goto out;
     }
 
-    if (size >= 0 && off + (int64_t) len <= size) {
+    // A view also covers a mapping that ends in the file's last page: that
+    // page maps whole, zeros past the end, as on Linux. Further out a view
+    // would have to grow the file.
+    int64_t size_pages = (size + 0xfff) & ~(int64_t) 0xfff;
+    if (size >= 0 && off < size && off + (int64_t) len <= (shared_write ? size : size_pages)) {
         int64_t aligned = off & ~(int64_t) 0xffff;
         size_t delta = (size_t) (off - aligned);
-        bool copy = !(flags & PX_MAP_SHARED);
+        size_t view_len = len + delta;
+        if ((int64_t) view_len > size - aligned)
+            view_len = (size_t) (size - aligned);
+        // A private view is charged commit for all of it up front (any page
+        // could be written), where Linux charges for pages written: a JVM
+        // pays 140MB for lib/modules and libjvm.so it only reads. Read-only
+        // private views are plain read views; if the guest makes one writable
+        // later, VirtualProtect refuses and the kernel copies each page on
+        // its first write instead (pt_set_flags).
+        bool copy = !(flags & PX_MAP_SHARED) && (prot & PX_PROT_WRITE);
         DWORD mprot = copy ? PAGE_WRITECOPY : shared_write ? PAGE_READWRITE : PAGE_READONLY;
         HANDLE fm = CreateFileMappingW(d->h, NULL, mprot, 0, 0, NULL);
         if (fm != NULL) {
             DWORD access = copy ? FILE_MAP_COPY : shared_write ? FILE_MAP_WRITE : FILE_MAP_READ;
-            char *base = MapViewOfFile(fm, access, (DWORD) (aligned >> 32), (DWORD) aligned, len + delta);
+            char *base = MapViewOfFile(fm, access, (DWORD) (aligned >> 32), (DWORD) aligned, view_len);
             CloseHandle(fm);
             if (base != NULL) {
                 struct mapping *m = calloc(1, sizeof(*m));
