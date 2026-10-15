@@ -807,6 +807,86 @@ static bool emit_simd(struct em *e, uint32_t x) {
     return true;
 }
 
+// Scalar floating point (single and double): data processing with 1, 2 and 3
+// sources, fmov immediate, compares, conditional select / compare, and the
+// conversions to and from general registers. Like the gadgets, it runs under
+// the host's FPCR and doesn't update the guest FPSR. Returns false for anything
+// not handled.
+static bool emit_fp_scalar(struct em *e, uint32_t x) {
+    if ((x >> 22 & 3) > 1) return false;                                      // half precision
+    int rd = x & 31, rn = (x >> 5) & 31, rm = (x >> 16) & 31;
+    uint32_t base = x & ~0x001F03FFu;
+    if ((x & 0xFF000000u) == 0x1F000000u) {                                   // fmadd fmsub fnmadd fnmsub
+        int ra = (x >> 10) & 31;
+        vload(e, V_N, rn); vload(e, V_M, rm); vload(e, V_T, ra);
+        put(e, (x & ~0x001F7FFFu) | ((uint32_t) V_M << 16) | ((uint32_t) V_T << 10) | ((uint32_t) V_N << 5) | V_D);
+        vstore(e, V_D, rd);
+        return true;
+    }
+    if ((x & 0x7F20FC00u) == 0x1E200000u) {                                   // conversions to / from integer
+        unsigned rmode = (x >> 19) & 3, op = (x >> 16) & 7;
+        if (rmode == 0 && (op == 2 || op == 3)) {                             // scvtf ucvtf: Vd <- Xn/Wn
+            int hn = rn == 31 ? 31 : hreg(e, rn);
+            put(e, (x & ~0x3FFu) | ((uint32_t) hn << 5) | V_D);
+            vstore(e, V_D, rd);
+            return true;
+        }
+        if (op <= 1 || (rmode == 0 && (op == 4 || op == 5))) {               // fcvt{n,p,m,z,a}{s,u}: Xd/Wd <- Vn
+            vload(e, V_N, rn);
+            if (rd == 31) return true;
+            int hd = hreg(e, rd);
+            put(e, (x & ~0x3FFu) | ((uint32_t) V_N << 5) | (uint32_t) hd);
+            writeback(e, rd);
+            return true;
+        }
+    }
+    if ((x & 0xFF200000u) != 0x1E200000u) return false;
+    if ((x & 0x7C00u) == 0x4000u && (x & 0x001F8000u) <= 0x00078000u) {   // 1 source: fmov fabs fneg fsqrt fcvt frint*
+        unsigned op = (x >> 15) & 0x3f;
+        if (op == 6 || op == 7 || op == 13 || op > 15) return false;         // bfcvt, fcvt to half, unallocated
+        vload(e, V_N, rn);
+        put(e, (x & ~0x3FFu) | ((uint32_t) V_N << 5) | V_D);
+        vstore(e, V_D, rd);
+        return true;
+    }
+    if ((x & 0xC00u) == 0x800u) {                                            // 2 source
+        if (((x >> 12) & 15) > 8) return false;
+        vload(e, V_N, rn); vload(e, V_M, rm);
+        put(e, base | ((uint32_t) V_M << 16) | ((uint32_t) V_N << 5) | V_D);
+        vstore(e, V_D, rd);
+        return true;
+    }
+    if ((x & 0x1FE0u) == 0x1000u) {                                           // fmov immediate
+        put(e, (x & ~0x1Fu) | V_D);
+        vstore(e, V_D, rd);
+        return true;
+    }
+    if ((x & 0xFC07u) == 0x2000u) {                                           // fcmp fcmpe (register or #0.0)
+        bool zero = x & 8;                                                     // #0.0: Rm must stay 0
+        vload(e, V_N, rn);
+        if (!zero) vload(e, V_M, rm);
+        put(e, (x & ~0x001F03E0u) | (zero ? 0 : (uint32_t) V_M << 16) | ((uint32_t) V_N << 5));
+        store_flags(e);
+        e->hflags = true;
+        return true;
+    }
+    if ((x & 0xC00u) == 0xC00u || (x & 0xC00u) == 0x400u) {                  // fcsel / fccmp fccmpe
+        bool sel = (x & 0xC00u) == 0xC00u;
+        if (!e->hflags) load_flags(e);
+        vload(e, V_N, rn); vload(e, V_M, rm);
+        if (sel) {
+            put(e, base | ((uint32_t) V_M << 16) | ((uint32_t) V_N << 5) | V_D);
+            vstore(e, V_D, rd);
+        } else {
+            put(e, (x & ~0x001F03E0u) | ((uint32_t) V_M << 16) | ((uint32_t) V_N << 5));
+            store_flags(e);
+            e->hflags = true;
+        }
+        return true;
+    }
+    return false;
+}
+
 // base (+ offset) -> x9 for a load/store; returns the host register of the base
 static int ldst_addr(struct em *e, int gn, int64_t imm, bool post) {
     int hn = hreg(e, gn);
@@ -823,7 +903,7 @@ static void ldst_wb(struct em *e, int gn, int hn, int64_t imm) {
     writeback(e, gn);
 }
 
-// SIMD & FP loads and stores (b/h/s/d/q, single and pair, no register offset)
+// SIMD & FP loads and stores (b/h/s/d/q, single and pair)
 static bool emit_ldst_fp(struct em *e, uint32_t x, unsigned spos) {
     if ((x & 0x3A000000u) == 0x28000000u) {                                   // pair
         unsigned opc = x >> 30, L = (x >> 22) & 1, idx = (x >> 23) & 3;
@@ -855,6 +935,19 @@ static bool emit_ldst_fp(struct em *e, uint32_t x, unsigned spos) {
         if (k == 2) return false;
         imm = sext((x >> 12) & 0x1ff, 9);
         wbmode = k == 1 ? 1 : k == 3 ? 2 : 0;
+    } else if ((x & 0x3B200C00u) == 0x38200800u) {                            // register offset
+        unsigned option = (x >> 13) & 7, S = (x >> 12) & 1;
+        if (!(option & 2)) return false;
+        int rm = (x >> 16) & 31;
+        int gn = rn == 31 ? G_SP : rn;
+        int hn = hreg(e, gn), hm = rm == 31 ? 31 : hreg(e, rm);
+        put(e, 0x8B200000u | ((uint32_t) hm << 16) | (option << 13) | ((S ? scale : 0) << 10) | ((uint32_t) hn << 5) | T_A);
+        bool load = opc & 1;
+        tlb_lookup(e, 1u << scale, !load, spos);
+        if (!load) vload(e, V_N, rt);
+        put(e, (x & 0xC0C00000u) | 0x3D000000u | (T_A << 5) | V_N);          // ldr/str vN, [x9]
+        if (load) vstore(e, V_N, rt);
+        return true;
     } else {
         return false;
     }
@@ -970,6 +1063,8 @@ static bool emit_insn(struct em *e, uint32_t x, uint64_t pc, unsigned spos, bool
         put(e, x);
         return true;
     }
+    if ((x & 0x5E000000u) == 0x1E000000u && simd_on && emit_fp_scalar(e, x))   // scalar floating point
+        return !e->fail;
     if ((x & 0x0E000000u) == 0x0E000000u && (x & 0x1F000000u) != 0x1F000000u && simd_on) {   // SIMD data processing
         if (emit_simd(e, x)) return !e->fail;
     }
