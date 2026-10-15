@@ -440,6 +440,27 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
             if (!is_prot_none)
                 anon_pages_unreserve((long)pages);
 #endif
+#ifdef GUEST_ARM64
+            // A PROT_NONE reservation needs no host memory, only host address
+            // space for the backing mmap, and that can run out first: threads
+            // the exit safety valve leaked keep their whole guest address
+            // space mapped in the host. Go's runtime dies at startup with
+            // "failed to reserve page summary memory" when one of its 1/8/64
+            // MB PROT_NONE reservations is refused (seen on a phone after
+            // several crashed JVMs; host address space is the likely, not a
+            // confirmed, cause). Fall back to a lazy reservation, which
+            // only gets host backing for what is later mprotect'ed or mapped
+            // over. Only on failure: a lazy page differs from a mapped
+            // PROT_NONE one on a stray write (see the V8 cage demand-map in
+            // handle_interrupt), so the normal path stays as it was. A
+            // MAP_FIXED one replaces what was there, as pt_map would have.
+            if (is_prot_none && err == _ENOMEM) {
+                if (!pt_is_hole(current->mem, page, pages))
+                    pt_unmap_always(current->mem, page, pages);
+                if (pt_map_lazy(current->mem, page, pages, prot) == 0)
+                    return page << PAGE_BITS;
+            }
+#endif
             return err;
         }
     } else {
