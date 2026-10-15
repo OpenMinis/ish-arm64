@@ -1,0 +1,53 @@
+1   SA_RESTART handler: read=4 ok data, handler ran 1
+2   plain handler: read=-1 EINTR, handler ran 1
+  then read=4 ok data
+3a  SIGCHLD default: read=4 ok data
+  waitpid child: exit 7, handler ran 0
+3b  SIGCHLD handler: read=-1 EINTR
+  then read=4 ok data
+  waitpid child: exit 7, handler ran >=1
+3c  SIGCHLD handler+SA_RESTART: read=4 ok data
+  waitpid child: exit 7, handler ran >=1
+3d  waitpid with plain SIGUSR1: EINTR, handler ran 1
+  then exit 3
+3e  waitpid with SA_RESTART SIGUSR1: exit 3, handler ran 1
+4a  alarm(1) plain: read=-1 EINTR, handler ran 1, took >=900ms yes
+  then read=4 ok data
+4b  alarm(1) SA_RESTART: read=4 ok data, handler ran 1, took >=900ms yes
+5a  ^C, pty read, SIGINT default: child signal 2
+5b  ^C, pty read, SIGINT handler: child exit 40 (read EINTR)
+5c  ^C, pipe read, SIGINT default: child signal 2
+5d  ^C, pipe read, SIGINT handler: child exit 40 (read EINTR)
+6a  kill -15, 1 thread(s) blocked in read: signal 15
+6b  kill -9, 1 thread(s) blocked in read: signal 9
+6c  kill -15, 3 thread(s) blocked in read: signal 15
+6d  kill -9, 3 thread(s) blocked in read: signal 9
+7a  write 4096 to a full pipe, plain handler: write=-1 EINTR, handler ran 1
+7b  write 4096 to a full pipe, SA_RESTART handler: write=4096 ok, handler ran 1
+7c  write 4 MB, interrupted midway: partial count, handler ran 1
+8a  poll(-1) plain: -1 EINTR, handler ran 1
+ppoll(10s) plain: -1 EINTR, handler ran 1
+select(NULL) plain: -1 EINTR, handler ran 1
+pselect(10s) plain: -1 EINTR, handler ran 1
+epoll_wait(-1) plain: -1 EINTR, handler ran 1
+nanosleep(2s) plain: -1 EINTR, remaining > 0: yes, handler ran 1
+clock_nanosleep(2s) plain: EINTR, handler ran 1
+futex wait (no timeout) plain: -1 EINTR, handler ran 1
+futex wait (2s timeout) plain: -1 EINTR, handler ran 1
+sigsuspend plain: -1 EINTR, handler ran 1
+8b  poll(-1) SA_RESTART: -1 EINTR, handler ran 1
+ppoll(10s) SA_RESTART: -1 EINTR, handler ran 1
+select(NULL) SA_RESTART: -1 EINTR, handler ran 1
+pselect(10s) SA_RESTART: -1 EINTR, handler ran 1
+epoll_wait(-1) SA_RESTART: -1 EINTR, handler ran 1
+nanosleep(2s) SA_RESTART: -1 EINTR, remaining > 0: yes, handler ran 1
+clock_nanosleep(2s) SA_RESTART: EINTR, handler ran 1
+futex wait (no timeout) SA_RESTART: 0 ok, handler ran 1
+futex wait (2s timeout) SA_RESTART: -1 EINTR, handler ran 1
+sigsuspend SA_RESTART: -1 EINTR, handler ran 1
+9a  SIGWINCH+SIGURG+SIGCHLD at default: read=4 ok data
+9b  SIGUSR1 ignored (SIG_IGN): read=4 ok data
+9c  SIGUSR1 blocked: read=4 ok data, still pending: yes
+9d  SIGSTOP then SIGCONT: read=4 ok data
+9e  SIGUSR1 handled by another thread: read=4 ok data, handler ran 1
+9f  no signal, data after 2 s: read=4 ok data, took >=1900ms yes

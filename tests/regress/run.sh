@@ -171,7 +171,56 @@ else
         echo "failed to build regress_leaked_thread_exit" >&2
         status=1
     fi
+
 fi
+
+# Signals against blocking calls: the output must equal the expected file,
+# which is what a real arm64 Alpine prints. Staged through the guest so it
+# works on a fakefs as well; the ^C-on-a-pty cases (5*) need a /dev/ptmx,
+# which only a fakefs (-m -f) has, so -r leaves them out. 9f runs again
+# in-process while the host bombards iSH with SIGUSR1 (iSH's guest-signal
+# wake-up), so its blocking read takes host EINTRs with no guest signal
+# behind them and must retry without the caller noticing.
+echo
+echo "########## signals vs blocking calls ##########"
+sig_bin=$(mktemp -t regress_signal_eintr)
+if "$CC_GUEST" -static -O1 -Wall -pthread -o "$sig_bin" tests/regress/regress_signal_eintr.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_signal_eintr status=none < "$sig_bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_signal_eintr; then
+    expected=$(cat tests/regress/regress_signal_eintr.expected)
+    out=$(timeout 900 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_signal_eintr 2>/dev/null)
+    if [ "$MOUNT_FLAG" != "-f" ]; then
+        echo "  SKIP  5a-5d (^C on a pty): no /dev/ptmx without a fakefs (-m -f)"
+        expected=$(echo "$expected" | grep -v '^5')
+        out=$(echo "$out" | grep -v '^5')
+    fi
+    if [ "$out" = "$expected" ]; then
+        echo "PASS: every case matches arm64 Linux"
+    else
+        echo "FAIL: differs from arm64 Linux:"
+        diff <(echo "$expected") <(echo "$out")
+        status=1
+    fi
+    sig_out=$(mktemp -t regress_9f)
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_signal_eintr -n 9f > "$sig_out" 2>/dev/null &
+    ish_pid=$!
+    # only once the case runs: before iSH installs its handler SIGUSR1 kills it
+    while kill -0 $ish_pid 2>/dev/null && ! grep -q 9f "$sig_out"; do sleep 0.05; done
+    while kill -0 $ish_pid 2>/dev/null; do kill -USR1 $ish_pid 2>/dev/null; sleep 0.005; done
+    wait $ish_pid
+    if grep -q 'read=4 ok data, took >=1900ms yes' "$sig_out"; then
+        echo "PASS: 9f under host SIGUSR1"
+    else
+        echo "FAIL: 9f under host SIGUSR1: $(cat "$sig_out")"
+        status=1
+    fi
+    rm -f "$sig_out"
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_signal_eintr
+else
+    echo "failed to build or stage regress_signal_eintr" >&2
+    status=1
+fi
+rm -f "$sig_bin"
 
 echo
 echo "########## cp regressions ##########"
