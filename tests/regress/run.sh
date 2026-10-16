@@ -278,6 +278,21 @@ else
 fi
 rm -f "$starve_bin"
 
+# When init exits with a child still running, iSH must stop the child and
+# exit 0 at once (it used to wait 2 s and die of its own SIGTERM, status 143).
+echo
+echo "########## init exits with a child still running ##########"
+halt_start=$(date +%s)
+"$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/sh -c 'sleep 30 & sleep 0.1; exit 0' < /dev/null
+halt_rc=$?
+halt_took=$(( $(date +%s) - halt_start ))
+if [ "$halt_rc" = 0 ] && [ "$halt_took" -lt 2 ]; then
+    echo "PASS: exit status 0 in under 2 s"
+else
+    echo "FAIL: exit status $halt_rc after ${halt_took}s"
+    status=1
+fi
+
 echo
 echo "########## cp regressions ##########"
 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/sh /tmp/regress_cp.sh ${FAKEFS_PATH:+"$FAKEFS_PATH"} || status=1

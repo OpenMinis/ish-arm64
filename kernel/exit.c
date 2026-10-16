@@ -480,8 +480,18 @@ noreturn void do_exit_group(int status) {
 }
 
 // always called from init process
+static int halt_count_tasks(void) {
+    int n = 0;
+    for (int i = 2; i < MAX_PID; i++) {
+        struct task *task = pid_get_task(i);
+        if (task != NULL && task != current)
+            n++;
+    }
+    return n;
+}
+
+// always called from init process, by do_exit with pids_lock held
 static void halt_system(void) {
-    int max_iterations = 10; // Timeout: wait maximum 10 seconds
     for (int state = 0; state < 3; state++) {
         int tasks_found = 0;
         for (int i = 2; i < MAX_PID; i++) {
@@ -501,16 +511,23 @@ static void halt_system(void) {
                 }
             }
         }
+        if (tasks_found == 0 || state == 2)
+            break;
+        // Give them up to a second to exit. Wait without pids_lock: exiting
+        // takes it, so holding it here - as this used to, through a whole
+        // sleep(1) per state - kept every task signalled above from
+        // finishing its exit, and a process that happened to be exiting when
+        // init did (an officecli resident just closed) reached state 2, whose
+        // host SIGTERM ended iSH with status 143 before the unmount below.
+        for (int waited = 0; waited < 1000 && tasks_found != 0; waited += 10) {
+            unlock(&pids_lock);
+            struct timespec ts = {0, 10 * 1000000L};
+            nanosleep(&ts, NULL);
+            lock(&pids_lock);
+            tasks_found = halt_count_tasks();
+        }
         if (tasks_found == 0)
             break;
-        if (state != 2) {
-            sleep(1);
-            // Timeout protection: if we've waited too long, force exit
-            if (--max_iterations <= 0) {
-                printk("halt_system: timeout after 10 seconds, %d tasks remaining\n", tasks_found);
-                break;
-            }
-        }
     }
 
     // unmount all filesystems
