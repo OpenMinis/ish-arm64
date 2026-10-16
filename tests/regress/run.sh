@@ -262,6 +262,22 @@ else
 fi
 rm -f "$kill_bin" "$host_mask"
 
+# mmap/mprotect/munmap must get the address-space lock while other threads
+# spin in guest code.
+echo
+echo "########## address-space writer vs spinning threads ##########"
+starve_bin=$(mktemp -t regress_writer_starve)
+if "$CC_GUEST" -static -O1 -Wall -pthread -o "$starve_bin" tests/regress/regress_writer_starve.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_writer_starve status=none < "$starve_bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_writer_starve; then
+    timeout 300 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_writer_starve || status=1
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_writer_starve
+else
+    echo "failed to build or stage regress_writer_starve" >&2
+    status=1
+fi
+rm -f "$starve_bin"
+
 echo
 echo "########## cp regressions ##########"
 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/sh /tmp/regress_cp.sh ${FAKEFS_PATH:+"$FAKEFS_PATH"} || status=1

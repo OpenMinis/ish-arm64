@@ -155,6 +155,8 @@ typedef struct {
     // -1: write-locked
     // >0: read-locked with this many readers
     atomic_int val;
+    // writers spinning in __write_wrlock; see read_wrlock_behind_writer
+    atomic_int writers;
     const char *file;
     int line;
     int pid;
@@ -169,6 +171,7 @@ static inline void wrlock_init(wrlock_t *lock) {
 #endif
     if (pthread_rwlock_init(&lock->l, pattr)) __builtin_trap();
     lock->val = lock->line = lock->pid = 0;
+    lock->writers = 0;
     lock->file = NULL;
 }
 
@@ -185,6 +188,17 @@ static inline void read_wrunlock(wrlock_t *lock) {
     assert(lock->val > 0);
     lock->val--;
     if (pthread_rwlock_unlock(&lock->l) != 0) __builtin_trap();
+}
+// Take the read lock again between JIT quanta, first giving a writer that
+// is trying for the lock the chance to get it: wait while one is, but at most
+// about a millisecond, so a writer that cannot win (one waiting for this very
+// thread to reach a GC safepoint, say) never holds this thread up for long -
+// a writer-preferring lock that blocked here deadlocked bun and claude.
+static inline void read_wrlock_behind_writer(wrlock_t *lock) {
+    struct timespec ts = {0, 20000};
+    for (int i = 0; i < 50 && atomic_load_explicit(&lock->writers, memory_order_relaxed); i++)
+        nanosleep(&ts, NULL);
+    read_wrlock(lock);
 }
 static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
     // Acquire the write lock without letting a *waiting* writer freeze out
@@ -218,12 +232,21 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
     // yields the CPU each iteration (it is not a busy-spin), and readers keep
     // making progress and releasing until the writer wins a trylock. This keeps
     // forward progress for readers guaranteed and the writer non-blocking.
+    //
+    // Not queueing has a cost of its own: readers that never stop running
+    // never leave the lock free at the same moment, so the writer could
+    // wait seconds (two .NET threads spinning on a runtime lock whose owner
+    // sat in munmap kept officecli stalled for up to a minute). So the
+    // writer announces itself in `writers`, and a JIT thread about to take
+    // the lock again holds back for a moment (read_wrlock_behind_writer).
     struct timespec _ts = {0, 1000}; // 1us initial backoff, grows to a steady sleep
+    atomic_fetch_add(&lock->writers, 1);
     while (pthread_rwlock_trywrlock(&lock->l) != 0) {
         nanosleep(&_ts, NULL);
         if (_ts.tv_nsec < 100000) // ramp up to a 100us steady sleep (yields CPU)
             _ts.tv_nsec *= 2;
     }
+    atomic_fetch_sub(&lock->writers, 1);
     assert(lock->val == 0);
     lock->val = -1;
     lock->file = file;

@@ -226,7 +226,7 @@ void task_run_current() {
         if (self->mem == NULL) {
             pthread_exit(NULL);
         }
-        read_wrlock(&self->mem->lock);
+        read_wrlock_behind_writer(&self->mem->lock);
 #ifdef GUEST_ARM64
         tlb_attach(tlb, &self->mem->mmu);
 #endif
