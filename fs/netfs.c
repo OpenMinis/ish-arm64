@@ -10,6 +10,7 @@
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include "kernel/task.h"
+#include "kernel/signal.h"
 #include "fs/fd.h"
 #include "fs/inode.h"
 #include "fs/netfs.h"
@@ -77,7 +78,12 @@ struct host_call {
     sigset_t old_mask;
 };
 
-static void call_begin(struct host_call *c) {
+// Returns _EINTR (and sets nothing up) when the thread already has a fatal
+// signal pending: one cancelled call must not be followed by a fresh,
+// uncancelled one. path_normalize ignores errors of intermediate components,
+// so `cat a/b/c` would otherwise go on to the next lookup after its first
+// call was cancelled and block a full host deadline again.
+static int call_begin(struct host_call *c) {
     c->id = __atomic_add_fetch(&next_call_id, 1, __ATOMIC_RELAXED);
     // SIGUSR1 is how iSH interrupts a thread's host syscall. A host call may
     // be running on a foreign stack (cgo), and iSH's handler has no
@@ -87,8 +93,16 @@ static void call_begin(struct host_call *c) {
     sigemptyset(&usr1);
     sigaddset(&usr1, SIGUSR1);
     pthread_sigmask(SIG_BLOCK, &usr1, &c->old_mask);
-    if (current != NULL)
-        atomic_store_explicit(&current->netfs_call, c->id, memory_order_release);
+    if (current == NULL)
+        return 0;
+    // Publish first, then look: see task_fatal_signal_pending.
+    atomic_store_explicit(&current->netfs_call, c->id, memory_order_seq_cst);
+    if (task_fatal_signal_pending(current)) {
+        atomic_store_explicit(&current->netfs_call, 0, memory_order_release);
+        pthread_sigmask(SIG_SETMASK, &c->old_mask, NULL);
+        return _EINTR;
+    }
+    return 0;
 }
 
 static void call_end(struct host_call *c) {
@@ -159,8 +173,10 @@ static int host_stat(struct mount *mount, const char *path, struct netfs_host_at
     if (!host_get(&ops))
         return _ENOTCONN;
     struct host_call c;
-    call_begin(&c);
-    int err = ops.stat(mount_data(mount)->handle, path, c.id, budget_key(), attr);
+    int err = call_begin(&c);
+    if (err < 0)
+        return err;
+    err = ops.stat(mount_data(mount)->handle, path, c.id, budget_key(), attr);
     call_end(&c);
     return from_host(err);
 }
@@ -241,7 +257,9 @@ static struct fd *netfs_fs_open(struct mount *mount, const char *path, int flags
             goto fail;
         }
         struct host_call c;
-        call_begin(&c);
+        err = call_begin(&c);
+        if (err < 0)
+            goto fail;
         err = from_host(ops.readdir(mount_data(mount)->handle, path, c.id, budget_key(),
                                     &file->entries, &file->count));
         call_end(&c);
@@ -339,8 +357,10 @@ static ssize_t netfs_pread(struct fd *fd, void *buf, size_t size, off_t off) {
         return _ENOTCONN;
     size_t n = 0;
     struct host_call c;
-    call_begin(&c);
-    int err = from_host(ops.read(mount_data(fd->mount)->handle, file->path, (uint64_t) off,
+    int err = call_begin(&c);
+    if (err < 0)
+        return err;
+    err = from_host(ops.read(mount_data(fd->mount)->handle, file->path, (uint64_t) off,
                                  buf, size, c.id, budget_key(), &n));
     call_end(&c);
     if (err < 0)

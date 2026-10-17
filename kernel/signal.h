@@ -393,4 +393,8 @@ struct rt_sigframe_ {
 extern int xsave_extra;
 extern int fxsave_extra;
 
+struct task;
+// [T-netfs-host-call] see kernel/signal.c
+bool task_fatal_signal_pending(struct task *task);
+
 #endif

@@ -105,6 +105,25 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
     }
 }
 
+// [T-netfs-host-call] Whether `task` has a signal pending that will end it:
+// SIGKILL, or an unblocked signal whose action is the default "terminate".
+// netfs checks this before every host call, under sighand->lock, after it has
+// published the call id - so a fatal signal either is seen here or sees the id
+// and cancels the call (deliver_signal_unlocked), never neither.
+bool task_fatal_signal_pending(struct task *task) {
+    if (task->sighand == NULL || (task->group != NULL && task->group->doing_group_exit))
+        return true;
+    lock(&task->sighand->lock);
+    bool fatal = sigset_has(task->pending, SIGKILL_);
+    sigset_t_ deliverable = task->pending & ~task->blocked;
+    for (int sig = 1; !fatal && sig < NUM_SIGS; sig++) {
+        if (sigset_has(deliverable, sig) && signal_action(task->sighand, sig) == SIGNAL_KILL)
+            fatal = true;
+    }
+    unlock(&task->sighand->lock);
+    return fatal;
+}
+
 void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
     if (task->sighand == NULL)
         return;
