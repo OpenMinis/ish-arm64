@@ -148,15 +148,16 @@ struct task {
     // lifetime, so it never dangles. NULL when not in a handler.
     void *native_offload_entry;
 
-    // [T-netfs-host-call] Id of the netfs host call this task is blocked in,
-    // 0 when none. Written by the task's own thread around the call (fs/netfs.c),
-    // read by the signalling thread to cancel it on a fatal signal.
-    _Atomic uint64_t netfs_call;
-
     // current condition/lock, so it can be notified in case of a signal
     cond_t *waiting_cond;
     lock_t *waiting_lock;
     lock_t waiting_cond_lock;
+
+    // [T-netfs-host-call] Id of the netfs host call this task is blocked in,
+    // 0 when none. Written by the task's own thread around the call (fs/netfs.c),
+    // read by the signalling thread to cancel it on a fatal signal. Last in the
+    // struct so no existing field moves.
+    _Atomic uint64_t netfs_call;
 };
 
 // current will always give the process that is currently executing
