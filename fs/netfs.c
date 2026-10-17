@@ -15,6 +15,7 @@
 #include "fs/fd.h"
 #include "fs/inode.h"
 #include "fs/netfs.h"
+#include "fs/poll.h"
 #include "fs/proc.h"
 #include "fs/stat.h"
 #include "util/list.h"
@@ -75,6 +76,7 @@ static struct netfs_mount *mount_data(struct mount *mount) {
 // One dmesg line per host call and per open/close when on. For diagnosing
 // hangs and reference problems on a device; costs one flag test when off.
 static bool netfs_trace;
+
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -443,6 +445,15 @@ static void netfs_seekdir(struct fd *fd, unsigned long pos) {
     file->pos = pos;
 }
 
+// Regular files and directories are always ready, as on Linux. Without this
+// an fd with no poll op is never ready in iSH (fs/poll.c), and busybox's
+// `read` builtin ppolls fd 0 before reading it: `read x < /netfs/file`
+// blocked forever, and the process was later torn down without closing its
+// fds, leaking a mount reference (umount EBUSY - phase 1 report §4-2).
+static int netfs_poll(struct fd *UNUSED(fd)) {
+    return POLL_READ | POLL_WRITE;
+}
+
 static int netfs_close(struct fd *fd) {
     struct netfs_file *file = fd->fs_data;
     if (file == NULL)
@@ -462,6 +473,7 @@ static int netfs_close(struct fd *fd) {
 
 const struct fd_ops netfs_fdops = {
     .pread = netfs_pread,
+    .poll = netfs_poll,
     .lseek = netfs_lseek,
     .readdir = netfs_readdir,
     .telldir = netfs_telldir,
