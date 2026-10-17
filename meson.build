@@ -1748,6 +1748,7 @@ if get_option('kernel') == 'ish'
         'fs/path.c',
         'fs/real.c',
         'fs/fake.c',
+        'fs/netfs.c',
 
         'fs/proc.c',
         'fs/proc/entry.c',

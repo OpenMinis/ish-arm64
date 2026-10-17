@@ -98,6 +98,12 @@ static int load_entry(exec_prg_header ph, addr_t bias, struct fd *fd) {
     int flags = P_READ;
     if (ph.flags & PH_W) flags |= P_WRITE;
 
+    // [T-netfs-host-call] A filesystem may offer no mmap (netfs). The main
+    // binary is stopped earlier by its missing x bit, but an ELF interpreter
+    // is opened without that check; calling the NULL pointer would kill the
+    // app rather than fail the exec.
+    if (fd->ops->mmap == NULL)
+        return _ENOEXEC;
     if ((err = fd->ops->mmap(fd, current->mem, PAGE(addr),
                     PAGE_ROUND_UP(filesize + PGOFFSET(addr)),
                     offset - PGOFFSET(addr), flags, MMAP_PRIVATE)) < 0)

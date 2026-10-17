@@ -1,3 +1,4 @@
+#include "fs/netfs.h"
 #include "debug.h"
 #include <string.h>
 #include <signal.h>
@@ -72,12 +73,24 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
         return;
 
     if (task != current) {
+        // [T-netfs-host-call] A thread blocked in a netfs host callback is in
+        // host code and never looks at the guest signal queue, like an
+        // in-process offload handler. On a FATAL signal — SIGKILL, or an
+        // unblocked one whose action is the default "terminate" — ask the host
+        // to return. Decided here, under sighand->lock, which signal_action
+        // needs; the call is made below, with the lock released. A signal the
+        // program handles itself does not interrupt stat/open/getdents, which
+        // the kernel would not restart (design §2-②, Q11).
+        bool netfs_cancel = atomic_load_explicit(&task->netfs_call, memory_order_acquire) != 0 &&
+            (sig == SIGKILL_ || signal_action(task->sighand, sig) == SIGNAL_KILL);
         pthread_kill(task->thread, SIGUSR1);
 
         // wake up any pthread condition waiters
         // actual madness, I hope to god it's correct
         // must release the sighand lock while going insane, to avoid a deadlock
         unlock(&task->sighand->lock);
+        if (netfs_cancel)
+            netfs_cancel_task_call(task);
         // Wake up the target thread's condvar wait.
         // We don't acquire waiting_lock (the associated mutex) because:
         // 1. It may be held by the target thread inside pthread_cond_wait,

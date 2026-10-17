@@ -4,6 +4,7 @@
 #include "kernel/fs.h"
 #include "fs/path.h"
 #include "fs/real.h"
+#include "fs/netfs.h"
 
 #define MAX_FILESYSTEMS 10
 static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
@@ -11,6 +12,8 @@ static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
     &procfs,
     &devptsfs,
     &tmpfs,
+    // [T-netfs-host-call] Registered always, used only when the host mounts one.
+    &netfs,
 };
 
 void fs_register(const struct fs_ops *fs) {

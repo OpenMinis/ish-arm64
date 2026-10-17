@@ -139,10 +139,13 @@ static int proc_show_mounts(struct proc_entry *UNUSED(entry), struct proc_data *
 
 // Forward declaration for /proc/net
 extern struct proc_children proc_net_children;
+// [T-netfs-host-call] /proc/fs/netfs/<name> (fs/netfs.c)
+extern struct proc_children proc_fs_children;
 
 // in alphabetical order
 struct proc_dir_entry proc_root_entries[] = {
     {"cpuinfo", .show = proc_show_cpuinfo},
+    {"fs", S_IFDIR, .children = &proc_fs_children},
     {"ish", S_IFDIR, .children = &proc_ish_children},
     {"meminfo", .show = proc_show_meminfo},
     {"mounts", .show = proc_show_mounts},
