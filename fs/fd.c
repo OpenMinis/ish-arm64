@@ -156,6 +156,17 @@ struct fd *f_get(fd_t f) {
     return fd;
 }
 
+// f_get() with a reference taken under the table lock, so a concurrent
+// close() of f cannot free it under the caller. Release with fd_close().
+struct fd *f_get_retained(fd_t f) {
+    lock(&current->files->lock);
+    struct fd *fd = fdtable_get(current->files, f);
+    if (fd != NULL)
+        fd_retain(fd);
+    unlock(&current->files->lock);
+    return fd;
+}
+
 static fd_t f_install_start(struct fd *fd, fd_t start) {
     assert(start >= 0);
     struct fdtable *table = current->files;

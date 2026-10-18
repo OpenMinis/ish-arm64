@@ -815,39 +815,45 @@ int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sock
     if (err < 0)
         return errno_map();
 
-    lock(&peer_lock);
+    // peer_lock is taken only to link the two ends. It was held across both
+    // sock_fd_create() calls, and the failure path's sys_close() takes it
+    // again in sock_close(): a socketpair() at RLIMIT_NOFILE hung its thread
+    // on a non-recursive mutex, and with it every later unix socket call in
+    // any guest process. Each host end is closed once: by sys_close() once it
+    // has a guest fd (sock_close), here while it has none.
     int fake_sockets[2];
     err = fake_sockets[0] = sock_fd_create(sockets[0], domain, type, protocol);
     if (fake_sockets[0] < 0) {
-        unlock(&peer_lock);
-        goto close_sockets;
+        close(sockets[0]);
+        close(sockets[1]);
+        return err;
     }
     err = fake_sockets[1] = sock_fd_create(sockets[1], domain, type, protocol);
     if (fake_sockets[1] < 0) {
-        unlock(&peer_lock);
-        goto close_fake_0;
+        close(sockets[1]);
+        sys_close(fake_sockets[0]);
+        return err;
     }
-    struct fd *sock1 = f_get(fake_sockets[0]);
-    struct fd *sock2 = f_get(fake_sockets[1]);
-    sock1->socket.unix_peer = sock2;
-    sock2->socket.unix_peer = sock1;
-    unlock(&peer_lock);
+    struct fd *sock1 = f_get_retained(fake_sockets[0]);
+    struct fd *sock2 = f_get_retained(fake_sockets[1]);
+    if (sock1 != NULL && sock2 != NULL) {
+        lock(&peer_lock);
+        sock1->socket.unix_peer = sock2;
+        sock2->socket.unix_peer = sock1;
+        unlock(&peer_lock);
+    }
+    if (sock1 != NULL)
+        fd_close(sock1);
+    if (sock2 != NULL)
+        fd_close(sock2);
 
-    err = _EFAULT;
-    if (user_put(sockets_addr, fake_sockets))
-        goto close_fake_1;
-
+    if (user_put(sockets_addr, fake_sockets)) {
+        sys_close(fake_sockets[1]);
+        sys_close(fake_sockets[0]);
+        return _EFAULT;
+    }
     STRACE(" [%d, %d]", fake_sockets[0], fake_sockets[1]);
     return 0;
-
-close_fake_1:
-    sys_close(fake_sockets[1]);
-close_fake_0:
-    sys_close(fake_sockets[0]);
-close_sockets:
-    close(sockets[0]);
-    close(sockets[1]);
-    return err;
 }
 
 int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, addr_t sockaddr_addr, dword_t sockaddr_len) {
