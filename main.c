@@ -397,7 +397,16 @@ static void ish_cli_memory_governor_start(void) {
         pthread_detach(t);
 }
 
+#ifdef _WIN32
+void state_dump_init(void); // kernel/state_dump.c
+#endif
+
 int main(int argc, char *const argv[]) {
+#ifdef _WIN32
+    // The guest snapshot Minis asks for when a command looks stuck
+    // (ISH_STATE_DIR; nothing at all without it).
+    state_dump_init();
+#endif
     ish_signpost_init();
     atexit(dump_pc_hist);
     { extern void dump_wx_stats(void); atexit(dump_wx_stats); }

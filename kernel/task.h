@@ -64,6 +64,13 @@ struct task {
     // Windows: an event instead (a pipe there is two loopback sockets, and
     // every wait a WSAPoll); NULL if not yet created
     void *futex_wake;
+    // The guest snapshot (kernel/state_dump.c): the syscall this task is in
+    // (x86_64 guest), its arguments, and since when (GetTickCount64 ms).
+    // Written by the task itself at entry and exit, read by the snapshot.
+    bool sc_active;
+    unsigned sc_nr;
+    uint64_t sc_args[6];
+    uint64_t sc_since_ms;
 #endif
     // Timestamp (CLOCK_MONOTONIC ns) of last time blocking became false.
     // Used by deadlock detector to check how long ALL threads have been stuck.

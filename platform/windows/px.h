@@ -176,6 +176,20 @@ int px_statvfs(const char *path, struct px_statvfs *st);
 int px_set_case_sensitive(const char *path);
 // The host path an fd was opened with (F_GETPATH).
 int px_fd_path(int fd, char *buf, size_t size);
+// Diagnostics (kernel/state_dump.c, the guest snapshot): one line about
+// host fd `fd`; for a socket also its local and peer ports (a pipe() end is
+// one side of a loopback pair, so the two ends of a pipe have each other's
+// ports). Only queries - nothing the guest could notice.
+int px_describe(int fd, char *buf, size_t size, int *local_port, int *peer_port);
+// The guest snapshot's trigger: the named event Local\ish-state-<host pid>;
+// each time it is set, `fn` runs on a thread of its own (blocked in a wait
+// the rest of the time: nothing while ish runs normally). False when it
+// could not be made.
+bool px_state_watch(void (*fn)(void));
+uint64_t px_tick_ms(void);
+unsigned long px_host_pid(void);
+// rename(), replacing `to` if it exists.
+int px_rename_replace(const char *from, const char *to);
 
 px_DIR *px_opendir(const char *path);
 px_DIR *px_fdopendir(int fd);

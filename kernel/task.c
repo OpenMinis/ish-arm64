@@ -70,6 +70,10 @@ struct task *task_create_(struct task *parent) {
     *task = (struct task) {};
     if (parent != NULL)
         *task = *parent;
+#ifdef _WIN32
+    // The parent is inside fork(); the child is not (state_dump.c).
+    task->sc_active = false;
+#endif
     task->pid = pid->id;
     pid->task = task;
 

@@ -512,6 +512,70 @@ out:
     return res;
 }
 
+static int px_port_of(const struct sockaddr_storage *a) {
+    if (a->ss_family == AF_INET)
+        return ntohs(((const struct sockaddr_in *) a)->sin_port);
+    if (a->ss_family == AF_INET6)
+        return ntohs(((const struct sockaddr_in6 *) a)->sin6_port);
+    return 0;
+}
+
+int px_describe(int fd, char *buf, size_t size, int *local_port, int *peer_port) {
+    *local_port = *peer_port = 0;
+    struct px_desc *d = px_get(fd);
+    if (d == NULL)
+        return snprintf(buf, size, "host fd %d not open", fd);
+    int len = 0;
+    switch (d->kind) {
+        case PX_SOCK: {
+            struct sockaddr_storage a;
+            int al = sizeof(a);
+            if (getsockname(d->s, (struct sockaddr *) &a, &al) == 0)
+                *local_port = px_port_of(&a);
+            al = sizeof(a);
+            bool connected = getpeername(d->s, (struct sockaddr *) &a, &al) == 0;
+            if (connected)
+                *peer_port = px_port_of(&a);
+            u_long avail = 0;
+            ioctlsocket(d->s, FIONREAD, &avail);
+            // Readable with nothing to read: the other end has closed (EOF).
+            fd_set rs;
+            FD_ZERO(&rs);
+            FD_SET(d->s, &rs);
+            struct timeval tv = {0, 0};
+            bool readable = select(0, &rs, NULL, NULL, &tv) > 0;
+            bool wr = (d->flags & PX_O_ACCMODE) == PX_O_WRONLY;
+            if (d->is_stdin)
+                len = snprintf(buf, size, "stdin bridge buffered=%lu%s", avail, readable && avail == 0 ? " eof" : "");
+            else if (d->is_pipe)
+                len = snprintf(buf, size, "pipe %s end, buffered=%lu%s%s", wr ? "write" : "read", avail,
+                               !wr && readable && avail == 0 ? ", writer closed (EOF)" : "",
+                               connected ? "" : ", peer gone");
+            else
+                len = snprintf(buf, size, "socket domain=%d type=%d local:%d peer:%d%s buffered=%lu%s",
+                               d->domain, d->type, *local_port, *peer_port, connected ? "" : " (not connected)",
+                               avail, readable && avail == 0 && connected ? " eof" : "");
+            break;
+        }
+        case PX_FILE:
+            len = snprintf(buf, size, "%s %s%s pos=%lld", d->is_dir ? "dir" : "file", d->path ? d->path : "?",
+                           d->is_tty ? " (tty)" : "", (long long) d->pos);
+            break;
+        case PX_CONSOLE_OUT: {
+            DWORD type = GetFileType(d->h);
+            len = snprintf(buf, size, "host %s", type == FILE_TYPE_PIPE ? "pipe (to Minis)" : type == FILE_TYPE_CHAR ? "console" : "file");
+            break;
+        }
+        case PX_NUL:
+            len = snprintf(buf, size, "NUL");
+            break;
+    }
+    if (len >= 0 && (size_t) len < size)
+        len += snprintf(buf + len, size - len, " refs=%d", atomic_load(&d->refs));
+    px_put(d);
+    return len;
+}
+
 int px_pipe(int fds[2]) {
     px_init();
     SOCKET s[2];

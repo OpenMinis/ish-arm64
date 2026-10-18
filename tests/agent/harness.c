@@ -118,7 +118,16 @@ static void harness_after_root(void) {
         current->group->fs_context = 1;
 }
 
+#ifdef _WIN32
+void state_dump_init(void); // kernel/state_dump.c
+#endif
+
 int main(int argc, char *const argv[]) {
+#ifdef _WIN32
+    // The guest snapshot Minis asks for when a command looks stuck
+    // (ISH_STATE_DIR; nothing at all without it).
+    state_dump_init();
+#endif
     const char *e;
     if ((e = getenv("ISHT_ROUTE")) != NULL) {
         const char *eq = strchr(e, '=');

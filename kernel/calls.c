@@ -33,6 +33,9 @@ dword_t syscall_success_stub(void) {
 
 // Syscall table is defined in arch-specific files (kernel/arch/*/calls.c)
 extern syscall_t syscall_table[];
+#ifdef _WIN32
+uint64_t state_dump_now_ms(void);
+#endif
 extern size_t syscall_table_size;
 
 void dump_stack(int lines);
@@ -92,12 +95,23 @@ void handle_interrupt(int interrupt) {
             static int systrace = -1;
             if (systrace == -1) { const char *e = getenv("ISH_SYSTRACE"); systrace = (e && e[0]=='1') ? 1 : 0; }
             uint64_t _a0=cpu->rdi,_a1=cpu->rsi,_a2=cpu->rdx,_a3=cpu->r10,_a4=cpu->r8,_a5=cpu->r9;
+#ifdef _WIN32
+            // For the guest snapshot (state_dump.c): what this task is in.
+            current->sc_nr = syscall_num;
+            current->sc_args[0] = _a0; current->sc_args[1] = _a1; current->sc_args[2] = _a2;
+            current->sc_args[3] = _a3; current->sc_args[4] = _a4; current->sc_args[5] = _a5;
+            current->sc_since_ms = state_dump_now_ms();
+            current->sc_active = true;
+#endif
             struct timespec _t0; if (systrace) clock_gettime(CLOCK_MONOTONIC, &_t0);
             struct sct_mark _sct;
             bool sct = sctimes_enabled();
             if (sct)
                 sctimes_begin(&_sct);
             int64_t result = syscall_table[syscall_num](_a0, _a1, _a2, _a3, _a4, _a5);
+#ifdef _WIN32
+            current->sc_active = false;
+#endif
             if (sct)
                 sctimes_end(&_sct, syscall_num);
             STRACE(" = 0x%llx\n", (unsigned long long) result);

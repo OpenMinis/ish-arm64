@@ -702,3 +702,43 @@ void px_prof_dump(void) {
     if (prof_finish != NULL)
         prof_finish();
 }
+
+// --- The guest snapshot's trigger (kernel/state_dump.c) ---------------------
+
+static void (*state_fn)(void);
+static HANDLE state_event;
+
+static DWORD WINAPI px_state_thread(LPVOID arg) {
+    (void) arg;
+    for (;;) {
+        if (WaitForSingleObject(state_event, INFINITE) != WAIT_OBJECT_0)
+            return 0;
+        state_fn();
+    }
+}
+
+bool px_state_watch(void (*fn)(void)) {
+    wchar_t name[64];
+    swprintf(name, 64, L"Local\\ish-state-%lu", GetCurrentProcessId());
+    state_event = CreateEventW(NULL, FALSE, FALSE, name);
+    if (state_event == NULL)
+        return false;
+    state_fn = fn;
+    HANDLE t = CreateThread(NULL, 0, px_state_thread, NULL, 0, NULL);
+    if (t == NULL)
+        return false;
+    CloseHandle(t);
+    return true;
+}
+
+uint64_t px_tick_ms(void) {
+    return GetTickCount64();
+}
+
+unsigned long px_host_pid(void) {
+    return GetCurrentProcessId();
+}
+
+int px_rename_replace(const char *from, const char *to) {
+    return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+}
