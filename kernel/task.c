@@ -166,6 +166,10 @@ void task_destroy(struct task *task) {
     }
 }
 
+#ifdef _WIN32
+static void reap_self(void);
+#endif
+
 static void task_run_tlb_cleanup(void *arg) {
 #ifdef GUEST_64BIT
     tlb_detach((struct tlb *) arg);   // exited while running guest code
@@ -196,6 +200,9 @@ static void task_run_tlb_cleanup(void *arg) {
                self->pid, (void *) mm, (unsigned) mm->refcount);
         mm_release_from(mm, "cleanup_handler");
     }
+#ifdef _WIN32
+    reap_self();
+#endif
 }
 
 #ifdef _WIN32
@@ -286,8 +293,66 @@ static void *task_thread(void *vtask) {
 static pthread_attr_t task_thread_attr;
 __attribute__((constructor)) static void create_attr() {
     pthread_attr_init(&task_thread_attr);
+#ifndef _WIN32
     pthread_attr_setdetachstate(&task_thread_attr, PTHREAD_CREATE_DETACHED);
+#endif
 }
+
+#ifdef _WIN32
+// winpthreads keeps an event of every detached thread for good, and of one
+// pthread_detach()ed after it started, and gives it back only to
+// pthread_join() (3000 threads: 3000 events more either way, 2 joined): one
+// for every guest thread that ever ran. So task threads are joinable, and as
+// each ends (its TLB key's destructor, about the last thing it runs) it
+// queues itself for a reaper thread that joins it. The reaper holds no lock,
+// so a thread whose last steps take one cannot deadlock against it.
+static lock_t reap_lock = LOCK_INITIALIZER;
+static cond_t reap_cond = COND_INITIALIZER;
+static pthread_t *reap_queue;
+static unsigned reap_count, reap_capacity;
+
+static void *reaper(void *unused) {
+    (void) unused;
+    lock(&reap_lock);
+    for (;;) {
+        while (reap_count == 0)
+            wait_for_ignore_signals(&reap_cond, &reap_lock, NULL);
+        pthread_t thread = reap_queue[--reap_count];
+        unlock(&reap_lock);
+        pthread_join(thread, NULL);
+        lock(&reap_lock);
+    }
+    return NULL;
+}
+
+static void reaper_start(void) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, reaper, NULL) != 0)
+        die("could not start the thread reaper");
+    pthread_attr_destroy(&attr);
+}
+
+static void reap_self(void) {
+    lock(&reap_lock);
+    if (reap_count == reap_capacity) {
+        unsigned capacity = reap_capacity ? reap_capacity * 2 : 64;
+        pthread_t *bigger = realloc(reap_queue, capacity * sizeof(*bigger));
+        if (bigger == NULL) {
+            // not joined: it keeps its event, nothing worse
+            unlock(&reap_lock);
+            return;
+        }
+        reap_queue = bigger;
+        reap_capacity = capacity;
+    }
+    reap_queue[reap_count++] = pthread_self();
+    notify_once(&reap_cond);
+    unlock(&reap_lock);
+}
+#endif
 
 int task_start(struct task *task) {
     // pthread_create returns an errno directly and never -1, so the old
@@ -295,6 +360,10 @@ int task_start(struct task *task) {
     // thread was never started. Under thread-stack exhaustion (EAGAIN) that
     // has to become a guest-visible clone() failure, not a dead task or a
     // die(). [T-ish-jit-oom-abort]
+#ifdef _WIN32
+    static pthread_once_t reaper_once = PTHREAD_ONCE_INIT;
+    pthread_once(&reaper_once, reaper_start);
+#endif
     int err = pthread_create(&task->thread, &task_thread_attr, task_thread, task);
     if (err != 0)
         return err == EAGAIN ? _EAGAIN : _ENOMEM;
