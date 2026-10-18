@@ -731,8 +731,9 @@ static unsigned osize(const struct gi *g) {
 static bool dbg_nosse;     // ISH_XLAT_NOSSE: leave SSE to the gadgets
 
 // The SSE instructions translated natively: moves, integer and logic
-// operations, and floating point arithmetic and conversions, none of which
-// touch the flags. The gadgets round those to nearest whatever the guest's
+// operations, floating point arithmetic, conversions and compares. Only
+// comis/ucomis touch the flags, all of them, as the guest's instruction
+// does. The gadgets round those to nearest whatever the guest's
 // MXCSR says and never set its exception bits: the host's own instructions,
 // under the host's default MXCSR, do the same. cvtsd2si/cvtss2si, which
 // honor the guest's rounding control, stay with the gadgets.
@@ -835,6 +836,22 @@ static bool classify_sse(const struct gi *g, struct cls *c) {
             c->reg_xmm = false; c->reg_gpr = true;
             c->acc = A_R; c->msize = pfx == 0xf2 ? 8 : 4;
             c->reg_rw = RW_W; c->rm_rw = RW_R;
+            return true;
+        case 0x2e: case 0x2f:  // ucomiss/comiss, ucomisd/comisd
+            // ZF PF CF from the compare, OF SF AF cleared: the host's
+            // instruction leaves the guest's flags, as a cmp does
+            if (pfx != 0 && pfx != 0x66) return false;
+            c->acc = A_R; c->msize = pfx == 0x66 ? 8 : 4;
+            c->reg_rw = RW_R; c->rm_rw = RW_R;
+            c->fw = F_ALL;
+            return true;
+        case 0xc2:             // cmpps/cmppd/cmpss/cmpsd: a mask per lane
+            if (pfx >= 0xf2) {
+                c->acc = A_R; c->msize = pfx == 0xf2 ? 8 : 4;
+            } else {
+                c->acc = A_R; c->msize = 16; c->memload = true;
+            }
+            c->reg_rw = RW_RW; c->rm_rw = RW_R;
             return true;
         case 0x54: case 0x55: case 0x56: case 0x57:  // and/andn/or/xor ps/pd
         case 0x14: case 0x15:                        // unpckl/unpckh ps/pd
