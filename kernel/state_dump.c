@@ -52,6 +52,7 @@ static const char *sc_name(unsigned nr) {
         case 33: return "dup2";
         case 34: return "pause";
         case 35: return "nanosleep";
+        case 40: return "sendfile";
         case 42: return "connect";
         case 43: return "accept";
         case 44: return "sendto";
@@ -76,7 +77,10 @@ static const char *sc_name(unsigned nr) {
         case 270: return "pselect6";
         case 271: return "ppoll";
         case 281: return "epoll_pwait";
+        case 275: return "splice";
+        case 276: return "tee";
         case 288: return "accept4";
+        case 326: return "copy_file_range";
         case 435: return "clone3";
         default: return NULL;
     }
@@ -162,7 +166,11 @@ static void describe_fd(struct out *o, struct task *t, int n, struct fd *fd) {
 static void describe_task(struct out *o, struct out *summary, struct task *t, uint64_t now) {
     pid_t_ ppid = t->parent ? t->parent->pid : 0;
     pid_t_ pgid = t->group ? t->group->pgid : 0;
-    const char *state = t->zombie ? "zombie" : t->exiting ? "exiting" : t->blocking ? "blocking" : "running";
+    const char *state = t->zombie     ? "zombie"
+                        : t->exiting  ? "exiting"
+                        : t->blocking ? "blocked"
+                        : t->sc_active ? "in syscall"
+                                       : "running guest code";
     char comm[17];
     memcpy(comm, t->comm, 16);
     comm[16] = 0;
