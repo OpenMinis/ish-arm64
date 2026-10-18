@@ -216,11 +216,15 @@ static inline int sock_flags_from_real(int real) {
 #define IP_TTL_ 2
 #define IP_HDRINCL_ 3
 #define IP_RETOPTS_ 7
+#define IP_PKTINFO_ 8
 #define IP_MTU_DISCOVER_ 10
 #define IP_RECVTTL_ 12
 #define IP_RECVTOS_ 13
+#define IP_MULTICAST_IF_ 32
 #define IP_MULTICAST_TTL_ 33
 #define IP_MULTICAST_LOOP_ 34
+#define IP_ADD_MEMBERSHIP_ 35
+#define IP_DROP_MEMBERSHIP_ 36
 #define TCP_NODELAY_ 1
 #define TCP_KEEPIDLE_ 4
 #define TCP_KEEPINTVL_ 5
@@ -232,9 +236,27 @@ static inline int sock_flags_from_real(int real) {
 #define IPV6_MULTICAST_IF_ 17
 #define IPV6_MULTICAST_HOPS_ 18
 #define IPV6_MULTICAST_LOOP_ 19
+#define IPV6_ADD_MEMBERSHIP_ 20
+#define IPV6_DROP_MEMBERSHIP_ 21
 #define IPV6_V6ONLY_ 26
+#define IPV6_RECVPKTINFO_ 49
+#define IPV6_PKTINFO_ 50
 #define IPV6_TCLASS_ 67
 #define ICMP6_FILTER_ 1
+
+// The host's options that ask for packet info, and the cmsgs that carry it.
+// Darwin defines the RFC 3542 IPv6 ones only under __APPLE_USE_RFC_3542.
+#if defined(__APPLE__)
+#define IP_RECVPKTINFO_HOST IP_RECVPKTINFO
+#define IP_PKTINFO_HOST IP_PKTINFO
+#define IPV6_RECVPKTINFO_HOST 61
+#define IPV6_PKTINFO_HOST 46
+#else
+#define IP_RECVPKTINFO_HOST IP_PKTINFO
+#define IP_PKTINFO_HOST IP_PKTINFO
+#define IPV6_RECVPKTINFO_HOST IPV6_RECVPKTINFO
+#define IPV6_PKTINFO_HOST IPV6_PKTINFO
+#endif
 
 static inline int sock_opt_to_real(int fake, int level) {
     switch (level) {
@@ -274,8 +296,14 @@ static inline int sock_opt_to_real(int fake, int level) {
             case IP_RETOPTS_: return IP_RETOPTS;
             case IP_RECVTTL_: return IP_RECVTTL;
             case IP_RECVTOS_: return IP_RECVTOS;
+            // set in sys_setsockopt (sock_set_ip_multicast); both read back
+            // an address
+            case IP_MULTICAST_IF_: return IP_MULTICAST_IF;
             case IP_MULTICAST_TTL_: return IP_MULTICAST_TTL;
             case IP_MULTICAST_LOOP_: return IP_MULTICAST_LOOP;
+            // a flag on both sides; the cmsg it asks for is translated in
+            // recvmsg (sock_cmsgs_to_guest)
+            case IP_PKTINFO_: return IP_RECVPKTINFO_HOST;
         } break;
         case IPPROTO_IPV6: switch (fake) {
             case IPV6_UNICAST_HOPS_: return IPV6_UNICAST_HOPS;
@@ -286,6 +314,11 @@ static inline int sock_opt_to_real(int fake, int level) {
             case IPV6_MULTICAST_IF_: return IPV6_MULTICAST_IF;
             case IPV6_MULTICAST_HOPS_: return IPV6_MULTICAST_HOPS;
             case IPV6_MULTICAST_LOOP_: return IPV6_MULTICAST_LOOP;
+            // struct ipv6_mreq is the same on both sides: group address,
+            // then an interface index the guest got from the host
+            case IPV6_ADD_MEMBERSHIP_: return IPV6_JOIN_GROUP;
+            case IPV6_DROP_MEMBERSHIP_: return IPV6_LEAVE_GROUP;
+            case IPV6_RECVPKTINFO_: return IPV6_RECVPKTINFO_HOST;
         } break;
     }
     return -1;

@@ -1256,6 +1256,85 @@ int_t sys_shutdown(fd_t sock_fd, dword_t how) {
 
 #define DEFAULT_TCP_CONGESTION "cubic"
 
+// SO_BINDTODEVICE names an interface; Darwin binds by index and per family
+// (IP_BOUND_IF, IPV6_BOUND_IF). The guest's interface names and indexes are
+// the host's (fs/netlink.c), except the loopback, which it calls "lo". An
+// empty name unbinds, an unknown one is ENODEV, as on Linux.
+static int sock_bind_to_device(struct fd *sock, const char *value, dword_t value_len) {
+    char name[IF_NAMESIZE] = {};
+    memcpy(name, value, value_len < sizeof(name) - 1 ? value_len : sizeof(name) - 1);
+#if defined(__APPLE__)
+    unsigned index = 0;
+    if (name[0] != '\0') {
+        index = if_nametoindex(strcmp(name, "lo") == 0 ? "lo0" : name);
+        if (index == 0)
+            return _ENODEV;
+    }
+    int err = 0;
+    if (sock->socket.domain == AF_INET_)
+        err = setsockopt(sock->real_fd, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index));
+    else if (sock->socket.domain == AF_INET6_)
+        err = setsockopt(sock->real_fd, IPPROTO_IPV6, IPV6_BOUND_IF, &index, sizeof(index));
+#else
+    int err = setsockopt(sock->real_fd, SOL_SOCKET, SO_BINDTODEVICE, name, strlen(name));
+#endif
+    if (err < 0)
+        return errno_map();
+    return 0;
+}
+
+// Linux takes three shapes for these: a bare interface address
+// (IP_MULTICAST_IF only), struct ip_mreq {group, interface address} and
+// struct ip_mreqn {group, interface address, interface index}, whose index
+// wins over the address. Darwin reads an 8-byte IP_MULTICAST_IF as a bare
+// address - the group's, not the interface's - and does not promise to look
+// at the index of an ip_mreqn, so each is restated in the host's terms: the
+// index through IP_MULTICAST_IFINDEX and MCAST_JOIN_GROUP, an address
+// through the plain options.
+static int sock_set_ip_multicast(int real_fd, dword_t option, const char *value, dword_t value_len) {
+#if defined(__APPLE__)
+    struct {
+        struct in_addr group;
+        struct in_addr address;
+        int32_t index;
+    } req = {};
+    if (value_len >= sizeof(req))
+        memcpy(&req, value, sizeof(req));
+    else if (value_len >= 8)
+        memcpy(&req, value, 8);
+    else if (option == IP_MULTICAST_IF_ && value_len >= sizeof(struct in_addr))
+        memcpy(&req.address, value, sizeof(req.address));
+    else
+        return _EINVAL;
+
+    int err;
+    if (option == IP_MULTICAST_IF_) {
+        if (req.index != 0)
+            err = setsockopt(real_fd, IPPROTO_IP, IP_MULTICAST_IFINDEX, &req.index, sizeof(req.index));
+        else
+            err = setsockopt(real_fd, IPPROTO_IP, IP_MULTICAST_IF, &req.address, sizeof(req.address));
+    } else if (req.index != 0) {
+        struct group_req gr = {.gr_interface = req.index};
+        struct sockaddr_in *group = (struct sockaddr_in *) &gr.gr_group;
+        group->sin_len = sizeof(*group);
+        group->sin_family = AF_INET;
+        group->sin_addr = req.group;
+        err = setsockopt(real_fd, IPPROTO_IP,
+                option == IP_ADD_MEMBERSHIP_ ? MCAST_JOIN_GROUP : MCAST_LEAVE_GROUP, &gr, sizeof(gr));
+    } else {
+        struct ip_mreq mreq = {.imr_multiaddr = req.group, .imr_interface = req.address};
+        err = setsockopt(real_fd, IPPROTO_IP,
+                option == IP_ADD_MEMBERSHIP_ ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+    }
+#else
+    // same numbers and structures as the guest
+    int err = setsockopt(real_fd, IPPROTO_IP, option, value, value_len);
+#endif
+    if (err < 0)
+        return errno_map();
+    return 0;
+}
+
 int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len) {
     STRACE("setsockopt(%d, %d, %d, 0x%x, %d)", sock_fd, level, option, value_addr, value_len);
     struct fd *sock = sock_getfd(sock_fd);
@@ -1292,22 +1371,11 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     // IP_MTU_DISCOVER has no equivalent on Darwin
     if (level == IPPROTO_IP && option == IP_MTU_DISCOVER_)
         return 0;
-    // [STAGE-0 PROBE] SO_BINDTODEVICE: bind this socket to a named interface.
-    // iSH has no interface model at all (/proc/net/dev is hardcoded dummy
-    // data), and Darwin's nearest equivalent is IP_BOUND_IF, which takes an
-    // ifindex rather than a name. Go's netns code sets this on every outbound
-    // dial, so rejecting it makes ALL dials fail with EINVAL. Accept and
-    // ignore: with a single host network path there is nothing to choose
-    // between, so unbound behaviour is what the caller wanted anyway.
-    if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
-        // Prefix is deliberately NOT "NETLINK_STUB": this has nothing to do
-        // with netlink and is NOT covered by ISH_NETLINK_STUB, so the old
-        // name implied that disabling the stub would disable this too.
-        // TRACE, not printk: Go sets this on EVERY outbound dial, and the
-        // unconditional form produced ~512KB of log in a single proxy test.
-        TRACE("SOCKOPT SO_BINDTODEVICE ignored (no iface model)\n");
-        return 0;
-    }
+    if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_)
+        return sock_bind_to_device(sock, value, value_len);
+    if (level == IPPROTO_IP && (option == IP_MULTICAST_IF_ ||
+                option == IP_ADD_MEMBERSHIP_ || option == IP_DROP_MEMBERSHIP_))
+        return sock_set_ip_multicast(sock->real_fd, option, value, value_len);
     // TCP_CONGESTION also has no equivalent on Darwin
 #if defined(__APPLE__)
     if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
@@ -1336,6 +1404,14 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     int err = setsockopt(sock->real_fd, real_level, real_opt, value, value_len);
     if (err < 0)
         return errno_map();
+#if defined(__APPLE__)
+    // On Linux, datagram sockets that all set SO_REUSEADDR share a port; BSD
+    // wants SO_REUSEPORT for that. Without it a guest mDNS responder cannot
+    // bind 5353 next to mDNSResponder (EADDRINUSE).
+    if (level == SOL_SOCKET_ && option == SO_REUSEADDR_ && sock->socket.type == SOCK_DGRAM_ &&
+            setsockopt(sock->real_fd, SOL_SOCKET, SO_REUSEPORT, value, value_len) < 0)
+        return errno_map();
+#endif
     return 0;
 }
 
@@ -1642,6 +1718,51 @@ out_free_iov:
     return err;
 }
 
+// The control messages a datagram socket asks for with IP_PKTINFO or
+// IPV6_RECVPKTINFO, restated with Linux's numbers in the guest's cmsghdr:
+// the length is as wide as a pointer (a size_t on 64-bit Linux, which musl
+// pads a socklen_t up to) and every message is aligned to it. The payloads,
+// struct in_pktinfo and struct in6_pktinfo, are laid out alike on both
+// sides. Any other host message is dropped. One that does not fit in what is
+// left of the guest's buffer ends the list with MSG_CTRUNC, as on Linux.
+static int sock_cmsgs_to_guest(struct msghdr *msg, addr_t control, uint_t *control_len, int *flags) {
+    const size_t align = sizeof(addr_t);
+#define GUEST_CMSG_ALIGN(len) (((len) + align - 1) & ~(align - 1))
+    const size_t header = GUEST_CMSG_ALIGN(sizeof(addr_t) + 2 * sizeof(int32_t));
+    size_t used = 0;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(msg); c != NULL; c = CMSG_NXTHDR(msg, c)) {
+        int32_t type;
+        if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO_HOST)
+            type = IP_PKTINFO_;
+        else if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_PKTINFO_HOST)
+            type = IPV6_PKTINFO_;
+        else
+            continue;
+        size_t data_len = c->cmsg_len - CMSG_LEN(0);
+        size_t len = header + data_len;
+        if (used + len > *control_len) {
+            *flags |= MSG_CTRUNC_;
+            break;
+        }
+        uint8_t out[len];
+        memset(out, 0, header);
+        addr_t out_len = len;
+        int32_t level = c->cmsg_level;
+        memcpy(out, &out_len, sizeof(out_len));
+        memcpy(out + sizeof(addr_t), &level, sizeof(level));
+        memcpy(out + sizeof(addr_t) + sizeof(level), &type, sizeof(type));
+        memcpy(out + header, CMSG_DATA(c), data_len);
+        if (user_write(control + used, out, len))
+            return _EFAULT;
+        used += GUEST_CMSG_ALIGN(len);
+    }
+#undef GUEST_CMSG_ALIGN
+    if (used > *control_len)
+        used = *control_len;
+    *control_len = used;
+    return 0;
+}
+
 int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     STRACE("recvmsg(%d, %#x, %d)", sock_fd, msghdr_addr, flags);
     struct fd *sock = sock_getfd(sock_fd);
@@ -1680,9 +1801,10 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         msg.msg_namelen = 0;
     }
 
-    char real_msg_control[CMSG_SPACE(sizeof(int))] = {}; // only used if needed
+    // only used if needed: room for one (1) fd, or for the control messages
+    // of a datagram socket (sock_cmsgs_to_guest)
+    char real_msg_control[256] __attribute__((aligned(8))) = {};
     if (msg_fake.msg_controllen != 0) {
-        // msg_control, include room for one (1) fd
         msg.msg_control = real_msg_control;
         msg.msg_controllen = sizeof(real_msg_control);
     } else {
@@ -1786,7 +1908,15 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     }
 
     // msg_control (changed)
+    uint_t guest_controllen = msg_fake.msg_controllen;
     msg_fake.msg_controllen = 0;
+    int cmsg_flags = 0;
+    if (sock->socket.domain != AF_LOCAL_ && res >= 0 && msg_fake.msg_control != 0) {
+        msg_fake.msg_controllen = guest_controllen;
+        int err = sock_cmsgs_to_guest(&msg, msg_fake.msg_control, &msg_fake.msg_controllen, &cmsg_flags);
+        if (err < 0)
+            return err;
+    }
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (sock->socket.domain == AF_LOCAL_ && cmsg != NULL &&
             cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
@@ -1832,7 +1962,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     msg_fake.msg_namelen = msg.msg_namelen;
 
     // msg_flags (changed)
-    msg_fake.msg_flags = sock_flags_from_real(msg.msg_flags);
+    msg_fake.msg_flags = sock_flags_from_real(msg.msg_flags) | cmsg_flags;
 
     // Write back the updated msghdr to guest memory
 #ifdef GUEST_ARM64

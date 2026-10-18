@@ -278,6 +278,29 @@ else
 fi
 rm -f "$starve_bin"
 
+# UDP multicast over the loopback: joining and leaving groups, IP_PKTINFO
+# and IPV6_PKTINFO, a shared port, SO_BINDTODEVICE. iSH exits 0 whatever the
+# guest does, so the verdict is read from what the test prints.
+echo
+echo "########## UDP multicast ##########"
+mcast_bin=$(mktemp -t regress_multicast)
+if "$CC_GUEST" -static -O1 -Wall -o "$mcast_bin" tests/regress/regress_multicast.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_multicast status=none < "$mcast_bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_multicast; then
+    out=$(timeout 60 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_multicast 2>/dev/null)
+    echo "$out" | grep -v '^PASS'
+    if echo "$out" | grep -q '^FAIL' || ! echo "$out" | grep -q '^PASS SO_BINDTODEVICE with no name unbinds$'; then
+        status=1
+    else
+        echo "PASS: $(echo "$out" | grep -c '^PASS') multicast cases match arm64 Linux"
+    fi
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_multicast
+else
+    echo "failed to build or stage regress_multicast" >&2
+    status=1
+fi
+rm -f "$mcast_bin"
+
 # When init exits with a child still running, iSH must stop the child and
 # exit 0 at once (it used to wait 2 s and die of its own SIGTERM, status 143).
 echo
