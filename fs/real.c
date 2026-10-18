@@ -323,6 +323,18 @@ int realfs_poll(struct fd *fd) {
     if (poll(&p, 1, 0) <= 0)
         return 0;
 
+    // An empty pipe whose writers are gone is POLLIN|POLLHUP on Darwin and
+    // Windows but only POLLHUP on Linux. CoreCLR's PAL worker waits for
+    // exactly that bare POLLHUP at shutdown; given POLLIN it spun in ppoll
+    // until the 2 s shutdown timeout, on every .NET process exit.
+    if ((p.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP)) {
+        struct stat st;
+        int avail;
+        if (fstat(fd->real_fd, &st) == 0 && S_ISFIFO(st.st_mode) &&
+                ioctl(fd->real_fd, FIONREAD, &avail) == 0 && avail == 0)
+            p.revents &= ~POLLIN;
+    }
+
 #if defined(__APPLE__)
     // this is the "WTF is apple smoking" section
 
