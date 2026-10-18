@@ -805,11 +805,11 @@ void tty_hangup(struct tty *tty) {
     list_for_each_entry(&tty->fds, fd, tty_other_fds) {
         // Use trylock to avoid blocking — if we can't get poll_lock,
         // the poll loop's 1-second timeout will pick up hung_up anyway.
-        if (pthread_mutex_trylock(&fd->poll_lock.m) == 0) {
+        if (trylock(&fd->poll_lock) == 0) {
             struct poll_fd *poll_fd;
             list_for_each_entry(&fd->poll_fds, poll_fd, polls) {
                 struct poll *poll = poll_fd->poll;
-                if (pthread_mutex_trylock(&poll->lock.m) == 0) {
+                if (trylock(&poll->lock) == 0) {
                     if (poll->notify_pipe[1] != -1)
                         write(poll->notify_pipe[1], "", 1);
                     unlock(&poll->lock);

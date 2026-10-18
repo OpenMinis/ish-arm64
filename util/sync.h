@@ -17,6 +17,71 @@
 
 #define LOCK_DEBUG 0
 
+// What the locks below are made of. On Windows, winpthreads makes kernel
+// objects (events, semaphores) for its mutexes, condition variables and
+// rwlocks that only pthread_*_destroy gives back, and iSH frees the
+// structures holding its locks without destroying them (tasks, fds, address
+// spaces...): every guest process left about 40 behind, so a shell loop
+// running /bin/true grew ish.exe by 30 handles and 0.4 MB a run until Minis'
+// 2 GiB job limit killed it. Slim reader/writer locks and condition
+// variables need no init or destroy and hold nothing.
+#ifdef _WIN32
+#ifdef _WINDOWS_
+typedef SRWLOCK sync_srw_t;
+typedef CONDITION_VARIABLE sync_cv_t;
+#else
+// windows.h stays out of iSH's sources (its macros collide with their
+// names): the part of it the locks use, as it declares it
+typedef struct _RTL_SRWLOCK { void *Ptr; } sync_srw_t;
+typedef struct _RTL_CONDITION_VARIABLE { void *Ptr; } sync_cv_t;
+__declspec(dllimport) void __stdcall InitializeSRWLock(sync_srw_t *);
+__declspec(dllimport) void __stdcall AcquireSRWLockExclusive(sync_srw_t *);
+__declspec(dllimport) void __stdcall ReleaseSRWLockExclusive(sync_srw_t *);
+__declspec(dllimport) unsigned char __stdcall TryAcquireSRWLockExclusive(sync_srw_t *);
+__declspec(dllimport) void __stdcall AcquireSRWLockShared(sync_srw_t *);
+__declspec(dllimport) void __stdcall ReleaseSRWLockShared(sync_srw_t *);
+__declspec(dllimport) unsigned char __stdcall TryAcquireSRWLockShared(sync_srw_t *);
+__declspec(dllimport) void __stdcall InitializeConditionVariable(sync_cv_t *);
+__declspec(dllimport) void __stdcall WakeConditionVariable(sync_cv_t *);
+__declspec(dllimport) void __stdcall WakeAllConditionVariable(sync_cv_t *);
+__declspec(dllimport) int __stdcall SleepConditionVariableSRW(sync_cv_t *, sync_srw_t *, unsigned long, unsigned long);
+__declspec(dllimport) unsigned long __stdcall GetLastError(void);
+#endif
+typedef sync_srw_t sync_mutex_t;
+typedef sync_cv_t sync_cond_t;
+typedef sync_srw_t sync_rwlock_t;
+#define SYNC_MUTEX_INITIALIZER {0}
+#define SYNC_COND_INITIALIZER {0}
+#define sync_mutex_init(m) InitializeSRWLock(m)
+#define sync_mutex_lock(m) AcquireSRWLockExclusive(m)
+#define sync_mutex_trylock(m) (TryAcquireSRWLockExclusive(m) ? 0 : EBUSY)
+#define sync_mutex_unlock(m) ReleaseSRWLockExclusive(m)
+#define sync_rwlock_init(l) (InitializeSRWLock(l), 0)
+#define sync_rwlock_destroy(l) ((void) (l), 0)
+#define sync_rwlock_rdlock(l) (AcquireSRWLockShared(l), 0)
+#define sync_rwlock_tryrdlock(l) (TryAcquireSRWLockShared(l) ? 0 : EBUSY)
+#define sync_rwlock_trywrlock(l) (TryAcquireSRWLockExclusive(l) ? 0 : EBUSY)
+#define sync_rwlock_rdunlock(l) (ReleaseSRWLockShared(l), 0)
+#define sync_rwlock_wrunlock(l) (ReleaseSRWLockExclusive(l), 0)
+#else
+typedef pthread_mutex_t sync_mutex_t;
+typedef pthread_cond_t sync_cond_t;
+typedef pthread_rwlock_t sync_rwlock_t;
+#define SYNC_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+#define SYNC_COND_INITIALIZER PTHREAD_COND_INITIALIZER
+#define sync_mutex_init(m) pthread_mutex_init(m, NULL)
+#define sync_mutex_lock(m) pthread_mutex_lock(m)
+#define sync_mutex_trylock(m) pthread_mutex_trylock(m)
+#define sync_mutex_unlock(m) pthread_mutex_unlock(m)
+#define sync_rwlock_init(l) pthread_rwlock_init(l, NULL)
+#define sync_rwlock_destroy(l) pthread_rwlock_destroy(l)
+#define sync_rwlock_rdlock(l) pthread_rwlock_rdlock(l)
+#define sync_rwlock_tryrdlock(l) pthread_rwlock_tryrdlock(l)
+#define sync_rwlock_trywrlock(l) pthread_rwlock_trywrlock(l)
+#define sync_rwlock_rdunlock(l) pthread_rwlock_unlock(l)
+#define sync_rwlock_wrunlock(l) pthread_rwlock_unlock(l)
+#endif
+
 // Slow-lock tracing: when enabled AND the ISH_LOCK_TRACE environment variable
 // is set, lock() spins with trylock and reports any wait longer than 3s. Useful
 // for diagnosing lock-order inversions and hangs.
@@ -34,7 +99,7 @@
 #endif
 
 typedef struct {
-    pthread_mutex_t m;
+    sync_mutex_t m;
     pthread_t owner;
 #if LOCK_DEBUG
     struct lock_debug {
@@ -47,7 +112,7 @@ typedef struct {
 } lock_t;
 
 static inline void lock_init(lock_t *lock) {
-    pthread_mutex_init(&lock->m, NULL);
+    sync_mutex_init(&lock->m);
 #if LOCK_DEBUG
     lock->debug = (struct lock_debug) {
         .initialized = true,
@@ -56,9 +121,9 @@ static inline void lock_init(lock_t *lock) {
 }
 
 #if LOCK_DEBUG
-#define LOCK_INITIALIZER {PTHREAD_MUTEX_INITIALIZER, 0, { .initialized = true }}
+#define LOCK_INITIALIZER {SYNC_MUTEX_INITIALIZER, 0, { .initialized = true }}
 #else
-#define LOCK_INITIALIZER {PTHREAD_MUTEX_INITIALIZER, 0}
+#define LOCK_INITIALIZER {SYNC_MUTEX_INITIALIZER, 0}
 #endif
 #if LOCK_SLOW_TRACE
 extern int g_lock_slow_trace; // set from ISH_LOCK_TRACE at startup
@@ -68,7 +133,7 @@ static inline void __lock(lock_t *lock, __attribute__((unused)) const char *file
     if (g_lock_slow_trace) {
         struct timespec _s; clock_gettime(CLOCK_MONOTONIC, &_s);
         int spun = 0;
-        while (pthread_mutex_trylock(&lock->m) != 0) {
+        while (sync_mutex_trylock(&lock->m) != 0) {
             struct timespec _b = {0, 200000}; nanosleep(&_b, NULL);
             struct timespec _n; clock_gettime(CLOCK_MONOTONIC, &_n);
             long ms = (_n.tv_sec-_s.tv_sec)*1000 + (_n.tv_nsec-_s.tv_nsec)/1000000;
@@ -83,7 +148,7 @@ static inline void __lock(lock_t *lock, __attribute__((unused)) const char *file
         goto done;
     }
 #endif
-    pthread_mutex_lock(&lock->m);
+    sync_mutex_lock(&lock->m);
     lock->owner = pthread_self();
 #if LOCK_SLOW_TRACE
 done:;
@@ -105,11 +170,11 @@ static inline void unlock(lock_t *lock) {
     lock->debug = (struct lock_debug) { .initialized = true };
 #endif
     lock->owner = zero_init(pthread_t);
-    pthread_mutex_unlock(&lock->m);
+    sync_mutex_unlock(&lock->m);
 }
 
 static inline int trylock(lock_t *lock, __attribute__((unused)) const char *file, __attribute__((unused)) int line) {
-    int status = pthread_mutex_trylock(&lock->m);
+    int status = sync_mutex_trylock(&lock->m);
 #if LOCK_DEBUG
     if (!status) {
         lock->debug.file = file;
@@ -126,9 +191,9 @@ static inline int trylock(lock_t *lock, __attribute__((unused)) const char *file
 // be woken by a signal
 
 typedef struct {
-    pthread_cond_t cond;
+    sync_cond_t cond;
 } cond_t;
-#define COND_INITIALIZER ((cond_t) {PTHREAD_COND_INITIALIZER})
+#define COND_INITIALIZER ((cond_t) {SYNC_COND_INITIALIZER})
 
 // Must call before using the condition
 void cond_init(cond_t *cond);
@@ -151,7 +216,7 @@ void notify_once(cond_t *cond);
 // on darwin pthread_rwlock_t is already like this, on linux you can configure
 // it to prefer writers. not worrying about anything else right now.
 typedef struct {
-    pthread_rwlock_t l;
+    sync_rwlock_t l;
     // 0: unlocked
     // -1: write-locked
     // >0: read-locked with this many readers
@@ -173,8 +238,11 @@ static inline void wrlock_init(wrlock_t *lock) {
     pattr = &attr;
     pthread_rwlockattr_init(pattr);
     pthread_rwlockattr_setkind_np(pattr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-#endif
     if (pthread_rwlock_init(&lock->l, pattr)) __builtin_trap();
+#else
+    (void) pattr;
+    if (sync_rwlock_init(&lock->l)) __builtin_trap();
+#endif
     lock->val = lock->line = lock->pid = 0;
     lock->file = NULL;
     lock->writers_waiting = 0;
@@ -184,17 +252,17 @@ static inline void wrlock_init(wrlock_t *lock) {
 
 extern int current_pid(void);
 static inline void wrlock_destroy(wrlock_t *lock) {
-    if (pthread_rwlock_destroy(&lock->l) != 0) __builtin_trap();
+    if (sync_rwlock_destroy(&lock->l) != 0) __builtin_trap();
 }
 static inline void read_wrlock(wrlock_t *lock) {
-    if (pthread_rwlock_rdlock(&lock->l) != 0) __builtin_trap();
+    if (sync_rwlock_rdlock(&lock->l) != 0) __builtin_trap();
     assert(lock->val >= 0);
     lock->val++;
 }
 static inline void read_wrunlock(wrlock_t *lock) {
     assert(lock->val > 0);
     lock->val--;
-    if (pthread_rwlock_unlock(&lock->l) != 0) __builtin_trap();
+    if (sync_rwlock_rdunlock(&lock->l) != 0) __builtin_trap();
 }
 static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
     // Acquire the write lock without letting a *waiting* writer freeze out
@@ -229,7 +297,7 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
     // making progress and releasing until the writer wins a trylock. This keeps
     // forward progress for readers guaranteed and the writer non-blocking.
     struct timespec _ts = {0, 1000}; // 1us initial backoff, grows to a steady sleep
-    if (pthread_rwlock_trywrlock(&lock->l) != 0) {
+    if (sync_rwlock_trywrlock(&lock->l) != 0) {
         // contended: the wait is a span of ISH_SYSCALL_TIMES (kernel/sctimes.c)
         struct sct_mark _m;
         bool _on = sctimes_enabled();
@@ -242,7 +310,7 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
             nanosleep(&_ts, NULL);
             if (_ts.tv_nsec < 100000) // ramp up to a 100us steady sleep (yields CPU)
                 _ts.tv_nsec *= 2;
-            _got = pthread_rwlock_trywrlock(&lock->l) == 0;
+            _got = sync_rwlock_trywrlock(&lock->l) == 0;
             // readers that went on running guest code since: again
             if (!_got && _ts.tv_nsec >= 100000 && lock->writer_waits != NULL)
                 lock->writer_waits(lock->writer_waits_arg);
@@ -258,14 +326,14 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
 }
 #define write_wrlock(lock) __write_wrlock(lock, __FILE__, __LINE__)
 static inline bool read_wrtrylock(wrlock_t *lock) {
-    if (pthread_rwlock_tryrdlock(&lock->l) != 0)
+    if (sync_rwlock_tryrdlock(&lock->l) != 0)
         return false;
     assert(lock->val >= 0);
     lock->val++;
     return true;
 }
 static inline bool write_wrtrylock(wrlock_t *lock) {
-    int err = pthread_rwlock_trywrlock(&lock->l);
+    int err = sync_rwlock_trywrlock(&lock->l);
     if (err == EBUSY) return false;
     if (err != 0) __builtin_trap();
     assert(lock->val == 0);
@@ -276,7 +344,7 @@ static inline void write_wrunlock(wrlock_t *lock) {
     assert(lock->val == -1);
     lock->val = lock->line = lock->pid = 0;
     lock->file = NULL;
-    if (pthread_rwlock_unlock(&lock->l) != 0) __builtin_trap();
+    if (sync_rwlock_wrunlock(&lock->l) != 0) __builtin_trap();
 }
 
 extern __thread sigjmp_buf unwind_buf;

@@ -14,15 +14,23 @@ __attribute__((constructor)) static void init_lock_slow_trace(void) {
 #endif
 
 void cond_init(cond_t *cond) {
+#ifdef _WIN32
+    InitializeConditionVariable(&cond->cond);
+#else
     pthread_condattr_t attr;
     pthread_condattr_init(&attr);
 #if __linux__
     pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
 #endif
     pthread_cond_init(&cond->cond, &attr);
+#endif
 }
 void cond_destroy(cond_t *cond) {
+#ifdef _WIN32
+    (void) cond;   // holds nothing
+#else
     pthread_cond_destroy(&cond->cond);
+#endif
 }
 
 static bool is_signal_pending(lock_t *lock) {
@@ -59,6 +67,19 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
     struct lock_debug lock_tmp = lock->debug;
     lock->debug = (struct lock_debug) { .initialized = lock->debug.initialized };
 #endif
+#ifdef _WIN32
+    // SleepConditionVariableSRW waits whole milliseconds: round up, so a
+    // short wait is not a spin
+    const unsigned long infinite = 0xffffffff, error_timeout = 1460;
+    unsigned long ms = infinite;
+    if (timeout != NULL) {
+        uint64_t ns = (uint64_t) timeout->tv_sec * 1000000000ull + (uint64_t) timeout->tv_nsec;
+        uint64_t m = (ns + 999999) / 1000000;
+        ms = m >= infinite ? infinite - 1 : (unsigned long) m;
+    }
+    if (!SleepConditionVariableSRW(&cond->cond, &lock->m, ms, 0) && GetLastError() == error_timeout)
+        rc = ETIMEDOUT;
+#else
     if (!timeout) {
         pthread_cond_wait(&cond->cond, &lock->m);
     } else {
@@ -74,21 +95,11 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
         rc = pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
 #elif __APPLE__
         rc = pthread_cond_timedwait_relative_np(&cond->cond, &lock->m, timeout);
-#elif defined(_WIN32)
-        // winpthreads waits against CLOCK_REALTIME
-        struct timespec abs_timeout;
-        clock_gettime(CLOCK_REALTIME, &abs_timeout);
-        abs_timeout.tv_sec += timeout->tv_sec;
-        abs_timeout.tv_nsec += timeout->tv_nsec;
-        if (abs_timeout.tv_nsec >= 1000000000) {
-            abs_timeout.tv_sec++;
-            abs_timeout.tv_nsec -= 1000000000;
-        }
-        rc = pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
 #else
 #error Unimplemented pthread_cond_wait relative timeout.
 #endif
     }
+#endif
 #if LOCK_DEBUG
     lock->debug = lock_tmp;
 #endif
@@ -105,10 +116,18 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
 }
 
 void notify(cond_t *cond) {
+#ifdef _WIN32
+    WakeAllConditionVariable(&cond->cond);
+#else
     pthread_cond_broadcast(&cond->cond);
+#endif
 }
 void notify_once(cond_t *cond) {
+#ifdef _WIN32
+    WakeConditionVariable(&cond->cond);
+#else
     pthread_cond_signal(&cond->cond);
+#endif
 }
 
 __thread sigjmp_buf unwind_buf;
