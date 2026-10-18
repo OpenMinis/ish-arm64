@@ -138,8 +138,10 @@ static int poll_event_callback(void *context, int types, union poll_fd_info info
     }
     return res;
 }
-dword_t sys_poll(addr_t fds, dword_t nfds, int_t timeout) {
-    STRACE("poll(0x%x, %d, %d)", fds, nfds, timeout);
+// timeout: NULL waits for ever
+static dword_t poll_common(addr_t fds, dword_t nfds, struct timespec *timeout) {
+    STRACE("poll(0x%x, %d, %ld.%09ld)", fds, nfds, timeout ? (long) timeout->tv_sec : -1L,
+           timeout ? (long) timeout->tv_nsec : 0L);
     struct pollfd_ polls[nfds];
     if (fds != 0 || nfds != 0)
         if (user_read(fds, polls, sizeof(struct pollfd_) * nfds))
@@ -191,12 +193,7 @@ dword_t sys_poll(addr_t fds, dword_t nfds, int_t timeout) {
             polls[i].revents = POLL_NVAL;
     }
     struct poll_context context = {polls, files, nfds};
-    struct timespec timeout_ts;
-    if (timeout >= 0) {
-        timeout_ts.tv_sec = timeout / 1000;
-        timeout_ts.tv_nsec = (timeout % 1000) * 1000000;
-    }
-    int res = poll_wait(poll, poll_event_callback, &context, timeout < 0 ? NULL : &timeout_ts);
+    int res = poll_wait(poll, poll_event_callback, &context, timeout);
     poll_destroy(poll);
     for (unsigned i = 0; i < nfds; i++) {
         if (files[i] != NULL)
@@ -212,6 +209,11 @@ dword_t sys_poll(addr_t fds, dword_t nfds, int_t timeout) {
         if (user_write(fds, polls, sizeof(struct pollfd_) * nfds))
             return _EFAULT;
     return res;
+}
+
+dword_t sys_poll(addr_t fds, dword_t nfds, int_t timeout) {
+    struct timespec timeout_ts = {.tv_sec = timeout / 1000, .tv_nsec = (timeout % 1000) * 1000000};
+    return poll_common(fds, nfds, timeout < 0 ? NULL : &timeout_ts);
 }
 
 dword_t sys_pselect(fd_t nfds, addr_t readfds_addr, addr_t writefds_addr, addr_t exceptfds_addr, addr_t timeout_addr, addr_t sigmask_addr) {
@@ -254,12 +256,14 @@ dword_t sys_pselect(fd_t nfds, addr_t readfds_addr, addr_t writefds_addr, addr_t
 }
 
 dword_t sys_ppoll(addr_t fds, dword_t nfds, addr_t timeout_addr, addr_t sigmask_addr, dword_t sigsetsize) {
-    int timeout = -1;
+    // the whole timespec: in milliseconds a timeout under 1 ms was 0, and
+    // a loop of ppoll(500 us) spun instead of sleeping
+    struct timespec timeout_ts;
     if (timeout_addr != 0) {
         struct timespec_ timeout_timespec;
         if (user_get(timeout_addr, timeout_timespec))
             return _EFAULT;
-        timeout = timeout_timespec.sec * 1000 + timeout_timespec.nsec / 1000000;
+        timeout_ts = convert_timespec(timeout_timespec);
     }
 
     sigset_t_ mask;
@@ -270,5 +274,5 @@ dword_t sys_ppoll(addr_t fds, dword_t nfds, addr_t timeout_addr, addr_t sigmask_
         sigmask_set_temp(mask);
     }
 
-    return sys_poll(fds, nfds, timeout);
+    return poll_common(fds, nfds, timeout_addr != 0 ? &timeout_ts : NULL);
 }
