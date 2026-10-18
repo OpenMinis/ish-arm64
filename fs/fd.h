@@ -62,6 +62,10 @@ struct fd {
             uint8_t unix_name_len;
             char unix_name[108];
             struct fd *unix_peer; // locked by peer_lock, for simplicity
+            // A connect() not yet picked up by accept(): its token, sent to
+            // the listener, and its link on the pending list (peer_lock).
+            uint64_t unix_connect_token;
+            struct list unix_pending;
             // [STAGE-0 PROBE] AF_NETLINK stub: the write end of the backing
             // socketpair. -1 for every non-netlink socket. See fs/sock.c.
             int netlink_peer_fd;

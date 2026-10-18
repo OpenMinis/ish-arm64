@@ -219,6 +219,21 @@ static bool fd_is_netlink_stub(struct fd *fd) {
 }
 
 static lock_t peer_lock = LOCK_INITIALIZER;
+// AF_LOCAL stream peers find each other through a token connect() writes
+// ahead of the data and accept() reads back. connect() must not wait for that
+// accept(): Linux completes it on the listener's backlog alone, and a server
+// that serves one connection at a time (officecli's resident mode) deadlocked
+// with a client stuck in connect(). Tokens rather than fd pointers, so an
+// accept() after the client closed finds nothing instead of a freed fd.
+static struct list unix_pending_connects = {&unix_pending_connects, &unix_pending_connects};
+static uint64_t unix_next_token;
+
+// Wait (peer_lock held) until accept() has paired a socket whose connect()
+// is still pending, for the few users that need the peer itself.
+static void unix_wait_for_peer(struct fd *sock) {
+    while (sock->socket.unix_peer == NULL && sock->socket.unix_connect_token != 0)
+        wait_for_ignore_signals(&sock->socket.unix_got_peer, &peer_lock, NULL);
+}
 
 static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     struct fd *fd = adhoc_fd_create(&socket_fdops);
@@ -612,15 +627,16 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (sock->socket.domain == AF_LOCAL_) {
         fill_cred(&sock->socket.unix_cred);
         assert(sock->socket.unix_peer == NULL);
-        // Send a pointer to ourselves to the other end so they can set up the peer pointers.
-        ssize_t res = write(sock->real_fd, &sock, sizeof(struct fd *));
-        if (res == sizeof(struct fd *)) {
-            // Wait for acknowledgement that it happened.
-            lock(&peer_lock);
-            while (sock->socket.unix_peer == NULL)
-                wait_for_ignore_signals(&sock->socket.unix_got_peer, &peer_lock, NULL);
-            unlock(&peer_lock);
+        // Send our token to the other end so accept() can set up the peer
+        // pointers; do not wait for it.
+        lock(&peer_lock);
+        uint64_t token = ++unix_next_token;
+        ssize_t res = write(sock->real_fd, &token, sizeof(token));
+        if (res == sizeof(token)) {
+            sock->socket.unix_connect_token = token;
+            list_add_tail(&unix_pending_connects, &sock->socket.unix_pending);
         }
+        unlock(&peer_lock);
     }
 
     return err;
@@ -679,12 +695,20 @@ int_t sys_accept(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
         lock(&peer_lock);
         struct fd *client_fd = f_get(client_f);
         fill_cred(&client_fd->socket.unix_cred);
+        uint64_t token;
+        ssize_t res = read(client, &token, sizeof(token));
         struct fd *peer;
-        ssize_t res = read(client, &peer, sizeof(peer));
-        if (res == sizeof(peer)) {
-            client_fd->socket.unix_peer = peer;
-            peer->socket.unix_peer = client_fd;
-            notify(&peer->socket.unix_got_peer);
+        if (res == sizeof(token)) {
+            list_for_each_entry(&unix_pending_connects, peer, socket.unix_pending) {
+                if (peer->socket.unix_connect_token != token)
+                    continue;
+                list_remove(&peer->socket.unix_pending);
+                peer->socket.unix_connect_token = 0;
+                client_fd->socket.unix_peer = peer;
+                peer->socket.unix_peer = client_fd;
+                notify(&peer->socket.unix_got_peer);
+                break;
+            }
         }
         unlock(&peer_lock);
     }
@@ -1195,6 +1219,7 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         if (value_len != sizeof(*cred))
             return _EINVAL;
         lock(&peer_lock);
+        unix_wait_for_peer(sock);
         if (sock->socket.domain != AF_LOCAL_ || sock->socket.unix_peer == NULL) {
             cred->pid = 0;
             cred->uid = cred->gid = -1;
@@ -1423,6 +1448,7 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
                 }
             }
             lock(&peer_lock);
+            unix_wait_for_peer(sock);
             struct fd *peer = sock->socket.unix_peer;
             if (peer == NULL) {
                 unlock(&peer_lock);
@@ -1851,6 +1877,8 @@ static int sock_close(struct fd *fd) {
     struct fd *peer = fd->socket.unix_peer;
     if (peer != NULL)
         peer->socket.unix_peer = NULL;
+    if (fd->socket.unix_connect_token != 0)
+        list_remove(&fd->socket.unix_pending);
     unlock(&peer_lock);
     if (fd->socket.domain == AF_LOCAL_) {
         lock(&fd->lock);
