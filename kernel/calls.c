@@ -107,13 +107,27 @@ void handle_interrupt(int interrupt) {
                         (unsigned long long)_a0,(unsigned long long)_a1,(unsigned long long)_a2,
                         (unsigned long long)_a3,(unsigned long long)_a4,(unsigned long long)_a5,
                         (unsigned long long)result);
+            // Restartable when Linux returns -ERESTARTSYS from it: receive_signals()
+            // re-executes it after a SA_RESTART handler or no handler at all. The
+            // rest are -ERESTARTNOHAND or timed and surface EINTR to any handler:
+            // poll/select/epoll_wait, nanosleep, sigsuspend, a timed futex wait.
             if ((int32_t) (uint32_t) result == _EINTR) {
                 switch (syscall_num) {
-                    case 202: // futex
-                    case 232: // epoll_wait
-                    case 281: // epoll_pwait
+                    case 202: // futex: only an untimed wait
+                        current->syscall_restartable = _a3 == 0;
+                        break;
                     case 0:   // read
                     case 1:   // write
+                    case 19:  // readv
+                    case 20:  // writev
+                    case 61:  // wait4
+                    case 247: // waitid
+                    case 43:  // accept
+                    case 288: // accept4
+                    case 44:  // sendto
+                    case 45:  // recvfrom
+                    case 46:  // sendmsg
+                    case 47:  // recvmsg
                         current->syscall_restartable = true;
                         break;
                 }
