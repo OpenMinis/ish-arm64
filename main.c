@@ -482,6 +482,20 @@ int main(int argc, char *const argv[]) {
 #ifdef _WIN32
     px_crash_init();
     px_prof_register();
+    // A guest AF_UNIX socket with a path is a host one named
+    // sock_tmp_prefix<pid>.<n>. "/tmp/ishsock" is C:\tmp, which Windows does
+    // not have: every bind() failed and every connect() with it.
+    {
+        extern const char *sock_tmp_prefix;
+        const char *tmp = getenv("TEMP");
+        if (tmp == NULL)
+            tmp = getenv("TMP");
+        static char prefix[80];
+        if (tmp != NULL && strlen(tmp) + sizeof("/ishsock") <= sizeof(prefix) - 24) {
+            snprintf(prefix, sizeof(prefix), "%s/ishsock", tmp);
+            sock_tmp_prefix = prefix;
+        }
+    }
 #endif
     char envp[512] = {0};
     size_t p = 0;
