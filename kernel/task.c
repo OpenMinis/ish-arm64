@@ -198,6 +198,20 @@ static void task_run_tlb_cleanup(void *arg) {
     }
 }
 
+#ifdef _WIN32
+// winpthreads' pthread_exit() runs no pthread_cleanup_push() handlers, only
+// the destructors of thread-specific keys, so on Windows the cleanup below
+// is a key's: with the handler, no guest thread's TLB was ever freed, and a
+// shell loop running /bin/true grew ish.exe by 0.35 MB a run (Minis' 2 GiB
+// job limit killed it after 150 s of a polling loop).
+static pthread_key_t tlb_key;
+static pthread_once_t tlb_key_once = PTHREAD_ONCE_INIT;
+static void tlb_key_init(void) {
+    if (pthread_key_create(&tlb_key, task_run_tlb_cleanup) != 0)
+        die("could not create the TLB key");
+}
+#endif
+
 void task_run_current() {
     struct cpu_state *cpu = &current->cpu;
     struct tlb *tlb = calloc(1, sizeof(struct tlb));
@@ -208,7 +222,12 @@ void task_run_current() {
     // (e.g. do_exit() after a native-offloaded execve, or SIGKILL path).
     // Without this, every guest process leaks ~304KB of TLB + ~48KB of
     // fiber_frame, dominating app memory after repeated ffmpeg invocations.
+#ifdef _WIN32
+    pthread_once(&tlb_key_once, tlb_key_init);
+    pthread_setspecific(tlb_key, tlb);
+#else
     pthread_cleanup_push(task_run_tlb_cleanup, tlb);
+#endif
 
     while (true) {
         // Check for group exit before entering JIT — this catches threads
@@ -249,7 +268,9 @@ void task_run_current() {
 
     // Never reached in practice (loop only exits via pthread_exit/do_exit),
     // but the pop is required for pthread_cleanup_push/pop balance.
+#ifndef _WIN32
     pthread_cleanup_pop(1);
+#endif
 }
 
 static void *task_thread(void *vtask) {
