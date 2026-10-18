@@ -216,6 +216,42 @@ uint_t sys_alarm(uint_t seconds) {
 // is specified to have. `rem` matters: sleep(1) and friends resume with the
 // remainder, so an interrupted sleep that reports a wrong remainder either
 // returns early or loops forever.
+#ifdef _WIN32
+static bool guest_signal_pending(void) {
+    lock(&current->sighand->lock);
+    bool pending = !!(current->pending & ~current->blocked);
+    unlock(&current->sighand->lock);
+    return pending;
+}
+
+// Windows: the host sleep (px_nanosleep, a high-resolution waitable timer)
+// is interruptible itself: deliver_signal()'s pthread_kill() wakes it with
+// EINTR, and a wake that comes before it starts is kept for it. A timed
+// condition variable wait in winpthreads measures against the coarse system
+// time, so every sleep from about 100 us up to 15 ms took 15.5 ms.
+static dword_t nanosleep_interruptible(struct timespec *req, addr_t rem_addr) {
+    struct timespec left = *req;
+    bool interrupted = false;
+    while (true) {
+        if (guest_signal_pending()) {
+            interrupted = true;
+            break;
+        }
+        struct timespec rem;
+        if (nanosleep(&left, &rem) == 0 || errno != EINTR)
+            break;
+        left = rem;   // a wake with no guest signal behind it: sleep the rest
+    }
+    struct timespec_ rem_ts = {.sec = 0, .nsec = 0};
+    if (interrupted) {
+        rem_ts.sec = left.tv_sec;
+        rem_ts.nsec = left.tv_nsec;
+    }
+    if (rem_addr != 0 && user_put(rem_addr, rem_ts))
+        return _EFAULT;
+    return interrupted ? _EINTR : 0;
+}
+#else
 static dword_t nanosleep_interruptible(struct timespec *req, addr_t rem_addr) {
     struct timespec start;
     if (clock_gettime(CLOCK_MONOTONIC, &start) < 0)
@@ -286,6 +322,7 @@ static dword_t nanosleep_interruptible(struct timespec *req, addr_t rem_addr) {
         return _EFAULT;
     return err == _EINTR ? _EINTR : 0;
 }
+#endif
 
 dword_t sys_nanosleep(addr_t req_addr, addr_t rem_addr) {
     struct timespec_ req_ts;
