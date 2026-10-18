@@ -164,7 +164,15 @@ static void poll_fd_free(struct poll_fd *poll_fd) {
 }
 
 bool poll_has_fd(struct poll *poll, struct fd *fd, int fd_no) {
-    return poll_find_fd(poll, fd, fd_no) != NULL;
+    // [T-ish-poll-has-fd-lock] The member list belongs to poll->lock, as in
+    // poll_del_fd/poll_mod_fd. Walked unlocked (epoll_ctl's EEXIST check), a
+    // concurrent close() of another member - poll_cleanup_fd unlinks and frees
+    // it under poll->lock - left this walk on freed memory (SIGSEGV at
+    // sys_epoll_ctl+200, fault 0xbabababababababa / 0x0, Go netpollers).
+    lock(&poll->lock);
+    bool found = poll_find_fd(poll, fd, fd_no) != NULL;
+    unlock(&poll->lock);
+    return found;
 }
 
 int poll_add_fd(struct poll *poll, struct fd *fd, int fd_no, int types, union poll_fd_info info) {
