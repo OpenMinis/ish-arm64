@@ -251,6 +251,13 @@ noreturn void do_exit(int status) {
         struct task *self = current;
         current = NULL;  // Clear before destroy to prevent dangling access
         task_destroy(self);
+    } else if (!current->mm_release_deferred) {
+        // A zombie now: once pids_lock goes, its parent can reap and free it
+        // before this thread's exit has run task_run_tlb_cleanup(), which
+        // reads current for a deferred mm release - there is none here. (It
+        // read freed memory: ish.exe crashed in about 1 of 4 runs of
+        // regress_signal_eintr 3e once that cleanup ran on Windows.)
+        current = NULL;
     }
     unlock(&pids_lock);
 
