@@ -301,6 +301,61 @@ else
 fi
 rm -f "$mcast_bin"
 
+# Transparent TCP forwarding (fs/xnet.h) against a fake SOCKS5 entry, and
+# the proof that it changes nothing while off: what plain sockets do must be
+# byte for byte the same with no configuration, with the switch off, and
+# with it on.
+echo
+echo "########## transparent TCP forwarding (xnet) ##########"
+xnet_dir=$(mktemp -d -t regress_xnet)
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "SKIP: no python3 for the fake entry"
+elif "$CC_GUEST" -static -O1 -Wall -o "$xnet_dir/bin" tests/regress/regress_xnet.c -lpthread &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_xnet status=none < "$xnet_dir/bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_xnet; then
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$xnet_dir/pass"
+    python3 tests/regress/xnet_fake_entry.py "$xnet_dir/port" "$xnet_dir/pass" "$xnet_dir/entry.log" &
+    entry_pid=$!
+    for _ in $(seq 50); do [ -s "$xnet_dir/port" ] && break; sleep 0.1; done
+    # xnet_conf <port> <fail_closed> <enabled>
+    xnet_conf() {
+        printf 'port=%s\nuser=shell\npassword=%s\nconn_id=1\nhook=198.18.0.0/15,fd00:1::/64\n' "$1" "$(cat "$xnet_dir/pass")"
+        printf 'exempt=198.19.0.0/16\nself=192.0.2.10,fd00:1::10\nfail_closed=%s\ngeneration=1\nenabled=%s\n' "$2" "$3"
+    }
+    xnet_conf "$(cat "$xnet_dir/port")" 0 1 > "$xnet_dir/on.conf"
+    xnet_conf "$(cat "$xnet_dir/port")" 0 0 > "$xnet_dir/off.conf"
+    xnet_conf 1 0 1 > "$xnet_dir/down.conf"
+    xnet_conf 1 1 1 > "$xnet_dir/closed.conf"
+    xnet_run() {
+        ISH_XNET_CONFIG="$1" timeout 180 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_xnet "$2" 2>/dev/null 666>>"$xnet_dir/ish.log"
+    }
+    out=$(xnet_run "$xnet_dir/on.conf" hook; xnet_run "$xnet_dir/down.conf" entry-down; xnet_run "$xnet_dir/closed.conf" fail-closed)
+    echo "$out" | grep -v '^PASS'
+    if echo "$out" | grep -q '^FAIL' || ! echo "$out" | grep -q '^PASS nothing left waiting at the end$' ||
+            [ "$(echo "$out" | grep -c '^PASS')" -lt 100 ]; then
+        status=1
+    else
+        echo "PASS: $(echo "$out" | grep -c '^PASS') forwarding cases"
+    fi
+    if grep -q -F -f "$xnet_dir/pass" "$xnet_dir/ish.log"; then
+        echo "FAIL: the entry password reached the log"
+        status=1
+    fi
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_xnet direct > "$xnet_dir/plain.txt" 2>/dev/null
+    same=1
+    for conf in off on; do
+        xnet_run "$xnet_dir/$conf.conf" direct > "$xnet_dir/$conf.txt"
+        cmp -s "$xnet_dir/plain.txt" "$xnet_dir/$conf.txt" || { echo "FAIL: plain sockets differ with xnet $conf"; diff "$xnet_dir/plain.txt" "$xnet_dir/$conf.txt"; same=0; status=1; }
+    done
+    [ "$same" = 1 ] && echo "PASS: plain sockets unchanged with xnet unconfigured, off and on"
+    kill "$entry_pid"
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_xnet
+else
+    echo "failed to build or stage regress_xnet" >&2
+    status=1
+fi
+rm -rf "$xnet_dir"
+
 # When init exits with a child still running, iSH must stop the child and
 # exit 0 at once (it used to wait 2 s and die of its own SIGTERM, status 143).
 echo
