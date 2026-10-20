@@ -15,6 +15,9 @@
 #include "emu/cpu.h"
 #include "emu/tlb.h"
 #include "fs/xnet.h"
+#define ISH_INTERNAL
+#include "fs/fake.h"
+#undef ISH_INTERNAL
 #include "xX_main_Xx.h"
 
 // Thread-local JIT recovery state (defined in asbestos.c)
@@ -382,6 +385,54 @@ static void ish_cli_memory_governor_start(void) {
         pthread_detach(t);
 }
 
+static char test_hook_guest[4096];
+static char test_hook_host[4096];
+
+static bool test_hook_prefix_match(const char *path, const char *prefix, const char **tail) {
+    size_t n = strlen(prefix);
+    if (strncmp(path, prefix, n) != 0 || (path[n] != '/' && path[n] != '\0'))
+        return false;
+    *tail = path + n;
+    return true;
+}
+
+static bool test_hook_translate(const char *guest_path, uint64_t fs_context,
+                                char *out, size_t out_size) {
+    (void) fs_context;
+    const char *tail;
+    if (!test_hook_prefix_match(guest_path, test_hook_guest, &tail))
+        return false;
+    snprintf(out, out_size, "%s%s", test_hook_host, tail);
+    return true;
+}
+
+static bool test_hook_reverse(const char *host_path, char *out, size_t out_size) {
+    const char *tail;
+    if (!test_hook_prefix_match(host_path, test_hook_host, &tail))
+        return false;
+    snprintf(out, out_size, "%s%s", test_hook_guest, tail);
+    return true;
+}
+
+static void test_path_hook_install(const char *spec) {
+    if (spec == NULL)
+        return;
+    const char *eq = strchr(spec, '=');
+    if (eq == NULL || eq == spec || spec[0] != '/') {
+        fprintf(stderr, "ISH_TEST_PATH_HOOK: expected /guest/prefix=/host/dir\n");
+        return;
+    }
+    snprintf(test_hook_guest, sizeof(test_hook_guest), "%.*s", (int) (eq - spec), spec);
+    // F_GETPATH reports the resolved path (/tmp -> /private/tmp), so the
+    // reverse hook has to compare against the same spelling.
+    if (realpath(eq + 1, test_hook_host) == NULL) {
+        fprintf(stderr, "ISH_TEST_PATH_HOOK: cannot resolve %s\n", eq + 1);
+        return;
+    }
+    fakefs_set_path_translate_hook(test_hook_translate);
+    fakefs_set_path_reverse_hook(test_hook_reverse);
+}
+
 int main(int argc, char *const argv[]) {
     ish_signpost_init();
     atexit(dump_pc_hist);
@@ -430,6 +481,12 @@ int main(int argc, char *const argv[]) {
         if (xc != NULL && ish_xnet_load_file(xc) < 0)
             fprintf(stderr, "ISH_XNET_CONFIG: cannot load %s\n", xc);
     }
+
+    // Path-translate hook (fs/fake.h), for tests: ISH_TEST_PATH_HOOK=
+    // <guest prefix>=<host dir> routes that guest subtree to the host dir
+    // the way the app routes /var/minis/workspace per session, so fakefs's
+    // hook-routed paths can be exercised from the CLI. Needs a -f rootfs.
+    test_path_hook_install(getenv("ISH_TEST_PATH_HOOK"));
 
     // Microbench helper: on SIGTERM/SIGINT, dump stats then _exit. This
     // bypasses the normal halt_system path which doesn't trigger when
