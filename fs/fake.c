@@ -405,7 +405,11 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         if (flags & O_APPEND_) real_flags |= O_APPEND;
         if (flags & O_NONBLOCK_) real_flags |= O_NONBLOCK;
         if (flags & O_NOFOLLOW_) real_flags |= O_NOFOLLOW;
-        int fd_no = open(host_abs, real_flags, 0666);
+        /* [T-ish-hook-mode] A hook-routed file has no meta.db row to hold
+         * the guest's mode, so the host file's own bits are the mode: create
+         * it with what the guest asked for (already umasked). Static bind
+         * mounts keep 0666, their mode lives in meta.db. */
+        int fd_no = open(host_abs, real_flags, via_hook ? (mode & 07777) : 0666);
         if (fd_no < 0) {
             return ERR_PTR(errno_map());
         }
@@ -777,9 +781,11 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         fake_stat->inode = (ino_t)host_stat.st_ino;
         fake_stat->nlink = host_stat.st_nlink;
         fake_stat->blksize = host_stat.st_blksize;
-        /* Pick a sensible mode: keep host's S_IFMT, default to 0644/0755. */
-        mode_t_ type = host_stat.st_mode & S_IFMT;
-        fake_stat->mode = type | (S_ISDIR(host_stat.st_mode) ? 0755 : 0644);
+        /* [T-ish-hook-mode] The host file's bits ARE the mode of a
+         * hook-routed path (no meta.db row). Forcing 0644 here dropped every
+         * chmod: `chmod +x` reached the host file, then exec read 0644 back
+         * and failed with EACCES. */
+        fake_stat->mode = host_stat.st_mode & (S_IFMT | 07777);
         fake_stat->uid = 0;
         fake_stat->gid = 0;
         fake_stat->size = host_stat.st_size;
@@ -893,8 +899,7 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
             char host_chk[PATH_MAX];
             bool via_hook = false;
             if (bind_mount_translate_path_ex(fd_path, host_chk, sizeof(host_chk), &via_hook) && via_hook) {
-                mode_t_ type = fake_stat->mode & S_IFMT;
-                fake_stat->mode = type | (S_ISDIR(fake_stat->mode) ? 0755 : 0644);
+                fake_stat->mode &= S_IFMT | 07777;
                 fake_stat->uid = 0;
                 fake_stat->gid = 0;
                 fake_stat->rdev = 0;
