@@ -19,6 +19,7 @@
 #define DEFAULT_CHANNEL verbose
 #include "fs/sock.h"
 #include "fs/netlink.h"
+#include "fs/xnet_internal.h"
 #include "debug.h"
 
 #define SOCKET_TYPE_MASK 0xf
@@ -413,6 +414,20 @@ static struct fd *sock_getfd(fd_t sock_fd) {
     return sock;
 }
 
+// Whether fs/xnet.c forwards this socket's connection (see fs/xnet.h). Only
+// then does it have a say in anything else the socket does.
+static inline bool sock_xnet(struct fd *sock) {
+    return __atomic_load_n(&sock->socket.xnet, __ATOMIC_ACQUIRE) != NULL;
+}
+
+// Before data moves on a forwarded socket: wait for its connection to be up,
+// or say why not. 0 to go on.
+static inline int sock_xnet_gate(struct fd *sock, int guest_flags) {
+    if (!sock_xnet(sock))
+        return 0;
+    return xnet_io_gate(sock, guest_flags & MSG_DONTWAIT_);
+}
+
 static uint32_t unix_socket_next_id() {
     static uint32_t next_id = 0;
     static lock_t next_id_lock = LOCK_INITIALIZER;
@@ -725,6 +740,20 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (err < 0)
         return err;
 
+    // Transparent forwarding (fs/xnet.h). Off by default; then this is one
+    // load of a flag and one of a NULL pointer.
+    if (sock_xnet(sock)) {
+        err = xnet_reconnect(sock);
+        if (err != XNET_PASS)
+            return err;
+    }
+    if (atomic_load_explicit(&xnet_on, memory_order_relaxed) && sock->socket.type == SOCK_STREAM_ &&
+            (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_)) {
+        err = xnet_connect(sock, (void *) &sockaddr, sockaddr_len);
+        if (err != XNET_PASS)
+            return err;
+    }
+
     err = connect(sock->real_fd, (void *) &sockaddr, sockaddr_len);
     if (err < 0) {
         int ce = errno;
@@ -857,6 +886,19 @@ int_t sys_accept4(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr, 
     return client_f;
 }
 
+// getsockname/getpeername's answer for a forwarded socket, written the way
+// the host's answer is.
+static int sock_xnet_write_addr(addr_t sockaddr_addr, addr_t sockaddr_len_addr, dword_t buffer_len,
+        struct sockaddr_storage *addr, socklen_t len) {
+    uint_t out_len = len;
+    int err = sockaddr_write(sockaddr_addr, addr, buffer_len, &out_len);
+    if (err < 0)
+        return err;
+    if (user_put(sockaddr_len_addr, out_len))
+        return _EFAULT;
+    return 0;
+}
+
 static void copy_unix_name(char *sockaddr, dword_t *sockaddr_len, struct fd *sock) {
     struct sockaddr_ *fake_addr = (void *) sockaddr;
     fake_addr->family = PF_LOCAL_;
@@ -909,6 +951,14 @@ int_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_ad
         return 0;
     }
 
+    if (sock_xnet(sock)) {
+        struct sockaddr_storage xaddr;
+        socklen_t xlen;
+        int xres = xnet_getsockname(sock, &xaddr, &xlen);
+        if (xres != XNET_PASS)
+            return sock_xnet_write_addr(sockaddr_addr, sockaddr_len_addr, sockaddr_len, &xaddr, xlen);
+    }
+
     int res = getsockname(sock->real_fd, (void *) sockaddr, &sockaddr_len);
     if (res < 0)
         return errno_map();
@@ -932,6 +982,16 @@ int_t sys_getpeername(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_ad
 
     // TODO if this is a unix socket, return the same string the peer passed to
     // bind once the peer pointer is available
+
+    if (sock_xnet(sock)) {
+        struct sockaddr_storage xaddr;
+        socklen_t xlen;
+        int xres = xnet_getpeername(sock, &xaddr, &xlen);
+        if (xres < 0)
+            return xres;
+        if (xres != XNET_PASS)
+            return sock_xnet_write_addr(sockaddr_addr, sockaddr_len_addr, sockaddr_len, &xaddr, xlen);
+    }
 
     char sockaddr[sockaddr_len];
     int res = getpeername(sock->real_fd, (void *) sockaddr, &sockaddr_len);
@@ -1008,6 +1068,9 @@ int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, a
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    int gate = sock_xnet_gate(sock, flags);
+    if (gate < 0)
+        return gate;
     char *buffer = malloc(len + 1);
     if (user_read(buffer_addr, buffer, len))
         return _EFAULT;
@@ -1126,6 +1189,9 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    int gate = sock_xnet_gate(sock, flags);
+    if (gate < 0)
+        return gate;
     int real_flags = sock_flags_to_real(flags);
     if (real_flags < 0)
         return _EINVAL;
@@ -1453,12 +1519,17 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     } else if (level == SOL_SOCKET_ && option == SO_ERROR_) {
         if (value_len != sizeof(dword_t))
             return _EINVAL;
-        int real_error;
-        socklen_t real_error_len = sizeof(real_error);
-        int err = getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len);
-        if (err < 0)
-            return errno_map();
-        *(dword_t *) value = real_error == 0 ? 0 : -err_map(real_error);
+        int xnet_error;
+        if (sock_xnet(sock) && xnet_so_error(sock, &xnet_error)) {
+            *(dword_t *) value = -xnet_error;
+        } else {
+            int real_error;
+            socklen_t real_error_len = sizeof(real_error);
+            int err = getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len);
+            if (err < 0)
+                return errno_map();
+            *(dword_t *) value = real_error == 0 ? 0 : -err_map(real_error);
+        }
     } else if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
         value_len = strlen(DEFAULT_TCP_CONGESTION);
         memcpy(value, DEFAULT_TCP_CONGESTION, value_len);
@@ -1543,6 +1614,9 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         return _EBADF;
     if (fd_is_netlink_stub(sock))
         return netlink_stub_sendmsg(sock, msghdr_addr);
+    err = sock_xnet_gate(sock, flags);
+    if (err < 0)
+        return err;
 
     // Read the guest msghdr struct into our internal 32-bit representation
     struct msghdr msg;
@@ -1770,6 +1844,9 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         return _EBADF;
     if (fd_is_netlink_stub(sock))
         return netlink_stub_recvmsg(sock, msghdr_addr, flags);
+    int gate = sock_xnet_gate(sock, flags);
+    if (gate < 0)
+        return gate;
 
     // Read the guest msghdr struct into our internal 32-bit representation
     struct msghdr_ msg_fake;
@@ -2099,7 +2176,9 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
         memcpy(buf, nlbuf, copy);
         return (ssize_t) copy;
     }
-    int err;
+    int err = sock_xnet_gate(fd, 0);
+    if (err < 0)
+        return err;
     int eintr_count = 0;
     for (;;) {
         ssize_t res = read(fd->real_fd, buf, size);
@@ -2136,7 +2215,9 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
     // bytes into the socketpair where nobody reads them.
     if (fd_is_netlink_stub(fd))
         return netlink_stub_reply(fd, buf, size);
-    int err;
+    int err = sock_xnet_gate(fd, 0);
+    if (err < 0)
+        return err;
     int eintr_count = 0;
     for (;;) {
         ssize_t res = write(fd->real_fd, buf, size);
@@ -2165,6 +2246,8 @@ static int sock_close(struct fd *fd) {
         fd->socket.netlink_peer_fd = -1;
     }
     sockrestart_end_listen(fd);
+    if (fd->socket.xnet != NULL)
+        xnet_release(fd);
     // FIXME next 3 lines should go in a function like release_unix_names
     inode_release_if_exist(fd->socket.unix_name_inode);
     if (fd->socket.unix_name_abstract != NULL)

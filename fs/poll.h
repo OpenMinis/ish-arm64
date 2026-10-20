@@ -106,6 +106,12 @@ void poll_destroy(struct poll *poll);
 // for fd_close
 void poll_cleanup_fd(struct fd *fd);
 
+// fd->real_fd now refers to a different host file (fs/xnet.c puts a socket in
+// place of another with dup2()), which has none of the old one's host poll
+// registrations: register it again in every poll the fd is in. Follow with
+// poll_wakeup().
+void poll_refresh_real_fd(struct fd *fd);
+
 // [T-ish-poll-spin-guard] /proc/ish/poll_spin: counters of host wakeups that
 // found nothing ready, plus switches for the four guards (regfile, hupedge, deadline,
 // backoff) so their effect can be measured A/B on a device without a rebuild.

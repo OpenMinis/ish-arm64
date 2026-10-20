@@ -2,6 +2,7 @@
 #include "fs/proc/ish.h"
 #include "kernel/errno.h"
 #include "fs/poll.h"
+#include "fs/xnet.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,6 +193,15 @@ static ssize_t proc_ish_write_poll_spin(struct proc_entry *UNUSED(entry), struct
     return poll_spin_control(data->data, data->size) == 0 ? (ssize_t) data->size : _EINVAL;
 }
 
+// Transparent forwarding counters (fs/xnet.h): numbers only, never the
+// entry's port or password.
+static int proc_ish_show_xnet(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char text[1024];
+    ish_xnet_describe(text, sizeof(text));
+    proc_printf(buf, "%s", text);
+    return 0;
+}
+
 struct proc_children proc_ish_children = PROC_CHILDREN({
     {"colors", .show = proc_ish_show_colors},
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
@@ -202,4 +212,5 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
 #endif
     {"poll_spin", .show = proc_ish_show_poll_spin, .pwrite = proc_ish_write_poll_spin},
     {"version", .show = proc_ish_show_version},
+    {"xnet", .show = proc_ish_show_xnet},
 });

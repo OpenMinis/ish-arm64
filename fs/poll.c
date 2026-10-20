@@ -288,6 +288,18 @@ void poll_cleanup_fd(struct fd *fd) {
     unlock(&fd->poll_lock);
 }
 
+void poll_refresh_real_fd(struct fd *fd) {
+    lock(&fd->poll_lock);
+    struct poll_fd *poll_fd;
+    list_for_each_entry(&fd->poll_fds, poll_fd, polls) {
+        lock(&poll_fd->poll->lock);
+        if (poll_fd_is_real(poll_fd))
+            poll_real_refresh(poll_fd->poll, fd);
+        unlock(&poll_fd->poll->lock);
+    }
+    unlock(&fd->poll_lock);
+}
+
 // Diagnostic: dump each member fd of a poll set with its current poll state.
 void poll_dump_members(struct poll *poll) {
     lock(&poll->lock);

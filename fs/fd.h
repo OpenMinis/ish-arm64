@@ -76,6 +76,9 @@ struct fd {
             uint32_t netlink_owe_seq;
             bool netlink_owe_done;
             long netlink_rcvtimeo_ms; // SO_RCVTIMEO; 0 = wait
+            // A TCP connection fs/xnet.c forwards through the app's entry,
+            // NULL for every other socket. See fs/xnet.h.
+            struct xnet_conn *xnet;
             cond_t unix_got_peer;
             // Queue of struct scm for sending file descriptors
             // locked by fd->lock

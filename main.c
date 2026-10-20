@@ -14,6 +14,7 @@
 #include "kernel/task.h"
 #include "emu/cpu.h"
 #include "emu/tlb.h"
+#include "fs/xnet.h"
 #include "xX_main_Xx.h"
 
 // Thread-local JIT recovery state (defined in asbestos.c)
@@ -420,6 +421,14 @@ int main(int argc, char *const argv[]) {
             void *poll_fn(void *arg);
             pthread_create(&pt, NULL, poll_fn, &poll_addr);
         }
+    }
+
+    // Transparent forwarding (fs/xnet.h), for tests: the app configures it
+    // through the API instead.
+    {
+        const char *xc = getenv("ISH_XNET_CONFIG");
+        if (xc != NULL && ish_xnet_load_file(xc) < 0)
+            fprintf(stderr, "ISH_XNET_CONFIG: cannot load %s\n", xc);
     }
 
     // Microbench helper: on SIGTERM/SIGINT, dump stats then _exit. This
