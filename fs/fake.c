@@ -1152,6 +1152,25 @@ retry:
     return res;
 }
 
+/* [T-ish-hook-utime] realfs_utime resolves the guest path under the rootfs
+ * root. For a hook-routed path that walks data/var/minis/<bucket>, the app's
+ * file-browser symlink, which points at whichever session the UI showed last,
+ * not at the calling task's session: the timestamps landed on another
+ * session's file of the same name, or failed with ENOENT (shutil.copy2,
+ * `cp -p`, `touch -d`, tar extract). Go to the host path the hook chose, as
+ * open/stat/setattr already do. */
+static int fakefs_utime(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime) {
+    char host_abs[PATH_MAX];
+    bool via_hook = false;
+    if (bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook) && via_hook) {
+        struct timespec times[2] = {atime, mtime};
+        if (utimensat(AT_FDCWD, host_abs, times, 0) < 0)
+            return errno_map();
+        return 0;
+    }
+    return realfs_utime(mount, path, atime, mtime);
+}
+
 static struct fd_ops fakefs_fdops;
 static void __attribute__((constructor)) init_fake_fdops() {
     fakefs_fdops = realfs_fdops;
@@ -1496,7 +1515,7 @@ const struct fs_ops fakefs = {
     .setattr = fakefs_setattr,
     .fsetattr = fakefs_fsetattr,
     .getpath = realfs_getpath,
-    .utime = realfs_utime,
+    .utime = fakefs_utime,
 
     .mkdir = fakefs_mkdir,
     .rmdir = fakefs_rmdir,
