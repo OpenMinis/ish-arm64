@@ -433,6 +433,7 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
      * synthesize the fake inode from the host inode so operations within a
      * single fd still behave consistently. */
     if (via_hook) {
+        fd->fake_via_hook = true;
         struct stat host_stat;
         if (fstat(fd->real_fd, &host_stat) == 0)
             fd->fake_inode = (ino_t)host_stat.st_ino;
@@ -855,6 +856,18 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     int err = realfs.fstat(fd, fake_stat);
     if (err < 0)
         return err;
+    // [T-ish-hook-fd-meta] fake_inode of a hook-routed fd is the host inode.
+    // Looking it up in meta.db found whatever unrelated row happened to carry
+    // that number: a file in /var/minis/workspace whose host inode matched
+    // /dev/null's row fstat'ed as a character device and read back 0 bytes.
+    // Same answer as fakefs_stat gives for the path.
+    if (fd->fake_via_hook) {
+        fake_stat->mode &= S_IFMT | 07777;
+        fake_stat->uid = 0;
+        fake_stat->gid = 0;
+        fake_stat->rdev = 0;
+        return 0;
+    }
     // [T-ish-exec-fewer-meta-txns] The row fakefs_open read a moment ago,
     // consumed once (see struct fd).
     if (fd->fake_open_stat.valid) {
@@ -980,10 +993,15 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
     /* If this fd was opened on a hook-routed path, its fake_inode is the
      * host inode and won't be in meta.db. Detect that by probing meta.db;
      * if absent, apply attr directly to the host fd. */
-    db_begin_read(fs);
+    // [T-ish-hook-fd-meta] Never probe meta.db with a host inode number: a
+    // collision made fchmod rewrite an unrelated row's mode.
     struct ish_stat ishstat;
-    bool in_meta = inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat);
-    db_commit(fs);
+    bool in_meta = false;
+    if (!fd->fake_via_hook) {
+        db_begin_read(fs);
+        in_meta = inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat);
+        db_commit(fs);
+    }
     if (!in_meta) {
         switch (attr.type) {
             case attr_mode:

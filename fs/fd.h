@@ -131,6 +131,10 @@ struct fd {
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
+    // [T-ish-hook-fd-meta] fakefs opened this fd through the path-translate
+    // hook: fake_inode is then the HOST inode number, which means nothing in
+    // meta.db and must never be looked up there.
+    bool fake_via_hook;
     // [T-ish-exec-fewer-meta-txns] fakefs_open reads the stat row inside the
     // transaction it already holds for the path lookup and parks it here; the
     // first fstat after open (generic_openat's own) consumes it instead of
