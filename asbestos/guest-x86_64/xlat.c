@@ -1224,6 +1224,7 @@ static void shift_flags(const struct gi *g, const struct xinsn *x, struct cls *c
 // fine: the rest a signal handler sees is about to be overwritten anyway.
 static bool dbg_nosucc;
 static bool dbg_allpoke;   // ISH_XLAT_ALLPOKE: check for interrupts at every exit
+static bool dbg_oldloop;   // ISH_XLAT_OLDLOOP: a block's loop back to its start through its exit
 // ISH_XLAT_SITEDUMP=<file>: every access site's checks and lookups, with what it accesses
 struct sitedump { uint64_t checks, lookups, ip; int32_t disp; int8_t kind, base, index, size; bool write, lead; };
 #define SITEDUMP_MAX (1u << 19)
@@ -2956,6 +2957,17 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
     unsigned nentries = 0;
     bool in_run = false;
     unsigned native = 0, tpl = 0, stream = 0;
+    // a conditional jump back to the block's start: the block is a loop
+    int loop_jcc = -1;
+    unsigned loop_top = 0;
+    bool have_top = false;
+    for (unsigned i = 0; i < total && !dbg_oldloop; i++) {
+        if (xis[i].mode != M_STREAM && xis[i].mode != M_TPL && xis[i].c.kind == K_JCC &&
+                (x.plan[xis[i].taken] & ~(1ull << 63)) == block->addr) {
+            loop_jcc = (int) i;
+            break;
+        }
+    }
     for (unsigned i = 0; i < total; i++) {
         const struct xinsn *in = i < n ? &xlog[i] : &tail;
         struct xi *xi = &xis[i];
@@ -2974,6 +2986,22 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             nentries++;
             in_run = true;
             x.valid = x.dirty = 0;
+            if (i == 0 && loop_jcc >= 0) {
+                // the loop's top: a pending interrupt leaves for the run loop
+                // at the block's start (the loop's stream slot has it)
+                unsigned l_poke = new_label(a);
+                loop_top = new_label(a);
+                have_top = true;
+                lbind(a, loop_top);
+                e_mov_load(a, R14, XMEM(H_CPU, CPU_OFF(poked_ptr)));
+                b1(a, 0x41); b1(a, 0x80); b1(a, 0x3e); b1(a, 0x00);  // cmpb $0, (%r14)
+                e_jcc_lab(a, 5, l_poke);
+                a->cur = SEC_COLD;
+                lbind(a, l_poke);
+                e_note_block(&x);
+                e_exit_slot(&x, xis[loop_jcc].taken);
+                a->cur = SEC_MAIN;
+            }
         }
         if (xi->mode == M_TPL) {
             tpl++;
@@ -2996,6 +3024,23 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
                 x.valid = F_ALL;
             }
             uint16_t dirty = x.dirty;
+            bool back = (x.plan[xi->taken] & ~(1ull << 63)) <= g->ip;
+            bool poke = dbg_allpoke || back;
+            uint16_t both = xi->live_taken | xi->live_fall, four = F_PF | F_AF | F_ZF | F_SF;
+            if (c->kind == K_JCC && (int) i == loop_jcc && have_top && !dbg_slowsync &&
+                    ((x.dirty & both & four) == 0 || (x.valid & four) == four)) {
+                // the block's own loop: the conditional jump goes straight
+                // back to its top (which checks for an interrupt), so that a
+                // round is one taken jump and so is leaving it. The flags
+                // either way need are written first, by stores that leave
+                // them be.
+                e_sync_flags(a, x.dirty & both, x.valid);
+                x.dirty &= ~both;
+                e_jcc_lab(a, c->cc, loop_top);
+                e_exit_chain(&x, xi->fall, xi->live_fall, false);   // forward
+                in_run = false;
+                continue;
+            }
             if (c->kind == K_JCC) {
                 unsigned l_taken = new_label(a);
                 e_jcc_lab(a, c->cc, l_taken);
@@ -3003,8 +3048,7 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
                 lbind(a, l_taken);
                 x.dirty = dirty;
             }
-            e_exit_chain(&x, xi->taken, xi->live_taken,
-                         dbg_allpoke || (x.plan[xi->taken] & ~(1ull << 63)) <= g->ip);
+            e_exit_chain(&x, xi->taken, xi->live_taken, poke);
             in_run = false;
             continue;
         }
@@ -3662,6 +3706,7 @@ static void xlat_init(void) {
         have_bmi2 = (rb >> 8) & 1;
     dbg_nosucc = getenv("ISH_XLAT_NOSUCC") != NULL;
     dbg_allpoke = getenv("ISH_XLAT_ALLPOKE") != NULL;
+    dbg_oldloop = getenv("ISH_XLAT_OLDLOOP") != NULL;
     dbg_nogroup = getenv("ISH_XLAT_NOGROUP") != NULL;
     dbg_slowsync = getenv("ISH_XLAT_SLOWSYNC") != NULL;
     dbg_nospgroup = getenv("ISH_XLAT_NOSPGROUP") != NULL;
