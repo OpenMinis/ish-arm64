@@ -1442,6 +1442,25 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     if (level == IPPROTO_IP && (option == IP_MULTICAST_IF_ ||
                 option == IP_ADD_MEMBERSHIP_ || option == IP_DROP_MEMBERSHIP_))
         return sock_set_ip_multicast(sock->real_fd, option, value, value_len);
+#if defined(__APPLE__)
+    // TCP_USER_TIMEOUT (milliseconds, 0 = the default) bounds how long sent
+    // data, or a SYN, may go unacknowledged. Darwin splits that in two, both
+    // in seconds. BIND's dig and nslookup set it on every TCP query socket
+    // and abort if it fails.
+    if (level == IPPROTO_TCP && option == TCP_USER_TIMEOUT_) {
+        if (value_len < sizeof(uint32_t))
+            return _EINVAL;
+        uint32_t ms;
+        memcpy(&ms, value, sizeof(ms));
+        if ((int32_t) ms < 0)
+            return _EINVAL;
+        int secs = (int) ((ms + 999) / 1000);
+        if (setsockopt(sock->real_fd, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &secs, sizeof(secs)) < 0 ||
+                setsockopt(sock->real_fd, IPPROTO_TCP, TCP_CONNECTIONTIMEOUT, &secs, sizeof(secs)) < 0)
+            return errno_map();
+        return 0;
+    }
+#endif
     // TCP_CONGESTION also has no equivalent on Darwin
 #if defined(__APPLE__)
     if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
@@ -1468,6 +1487,18 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         return 0;
 
     int err = setsockopt(sock->real_fd, real_level, real_opt, value, value_len);
+#if defined(__APPLE__)
+    // Darwin takes a TCP_MAXSEG only up to the current MSS, 512 before
+    // connect(); Linux takes 88..32767 at any time and clamps later. A value
+    // Linux would take is accepted and the host keeps its own MSS.
+    if (err < 0 && errno == EINVAL && level == IPPROTO_TCP && option == TCP_MAXSEG_ &&
+            value_len >= sizeof(int32_t)) {
+        int32_t mss;
+        memcpy(&mss, value, sizeof(mss));
+        if (mss >= 88 && mss <= 32767)
+            err = 0;
+    }
+#endif
     if (err < 0)
         return errno_map();
 #if defined(__APPLE__)
@@ -1530,6 +1561,18 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
                 return errno_map();
             *(dword_t *) value = real_error == 0 ? 0 : -err_map(real_error);
         }
+#if defined(__APPLE__)
+    } else if (level == IPPROTO_TCP && option == TCP_USER_TIMEOUT_) {
+        if (value_len < sizeof(uint32_t))
+            return _EINVAL;
+        int secs;
+        socklen_t secs_len = sizeof(secs);
+        if (getsockopt(sock->real_fd, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &secs, &secs_len) < 0)
+            return errno_map();
+        uint32_t ms = secs > 0 ? (uint32_t) secs * 1000 : 0;
+        memcpy(value, &ms, sizeof(ms));
+        value_len = sizeof(ms);
+#endif
     } else if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
         value_len = strlen(DEFAULT_TCP_CONGESTION);
         memcpy(value, DEFAULT_TCP_CONGESTION, value_len);
