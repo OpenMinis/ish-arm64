@@ -356,6 +356,74 @@ else
 fi
 rm -rf "$xnet_dir"
 
+# Transparent UDP and DNS forwarding (fs/xnet.h, stage 2): the same fake
+# entry with UDP ASSOCIATE, one that refuses it, and the same proof that
+# plain datagram sockets are untouched while off.
+echo
+echo "########## transparent UDP and DNS forwarding (xnet) ##########"
+xudp_dir=$(mktemp -d -t regress_xnet_udp)
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "SKIP: no python3 for the fake entry"
+elif "$CC_GUEST" -static -O1 -Wall -o "$xudp_dir/bin" tests/regress/regress_xnet_udp.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_xnet_udp status=none < "$xudp_dir/bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_xnet_udp; then
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$xudp_dir/pass"
+    python3 tests/regress/xnet_fake_entry.py "$xudp_dir/port" "$xudp_dir/pass" "$xudp_dir/entry.log" &
+    udp_entry_pid=$!
+    python3 tests/regress/xnet_fake_entry.py "$xudp_dir/port2" "$xudp_dir/pass" "$xudp_dir/entry2.log" noudp &
+    noudp_entry_pid=$!
+    for _ in $(seq 50); do [ -s "$xudp_dir/port" ] && [ -s "$xudp_dir/port2" ] && break; sleep 0.1; done
+    # xudp_conf <port> <fail_closed> <enabled>
+    xudp_conf() {
+        printf 'port=%s\nuser=shell\npassword=%s\nconn_id=1\n' "$1" "$(cat "$xudp_dir/pass")"
+        printf 'hook=198.18.0.0/15,fd00:1::/64,10.99.0.0/16\nudp_hook=198.18.0.0/15,fd00:1::/64\n'
+        printf 'exempt=198.19.0.0/16\nresolvers=198.18.0.53,10.250.0.53\ndns_intercept=1\n'
+        printf 'self=192.0.2.10,fd00:1::10\nfail_closed=%s\ngeneration=1\nenabled=%s\n' "$2" "$3"
+    }
+    xudp_conf "$(cat "$xudp_dir/port")" 0 1 > "$xudp_dir/on.conf"
+    xudp_conf "$(cat "$xudp_dir/port")" 0 0 > "$xudp_dir/off.conf"
+    xudp_conf "$(cat "$xudp_dir/port2")" 0 1 > "$xudp_dir/noudp.conf"
+    xudp_conf 1 0 1 > "$xudp_dir/down.conf"
+    xudp_conf 1 1 1 > "$xudp_dir/closed.conf"
+    xudp_run() {
+        ISH_XNET_CONFIG="$1" timeout 180 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_xnet_udp "$2" 2>/dev/null 666>>"$xudp_dir/ish.log"
+    }
+    out=$(xudp_run "$xudp_dir/on.conf" udp; xudp_run "$xudp_dir/down.conf" entry-down
+          xudp_run "$xudp_dir/closed.conf" fail-closed; xudp_run "$xudp_dir/noudp.conf" noudp)
+    echo "$out" | grep -v '^PASS'
+    if echo "$out" | grep -q '^FAIL' || ! echo "$out" | grep -q '^PASS every association closed with its socket$' ||
+            [ "$(echo "$out" | grep -c '^PASS')" -lt 70 ]; then
+        status=1
+    else
+        echo "PASS: $(echo "$out" | grep -c '^PASS') UDP/DNS forwarding cases"
+    fi
+    if grep -q -F -f "$xudp_dir/pass" "$xudp_dir/ish.log"; then
+        echo "FAIL: the entry password reached the log"
+        status=1
+    fi
+    if grep -q '^DNS shell~x[0-9a-f]*~dns tailnode.example.ts.net$' "$xudp_dir/entry.log" &&
+            grep -q '^DNS-TCP shell~x[0-9a-f]*~dns tailnode.example.ts.net$' "$xudp_dir/entry.log" &&
+            ! grep -q '^SPOOF' "$xudp_dir/entry.log"; then
+        echo "PASS: the entry saw DNS over UDP and TCP marked ~dns, and no datagram from elsewhere"
+    else
+        echo "FAIL: the entry's log is not what the DNS cases should leave"
+        status=1
+    fi
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_xnet_udp direct > "$xudp_dir/plain.txt" 2>/dev/null
+    same=1
+    for conf in off on; do
+        xudp_run "$xudp_dir/$conf.conf" direct > "$xudp_dir/$conf.txt"
+        cmp -s "$xudp_dir/plain.txt" "$xudp_dir/$conf.txt" || { echo "FAIL: plain datagram sockets differ with xnet $conf"; diff "$xudp_dir/plain.txt" "$xudp_dir/$conf.txt"; same=0; status=1; }
+    done
+    [ "$same" = 1 ] && echo "PASS: plain datagram sockets unchanged with xnet unconfigured, off and on"
+    kill "$udp_entry_pid" "$noudp_entry_pid"
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_xnet_udp
+else
+    echo "failed to build or stage regress_xnet_udp" >&2
+    status=1
+fi
+rm -rf "$xudp_dir"
+
 # When init exits with a child still running, iSH must stop the child and
 # exit 0 at once (it used to wait 2 s and die of its own SIGTERM, status 143).
 echo
