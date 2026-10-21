@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 
 struct fd;
 
@@ -34,5 +35,20 @@ int xnet_getpeername(struct fd *sock, struct sockaddr_storage *out, socklen_t *l
 int xnet_getsockname(struct fd *sock, struct sockaddr_storage *out, socklen_t *len);
 // The socket's last reference is going away.
 void xnet_release(struct fd *sock);
+
+// UDP of an AF_INET/AF_INET6 datagram socket. The send and receive calls
+// take a host msghdr and host flags and behave as sendmsg()/recvmsg() on
+// real_fd (a result, or -1 with errno set). They return false when the
+// datagram is none of xnet's business: the caller then makes the host call
+// it would have made anyway.
+//
+// Send: whenever the switch is on or sock->socket.xudp is set. Receive: only
+// when sock->socket.xudp is set.
+bool xnet_udp_sendmsg(struct fd *sock, const struct msghdr *msg, int flags, ssize_t *result);
+bool xnet_udp_recvmsg(struct fd *sock, struct msghdr *msg, int flags, ssize_t *result);
+// connect() and getpeername() of such a socket: a result, or XNET_PASS.
+int xnet_udp_connect(struct fd *sock, const struct sockaddr *addr, socklen_t len);
+int xnet_udp_getpeername(struct fd *sock, struct sockaddr_storage *out, socklen_t *len);
+void xnet_udp_release(struct fd *sock);
 
 #endif

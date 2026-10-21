@@ -20,7 +20,14 @@
 // port or password: they live only in kernel memory, are never logged, and
 // nothing is put in the guest's environment or /proc.
 //
-// UDP is not forwarded yet (stage 2), nor is inbound traffic or ICMP.
+// UDP (stage 2) goes through the same entry with SOCKS5 UDP ASSOCIATE: a
+// datagram to a hooked destination is wrapped in the RFC 1928 UDP header and
+// sent, from the guest's own host socket, to the relay the entry opened for
+// it; what comes back from the relay is unwrapped and handed to the guest as
+// coming from the real source. The control connection that keeps the
+// association alive is a hidden host socket, never in the guest's fd table.
+// See ish_xnet_set_routes2 for which datagrams are wrapped, and the DNS
+// interception. Inbound traffic and ICMP are not forwarded.
 //
 // Threading: every function here may be called from any host thread, at any
 // time, including while guest connections are being made. Strings are copied
@@ -67,7 +74,7 @@ int ish_xnet_configure(uint16_t entry_port, const char *username, const char *pa
 //         be missing). getsockname() on a forwarded connection reports the
 //         one of the destination's family, so the local end looks like the
 //         tailnet interface; without one it reports the unspecified address.
-// dns_intercept: reserved for stage 2 (UDP); ignored for now.
+// dns_intercept: ignored here (no resolvers); see ish_xnet_set_routes2.
 // fail_closed: what to do when the entry cannot be reached. false (the
 //         default, and what the task asks for): the connection goes out
 //         directly, as if not hooked, and the entry is retried after 10 s.
@@ -87,6 +94,41 @@ int ish_xnet_set_routes(uint64_t generation,
         bool dns_intercept,
         const char *const *self_addrs, size_t self_count,
         bool fail_closed);
+
+// The full snapshot, TCP and UDP. ish_xnet_set_routes is this with no UDP
+// prefixes, no resolvers and dns_intercept false.
+//
+// udp_hook: prefixes whose UDP is wrapped and sent through the entry's
+//         relay. Usually the TCP hook list, except for a route through an
+//         upstream HTTP proxy, which cannot carry UDP: then only the tailnet
+//         prefixes. A datagram that matches hook but not udp_hook goes out
+//         directly and is logged as udp-direct(proxy-route). exempt applies
+//         to UDP as to TCP.
+// resolvers: the guest's nameservers (bare addresses, as in its
+//         /etc/resolv.conf). TCP and UDP to port 53 of one of them is never
+//         treated by the hook lists: with dns_intercept false it goes out
+//         directly, as it would without forwarding (a resolver that only
+//         exists on this device - a VPN app's 198.18.0.x, say - stays
+//         reachable when an exit node takes 0/0); with dns_intercept true it
+//         goes through the entry marked as DNS ("<user>~x<id>~dns"), and the
+//         entry answers tailnet names itself and passes the rest on.
+// Other fields are as for ish_xnet_set_routes.
+struct ish_xnet_routes {
+    uint64_t generation;
+    const char *const *hook;
+    size_t hook_count;
+    const char *const *exempt;
+    size_t exempt_count;
+    const char *const *udp_hook;
+    size_t udp_hook_count;
+    const char *const *resolvers;
+    size_t resolver_count;
+    const char *const *self_addrs;
+    size_t self_count;
+    bool dns_intercept;
+    bool fail_closed;
+};
+int ish_xnet_set_routes2(const struct ish_xnet_routes *routes);
 
 // The master switch, off at start. Off means connect() is not looked at at
 // all. Turning it off does not affect connections already forwarded.
@@ -123,6 +165,32 @@ struct ish_xnet_stats {
     uint64_t cancelled;       // guest closed the socket before the answer
     uint64_t entry_down_events; // times the entry was found unreachable
     uint32_t pending;         // waiting for the entry's answer right now
+    // DNS (both protocols)
+    bool dns_intercept;
+    uint32_t udp_hook_prefixes;
+    uint32_t resolvers;
+    uint64_t pass_resolver;   // port 53 of a resolver, dns_intercept off: direct
+    uint64_t dns_tcp_hooked;  // TCP connections to a resolver sent as DNS
+    // UDP: per datagram sent, except where noted
+    uint64_t udp_sent;        // wrapped and sent to a relay (DNS included)
+    uint64_t udp_dns_sent;    // of those, to a resolver as DNS
+    uint64_t udp_received;    // unwrapped from a relay and delivered
+    uint64_t udp_dropped;     // relay datagrams that were malformed or stale,
+                              // and datagrams a connect()ed socket filtered
+    uint64_t udp_pass_no_match;
+    uint64_t udp_pass_exempt;
+    uint64_t udp_pass_local;
+    uint64_t udp_pass_bound;
+    uint64_t udp_pass_proxy_route; // hook but not udp_hook: udp-direct(proxy-route)
+    uint64_t udp_pass_v6only; // IPv6-only socket: cannot reach the IPv4 relay
+    uint64_t udp_pass_entry_down;
+    uint64_t udp_refused_closed; // entry unreachable and fail_closed
+    uint64_t udp_too_big;     // EMSGSIZE: no room for the header
+    // UDP associations (per socket and kind: ordinary or DNS)
+    uint64_t udp_assoc_opened;
+    uint64_t udp_assoc_failed;
+    uint64_t udp_assoc_renewed; // opened again after the entry ended one
+    uint32_t udp_assoc_active;
 };
 void ish_xnet_stats(struct ish_xnet_stats *out);
 
@@ -132,8 +200,9 @@ size_t ish_xnet_describe(char *buf, size_t size);
 
 // For the command-line build only (main.c, ISH_XNET_CONFIG=<file>): apply a
 // configuration from a host file of "key=value" lines - port, user,
-// password, conn_id (0/1), hook, exempt, self (comma-separated lists),
-// fail_closed (0/1), generation, enabled (0/1). The app calls the functions
+// password, conn_id (0/1), hook, exempt, udp_hook, resolvers, self
+// (comma-separated lists), dns_intercept, fail_closed (0/1), generation,
+// enabled (0/1). The app calls the functions
 // above instead. Returns 0 or -errno.
 int ish_xnet_load_file(const char *path);
 

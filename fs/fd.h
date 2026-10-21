@@ -79,6 +79,9 @@ struct fd {
             // A TCP connection fs/xnet.c forwards through the app's entry,
             // NULL for every other socket. See fs/xnet.h.
             struct xnet_conn *xnet;
+            // A datagram socket that sent through the entry's UDP relay (or
+            // connect()ed to a destination that does), NULL otherwise.
+            struct xnet_udp *xudp;
             cond_t unix_got_peer;
             // Queue of struct scm for sending file descriptors
             // locked by fd->lock
