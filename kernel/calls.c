@@ -57,6 +57,10 @@ __thread volatile int jit_crash_count = 0;
 
 static _Atomic(ish_timer_tick_hook_t) g_timer_tick_hook = NULL;
 
+bool ish_timer_tick_hook_set(void) {
+    return atomic_load_explicit(&g_timer_tick_hook, memory_order_acquire) != NULL;
+}
+
 void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook) {
     atomic_store_explicit(&g_timer_tick_hook, hook, memory_order_release);
 }

@@ -14,6 +14,7 @@
 // that touches one is translated from then on (vm_leave).
 #include <sys/mman.h>
 #include "emu/arch/x86/cpuid.h"
+#include "kernel/task.h"
 static int vm_state;   // 0: not looked, 1: on, -1: off (no hypervisor)
 #define FM_GUEST_PAGES (1ull << (32 - PAGE_BITS))   // the window: the low 4GB
 #define FAULT_AROUND 64   // pages mapped with one faulted on above the window
@@ -151,9 +152,13 @@ static void vm_about_to_block(void) {
 // ISH_WHP=1: VMs, 0: translated; unset: VMs where the machine can run them
 // (px_vm_supported), translated where it can't, and quietly so. Looked at
 // first by the first address space, before there are threads of guests.
+// Unset means translated too where whoever embeds ish counts timer ticks
+// (ish_set_timer_tick_hook): code running in a VM makes none.
 static int whp_env(void) {
     const char *e = getenv("ISH_WHP");
-    return e != NULL && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : -1;
+    if (e != NULL && (e[0] == '0' || e[0] == '1'))
+        return e[0] - '0';
+    return ish_timer_tick_hook_set() ? 0 : -1;
 }
 bool vm_wanted(void) {
     static int wanted = -1;

@@ -302,6 +302,7 @@ extern void (*exit_hook)(struct task *task, int code);
 
 typedef int (*ish_timer_tick_hook_t)(void);
 void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook);
+bool ish_timer_tick_hook_set(void);
 
 // [fork-guard] Called in sys_clone before a new task is created.
 // Return 0 to allow the fork, or a negative errno (e.g. _EAGAIN) to deny it;
