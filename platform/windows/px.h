@@ -230,6 +230,115 @@ int px_mprotect(void *addr, size_t len, int prot);
 void *px_jit_reserve(void *hint, size_t len);
 bool px_jit_commit(void *addr, size_t len, bool exec);
 void px_jit_release(void *addr);
+// The guest window (kernel/memory.c FASTMEM): len bytes reserved with a
+// no-access guard of guard bytes on each side; pages committed (zeroed),
+// decommitted and protected in it; whether a page is committed.
+void *px_fm_reserve(size_t len, size_t guard);
+void px_fm_release(void *base, size_t len, size_t guard);
+int px_fm_commit(void *addr, size_t len, int prot);
+// The same, the hypervisor's page tables left to fill (a px_fm_protect follows)
+int px_fm_commit_unfilled(void *addr, size_t len, int prot);
+void px_fm_decommit(void *addr, size_t len);
+int px_fm_protect(void *addr, size_t len, int prot);
+bool px_fm_committed(void *addr);
+// The same, and *end: where that answer ends (the region addr is in)
+bool px_fm_committed_until(void *addr, char **end);
+// The n pages from addr that are resident (in the working set): a bit each.
+int px_fm_resident(void *addr, size_t n, uint64_t *res);
+// addr is in a read-only view of a file (its pages are the file's)
+bool px_fm_file_view(void *addr);
+// Pages written since they were committed or last px_fm_unwritten (a bit
+// each, n pages from addr); -1 if unknown.
+int px_fm_written(void *addr, size_t n, uint64_t *written);
+void px_fm_unwritten(void *addr, size_t len);
+// An access violation at a pc for which fn returns nonzero resumes there; fn
+// gets the faulting code's r11 too.
+void px_fault_redirect(uintptr_t (*fn)(uintptr_t pc, uintptr_t r11));
+// A Windows Hypervisor Platform VM (whp.c) with a slot for each address
+// space: its window, as guest addresses below 4GB. px_vm_new: a slot, NULL if
+// there is no hypervisor (px_vm_present) or no slot left; px_vm_attach to a
+// window, px_vm_detach when its address space goes away, and it can take
+// another. A slot keeps its window mapped (px_vm_window) for the next address
+// space to get that window, until px_vm_forget.
+// px_vm_vcpu: a virtual processor in 64-bit user mode for a thread, with a
+// host thread of its own that runs it, -1 if none; px_vm_vcpu_release when
+// the thread is gone.
+//
+// The guest's syscalls don't leave the VM: a stub at CPL0 stores the
+// registers (and fxsave) in the processor's mailbox and waits for an answer
+// there, which costs a fraction of a microsecond against tens for a VM exit.
+// px_vm_wait returns PX_VM_SYSCALL for one (the processor may still be
+// running, waiting); px_vm_answer returns rax to it; px_vm_answer_full makes
+// it stop instead (after loading the mailbox's fxsave), for px_vm_set to load
+// any register state. Anything else that stops the processor is an exit:
+// px_vm_get and px_vm_set work then, px_vm_go runs it again.
+struct px_vm;
+struct px_vm_regs {
+    uint64_t gpr[16];   // rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15
+    uint64_t rip, rflags, fs_base, gs_base;
+};
+enum { PX_VM_EXCEPTION, PX_VM_MEMORY, PX_VM_CANCELED, PX_VM_OTHER, PX_VM_SYSCALL };
+struct px_vm_exit {
+    int kind;
+    unsigned reason;    // WHV_RUN_VP_EXIT_REASON
+    unsigned vector, error;   // PX_VM_EXCEPTION
+    uint64_t addr;      // PX_VM_EXCEPTION: #PF's address; PX_VM_MEMORY: the address
+    bool is_write;      // PX_VM_MEMORY
+};
+struct px_vm_mailbox {
+    volatile uint32_t state;   // PX_MB_*
+    volatile uint32_t asleep;  // ish isn't watching: a syscall stops to wake it
+    uint64_t gpr[16];          // at the syscall (rcx: rip after it, r11: rflags); gpr[0]: the answer
+    volatile uint32_t flush;   // with the answer: page tables changed, reload cr3
+    volatile uint32_t park;    // the syscall blocks: stop waiting for it
+    uint8_t pad2[0x100 - 0x90];
+    uint8_t fx[512];           // fxsave
+};
+enum { PX_MB_IDLE, PX_MB_CALL, PX_MB_ANSWER, PX_MB_FULL };
+void px_vm_cpuid(uint32_t leaf, uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx);
+void px_vm_prepare(bool check);   // check: px_vm_supported() first, on its thread
+// called by a thread about to block (sleeps, futex, condition waits)
+extern void (*px_about_to_block)(void);
+static inline void px_blocking(void) {
+    if (px_about_to_block != NULL)
+        px_about_to_block();
+}
+struct px_vm *px_vm_new(void);
+bool px_vm_present(void);
+void px_vm_attach(struct px_vm *vm, void *window);
+void px_vm_detach(struct px_vm *vm);
+void *px_vm_window(struct px_vm *vm);
+void px_vm_forget(void *window);
+int px_vm_vcpu(struct px_vm *vm);
+void px_vm_vcpu_release(struct px_vm *vm, int vp);
+struct px_vm_mailbox *px_vm_mailbox(struct px_vm *vm, int vp);
+int px_vm_wait(struct px_vm *vm, int vp, struct px_vm_exit *x, volatile bool *poked);
+void px_vm_answer(struct px_vm *vm, int vp, uint64_t rax);
+void px_vm_answer_full(struct px_vm *vm, int vp);
+bool px_vm_get(struct px_vm *vm, int vp, struct px_vm_regs *r);
+bool px_vm_set(struct px_vm *vm, int vp, const struct px_vm_regs *r);
+bool px_vm_get_sse(struct px_vm *vm, int vp, void *xmm16, uint32_t *mxcsr);
+bool px_vm_set_sse(struct px_vm *vm, int vp, const void *xmm16, uint32_t mxcsr);
+void px_vm_go(struct px_vm *vm, int vp);
+void px_vm_cancel(struct px_vm *vm, int vp);
+uint64_t px_vm_stub_stops(void);
+bool px_vm_stopped_waiting(struct px_vm *vm, int vp);
+void px_vm_counters(uint64_t *nested_faults, uint64_t *nested_us, uint64_t *intercepts, uint64_t *run_us);
+// px_vm_populate's calls, bytes and time, so far
+void px_vm_populate_stats(uint64_t *calls, uint64_t *bytes, uint64_t *us);
+// Guest pages above the window (4GB and up): px_vm_map_page maps the guest
+// page va to host, a page of the allocation [base, base + size), false when
+// out of page tables; px_vm_unmap_pages when ish's mappings there change;
+// px_vm_forget_host before host memory mapped so goes away. When an entry
+// changed, px_vm_shootdown.
+bool px_vm_map_page(struct px_vm *vm, uint64_t va, void *host, void *base, size_t size, bool write, bool exec);
+bool px_vm_unmap_pages(struct px_vm *vm, uint64_t va, uint64_t len);
+void px_vm_shootdown(struct px_vm *vm);
+void px_vm_hold(struct px_vm *vm, bool hold);
+bool px_vm_supported(void);
+extern bool px_vm_verbose;
+void px_vm_forget_host(void *host, size_t len);
+void px_vm_populate(void *addr, size_t len, bool write);   // fresh window pages
 // A file mapped shared and read-write, size bytes (grown sparse if shorter),
 // for the translation cache other ish processes map too. NULL on failure.
 // path is UTF-8; directories are created.
@@ -289,6 +398,8 @@ void px_backtrace_symbols_fd(void *const *buf, int size, int fd);
 void px_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle);
 void px_mem_info(uint64_t *total, uint64_t *avail);
 uint64_t px_uptime_ms(void);
+// ISH_BOOT_TRACE: what happens when, in ms since the process was made (stderr)
+void px_boot_mark(const char *what);
 // The process's private committed memory (its footprint, for the memory
 // governor), and a last-chance handler that reports host crashes.
 uint64_t px_process_footprint(void);

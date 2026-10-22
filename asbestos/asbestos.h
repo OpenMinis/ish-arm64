@@ -97,6 +97,7 @@ struct fiber_block {
     uintptr_t xjit_link_orig[2]; // where it points while unchained
     void *xjit_stub;            // counting entry while it runs as gadgets, or NULL
     uint8_t *xjit_counter;      // its count (data region)
+    void *xjit_faults;          // where its accesses' faults go (xlat.c FASTMEM), or NULL
     uintptr_t xjit_gadget0;     // the gadget code[0] held before the stub
 #endif
 

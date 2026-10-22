@@ -89,6 +89,36 @@ struct mem {
 };
 #endif
 
+#if defined(_WIN32) && defined(GUEST_X86_64)
+// The guest window: the low 4 GB of each address space mapped at
+// mmu.fm_base, so that translated code (asbestos/guest-x86_64/xlat.c) reaches
+// a guest address with no check. Private memory there is the guest's memory
+// itself (pt entries point into the window); a fork copies it. Pages that
+// aren't there fault, and their access goes the checked way.
+#define FASTMEM 1
+#define FM_PAGES ((page_t) 1 << 20)
+// Maps pages at start in the window, flags as pt_map's: zeros, or what file
+// has from offset (read in as they are first used). 0, or an error. 1: not
+// there (no window, not all in it, or shared), for the caller to map them
+// the usual way.
+struct fd;
+int pt_map_window(struct mem *mem, page_t start, pages_t pages, unsigned flags,
+                  struct fd *file, int64_t offset);
+// mmu.fm_want and no window yet: give the address space one, moving its
+// pages in, and drop its translations. Takes the write lock.
+void mem_window_migrate(struct mem *mem);
+#endif
+
+// Reads in the code at addr (and the page after, which a block may run
+// into) if it is a window page not read in yet (FASTMEM). For the compiler,
+// before it takes its lock: reading it in there would wait for the write
+// lock while a thread holding mem->lock waits for the compiler's. The
+// caller holds mem->lock once, as a reader.
+void mmu_fill_lazy(struct mmu *mmu, addr_t addr);
+// Nonzero while this thread compiles (asbestos/asbestos.c): a window page not
+// read in yet reads as unmapped then, instead of waiting for the write lock.
+extern __thread int mem_no_fill;
+
 // Initialize the address space
 void mem_init(struct mem *mem);
 // Uninitialize the address space
@@ -111,6 +141,14 @@ struct data {
     void *data; // immutable
     size_t size; // also immutable
     atomic_uint refcount;
+#ifdef FASTMEM
+    // in its address space's window: pages go back to the window one by one
+    // as they are unmapped, never shared with another one
+    bool window;
+    // the file P_LAZY pages come from, data->data's place in it
+    struct fd *lazy_fd;
+    int64_t lazy_off;
+#endif
 
     // for display in /proc/pid/maps
     struct fd *fd;
@@ -152,6 +190,8 @@ struct pt_entry {
 // clears this flag (bumping mmu->changes) before the store is allowed to
 // land. Set by mmu_mark_code_page when a block is compiled from the page.
 #define P_CODE (1 << 8)
+// FASTMEM: a window page of a file mapping not read in yet (mem_ptr does it)
+#define P_LAZY (1 << 9)
 
 bool pt_is_hole(struct mem *mem, page_t start, pages_t pages);
 page_t pt_find_hole(struct mem *mem, pages_t size);

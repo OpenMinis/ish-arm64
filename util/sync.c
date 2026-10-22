@@ -56,6 +56,9 @@ int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
 }
 
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+#ifdef _WIN32
+    px_blocking();   // a hypervisor VM's processor stops waiting (whp.c)
+#endif
     if (current) {
         lock(&current->waiting_cond_lock);
         current->waiting_cond = cond;

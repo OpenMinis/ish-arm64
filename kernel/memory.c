@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 #define DEFAULT_CHANNEL memory
 #include "debug.h"
@@ -28,6 +29,233 @@ static struct mmu_ops mem_mmu_ops;
 #include "kernel/mm.h"
 #include "emu/tlb.h"
 
+#ifdef FASTMEM
+// Where the window's time goes (printed with ISH_XJIT_STATS=1)
+#include <time.h>
+enum { FS_INIT, FS_DESTROY, FS_MAP, FS_UNMAP, FS_FILL, FS_FORK, FS_MIGRATE, FS_N };
+static _Atomic uint64_t fs_ns[FS_N], fs_n[FS_N];
+static int fs_stats = -1;
+static uint64_t fs_now(void) {
+    if (fs_stats < 0)
+        fs_stats = getenv("ISH_XJIT_STATS") != NULL;
+    if (!fs_stats)
+        return 0;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t) t.tv_sec * 1000000000ull + (uint64_t) t.tv_nsec;
+}
+#define FS_BEGIN uint64_t fs_t0 = fs_now()
+#define FS_END(k) (fs_t0 != 0 ? (atomic_fetch_add(&fs_ns[k], fs_now() - fs_t0), atomic_fetch_add(&fs_n[k], 1)) : 0)
+static _Atomic uint64_t fm_pages_kept, fm_pages_committed, fm_pages_file, fm_pages_recycled;
+void fm_stats_print(FILE *out) {
+    fprintf(out, "[fm] pages mapped: %llu reused, %llu committed, %llu of files; %llu kept at munmap\n",
+            (unsigned long long) fm_pages_kept, (unsigned long long) fm_pages_committed,
+            (unsigned long long) fm_pages_file, (unsigned long long) fm_pages_recycled);
+    static const char *names[] = {"init", "destroy", "map", "unmap", "fill", "fork", "migrate"};
+    for (int k = 0; k < FS_N; k++)
+        fprintf(out, "[fm] %-8s n=%6llu %8.2f ms\n", names[k], (unsigned long long) fs_n[k], fs_ns[k] / 1e6);
+}
+// The window's guards: a group of accesses checked once, or an access with a
+// displacement, a little outside it faults too.
+#define FM_GUARD ((size_t) 1 << 20)
+
+// ISH_FASTMEM: 0 none; 1 once a process has run a while (mem_window_migrate()),
+// so that the many that don't live long pay nothing; 2 from its start.
+static int fm_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("ISH_FASTMEM");
+        mode = e != NULL && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 0;
+#if defined(_WIN32) && defined(GUEST_X86_64)
+        // the hypervisor VMs run address spaces that have a window from the
+        // start
+        extern bool vm_wanted(void);   // asbestos/guest-x86_64/vm.c
+        if (e == NULL && vm_wanted())
+            mode = 2;
+#endif
+    }
+    return mode;
+}
+
+static bool fm_fits(struct mem *mem, page_t start, pages_t pages) {
+    return mem->mmu.fm_base != NULL && pages > 0 && start < FM_PAGES && pages <= FM_PAGES - start;
+}
+
+// What the window lets through: the checked path sees to the rest (a page
+// with compiled code takes its stores there, see P_CODE).
+static int fm_prot(unsigned flags) {
+    if (!(flags & (P_READ | P_WRITE | P_EXEC)))
+        return 0;
+    if (P_WRITABLE(flags) && !(flags & P_CODE))
+        return PROT_READ | PROT_WRITE;
+    return PROT_READ;
+}
+
+static void fm_protect_entry(struct pt_entry *entry) {
+    // a page not read in yet stays out: reading it in protects it
+    if (entry->data->window && !(entry->flags & P_LAZY))
+        px_fm_protect((char *) entry->data->data + entry->offset, PAGE_SIZE, fm_prot(entry->flags));
+}
+
+// The window protection of n pages from page, whose memory is host on: runs
+// of the same protection at once (a system call or two per run, not per
+// page). Pages not read in yet are left out.
+static void fm_protect_pages(struct mem *mem, char *host, page_t page, pages_t n) {
+    pages_t i = 0;
+    while (i < n) {
+        struct pt_entry *e = mem_pt(mem, page + i);
+        if (e == NULL || !e->data->window || (e->flags & P_LAZY)) {
+            i++;
+            continue;
+        }
+        int prot = fm_prot(e->flags);
+        pages_t j = i + 1;
+        while (j < n) {
+            struct pt_entry *f = mem_pt(mem, page + j);
+            if (f == NULL || !f->data->window || (f->flags & P_LAZY) || fm_prot(f->flags) != prot)
+                break;
+            j++;
+        }
+        px_fm_protect(host + ((size_t) i << PAGE_BITS), (size_t) (j - i) << PAGE_BITS, prot);
+        i = j;
+    }
+}
+
+// Reads in the P_LAZY page and those around it of the same mapping, up to a
+// chunk. With the write lock: no thread runs guest code meanwhile, so none
+// sees a page half read in through the window (in a hypervisor VM, they are
+// held: vm_hold). A hypervisor VM leaves the VM
+// for each page it misses, which costs more than reading a lot more.
+#define FM_CHUNK 16
+#define FM_CHUNK_VM 256
+static void fm_fill_run(struct mem *mem, page_t page, pages_t most) {
+    struct pt_entry *first = mem_pt(mem, page);
+    if (first == NULL || !(first->flags & P_LAZY))
+        return;
+    FS_BEGIN;
+    struct data *data = first->data;
+    // from up to half a chunk before it
+    for (pages_t back = 0; back < most / 2 && page > 0; back++) {
+        struct pt_entry *e = mem_pt(mem, page - 1);
+        if (e == NULL || e->data != data || !(e->flags & P_LAZY) ||
+                e->offset + PAGE_SIZE != first->offset)
+            break;
+        page--;
+        first = e;
+    }
+    pages_t n = 1;
+    while (n < most && page + n < FM_PAGES) {
+        struct pt_entry *e = mem_pt(mem, page + n);
+        if (e == NULL || e->data != data || !(e->flags & P_LAZY) ||
+                e->offset != first->offset + ((size_t) n << PAGE_BITS))
+            break;
+        n++;
+    }
+    char *host = (char *) data->data + first->offset;
+    size_t len = (size_t) n << PAGE_BITS;
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    extern void vm_hold(struct mmu *mmu, bool hold);   // asbestos/guest-x86_64/vm.c
+    vm_hold(&mem->mmu, true);
+#endif
+    if (px_fm_commit(host, len, PROT_READ | PROT_WRITE) < 0) {
+#if defined(_WIN32) && defined(GUEST_X86_64)
+        vm_hold(&mem->mmu, false);
+#endif
+        return;
+    }
+    int64_t off = data->lazy_off + (int64_t) first->offset;
+    for (size_t done = 0; done < len;) {
+        ssize_t got = pread(data->lazy_fd->real_fd, host + done, len - done, off + (int64_t) done);
+        if (got <= 0)
+            break;   // past the end: zeros
+        done += (size_t) got;
+    }
+    // what a fork copies is what the guest wrote, not this
+    px_fm_unwritten(host, len);
+    for (pages_t i = 0; i < n; i++)
+        mem_pt(mem, page + i)->flags &= ~P_LAZY;
+    fm_protect_pages(mem, host, page, n);
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    vm_hold(&mem->mmu, false);
+#endif
+    FS_END(FS_FILL);
+}
+
+static void fm_fill(struct mem *mem, page_t page) {
+    fm_fill_run(mem, page, mem->mmu.vm != NULL ? FM_CHUNK_VM : FM_CHUNK);
+}
+
+// The window's copies of pages kept elsewhere (that a hypervisor VM reads
+// there) go: translated code would read them instead of the pages.
+void mem_window_drop_copies(struct mem *mem) {
+    if (mem->mmu.fm_base == NULL)
+        return;
+    for (page_t page = 0; page < FM_PAGES; mem_next_page(mem, &page)) {
+        struct pt_entry *pt = mem_pt(mem, page);
+        if (pt != NULL && !pt->data->window)
+            px_fm_decommit(mem->mmu.fm_base + ((size_t) page << PAGE_BITS), PAGE_SIZE);
+    }
+}
+
+// In a hypervisor VM a window page costs a call to the driver to fill each
+// time it is committed (px_vm_populate), and unmapping and mapping again is
+// what malloc does all the time: anonymous pages unmapped are kept, filled,
+// up to FM_RECYCLE_MAX, and the next mapping of just those pages gets them
+// zeroed. (Touching them meanwhile doesn't fault, as it should.)
+#define FM_RECYCLE_MAX 16384   // pages: 64MB
+#define FM_RECYCLE_RUN 256     // pages: longer runs are zeroed by the system
+static bool fm_recycle_put(struct mem *mem, page_t page) {
+    if (mem->mmu.fm_recycled_pages >= FM_RECYCLE_MAX)
+        return false;
+    if (mem->mmu.fm_recycled == NULL && (mem->mmu.fm_recycled = calloc(FM_PAGES / 64, 8)) == NULL)
+        return false;
+    uint64_t bit = 1ull << (page % 64);
+    if (!(mem->mmu.fm_recycled[page / 64] & bit)) {
+        mem->mmu.fm_recycled[page / 64] |= bit;
+        mem->mmu.fm_recycled_pages++;
+        fm_pages_recycled++;
+    }
+    return true;
+}
+
+// The pages [start, start + pages) aren't kept any more; true if they all
+// were (ready to use, but for zeroing)
+static bool fm_recycled(struct mem *mem, page_t page) {
+    return mem->mmu.fm_recycled != NULL && (mem->mmu.fm_recycled[page / 64] >> (page % 64)) & 1;
+}
+
+static bool fm_recycle_take(struct mem *mem, page_t start, pages_t pages) {
+    if (mem->mmu.fm_recycled == NULL || mem->mmu.fm_recycled_pages == 0)
+        return false;
+    bool all = true;
+    for (page_t page = start; page < start + pages; page++) {
+        uint64_t bit = 1ull << (page % 64);
+        if (mem->mmu.fm_recycled[page / 64] & bit) {
+            mem->mmu.fm_recycled[page / 64] &= ~bit;
+            mem->mmu.fm_recycled_pages--;
+        } else {
+            all = false;
+        }
+    }
+    return all;
+}
+
+// mem_destroy: unmapping everything before the window goes back emptied
+static __thread bool fm_destroying;
+
+// Hypervisor VMs (asbestos/guest-x86_64/vm.c), where a page missed costs a
+// VM exit: files mapped are read in at once, up to FM_EAGER
+#define FM_EAGER 512
+static bool fm_eager(void) {
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    extern bool vm_wanted(void);   // asbestos/guest-x86_64/vm.c
+    return vm_wanted();
+#else
+    return false;
+#endif
+}
+#endif
+
 
 #ifdef GUEST_64BIT
 // ============================================================
@@ -43,6 +271,7 @@ static void mem_poke_readers(void *arg) {
             __atomic_store_n(tlb->frame->cpu.poked_ptr, true, __ATOMIC_SEQ_CST);
     }
     unlock(&mmu->tlbs_lock);
+    // (threads in a hypervisor VM don't hold the lock while the guest runs)
 }
 
 void mem_init(struct mem *mem) {
@@ -53,6 +282,21 @@ void mem_init(struct mem *mem) {
     mem->mmu.ops = &mem_mmu_ops;
     mem->mmu.asbestos = asbestos_new(&mem->mmu);
     mem->mmu.changes = 0;
+#ifdef GUEST_X86_64
+    mem->mmu.fm_base = NULL;
+    mem->mmu.fm_ticks = 0;
+    mem->mmu.fm_want = false;
+    mem->mmu.vm = NULL;
+    mem->mmu.fm_recycled = NULL;
+    mem->mmu.fm_recycled_pages = 0;
+#endif
+#ifdef FASTMEM
+    if (fm_mode() == 2) {
+        FS_BEGIN;
+        mem->mmu.fm_base = px_fm_reserve((size_t) FM_PAGES << PAGE_BITS, FM_GUARD);
+        FS_END(FS_INIT);
+    }
+#endif
     lock_init(&mem->mmu.tlbs_lock);
     list_init(&mem->mmu.tlbs);
     wrlock_init(&mem->lock);
@@ -113,6 +357,15 @@ void mem_destroy(struct mem *mem) {
     // second cleanup path can't dereference a stale pointer.
     asbestos_free(mem->mmu.asbestos);
     mem->mmu.asbestos = NULL;
+#ifdef FASTMEM
+    FS_BEGIN;
+    free(mem->mmu.fm_recycled);
+    mem->mmu.fm_recycled = NULL;
+    if (mem->mmu.fm_base != NULL)
+        px_fm_release(mem->mmu.fm_base, (size_t) FM_PAGES << PAGE_BITS, FM_GUARD);
+    FS_END(FS_DESTROY);
+    mem->mmu.fm_base = NULL;
+#endif
     pt_node_free(mem->pgdir, 0);
     mem->pgdir = NULL;
     write_wrunlock(&mem->lock);
@@ -424,7 +677,13 @@ void mem_destroy(struct mem *mem) {
            current ? current->pid : -1, (void *) mem,
            (unsigned long long) MM_OF_MEM(mem)->seq, mem->lock.val, mem->lock.pid);
     write_wrlock(&mem->lock);
+#ifdef FASTMEM
+    fm_destroying = true;   // px_fm_release empties the window at once
+#endif
     pt_unmap_always(mem, 0, MEM_PAGES);
+#ifdef FASTMEM
+    fm_destroying = false;
+#endif
     // [T-ish-mm-double-destroy-crash] Freed asbestos MUST also be nulled out.
     // Under CLONE_VM exit_group races (multi-threaded python3 during MCP
     // teardown), the same struct mm can be reached by a second cleanup path
@@ -637,12 +896,24 @@ int pt_unmap(struct mem *mem, page_t start, pages_t pages) {
 }
 
 int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    // a hypervisor VM's page tables above the window (asbestos/guest-x86_64/vm.c)
+    extern void vm_pages_changed(struct mmu *mmu, page_t start, pages_t pages);
+    if (mem->mmu.vm != NULL)
+        vm_pages_changed(&mem->mmu, start, pages);
+#endif
     // Reset mmap_hint if freed region is above it, so pt_find_hole can
     // reuse the freed space on the next mmap(addr=0).
     if (start + pages - 1 > mem->mmap_hint)
         mem->mmap_hint = start + pages - 1;
 
     mem_remove_reservations(mem, start, pages);
+#ifdef FASTMEM
+    // window pages go back as they are unmapped, a run at a time (unless the
+    // whole window is about to)
+    char *fm_run = NULL;
+    size_t fm_len = 0;
+#endif
 
     for (page_t page = start; page < start + pages; mem_next_page(mem, &page)) {
         struct pt_entry *pt = mem_pt(mem, page);
@@ -651,6 +922,27 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
 
         asbestos_invalidate_page(mem->mmu.asbestos, page);
         struct data *data = pt->data;
+#ifdef FASTMEM
+        // (a page kept elsewhere may have a read-only copy in the window, for
+        // a hypervisor VM: asbestos/guest-x86_64/vm.c)
+        if (data->window && !fm_destroying && pages <= FM_RECYCLE_RUN && fm_eager() &&
+                (pt->flags & P_ANONYMOUS) && !(pt->flags & (P_SHARED | P_COW)) &&
+                fm_prot(pt->flags) == (PROT_READ | PROT_WRITE) && fm_recycle_put(mem, page)) {
+            // kept (fm_recycle_put)
+        } else if ((data->window || (mem->mmu.vm != NULL && page < FM_PAGES)) && !fm_destroying) {
+            char *host = data->window ? (char *) data->data + pt->offset
+                                      : mem->mmu.fm_base + ((size_t) page << PAGE_BITS);
+            if (fm_run != NULL && fm_run + fm_len != host) {
+                px_fm_decommit(fm_run, fm_len);
+                fm_run = NULL;
+            }
+            if (fm_run == NULL) {
+                fm_run = host;
+                fm_len = 0;
+            }
+            fm_len += PAGE_SIZE;
+        }
+#endif
 #if ANON_MMAP_LIMIT_PAGES > 0
         // Decrement per-page for anonymous mappings. This correctly handles
         // partial unmaps (munmap of subset of original mmap region) where the
@@ -667,15 +959,31 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
         mem_pt_del(mem, page);
         if (--data->refcount == 0) {
             // vdso wasn't allocated with mmap, it's just in our data segment
+#ifdef FASTMEM
+            if (data->data != vdso_data && !data->window) {
+                px_vm_forget_host(data->data, data->size);   // a VM may have it mapped
+#else
             if (data->data != vdso_data) {
+#endif
                 munmap(data->data, data->size);
             }
             if (data->fd != NULL) {
                 fd_close(data->fd);
             }
+#ifdef FASTMEM
+            if (data->lazy_fd != NULL)
+                fd_close(data->lazy_fd);
+#endif
             free(data);
         }
     }
+#ifdef FASTMEM
+    if (fm_run != NULL) {
+        FS_BEGIN;
+        px_fm_decommit(fm_run, fm_len);
+        FS_END(FS_UNMAP);
+    }
+#endif
     mem_changed(mem);
     return 0;
 }
@@ -687,8 +995,226 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
 _Atomic uint64_t st_anon_mmaps;        // host mmap calls for anonymous memory
 _Atomic uint64_t st_anon_pages_mapped; // guest pages they backed
 
+#ifdef FASTMEM
+// Moves the pages of one mapping from page on (n of them, the same data at
+// consecutive offsets) into the window: a read-only view of a file as P_LAZY
+// pages (read in again as used), anything else copied.
+static void fm_migrate_run(struct mem *mem, page_t page, pages_t n) {
+    struct pt_entry *first = mem_pt(mem, page);
+    struct data *od = first->data;
+    char *from = (char *) od->data + first->offset;
+    char *to = mem->mmu.fm_base + ((size_t) page << PAGE_BITS);
+    size_t len = (size_t) n << PAGE_BITS;
+    bool lazy = od->fd != NULL && od->fd->real_fd >= 0 && !(first->flags & P_ANONYMOUS) &&
+        px_fm_file_view(from);
+    unsigned *flags = malloc(n * sizeof(*flags));
+    if (flags == NULL)
+        return;
+    for (pages_t i = 0; i < n; i++)
+        flags[i] = mem_pt(mem, page + i)->flags & ~(P_CODE | P_COW);
+    struct fd *fd = od->fd != NULL ? fd_retain(od->fd) : NULL;
+    int64_t file_off = (int64_t) od->file_offset + (int64_t) first->offset;
+    const char *name = od->name;
+    px_fm_decommit(to, len);
+    // a view's pages already in memory are copied (cheaper than reading them
+    // in again as they are used), the others left for the file
+    uint64_t *copy = NULL;
+    if (lazy) {
+        copy = malloc((n + 63) / 64 * 8);
+        if (copy != NULL && px_fm_resident(from, n, copy) < 0)
+            memset(copy, 0, (n + 63) / 64 * 8);
+    }
+    for (pages_t i = 0; i < n;) {
+        bool c = !lazy || (copy != NULL && ((copy[i / 64] >> (i % 64)) & 1));
+        pages_t j = i + 1;
+        while (j < n && (!lazy || (copy != NULL && ((copy[j / 64] >> (j % 64)) & 1))) == c)
+            j++;
+        if (c) {
+            char *t = to + ((size_t) i << PAGE_BITS);
+            px_fm_commit(t, (size_t) (j - i) << PAGE_BITS, PROT_READ | PROT_WRITE);
+            for (pages_t k = i; k < j; k++) {
+                char *f = from + ((size_t) k << PAGE_BITS);
+                if (!px_fm_committed(f))
+                    continue;   // never touched: zeros
+                bool none = fm_prot(flags[k]) == 0;
+                if (none)
+                    mprotect(f, PAGE_SIZE, PROT_READ);
+                memcpy(to + ((size_t) k << PAGE_BITS), f, PAGE_SIZE);
+                if (none)
+                    mprotect(f, PAGE_SIZE, PROT_NONE);
+            }
+            if (lazy)   // the file's own pages: not written, for a fork
+                px_fm_unwritten(t, (size_t) (j - i) << PAGE_BITS);
+        }
+        i = j;
+    }
+#if ANON_MMAP_LIMIT_PAGES > 0
+    // pt_map lets go of the old pages (uncharging the anonymous ones): the
+    // new ones are the same pages, charged again
+    long charged = 0;
+    for (pages_t i = 0; i < n; i++)
+        if ((flags[i] & P_ANONYMOUS) && anon_page_is_charged(flags[i]))
+            charged++;
+#endif
+    if (pt_map(mem, page, n, to, 0, flags[0]) < 0) {
+        px_fm_decommit(to, len);
+        if (fd != NULL)
+            fd_close(fd);
+        free(copy);
+        free(flags);
+        return;
+    }
+#if ANON_MMAP_LIMIT_PAGES > 0
+    atomic_fetch_add(&anon_page_count, charged);
+#endif
+    struct data *nd = mem_pt(mem, page)->data;
+    nd->window = true;
+    nd->name = name;
+    nd->fd = fd;
+    nd->file_offset = (size_t) file_off;
+    if (lazy) {
+        nd->lazy_fd = fd_retain(fd);
+        nd->lazy_off = file_off;
+    }
+    for (pages_t i = 0; i < n; i++) {
+        bool copied = !lazy || (copy != NULL && ((copy[i / 64] >> (i % 64)) & 1));
+        mem_pt(mem, page + i)->flags = flags[i] | (copied ? 0 : P_LAZY);
+    }
+    fm_protect_pages(mem, to, page, n);
+    free(copy);
+    free(flags);
+}
+
+#define FM_HIGH_MAX ((pages_t) 16384)   // 64 MB above 4 GB: no window
+void mem_window_migrate(struct mem *mem) {
+    write_wrlock(&mem->lock);
+    if (mem->mmu.fm_base != NULL || !mem->mmu.fm_want) {
+        write_wrunlock(&mem->lock);
+        return;
+    }
+    // Memory above 4 GB stays out of the window: a program that keeps much of
+    // its data there (V8 puts its heap cage there) would pay for the move and
+    // gain little. Not now, nor later.
+    pages_t high = 0;
+    for (struct mem_reservation *r = mem->reservations; r != NULL; r = r->next)
+        if (r->start >= FM_PAGES)
+            high += r->pages;
+    for (page_t page = FM_PAGES; page < MEM_PAGES && high < FM_HIGH_MAX; mem_next_page(mem, &page))
+        if (mem_pt(mem, page) != NULL)
+            high++;
+    if (high >= FM_HIGH_MAX) {
+        mem->mmu.fm_want = false;
+        mem->mmu.fm_ticks = UINT_MAX;
+        write_wrunlock(&mem->lock);
+        return;
+    }
+    FS_BEGIN;
+    mem->mmu.fm_base = px_fm_reserve((size_t) FM_PAGES << PAGE_BITS, FM_GUARD);
+    if (mem->mmu.fm_base == NULL) {
+        mem->mmu.fm_want = false;
+        write_wrunlock(&mem->lock);
+        return;
+    }
+    for (page_t page = 0; page < FM_PAGES; mem_next_page(mem, &page)) {
+        struct pt_entry *e = mem_pt(mem, page);
+        if (e == NULL || e->data->window || (e->flags & P_SHARED) || e->data->data == vdso_data)
+            continue;
+        pages_t n = 1;
+        while (page + n < FM_PAGES) {
+            struct pt_entry *f = mem_pt(mem, page + n);
+            if (f == NULL || f->data != e->data || (f->flags & P_SHARED) ||
+                    f->offset != e->offset + ((size_t) n << PAGE_BITS))
+                break;
+            n++;
+        }
+        fm_migrate_run(mem, page, n);
+        page += n - 1;   // mem_next_page adds the last one
+    }
+    // what was translated without the window goes; blocks come back with it
+    asbestos_invalidate_all(mem->mmu.asbestos);
+    mem_changed(mem);
+    FS_END(FS_MIGRATE);
+    write_wrunlock(&mem->lock);
+}
+#endif
+
+#ifdef FASTMEM
+int pt_map_window(struct mem *mem, page_t start, pages_t pages, unsigned flags,
+                  struct fd *file, int64_t offset) {
+    if (!fm_fits(mem, start, pages))
+        return 1;
+    if (flags & P_SHARED) {
+        // kept elsewhere: nothing of the window may be left there for an
+        // access to land on (pages kept to use again, a VM's copies)
+        if (fm_recycle_take(mem, start, pages) || mem->mmu.vm != NULL)
+            px_fm_decommit(mem->mmu.fm_base + ((size_t) start << PAGE_BITS), (size_t) pages << PAGE_BITS);
+        return 1;
+    }
+    FS_BEGIN;
+    for (page_t page = start; page < start + pages; page++)
+        if (mem_pt(mem, page) != NULL)
+            pt_unmap(mem, page, 1);
+    char *memory = mem->mmu.fm_base + ((size_t) start << PAGE_BITS);
+    size_t len = (size_t) pages << PAGE_BITS;
+    if (file != NULL) {
+        atomic_fetch_add_explicit(&fm_pages_file, pages, memory_order_relaxed);
+        fm_recycle_take(mem, start, pages);
+        px_fm_decommit(memory, len);
+        flags |= P_LAZY;
+    } else if (fm_prot(flags) == (PROT_READ | PROT_WRITE) && mem->mmu.fm_recycled_pages > 0) {
+        // the pages kept zeroed (committed and filled already), the rest
+        // committed, a run of each at a time
+        for (page_t page = start; page < start + pages;) {
+            bool kept = fm_recycled(mem, page);
+            page_t end = page + 1;
+            while (end < start + pages && fm_recycled(mem, end) == kept)
+                end++;
+            if (kept)
+                fm_recycle_take(mem, page, end - page);
+            char *at = mem->mmu.fm_base + ((size_t) page << PAGE_BITS);
+            size_t run = (size_t) (end - page) << PAGE_BITS;
+            if (kept)
+                memset(at, 0, run);
+            else if (px_fm_commit(at, run, fm_prot(flags)) < 0)
+                return _ENOMEM;
+            atomic_fetch_add_explicit(kept ? &fm_pages_kept : &fm_pages_committed, end - page, memory_order_relaxed);
+            page = end;
+        }
+    } else {
+        atomic_fetch_add_explicit(&fm_pages_committed, pages, memory_order_relaxed);
+        fm_recycle_take(mem, start, pages);
+        if (px_fm_commit(memory, len, fm_prot(flags)) < 0)
+            return _ENOMEM;
+    }
+    int err = pt_map(mem, start, pages, memory, 0, flags);
+    if (err < 0) {
+        px_fm_decommit(memory, len);
+        return err;
+    }
+    struct data *data = mem_pt(mem, start)->data;
+    data->window = true;
+    if (file != NULL) {
+        data->lazy_fd = fd_retain(file);
+        data->lazy_off = offset;
+    }
+    FS_END(FS_MAP);
+    if (file != NULL && pages <= FM_EAGER && fm_eager()) {
+        for (page_t page = start; page < start + pages; page++)
+            if (mem_pt(mem, page)->flags & P_LAZY)
+                fm_fill_run(mem, page, FM_CHUNK_VM);
+    }
+    return 0;
+}
+#endif
+
 int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
     if (pages == 0) return 0;
+    int err;
+#ifdef FASTMEM
+    err = pt_map_window(mem, start, pages, flags | P_ANONYMOUS, NULL, 0);
+    if (err <= 0)
+        goto mapped;
+#endif
     // Use host PROT_NONE for guest PROT_NONE mappings. Go runtime reserves
     // ~1.1GB of PROT_NONE address space for page summaries; allocating real
     // memory for these wastes physical RAM and causes iOS jetsam kills.
@@ -706,7 +1232,10 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
         atomic_fetch_add_explicit(&st_anon_pages_mapped, (uint64_t)pages,
                                   memory_order_relaxed);
     }
-    int err = pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
+    err = pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
+#ifdef FASTMEM
+mapped:
+#endif
 #if ANON_MMAP_LIMIT_PAGES > 0
     // [T-ish-anon-count-negative] Charge HERE, not at the call sites.
     //
@@ -883,9 +1412,15 @@ _Atomic uint64_t st_wx_clears = 0;
 // allocation type and state, not user-visible protection bits. P_CODE must
 // survive mprotect: making a compiled code page writable doesn't remove the
 // need to invalidate its blocks on the first store.
-#define P_META_FLAGS (P_ANONYMOUS | P_GROWSDOWN | P_COW | P_SHARED | P_CODE)
+#define P_META_FLAGS (P_ANONYMOUS | P_GROWSDOWN | P_COW | P_SHARED | P_CODE | P_LAZY)
 
 int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    // a hypervisor VM's page tables above the window (asbestos/guest-x86_64/vm.c)
+    extern void vm_pages_changed(struct mmu *mmu, page_t start, pages_t pages);
+    if (mem->mmu.vm != NULL)
+        vm_pages_changed(&mem->mmu, start, pages);
+#endif
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) == NULL) {
             if (mem_find_reservation(mem, page) != NULL)
@@ -978,6 +1513,12 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
         }
 #endif
 
+#ifdef FASTMEM
+        // the window carries the protection, whichever way it goes (below,
+        // for the whole range)
+        if (entry->data->window)
+            continue;
+#endif
         // check if protection is increasing
         if ((flags & ~old_flags) & (P_READ|P_WRITE)) {
             void *data = (char *) entry->data->data + entry->offset;
@@ -995,11 +1536,190 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
             }
         }
     }
+#ifdef FASTMEM
+    if (fm_fits(mem, start, pages))
+        fm_protect_pages(mem, mem->mmu.fm_base + ((size_t) start << PAGE_BITS), start, pages);
+#endif
     mem_changed(mem);
     return 0;
 }
 
+#ifdef FASTMEM
+// A fork's copy of the window pages from page on that belong to the same
+// mapping, in a row: they are never shared (a copy on write would have to
+// put another page where the shared one is), so the child gets what the
+// parent wrote, copied, and the rest as it was made: zeros, or the file
+// again (P_LAZY). Returns how many pages it took, 0 if it can't.
+static pages_t fm_fork_copy_(struct mem *src, struct mem *dst, page_t page);
+static pages_t fm_fork_copy(struct mem *src, struct mem *dst, page_t page) {
+    FS_BEGIN;
+    pages_t n = fm_fork_copy_(src, dst, page);
+    FS_END(FS_FORK);
+    return n;
+}
+static pages_t fm_fork_copy_(struct mem *src, struct mem *dst, page_t page) {
+    struct pt_entry *first = mem_pt(src, page);
+    struct data *sd = first->data;
+    pages_t n = 0;
+    while (page + n < FM_PAGES) {
+        struct pt_entry *e = mem_pt(src, page + n);
+        if (e == NULL || e->data != sd || e->offset != first->offset + ((size_t) n << PAGE_BITS))
+            break;
+        n++;
+    }
+    if (!fm_fits(dst, page, n))
+        return 0;
+    size_t len = (size_t) n << PAGE_BITS;
+    char *from = (char *) sd->data + first->offset;
+    char *to = dst->mmu.fm_base + ((size_t) page << PAGE_BITS);
+    uint64_t *written = malloc((n + 63) / 64 * 8);
+    if (written == NULL)
+        return 0;
+    if (px_fm_written(from, n, written) < 0)
+        memset(written, 0xff, (n + 63) / 64 * 8);
+    px_fm_decommit(to, len);
+    if (pt_map(dst, page, n, to, 0, first->flags & ~P_CODE) < 0) {
+        free(written);
+        return 0;
+    }
+    struct data *dd = mem_pt(dst, page)->data;
+    dd->window = true;
+    dd->name = sd->name;
+    if (sd->fd != NULL) {
+        dd->fd = fd_retain(sd->fd);
+        dd->file_offset = sd->file_offset + first->offset;
+    }
+    if (sd->lazy_fd != NULL) {
+        dd->lazy_fd = fd_retain(sd->lazy_fd);
+        dd->lazy_off = sd->lazy_off + (int64_t) first->offset;
+    }
+    // which pages the file has again, the rest committed a run at a time.
+    // (In a hypervisor VM a page missed costs an exit: the parent's copy of
+    // what it read in is copied too.)
+    bool copy_read = fm_eager();
+    for (pages_t i = 0; i < n; i++) {
+        unsigned flags = mem_pt(src, page + i)->flags & ~P_CODE;
+        bool w = (written[i / 64] >> (i % 64)) & 1;
+        if ((flags & P_LAZY) || (sd->lazy_fd != NULL && !w && !copy_read))
+            flags |= P_LAZY;   // the file has it
+        mem_pt(dst, page + i)->flags = flags;
+    }
+    for (pages_t i = 0; i < n;) {
+        if (mem_pt(dst, page + i)->flags & P_LAZY) {
+            i++;
+            continue;
+        }
+        pages_t j = i + 1;
+        while (j < n && !(mem_pt(dst, page + j)->flags & P_LAZY))
+            j++;
+        // filled once, by fm_protect_pages below: twice cost a fork 1.4ms in a VM
+        px_fm_commit_unfilled(to + ((size_t) i << PAGE_BITS), (size_t) (j - i) << PAGE_BITS, PROT_READ | PROT_WRITE);
+        i = j;
+    }
+    // what the parent wrote (or read in); the rest is zeros
+    char *region_end = NULL;
+    bool committed = false;
+    for (pages_t i = 0; i < n; i++) {
+        bool w = (written[i / 64] >> (i % 64)) & 1;
+        if ((!w && !(copy_read && sd->lazy_fd != NULL)) || (mem_pt(dst, page + i)->flags & P_LAZY))
+            continue;
+        char *f = from + ((size_t) i << PAGE_BITS);
+        int prot = fm_prot(mem_pt(src, page + i)->flags);
+        if (f >= region_end)
+            committed = px_fm_committed_until(f, &region_end);
+        if (!committed)
+            continue;
+        if (prot == 0)
+            px_fm_protect(f, PAGE_SIZE, PROT_READ);
+        memcpy(to + ((size_t) i << PAGE_BITS), f, PAGE_SIZE);
+        if (prot == 0)
+            px_fm_protect(f, PAGE_SIZE, 0);
+    }
+    fm_protect_pages(dst, to, page, n);
+    free(written);
+    return n;
+}
+#endif
+
+#ifdef FASTMEM
+// A fork's copy of window pages for a child without the window (it gets its
+// own once it has run a while): those the parent wrote, copied; the rest of
+// a file mapping as a view of the file again; zeros otherwise. The same
+// mapping in a row from page on, as fm_fork_copy(); in pieces of one kind.
+static pages_t fm_fork_plain(struct mem *src, struct mem *dst, page_t page) {
+    struct pt_entry *first = mem_pt(src, page);
+    struct data *sd = first->data;
+    pages_t n = 0;
+    while (page + n < FM_PAGES) {
+        struct pt_entry *e = mem_pt(src, page + n);
+        if (e == NULL || e->data != sd || e->offset != first->offset + ((size_t) n << PAGE_BITS))
+            break;
+        n++;
+    }
+    char *from = (char *) sd->data + first->offset;
+    uint64_t *written = malloc((n + 63) / 64 * 8);
+    if (written == NULL)
+        return 0;
+    if (px_fm_written(from, n, written) < 0)
+        memset(written, 0xff, (n + 63) / 64 * 8);
+    // a page the file has: never written here (or not read in at all)
+    #define FROM_FILE(i) (sd->lazy_fd != NULL && ((mem_pt(src, page + (i))->flags & P_LAZY) || \
+                          !((written[(i) / 64] >> ((i) % 64)) & 1)))
+    for (pages_t i = 0; i < n;) {
+        bool file = FROM_FILE(i);
+        pages_t j = i + 1;
+        while (j < n && FROM_FILE(j) == file)
+            j++;
+        size_t len = (size_t) (j - i) << PAGE_BITS;
+        unsigned flags = mem_pt(src, page + i)->flags & ~(P_CODE | P_LAZY);
+        int64_t off = sd->lazy_off + (int64_t) mem_pt(src, page + i)->offset;
+        char *memory;
+        if (file) {
+            memory = mmap(NULL, len, PROT_READ | ((flags & P_WRITE) ? PROT_WRITE : 0), MAP_PRIVATE,
+                          sd->lazy_fd->real_fd, off);
+        } else {
+            memory = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (memory != MAP_FAILED) {
+                for (pages_t k = i; k < j; k++) {
+                    char *f = from + ((size_t) k << PAGE_BITS);
+                    if (!((written[k / 64] >> (k % 64)) & 1) || !px_fm_committed(f))
+                        continue;
+                    bool none = fm_prot(mem_pt(src, page + k)->flags) == 0;
+                    if (none)
+                        px_fm_protect(f, PAGE_SIZE, PROT_READ);
+                    memcpy(memory + ((size_t) (k - i) << PAGE_BITS), f, PAGE_SIZE);
+                    if (none)
+                        px_fm_protect(f, PAGE_SIZE, 0);
+                }
+            }
+        }
+        if (memory == MAP_FAILED || pt_map(dst, page + i, j - i, memory, 0, flags) < 0) {
+            free(written);
+            return 0;
+        }
+        struct data *dd = mem_pt(dst, page + i)->data;
+        dd->name = sd->name;
+        if (sd->fd != NULL) {
+            dd->fd = fd_retain(sd->fd);
+            dd->file_offset = sd->file_offset + mem_pt(src, page + i)->offset;
+        }
+        for (pages_t k = i; k < j; k++)
+            mem_pt(dst, page + k)->flags = mem_pt(src, page + k)->flags & ~(P_CODE | P_LAZY);
+        i = j;
+    }
+    #undef FROM_FILE
+    free(written);
+    return n;
+}
+#endif
+
 int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t pages) {
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    // the source's pages turn copy on write: its VM's entries for them go
+    extern void vm_pages_changed(struct mmu *mmu, page_t start, pages_t pages);
+    if (src->mmu.vm != NULL)
+        vm_pages_changed(&src->mmu, start, pages);
+#endif
 #if ANON_MMAP_LIMIT_PAGES > 0
     long anon_copied = 0;
 #endif
@@ -1009,6 +1729,25 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
             continue;
         if (pt_unmap_always(dst, page, 1) < 0)
             return -1;
+#ifdef FASTMEM
+        if (entry->data->window) {
+            for (page_t p = page; p < FM_PAGES && mem_pt(src, p) != NULL && mem_pt(src, p)->data == entry->data; p++)
+                pt_unmap_always(dst, p, 1);
+            // the child gets the window from its start only if everything does
+            pages_t n = fm_mode() == 2 ? fm_fork_copy(src, dst, page) : fm_fork_plain(src, dst, page);
+            if (n == 0)
+                return -1;
+#if ANON_MMAP_LIMIT_PAGES > 0
+            for (pages_t i = 0; i < n; i++) {
+                unsigned f = mem_pt(src, page + i)->flags;
+                if ((f & P_ANONYMOUS) && anon_page_is_charged(f))
+                    anon_copied++;
+            }
+#endif
+            page += n - 1;   // mem_next_page adds the last one
+            continue;
+        }
+#endif
         if (!(entry->flags & P_SHARED))
             entry->flags |= P_COW;
         entry->data->refcount++;
@@ -1070,6 +1809,8 @@ static void *mem_ptr_nofault(struct mem *mem, addr_t addr, int type) {
     struct pt_entry *entry = mem_pt(mem, PAGE(addr));
     if (entry == NULL)
         return NULL;
+    if (entry->flags & P_LAZY)
+        return NULL;   // not read in yet: mem_ptr does it
     if (type == MEM_WRITE && !P_WRITABLE(entry->flags))
         return NULL;
     return entry->data->data + entry->offset + PGOFFSET(addr);
@@ -1325,6 +2066,21 @@ check_reservation: ;
     }
 
 have_entry:
+#ifdef FASTMEM
+    if (entry != NULL && (entry->flags & P_LAZY)) {
+        if (mem_no_fill)
+            return NULL;
+        read_wrunlock(&mem->lock);
+#ifndef NDEBUG
+        remapped = true;
+#endif
+        write_wrlock(&mem->lock);
+        fm_fill(mem, page);
+        write_wrunlock(&mem->lock);
+        read_wrlock(&mem->lock);
+        entry = mem_pt(mem, page);
+    }
+#endif
 #ifdef GUEST_X86_64
     // A page with no access must fault on a read as well. The JVM puts its
     // heap after a PROT_NONE page and loads from it as an implicit null
@@ -1364,6 +2120,9 @@ have_entry:
         // cleared flag and discard its possibly-torn block).
         if (__atomic_load_n(&entry->flags, __ATOMIC_RELAXED) & P_CODE) {
             __atomic_fetch_and(&entry->flags, ~P_CODE, __ATOMIC_ACQ_REL);
+#ifdef FASTMEM
+            fm_protect_entry(entry);
+#endif
             atomic_fetch_add_explicit(&st_wx_clears, 1, memory_order_relaxed);
             mem_changed(mem);
             // Order the bump before the caller's store: a compiling thread
@@ -1451,11 +2210,38 @@ int mmu_mark_code_page(struct mmu *mmu, page_t page) {
     struct pt_entry *entry = mem_pt(mem, page);
     if (entry == NULL)
         return -1;
+#ifdef FASTMEM
+    // read-only in the window first: once P_CODE is there, every store to
+    // the page must come through mem_ptr
+    if (entry->data->window && !(entry->flags & (P_CODE | P_LAZY)))
+        px_fm_protect((char *) entry->data->data + entry->offset, PAGE_SIZE,
+                      fm_prot(entry->flags | P_CODE));
+#endif
     unsigned old = __atomic_fetch_or(&entry->flags, P_CODE, __ATOMIC_ACQ_REL);
     if (old & P_CODE)
         return 0;
     mem_changed(mem);
     return 1;
+}
+
+__thread int mem_no_fill;
+
+void mmu_fill_lazy(struct mmu *mmu, addr_t addr) {
+#ifdef FASTMEM
+    struct mem *mem = container_of(mmu, struct mem, mmu);
+    for (page_t page = PAGE(addr); page <= PAGE(addr) + 1; page++) {
+        struct pt_entry *entry = mem_pt(mem, page);
+        if (entry == NULL || !(entry->flags & P_LAZY))
+            continue;
+        read_wrunlock(&mem->lock);
+        write_wrlock(&mem->lock);
+        fm_fill(mem, page);
+        write_wrunlock(&mem->lock);
+        read_wrlock(&mem->lock);
+    }
+#else
+    (void) mmu; (void) addr;
+#endif
 }
 
 // Whether the P_CODE mark placed by mmu_mark_code_page is still there. A

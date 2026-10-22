@@ -711,6 +711,7 @@ void xjit_block(struct fiber_block *block) {
     block->xjit_data = NULL;
     block->xjit_entry = 0;
     block->xjit_link[0] = block->xjit_link[1] = NULL;
+    block->xjit_faults = NULL;
 #ifdef GUEST_X86_64
     block->xjit_stub = NULL;
     block->xjit_counter = NULL;
@@ -818,6 +819,9 @@ static void xjit_splice(struct fiber_block *block) {
 }
 
 void xjit_block_free(struct fiber_block *block) {
+#ifdef GUEST_X86_64
+    fm_forget(block);
+#endif
     if (block->xjit_code != NULL)
         code_free(block->xjit_code);
 #ifdef GUEST_X86_64

@@ -369,6 +369,15 @@ int realfs_poll(struct fd *fd) {
 }
 
 int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off_t offset, int prot, int flags) {
+#ifdef FASTMEM
+    // A private mapping is a copy in the guest window, where translated code
+    // reaches it without a check, read in as it is used.
+    if (!(flags & MMAP_SHARED)) {
+        int err = pt_map_window(mem, start, pages, prot, fd, offset);
+        if (err <= 0)
+            return err;
+    }
+#endif
     int mmap_flags = 0;
     if (flags & MMAP_PRIVATE) mmap_flags |= MAP_PRIVATE;
     if (flags & MMAP_SHARED) mmap_flags |= MAP_SHARED;

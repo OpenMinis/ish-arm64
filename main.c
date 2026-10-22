@@ -403,11 +403,18 @@ void state_dump_init(void); // kernel/state_dump.c
 
 int main(int argc, char *const argv[]) {
 #ifdef _WIN32
+    px_boot_mark("main");
     // The guest snapshot Minis asks for when a command looks stuck
     // (ISH_STATE_DIR; nothing at all without it).
     state_dump_init();
 #endif
     ish_signpost_init();
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    // VMs where the machine can: the VM gets made while ish starts
+    // (asbestos/guest-x86_64/vm.c)
+    extern void vm_prepare(void);
+    vm_prepare();
+#endif
     atexit(dump_pc_hist);
     { extern void dump_wx_stats(void); atexit(dump_wx_stats); }
     // Write watchpoint (diagnostic): ISH_WATCH_PAGE=<hex page addr> arms the

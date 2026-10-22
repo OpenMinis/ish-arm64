@@ -120,6 +120,9 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     int err = mount_root(fs, root_realpath);
     if (err < 0)
         return err;
+#ifdef _WIN32
+    px_boot_mark("root mounted");
+#endif
 
     become_first_process();
     current->thread = pthread_self();
@@ -299,7 +302,13 @@ do_exec:
         err = do_execve(argv[optind], exec_argc, argv_copy, envp_buf);
     }
 #else
+#ifdef _WIN32
+    px_boot_mark("execve");
+#endif
     err = do_execve(argv[optind], exec_argc, argv_copy, envp == NULL ? "\0" : envp);
+#ifdef _WIN32
+    px_boot_mark("execve done");
+#endif
 #endif
     free(argv_copy); // do_execve copied it into the guest
     if (err < 0)

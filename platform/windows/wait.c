@@ -159,7 +159,10 @@ int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms) {
     return res;
 }
 
+void (*px_about_to_block)(void);
+
 static int sleep_ns(int64_t ns, struct timespec *rem) {
+    px_blocking();
     struct px_thread *t = self();
     if (px_interrupted())
         return px_fail(EINTR);
@@ -219,6 +222,7 @@ void px_wake_free(void *w) {
 }
 
 int px_wake_wait(void *w, int timeout_ms) {
+    px_blocking();
     struct px_thread *t = self();
     if (px_interrupted())
         return px_fail(EINTR);

@@ -488,6 +488,9 @@ noreturn void do_exit_group(int status) {
 
 // always called from init process
 static void halt_system(int status) {
+#ifdef _WIN32
+    px_boot_mark("halt");
+#endif
     int max_iterations = 10; // Timeout: wait maximum 10 seconds
     for (int state = 0; state < 3; state++) {
         int tasks_found = 0;
@@ -531,6 +534,9 @@ static void halt_system(int status) {
         mount_remove(mount);
     }
     unlock(&mounts_lock);
+#ifdef _WIN32
+    px_boot_mark("unmounted");
+#endif
 
     // Restore host terminal settings before exiting.
     // _exit() does not call atexit handlers, so we must do this explicitly.
@@ -544,12 +550,33 @@ static void halt_system(int status) {
     extern void xjit_dump_stats(void);
     xjit_dump_stats();
 #endif
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    extern void vm_dump_stats(void);
+    vm_dump_stats();
+#endif
+    if (getenv("ISH_XJIT_STATS") != NULL) {
+        uint64_t dc[2], pc[6];
+        dentry_cache_stats(dc);
+        path_cache_stats(pc);
+        fprintf(stderr, "[path] components: %llu hits, %llu misses; whole paths: %llu hits, %llu misses\n",
+                (unsigned long long) dc[0], (unsigned long long) dc[1], (unsigned long long) pc[0],
+                (unsigned long long) (pc[1] + pc[2] + pc[3] + pc[4]));
+        extern void meta_cache_stats(uint64_t out[4]);
+        uint64_t mc[4];
+        meta_cache_stats(mc);
+        fprintf(stderr, "[meta] %llu hits, %llu misses; %llu writes, made stale %llu times by others\n",
+                (unsigned long long) mc[0], (unsigned long long) mc[1], (unsigned long long) mc[2],
+                (unsigned long long) mc[3]);
+    }
 
     // Force exit the entire host process. Orphaned guest threads
     // (stuck in JIT loops after do_exit_group force cleanup) keep
     // the host process alive indefinitely. _exit is safe here since
     // init dying means we're shutting down completely. Report init's status
     // the way exit_hook would have (it never runs for init: we don't return).
+#ifdef _WIN32
+    px_boot_mark("exit");
+#endif
     if (status & 0xff)
         _exit(128 + (status & 0xff));
     _exit((status >> 8) & 0xff);

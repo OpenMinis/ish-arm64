@@ -96,6 +96,7 @@ if host_windows
             'platform/windows/wait.c',
             'platform/windows/mman.c',
             'platform/windows/misc.c',
+            'platform/windows/whp.c',
         ],
         c_args: ['-DPX_IMPL', '-D_WIN32_WINNT=0x0A00', '-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX', '-DUNICODE', '-D_UNICODE'],
         dependencies: threads)

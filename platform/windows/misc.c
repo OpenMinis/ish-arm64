@@ -452,6 +452,20 @@ void px_mem_info(uint64_t *total, uint64_t *avail) {
     *avail = ms.ullAvailPhys;
 }
 
+void px_boot_mark(const char *what) {
+    static int on = -1;
+    if (on < 0)
+        on = getenv("ISH_BOOT_TRACE") != NULL;
+    if (!on)
+        return;
+    FILETIME made, e, k, u, now;
+    GetProcessTimes(GetCurrentProcess(), &made, &e, &k, &u);
+    GetSystemTimePreciseAsFileTime(&now);
+    uint64_t a = ((uint64_t) made.dwHighDateTime << 32) | made.dwLowDateTime;
+    uint64_t b = ((uint64_t) now.dwHighDateTime << 32) | now.dwLowDateTime;
+    fprintf(stderr, "[boot] %-24s %7.2f ms\n", what, (b - a) / 1e4);
+}
+
 uint64_t px_uptime_ms(void) {
     return GetTickCount64();
 }

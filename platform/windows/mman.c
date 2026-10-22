@@ -9,6 +9,7 @@
 // a file mapped MAP_FIXED over memory already reserved.
 #include "px_impl.h"
 #include <winioctl.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -357,6 +358,179 @@ bool px_jit_commit(void *addr, size_t len, bool exec) {
 
 void px_jit_release(void *addr) {
     VirtualFree(addr, 0, MEM_RELEASE);
+}
+
+// ---- the guest window (kernel/memory.c, FASTMEM): the low 4 GB of a guest
+// address space at a fixed place in the host's, reserved with a guard on each
+// side so that an access a little outside it faults too. Translated code
+// reaches guest memory there with no check; what isn't committed, or is
+// protected, faults, and the fault goes to that access's checked path.
+// Write-watched: a fork copies only the pages written since they were
+// committed or filled (px_fm_written).
+// Windows given back, emptied, for the next ones: a hypervisor VM that had
+// one mapped keeps it so (whp.c), which spares mapping it again.
+#define FM_POOL 64
+static struct { char *base; size_t len, guard; } fm_pool[FM_POOL];
+static int fm_pooled;
+static SRWLOCK fm_pool_lock = SRWLOCK_INIT;
+
+void *px_fm_reserve(size_t len, size_t guard) {
+    char *p = NULL;
+    AcquireSRWLockExclusive(&fm_pool_lock);
+    for (int i = fm_pooled - 1; i >= 0 && p == NULL; i--) {
+        if (fm_pool[i].len == len && fm_pool[i].guard == guard) {
+            p = fm_pool[i].base;
+            fm_pool[i] = fm_pool[--fm_pooled];
+        }
+    }
+    ReleaseSRWLockExclusive(&fm_pool_lock);
+    if (p != NULL)
+        return p;
+    p = VirtualAlloc(NULL, len + 2 * guard, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
+    return p != NULL ? p + guard : NULL;
+}
+
+// Which of the n pages from addr were written since their last reset: a bit
+// each in written (n bits). -1 if Windows can't say.
+int px_fm_written(void *addr, size_t n, uint64_t *written) {
+    memset(written, 0, (n + 63) / 64 * 8);
+    PVOID *pages = malloc(n * sizeof(*pages));
+    if (pages == NULL)
+        return -1;
+    ULONG_PTR count = n;
+    DWORD gran;
+    if (GetWriteWatch(0, addr, n * 4096, pages, &count, &gran) != 0) {
+        free(pages);
+        return -1;
+    }
+    for (ULONG_PTR i = 0; i < count; i++) {
+        size_t k = (size_t) ((char *) pages[i] - (char *) addr) / 4096;
+        if (k < n)
+            written[k / 64] |= 1ull << (k % 64);
+    }
+    free(pages);
+    return 0;
+}
+
+void px_fm_unwritten(void *addr, size_t len) {
+    ResetWriteWatch(addr, len);
+}
+
+void px_fm_release(void *base, size_t len, size_t guard) {
+    char *start = (char *) base - guard;
+    VirtualFree(start, len + 2 * guard, MEM_DECOMMIT);
+    ResetWriteWatch(start, len + 2 * guard);
+    AcquireSRWLockExclusive(&fm_pool_lock);
+    bool kept = fm_pooled < FM_POOL;
+    if (kept)
+        fm_pool[fm_pooled++] = (typeof(fm_pool[0])) {base, len, guard};
+    ReleaseSRWLockExclusive(&fm_pool_lock);
+    if (!kept) {
+        px_vm_forget(base);
+        VirtualFree(start, 0, MEM_RELEASE);
+    }
+}
+
+// Fresh zero pages (prot 0: none, they stay reserved).
+int px_fm_commit_unfilled(void *addr, size_t len, int prot) {
+    VirtualFree(addr, len, MEM_DECOMMIT);
+    if (prot != 0 && !VirtualAlloc(addr, len, MEM_COMMIT, page_prot(prot, false)))
+        return px_fail_win();
+    return 0;
+}
+int px_fm_commit(void *addr, size_t len, int prot) {
+    if (px_fm_commit_unfilled(addr, len, prot) < 0)
+        return -1;
+    if (prot != 0)
+        px_vm_populate(addr, len, prot & PX_PROT_WRITE);
+    return 0;
+}
+
+void px_fm_decommit(void *addr, size_t len) {
+    VirtualFree(addr, len, MEM_DECOMMIT);
+}
+
+// Protection of committed pages; reserved ones are committed (zero) unless
+// prot is 0.
+int px_fm_protect(void *addr, size_t len, int prot) {
+    char *p = addr, *end = p + len;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+            return px_fail_win();
+        char *region_end = (char *) mbi.BaseAddress + mbi.RegionSize;
+        size_t n = (region_end < end ? region_end : end) - p;
+        if (mbi.State == MEM_COMMIT) {
+            DWORD old;
+            if (!VirtualProtect(p, n, page_prot(prot, false), &old))
+                return px_fail_win();
+        } else if (prot != 0 && !VirtualAlloc(p, n, MEM_COMMIT, page_prot(prot, false))) {
+            return px_fail_win();
+        }
+        p += n;
+    }
+    if (prot != 0)
+        px_vm_populate(addr, len, prot & PX_PROT_WRITE);
+    return 0;
+}
+
+// Which of the n pages from addr are in this process's working set (touched,
+// and still there): a bit each in res. -1 if Windows can't say.
+int px_fm_resident(void *addr, size_t n, uint64_t *res) {
+    memset(res, 0, (n + 63) / 64 * 8);
+    PSAPI_WORKING_SET_EX_INFORMATION *ws = malloc(n * sizeof(*ws));
+    if (ws == NULL)
+        return -1;
+    for (size_t i = 0; i < n; i++)
+        ws[i].VirtualAddress = (char *) addr + i * 4096;
+    if (!QueryWorkingSetEx(GetCurrentProcess(), ws, (DWORD) (n * sizeof(*ws)))) {
+        free(ws);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++)
+        if (ws[i].VirtualAttributes.Valid)
+            res[i / 64] |= 1ull << (i % 64);
+    free(ws);
+    return 0;
+}
+
+// A view of a file that can't have been written: its pages are the file's.
+bool px_fm_file_view(void *addr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.Type == MEM_MAPPED &&
+        (mbi.AllocationProtect == PAGE_READONLY || mbi.AllocationProtect == PAGE_EXECUTE_READ);
+}
+
+bool px_fm_committed(void *addr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT;
+}
+
+bool px_fm_committed_until(void *addr, char **end) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(addr, &mbi, sizeof(mbi))) {
+        *end = (char *) addr + 4096;
+        return false;
+    }
+    *end = (char *) mbi.BaseAddress + mbi.RegionSize;
+    return mbi.State == MEM_COMMIT;
+}
+
+static uintptr_t (*fault_redirect)(uintptr_t pc, uintptr_t r11);
+static LONG CALLBACK fault_redirect_veh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || fault_redirect == NULL)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t to = fault_redirect((uintptr_t) ep->ContextRecord->Rip, (uintptr_t) ep->ContextRecord->R11);
+    if (to == 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+    ep->ContextRecord->Rip = to;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void px_fault_redirect(uintptr_t (*fn)(uintptr_t pc, uintptr_t r11)) {
+    if (fault_redirect == NULL)
+        AddVectoredExceptionHandler(1, fault_redirect_veh);
+    fault_redirect = fn;
 }
 
 // ---- the translation cache's file (asbestos/guest-x86_64/xlat.c)

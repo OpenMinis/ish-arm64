@@ -265,7 +265,16 @@ struct mm *mm_copy(struct mm *mm) {
     mem_init(&new_mm->mem);
     fd_retain(new_mm->exefile);
     write_wrlock(&mm->mem.lock);
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    // the parent's threads in a hypervisor VM don't hold the lock: they stop
+    // too, for the child to get the memory of one moment
+    extern void vm_hold(struct mmu *mmu, bool hold);   // asbestos/guest-x86_64/vm.c
+    vm_hold(&mm->mem.mmu, true);
+#endif
     pt_copy_on_write(&mm->mem, &new_mm->mem, 0, MEM_PAGES);
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    vm_hold(&mm->mem.mmu, false);
+#endif
     write_wrunlock(&mm->mem.lock);
     return new_mm;
 }
@@ -509,9 +518,17 @@ addr_t sys_mmap(addr_t args_addr) {
 // Diagnostic (ISH_VMA_TRACE=1): log munmap/madvise/mprotect that touch a
 // file-backed mapping. Used to track how guest runtimes reclaim file-backed
 // regions (e.g. bun MADV_DONTNEED'ing its embedded bytecode cache).
+// the tracing switches, looked up once: getenv is slow on Windows, and these
+// are asked on every munmap, mprotect and madvise
+static bool trace_env(const char *name, int *cached) {
+    if (*cached < 0)
+        *cached = getenv(name) != NULL;
+    return *cached;
+}
+static int vma_trace_on = -1, prot_trace_on = -1;
+
 static int vma_trace_hits_file(addr_t addr, addr_t len) {
-    extern char *getenv(const char *);
-    if (!getenv("ISH_VMA_TRACE")) return 0;
+    if (!trace_env("ISH_VMA_TRACE", &vma_trace_on)) return 0;
     addr_t end = addr + len;
     int found = 0;
     read_wrlock(&current->mem->lock);
@@ -530,7 +547,7 @@ int_t sys_munmap(addr_t addr, addr_t len) {
     if (vma_trace_hits_file(addr, len))
         fprintf(stderr, "[vma] munmap(0x%llx, 0x%llx) [file-backed] pid=%d\n",
                 (unsigned long long)addr, (unsigned long long)len, current->pid);
-    if (getenv("ISH_PROT_TRACE")) {
+    if (trace_env("ISH_PROT_TRACE", &prot_trace_on)) {
         addr_t end = addr + len;
         if (end > 0xed000000ULL && addr < 0xf0000000ULL) {
             fprintf(stderr, "[PROT_TRACE] munmap(0x%llx, 0x%llx)\n",
@@ -599,7 +616,7 @@ addr_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags) 
 
 int_t sys_mprotect(addr_t addr, addr_t len, int_t prot) {
     STRACE("mprotect(0x%llx, 0x%llx, 0x%x)", (unsigned long long)addr, (unsigned long long)len, prot);
-    if (getenv("ISH_PROT_TRACE")) {
+    if (trace_env("ISH_PROT_TRACE", &prot_trace_on)) {
         // Trace mprotect that touches the node binary range (V8 codespace candidate).
         addr_t end = addr + len;
         if (end > 0xed000000ULL && addr < 0xf0000000ULL) {

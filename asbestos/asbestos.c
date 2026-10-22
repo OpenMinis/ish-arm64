@@ -393,7 +393,14 @@ struct asbestos *asbestos_new(struct mmu *mmu) {
     return asbestos;
 }
 
+#if defined(_WIN32) && defined(GUEST_X86_64)
+static void vm_mmu_gone(struct mmu *mmu);   // guest-x86_64/vm.c
+#endif
+
 void asbestos_free(struct asbestos *asbestos) {
+#if defined(_WIN32) && defined(GUEST_X86_64)
+    vm_mmu_gone(asbestos->mmu);
+#endif
     for (size_t i = 0; i < asbestos->hash_size; i++) {
         struct fiber_block *block, *tmp;
         if (list_null(&asbestos->hash[i]))
@@ -612,7 +619,21 @@ static void fiber_block_promote(struct fiber_block *block, struct tlb *tlb) {
 }
 #endif
 
+static struct fiber_block *fiber_block_compile_locked(addr_t ip, struct tlb *tlb);
+// Compiling reads the guest's code under the compiler's lock: no reading in
+// of window pages there (mmu_fill_lazy() did the block's own beforehand).
 static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
+#ifdef FASTMEM
+    mem_no_fill++;
+#endif
+    struct fiber_block *block = fiber_block_compile_locked(ip, tlb);
+#ifdef FASTMEM
+    mem_no_fill--;
+#endif
+    return block;
+}
+
+static struct fiber_block *fiber_block_compile_locked(addr_t ip, struct tlb *tlb) {
     ISH_SIGNPOST_SCOPE_BEGIN(jit, "block_compile", _bc_spid);
     struct gen_state state;
     TRACE("%d %08x --- compiling:\n", current_pid(), ip);
@@ -1042,6 +1063,9 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
             block = cache[cache_index];
             if (no_block_cache >= 2 ||
                     (no_jit_reuse && ip >= 0xc0000000ULL && ip < 0xe0000000ULL)) {
+#ifdef FASTMEM
+                mmu_fill_lazy(asbestos->mmu, ip);
+#endif
                 lock(&asbestos->lock);
                 block = fiber_block_compile(ip, tlb);
                 if (block == NULL) {
@@ -1059,6 +1083,9 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 extern _Atomic uint64_t st_block_cache_miss, st_block_compile;
                 if (stage_trace_on())
                     atomic_fetch_add_explicit(&st_block_cache_miss, 1, memory_order_relaxed);
+#ifdef FASTMEM
+                mmu_fill_lazy(asbestos->mmu, ip);
+#endif
                 lock(&asbestos->lock);
                 block = fiber_lookup(asbestos, ip);
                 if (block == NULL) {
@@ -1245,6 +1272,9 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
 
         if (interrupt == INT_NONE && __atomic_exchange_n(frame->cpu.poked_ptr, false, __ATOMIC_ACQUIRE)) {
             interrupt = INT_TIMER;
+#if defined(ISH_XJIT) && defined(GUEST_X86_64)
+            xjit_poked(asbestos);
+#endif
             {
                 extern int stage_trace_on(void);
                 extern _Atomic uint64_t st_int_poke, st_int_poke_foreign;
@@ -1257,6 +1287,9 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         }
         if (interrupt == INT_NONE && (++frame->cpu.cycle & ((1 << 10) - 1)) == 0) {
             interrupt = INT_TIMER;
+#if defined(ISH_XJIT) && defined(GUEST_X86_64)
+            xjit_tick(asbestos);
+#endif
             {
                 extern int stage_trace_on(void);
                 extern _Atomic uint64_t st_int_cycle;
@@ -1474,6 +1507,11 @@ static int x64_trace_steps(struct cpu_state *cpu, struct tlb *tlb, FILE *f) {
 }
 #endif
 
+#if defined(_WIN32) && defined(GUEST_X86_64)
+#include "asbestos/guest-x86_64/vm.c"
+#define VM_BACKEND 1
+#endif
+
 int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     ish_thread_marker = 1;
     if (cpu->poked_ptr == NULL)
@@ -1489,12 +1527,21 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
 #endif
     struct asbestos *asbestos = cpu->mmu->asbestos;
     __atomic_add_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
-    tlb_refresh(tlb, cpu->mmu);
 #ifdef GUEST_X86_64
     FILE *trace = x64_trace_file();
-    int interrupt = trace != NULL && x64_trace_armed ? x64_trace_steps(cpu, tlb, trace) :
-        (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
+    int interrupt;
+#ifdef VM_BACKEND
+    if (vm_ready(cpu)) {
+        interrupt = vm_run(cpu);   // no TLB in a VM
+    } else
+#endif
+    {
+        tlb_refresh(tlb, cpu->mmu);
+        interrupt = trace != NULL && x64_trace_armed ? x64_trace_steps(cpu, tlb, trace) :
+            (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
+    }
 #else
+    tlb_refresh(tlb, cpu->mmu);
     int interrupt = (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
 #endif
     cpu->trapno = interrupt;
@@ -1531,4 +1578,7 @@ void cpu_poke(struct cpu_state *cpu) {
             atomic_fetch_add_explicit(&st_poke_calls, 1, memory_order_relaxed);
     }
     __atomic_store_n(cpu->poked_ptr, true, __ATOMIC_SEQ_CST);
+#ifdef VM_BACKEND
+    vm_poke(cpu);
+#endif
 }

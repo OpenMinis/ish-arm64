@@ -263,6 +263,10 @@ void task_run_current() {
             if (spins < 100) sched_yield(); else nanosleep(&ts, NULL);
         }
 #endif
+#ifdef FASTMEM
+        if (self->mem->mmu.fm_want && self->mem->mmu.fm_base == NULL)
+            mem_window_migrate(self->mem);
+#endif
         read_wrlock(&self->mem->lock);
 #ifdef GUEST_64BIT
         tlb_attach(tlb, &self->mem->mmu);

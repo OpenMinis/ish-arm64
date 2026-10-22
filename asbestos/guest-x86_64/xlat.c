@@ -20,6 +20,7 @@
 // generic instructions), ISH_XLAT_NTH=lo[:hi] (only those of them, in
 // translation order; one prints it), ISH_XLAT_NOSUCC, ISH_XLAT_NOLINK.
 
+#include <limits.h>
 #include <stddef.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -1325,6 +1326,15 @@ static int32_t slot_off(int g) {
     return CPU_OFF(regs) + 8 * g;
 }
 
+// Guest r8-r15 a block uses a lot live in host registers while it runs:
+// those of guest registers the block doesn't touch, whose values wait in
+// their own slots meanwhile (promotion, see choose_promotions()). The host
+// register of guest register gr in the block being translated, or -1.
+static __thread int8_t xpromo[16];   // the host register + 1, 0: none
+static int promo_host(int gr) {
+    return gr >= 8 && gr < 16 ? xpromo[gr] - 1 : -1;
+}
+
 // Maps guest register gr (an operand at 8 bits if byte) to the host.
 static void map_reg(const struct gi *g, int gr, bool byte, struct hop *h, struct plan *p,
                     const int *scratch, unsigned *nscratch, int *scratch_for) {
@@ -1386,7 +1396,29 @@ struct xctx {
     struct { unsigned slot; uint32_t field; } links[2];
     unsigned nlinks;
     unsigned ndata;   // words of data (guesses), in the data region
+    bool fm;          // the guest window: accesses go there with no check (FASTMEM)
+    bool r9_fm;       // r9 holds the window's base here (FASTMEM)
+    uint64_t fm_base; // the window's base: fixed for the address space once it has one
+    // promoted registers (choose_promotions()): guest gr[k] in host h[k]
+    unsigned npromo;
+    int8_t pgr[7], ph[7];
 };
+
+// Promoted registers in (at a run's start) or out (before anything that
+// leaves the native code or needs the guest's registers where they belong).
+// Moves only: the flags and every other register stay.
+static void e_promo_swap(struct xctx *x, bool in) {
+    for (unsigned k = 0; k < x->npromo; k++) {
+        int gr = x->pgr[k], h = x->ph[k];
+        if (in) {
+            e_mov_store(x->a, XMEM(H_CPU, slot_off(h)), h);
+            e_mov_load(x->a, h, XMEM(H_CPU, slot_off(gr)));
+        } else {
+            e_mov_store(x->a, XMEM(H_CPU, slot_off(gr)), h);
+            e_mov_load(x->a, h, XMEM(H_CPU, slot_off(h)));
+        }
+    }
+}
 
 static void sync_dirty(struct xctx *x) {
     e_sync_flags(x->a, x->dirty, x->valid);
@@ -1437,6 +1469,7 @@ static void e_exit_slot(struct xctx *x, unsigned s) {
 // is finite.
 static void e_exit_chain(struct xctx *x, unsigned s, uint16_t live, bool poke) {
     struct xasm *a = x->a;
+    e_promo_swap(x, false);
     e_sync_flags(a, x->dirty & live, x->valid);
     unsigned l_stub = new_label(a);
     // an interrupt pending: leave through the gadgets, which see to it
@@ -1554,7 +1587,9 @@ static void e_addr(struct xctx *x, const struct gi *g, int dst, bool seg) {
     } else {
         int base = -1, index = -1;
         if (g->base >= 0) {
-            if (g->base >= 8) {
+            if (promo_host(g->base) >= 0) {
+                base = promo_host(g->base);
+            } else if (g->base >= 8) {
                 e_mov_load(a, R14, XMEM(H_CPU, slot_off(g->base)));
                 base = R14;
             } else {
@@ -1562,7 +1597,9 @@ static void e_addr(struct xctx *x, const struct gi *g, int dst, bool seg) {
             }
         }
         if (g->index >= 0) {
-            if (g->index >= 8) {
+            if (promo_host(g->index) >= 0) {
+                index = promo_host(g->index);
+            } else if (g->index >= 8) {
                 e_mov_load(a, R15, XMEM(H_CPU, slot_off(g->index)));
                 index = R15;
             } else {
@@ -1602,6 +1639,220 @@ static void e_tlb_index(struct xasm *a) {
     e_rex(a, true, R15, -1, R14, false); b1(a, 0x31); b1(a, modrm_b(3, R15, R14));  // xor %r15, %r14
     e_rex(a, false, -1, -1, R14, false); b1(a, 0x81); b1(a, modrm_b(3, 4, R14));
     b4(a, ((1u << TLB_BITS) - 1) << 5);
+}
+
+// ---------------------------------------------------------------- the window
+
+// FASTMEM (kernel/memory.c): the guest's low 4 GB are at mmu->fm_base, where
+// what isn't the guest's memory faults. An access goes there after a test
+// that its address is under 4 GB; when it faults, the handler resumes at its
+// checked path (the TLB lookup, then the miss path for what the guest gets:
+// a signal, a copy on write, the stack growing). Each access's host code is
+// registered with where its fault goes, by 64-byte bucket of the code.
+static bool fm_xlat;
+static _Atomic uint64_t st_fm_faults;
+struct fm_fault {
+    uintptr_t lo, hi, to;
+    uint64_t gip;            // the guest instruction
+    _Atomic unsigned hits;
+    unsigned bucket;
+    struct fm_fault *next;
+};
+struct fm_block {
+    unsigned n;
+    struct fm_fault *f[];
+};
+#define FM_BUCKETS (1u << 16)
+static struct fm_fault *fm_table[FM_BUCKETS];
+static pthread_mutex_t fm_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread struct { unsigned lo, hi, to; uint64_t gip; } *fm_pending;
+
+// An access whose memory isn't in the window (a shared mapping, say) faults
+// every time, a few microseconds each. After FM_DEMOTE of them its guest
+// instruction goes on the slow list, its thread is poked, and the run loop
+// (xjit_poked()) invalidates its page: translated again, it is checked the
+// usual way. Guest addresses of any process: one that shares the address
+// only gets the checked access, which is what everything had before.
+static unsigned fm_demote = 64;   // ISH_FM_DEMOTE (0: never)
+#define FM_SLOW_SIZE 4096
+static _Atomic uint64_t fm_slow[FM_SLOW_SIZE];
+static _Atomic unsigned fm_nslow;
+static uint64_t fm_queue[64];
+static unsigned fm_nqueue;
+static _Atomic uint64_t st_fm_demoted;
+
+static unsigned fm_slot(uint64_t gip) {
+    return (unsigned) ((gip * 0x9e3779b97f4a7c15ull) >> 52) & (FM_SLOW_SIZE - 1);
+}
+
+static bool fm_is_slow(uint64_t gip) {
+    if (atomic_load_explicit(&fm_nslow, memory_order_relaxed) == 0)
+        return false;
+    for (unsigned k = fm_slot(gip), n = 0; n < FM_SLOW_SIZE; k = (k + 1) & (FM_SLOW_SIZE - 1), n++) {
+        uint64_t v = atomic_load_explicit(&fm_slow[k], memory_order_acquire);
+        if (v == gip)
+            return true;
+        if (v == 0)
+            return false;
+    }
+    return false;
+}
+
+// under fm_lock
+static void fm_add_slow(uint64_t gip) {
+    if (fm_is_slow(gip) || fm_nslow >= FM_SLOW_SIZE / 2)
+        return;
+    unsigned k = fm_slot(gip);
+    while (atomic_load_explicit(&fm_slow[k], memory_order_relaxed) != 0)
+        k = (k + 1) & (FM_SLOW_SIZE - 1);
+    atomic_store_explicit(&fm_slow[k], gip, memory_order_release);
+    atomic_fetch_add(&fm_nslow, 1);
+}
+
+// FASTMEM adaptive: an address space that keeps running gets the window
+// (kernel/memory.c mem_window_migrate(), from task_run_current()). 2048 ticks
+// of the run loop: a process that ran that long is likely to run on.
+static unsigned fm_ticks = 2048;   // ISH_FASTMEM_TICKS
+void xjit_tick(struct asbestos *asbestos) {
+    struct mmu *mmu = asbestos->mmu;
+    if (fm_xlat && mmu->fm_base == NULL && !mmu->fm_want && mmu->fm_ticks != UINT_MAX &&
+            ++mmu->fm_ticks >= fm_ticks)
+        mmu->fm_want = true;
+}
+
+// The run loop, after its thread was poked: the pages to translate again.
+void xjit_poked(struct asbestos *asbestos) {
+    if (!fm_xlat || fm_nqueue == 0)
+        return;
+    uint64_t gips[64];
+    unsigned n;
+    pthread_mutex_lock(&fm_lock);
+    n = fm_nqueue;
+    memcpy(gips, fm_queue, n * sizeof(gips[0]));
+    for (unsigned i = 0; i < n; i++)
+        fm_add_slow(gips[i]);
+    fm_nqueue = 0;
+    pthread_mutex_unlock(&fm_lock);
+    for (unsigned i = 0; i < n; i++)
+        asbestos_invalidate_page(asbestos, PAGE(gips[i]));
+    atomic_fetch_add_explicit(&st_fm_demoted, n, memory_order_relaxed);
+}
+static __thread unsigned fm_npending, fm_cappending;
+
+
+#ifdef _WIN32
+static unsigned fm_bucket(uintptr_t pc) {
+    return (unsigned) (pc >> 6) & (FM_BUCKETS - 1);
+}
+
+static uintptr_t fm_redirect(uintptr_t pc, uintptr_t r11) {
+    uintptr_t to = 0;
+    bool poke = false;
+    pthread_mutex_lock(&fm_lock);
+    for (struct fm_fault *f = fm_table[fm_bucket(pc)]; f != NULL; f = f->next) {
+        if (pc >= f->lo && pc < f->hi) {
+            to = f->to;
+            unsigned hits = atomic_fetch_add_explicit(&f->hits, 1, memory_order_relaxed) + 1;
+            if (fm_demote != 0 && (hits == fm_demote || hits % 4096 == 0) && fm_nqueue < array_size(fm_queue)) {
+                fm_queue[fm_nqueue++] = f->gip;
+                poke = true;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&fm_lock);
+    if (poke && r11 != 0) {
+        struct cpu_state *cpu = (struct cpu_state *) r11;   // H_CPU
+        if (cpu->poked_ptr != NULL)
+            __atomic_store_n(cpu->poked_ptr, true, __ATOMIC_SEQ_CST);
+    }
+    if (to != 0)
+        atomic_fetch_add_explicit(&st_fm_faults, 1, memory_order_relaxed);
+    return to;
+}
+#endif
+
+// An access of the block being translated: a fault in [lo, hi) goes to to
+// (labels, placed when the block is).
+static void fm_note(struct xasm *a, unsigned lo, unsigned hi, unsigned to, uint64_t gip) {
+    if (fm_npending == fm_cappending) {
+        unsigned cap = fm_cappending ? fm_cappending * 2 : 256;
+        void *bigger = realloc(fm_pending, cap * sizeof(*fm_pending));
+        if (bigger == NULL) {
+            a->overflow = true;   // it couldn't be registered: no translation
+            return;
+        }
+        fm_pending = bigger;
+        fm_cappending = cap;
+    }
+    fm_pending[fm_npending].lo = lo;
+    fm_pending[fm_npending].hi = hi;
+    fm_pending[fm_npending].to = to;
+    fm_pending[fm_npending].gip = gip;
+    fm_npending++;
+}
+
+// The block's code is in place: register its accesses, one node for each
+// bucket a range touches.
+static bool fm_register(struct xasm *a, struct fiber_block *block, uint8_t *const sec_base[2]) {
+    if (fm_npending == 0)
+        return true;
+    unsigned n = 0;
+    uintptr_t (*r)[4] = malloc(fm_npending * sizeof(*r));
+    if (r == NULL)
+        return false;
+    for (unsigned i = 0; i < fm_npending; i++) {
+        const struct xlabel *lo = &a->lab[fm_pending[i].lo], *hi = &a->lab[fm_pending[i].hi],
+                            *to = &a->lab[fm_pending[i].to];
+        r[i][0] = (uintptr_t) (sec_base[lo->sec] + lo->off);
+        r[i][1] = (uintptr_t) (sec_base[hi->sec] + hi->off);
+        r[i][2] = (uintptr_t) (sec_base[to->sec] + to->off);
+        r[i][3] = (uintptr_t) fm_pending[i].gip;
+        n += (unsigned) (((r[i][1] - 1) >> 6) - (r[i][0] >> 6) + 1);
+    }
+    struct fm_block *fb = malloc(sizeof(*fb) + n * sizeof(fb->f[0]));
+    if (fb == NULL) {
+        free(r);
+        return false;
+    }
+    fb->n = 0;
+    for (unsigned i = 0; i < fm_npending; i++) {
+        for (uintptr_t b = r[i][0] >> 6; b <= (r[i][1] - 1) >> 6; b++) {
+            struct fm_fault *f = malloc(sizeof(*f));
+            if (f == NULL)
+                continue;
+            *f = (struct fm_fault) {r[i][0], r[i][1], r[i][2], r[i][3], 0, (unsigned) b & (FM_BUCKETS - 1), NULL};
+            fb->f[fb->n++] = f;
+        }
+    }
+    free(r);
+    pthread_mutex_lock(&fm_lock);
+    for (unsigned i = 0; i < fb->n; i++) {
+        fb->f[i]->next = fm_table[fb->f[i]->bucket];
+        fm_table[fb->f[i]->bucket] = fb->f[i];
+    }
+    pthread_mutex_unlock(&fm_lock);
+    block->xjit_faults = fb;
+    return true;
+}
+
+static void fm_forget(struct fiber_block *block) {
+    struct fm_block *fb = block->xjit_faults;
+    if (fb == NULL)
+        return;
+    pthread_mutex_lock(&fm_lock);
+    for (unsigned i = 0; i < fb->n; i++) {
+        struct fm_fault **pp = &fm_table[fb->f[i]->bucket];
+        while (*pp != NULL && *pp != fb->f[i])
+            pp = &(*pp)->next;
+        if (*pp != NULL)
+            *pp = fb->f[i]->next;
+    }
+    pthread_mutex_unlock(&fm_lock);
+    for (unsigned i = 0; i < fb->n; i++)
+        free(fb->f[i]);
+    free(fb);
+    block->xjit_faults = NULL;
 }
 
 // ---------------------------------------------------------------- bodies
@@ -1724,7 +1975,9 @@ static void e_body(struct xasm *a, const struct body *bd) {
         case K_PUSH: {
             int gr = (g->op & 7) | ((g->rex & 1) ? 8 : 0);
             int h = gr == 4 ? R8 : gr;
-            if (gr >= 8) {
+            if (promo_host(gr) >= 0) {
+                h = promo_host(gr);
+            } else if (gr >= 8) {
                 e_mov_load(a, R15, XMEM(H_CPU, slot_off(gr)));
                 h = R15;
             }
@@ -1741,7 +1994,9 @@ static void e_body(struct xasm *a, const struct body *bd) {
         }
         case K_POP: {
             int gr = (g->op & 7) | ((g->rex & 1) ? 8 : 0);
-            if (gr >= 8) {
+            if (promo_host(gr) >= 0) {
+                e_mov_load(a, promo_host(gr), hmem(NULL));
+            } else if (gr >= 8) {
                 e_mov_load(a, R15, hmem(NULL));
                 e_mov_store(a, XMEM(H_CPU, slot_off(gr)), R15);
             } else {
@@ -1847,9 +2102,18 @@ static void e_range_lookup(struct xasm *a, int lo, int hi, bool write, struct xm
         e_mov_store(a, site_dma, R9);
 }
 
+// (FASTMEM) The operand (%r13,%r9) found the checked way, as an offset from
+// the window's base in r9 instead, which later accesses rely on.
+static void e_fm_rebase(struct xasm *a, uint64_t fm_base) {
+    e_rr(a, true, 0x01, R9, R13);                       // add %r9, %r13
+    e_movabs(a, R9, fm_base);
+    e_rr(a, true, 0x29, R9, R13);                       // sub %r9, %r13
+}
+
 // A group's access after the lead's: the lead checked its page.
 static void e_mem_member(struct xctx *x, const struct body *bd, const struct mgrp *mg, bool load_flags) {
     struct xasm *a = x->a;
+    x->r9_fm = false;
     if (dbg_sitestats) {
         // without touching the flags
         e_mov_load(a, R9, XMEM(H_TLB, TLBREL(xs_member)));
@@ -1877,7 +2141,8 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     const struct gi *dg = bd->g;
     bool ptr = bd->c->kind == K_GENERIC && dg->base != BASE_RIP && dg->base != 4 &&
                (dg->base != 5 || dbg_tlbdirect == 3) && (dg->base >= 0 || dg->index >= 0);
-    bool direct = dbg_tlbdirect == 1 || (dbg_tlbdirect >= 2 && ptr);
+    bool fm = x->fm && mg == NULL && !fm_is_slow(dg->ip);
+    bool direct = !fm && (dbg_tlbdirect == 1 || (dbg_tlbdirect >= 2 && ptr));
     // A group's members load the lead's data_minus_addr from its site; the page
     // goes with it, for a site check that shares the entry (sites wrap).
     int learn = direct ? (mg ? 3 : 0) : 3;
@@ -1904,6 +2169,16 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     }
     if (direct) {
         e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_miss, learn);
+    } else if (fm) {
+        // under 4 GB: the window has it, or faults to l_lookup (fm_note
+        // below). r9 is its base from here on: the checked path leaves the
+        // operand as an offset from it too.
+        e_rr(a, false, 0x89, R13, R15);                 // mov %r13d, %r15d
+        e_rr(a, true, 0x39, R15, R13);                  // cmp %r15, %r13
+        e_jcc_lab(a, 5, l_lookup);                      // jne
+        if (!x->r9_fm)
+            e_movabs(a, R9, x->fm_base);
+        x->r9_fm = true;
     } else {
         if (lo == 0)
             e_rr(a, true, 0x89, R13, R15);
@@ -1920,8 +2195,15 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
         e_restore_flags(a);
     if (load_flags)
         e_call_abs(a, load_flags_stub);
+    unsigned l_body = new_label(a);
+    lbind(a, l_body);
     e_body(a, bd);
     lbind(a, l_after);
+    if (fm)
+        fm_note(a, l_body, l_after, l_lookup, dg->ip);
+    // a checked access (a demoted site's, say) leaves r9 the page's
+    // data_minus_addr, which needn't be the window's base
+    x->r9_fm = fm;
     e_after(a, bd);
 
     // slow paths
@@ -1935,6 +2217,8 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
         e_rm(a, true, 0xff, 0, XMEM(H_TLB, TLBREL(xs_lookup)));
     if (!direct) {
         e_range_lookup(a, lo, hi, gwrite, site_page, site_dma, l_miss, learn);
+        if (fm)
+            e_fm_rebase(a, x->fm_base);
         e_jmp_lab(a, l_back);
     }
 
@@ -1949,12 +2233,20 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
         e_restore_flags(a);
         e_sync_flags(a, sync, x->valid);
     }
+    // the guest's registers where a fault expects them
+    e_promo_swap(x, false);
     // lea orig(%rip), %r9
     b1(a, 0x4c); b1(a, 0x8d); b1(a, 0x0d); rel_lab(a, l_orig);
     e_call_abs(a, write ? (const void *) handle_write_miss : (const void *) handle_read_miss);
+    e_promo_swap(x, true);
     if (mg == NULL) {
         // r13 is the host address now
-        b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
+        if (fm) {
+            e_movabs(a, R9, x->fm_base);
+            e_rr(a, true, 0x29, R9, R13);                               // sub %r9, %r13
+        } else {
+            b1(a, 0x41); b1(a, (uint8_t) (0xb8 + (R9 & 7))); b4(a, 0);  // movl $0, %r9d
+        }
         e_jmp_lab(a, l_back);
     } else {
         // The others need the page too: the address again, and the TLB
@@ -1981,6 +2273,7 @@ static void e_mem_insn(struct xctx *x, const struct body *bd, unsigned size, boo
     if (keep)
         e_restore_flags(a);
     e_sync_flags(a, sync, x->valid);
+    e_promo_swap(x, false);
     e_note_block(x);
     e_movabs_slot(x, H_IP, bd->in->s0 + 1);
     e_jmp_abs(a, (const void *) x->plan[bd->in->s0]);
@@ -2090,8 +2383,8 @@ static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
                     break;
                 }
                 e_addr(x, g, R13, false);
-                if (gr < 8) {
-                    int h = gr == 4 ? R8 : gr;
+                if (gr < 8 || promo_host(gr) >= 0) {
+                    int h = gr == 4 ? R8 : gr < 8 ? gr : promo_host(gr);
                     if (os == 2) b1(a, 0x66);
                     e_rr(a, os == 8, 0x89, R13, h);
                 } else {
@@ -2113,11 +2406,12 @@ static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
                 bool byte = g->map == 0 && g->op >= 0xb0 && g->op <= 0xb7;
                 int h;
                 bool norex = false;
+                bool slot = gr >= 8 && promo_host(gr) < 0;
                 if (byte && !g->rex && gr >= 4)
                     h = gr, norex = true;  // ah..bh
                 else
-                    h = gr == 4 ? R8 : gr >= 8 ? R14 : gr;
-                if (gr >= 8)
+                    h = gr == 4 ? R8 : gr < 8 ? gr : slot ? R14 : promo_host(gr);
+                if (slot)
                     e_mov_load(a, R14, XMEM(H_CPU, slot_off(gr)));
                 if (g->p66) b1(a, 0x66);
                 if (!norex)
@@ -2125,7 +2419,7 @@ static void e_native(struct xctx *x, const struct xinsn *in, const struct gi *g,
                 if (g->map == 1) b1(a, 0x0f);
                 b1(a, (uint8_t) ((g->op & ~7) | (h & 7)));
                 bn(a, &in->bytes[g->immoff], g->immlen);
-                if (gr >= 8)
+                if (slot)
                     e_mov_store(a, XMEM(H_CPU, slot_off(gr)), R14);
                 break;
             }
@@ -2228,6 +2522,14 @@ static void xlat_dump_stats(FILE *out) {
     fprintf(out, "[xlat] tiers: counted=%llu promoted=%llu differs=%llu failed=%llu\n",
             (unsigned long long) st_counted, (unsigned long long) st_promote_ok,
             (unsigned long long) st_promote_differs, (unsigned long long) st_promote_failed);
+    if (fm_xlat) {
+        fprintf(out, "[xlat] window: faults=%llu demoted=%llu\n", (unsigned long long) st_fm_faults,
+                (unsigned long long) st_fm_demoted);
+#ifdef _WIN32
+        extern void fm_stats_print(FILE *out);   // kernel/memory.c
+        fm_stats_print(out);
+#endif
+    }
     fprintf(out, "[xlat] insns native=%llu template=%llu stream=%llu\n",
             (unsigned long long) st_native, (unsigned long long) st_tpl,
             (unsigned long long) st_stream);
@@ -2619,7 +2921,9 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
         // the target, before the call's push moves rsp
         if (g->mod == 3) {
             int gr = g->rm;
-            if (gr >= 8)
+            if (promo_host(gr) >= 0)
+                e_mov_rr(a, R10, promo_host(gr));
+            else if (gr >= 8)
                 e_mov_load(a, R10, XMEM(H_CPU, slot_off(gr)));
             else
                 e_mov_rr(a, R10, gr == 4 ? R8 : gr);
@@ -2647,6 +2951,7 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
             e_exit_chain(x, xi->taken, F_ALL, true);
             break;
         case K_CALLI: case K_JMPI:
+            e_promo_swap(x, false);
             e_dispatch_r10(x);
             break;
         case K_RET: {
@@ -2657,6 +2962,7 @@ static void e_branch_insn(struct xctx *x, const struct xinsn *in, const struct x
                 e_mem_member(x, &bd, mg, false);
             else
                 e_mem_insn(x, &bd, 8, false, 0, false, NULL);
+            e_promo_swap(x, false);
             e_ret_dispatch(x);
             break;
         }
@@ -2667,6 +2973,179 @@ static unsigned dbg_kinds = ~0u;  // ISH_XLAT_KINDS: bit per K_* translated
 static unsigned dbg_op_lo = 0, dbg_op_hi = ~0u;  // ISH_XLAT_OPS=lo:hi
 static bool dbg_nth_on;
 static unsigned dbg_nth_lo, dbg_nth_hi;  // ISH_XLAT_NTH=lo:hi: only those of them
+// ---------------------------------------------------------------- promotion
+
+// The host register a guest register gr (0-15) lives in, as one of rax..rdi:
+// a bit for each (rsp is r8: none).
+static unsigned low_bit(const struct gi *g, int gr, bool byte) {
+    if (gr < 0 || gr >= 8)
+        return 0;
+    if (byte && !g->rex && gr >= 4)
+        return 1u << (gr - 4);   // ah..bh
+    return gr == 4 ? 0 : 1u << gr;
+}
+
+// A K_GENERIC instruction that names every register it uses.
+static bool explicit_only(const struct gi *g, const struct cls *c) {
+    unsigned op = g->op;
+    if (c->sse)
+        return true;
+    if (g->map == 0) {
+        if (op < 0x40)
+            return (op & 7) <= 3;
+        switch (op) {
+            case 0x63: case 0x69: case 0x6b: case 0x80: case 0x81: case 0x83: case 0x84: case 0x85:
+            case 0x86: case 0x87: case 0x88: case 0x89: case 0x8a: case 0x8b: case 0xc0: case 0xc1:
+            case 0xd0: case 0xd1: case 0xc6: case 0xc7:
+                return true;
+            case 0xf6: case 0xf7:
+                return g->rawreg <= 3;   // not mul/imul with rax:rdx
+            case 0xfe: case 0xff:
+                return g->rawreg <= 1;
+        }
+        return false;
+    }
+    if (g->map == 1) {
+        if ((op >= 0x40 && op <= 0x4f) || (op >= 0x90 && op <= 0x9f))
+            return true;
+        switch (op) {
+            case 0xaf: case 0xb6: case 0xb7: case 0xbe: case 0xbf: case 0xb8: case 0xa3: case 0xab:
+            case 0xb3: case 0xbb: case 0xba: case 0xbc: case 0xbd: case 0xa4: case 0xac: case 0xc0: case 0xc1:
+                return true;
+        }
+    }
+    return false;
+}
+
+// The low host registers a native instruction uses (0xff: maybe any), and
+// what its r8-r15 cost in slot accesses, added to use[gr - 8].
+static unsigned insn_regs(const struct xi *xi, unsigned use[8]) {
+    const struct gi *g = &xi->g;
+    const struct cls *c = &xi->c;
+    const struct plan *p = &xi->p;
+    unsigned m = 0;
+    bool addr = false;
+    switch (c->kind) {
+        case K_NOP: case K_JCC: case K_JMP: case K_CALL: case K_RET: case K_PUSHI:
+            return 0;
+        case K_LEAVE:
+            return 1u << RBP;
+        case K_IMPLICIT:
+            if (g->map == 0 && (g->op == 0xf5 || g->op == 0xf8 || g->op == 0xf9))
+                return 0;   // cmc, clc, stc
+            return g->map == 0 && g->op == 0x99 ? (1u << RAX) | (1u << RDX) : 1u << RAX;
+        case K_PUSH: case K_POP: case K_OPREG: {
+            int gr = (g->op & 7) | ((g->rex & 1) ? 8 : 0);
+            bool byte = c->kind == K_OPREG && g->map == 0 && g->op >= 0xb0 && g->op <= 0xb7;
+            if (c->kind == K_OPREG && (g->map != 0 || g->op < 0x90 || g->op > 0xbf))
+                return 0xff;
+            if (c->kind == K_OPREG && g->op >= 0x90 && g->op <= 0x97)
+                m |= 1u << RAX;   // xchg with rax
+            if (gr >= 8)
+                use[gr - 8] += 2;
+            return m | low_bit(g, gr, byte);
+        }
+        case K_LEA:
+            if (g->reg >= 8)
+                use[g->reg - 8] += 1;
+            m = low_bit(g, g->reg, false);
+            addr = true;
+            break;
+        case K_CALLI: case K_JMPI:
+            if (g->mod == 3) {
+                if (g->rm >= 8)
+                    use[g->rm - 8] += 1;
+                return low_bit(g, g->rm, false);
+            }
+            addr = true;
+            break;
+        case K_GENERIC:
+            if (!explicit_only(g, c))
+                return 0xff;
+            if (c->reg_gpr) {
+                m |= low_bit(g, g->reg, c->reg_byte);
+                if (p->reg.slot >= 0)
+                    use[g->reg - 8] += 2;
+            }
+            if (!p->mem && !c->rm_xmm) {
+                m |= low_bit(g, g->rm, c->rm_byte);
+                if (p->rm.slot >= 0 && !(p->reg.slot >= 0 && g->rm == g->reg))
+                    use[g->rm - 8] += 2;
+            }
+            addr = p->mem;
+            break;
+        default:
+            return 0xff;
+    }
+    if (addr && g->base != BASE_RIP) {
+        m |= low_bit(g, g->base, false) | low_bit(g, g->index, false);
+        if (g->base >= 8)
+            use[g->base - 8] += 1;
+        if (g->index >= 8)
+            use[g->index - 8] += 1;
+    }
+    return m;
+}
+
+static bool dbg_nopromo;   // ISH_XLAT_NOPROMO: r8-r15 always in their slots
+
+// Which of r8-r15 the block keeps in host registers, and where: those it
+// uses most, while there are rax..rdi it doesn't use at all. In and out
+// cost four moves each; a loop of the block itself pays them once.
+static void choose_promotions(struct xctx *x, struct xi *xis, unsigned total, bool loop) {
+    memset(xpromo, 0, sizeof(xpromo));
+    x->npromo = 0;
+    if (dbg_nopromo)
+        return;
+    unsigned use[8] = {0}, low = 0;
+    for (unsigned i = 0; i < total; i++) {
+        if (xis[i].mode != M_NATIVE)
+            continue;
+        low |= insn_regs(&xis[i], use);
+        if (low == 0xff)
+            return;
+    }
+    static const int8_t free_order[] = {RBX, RSI, RDI, RBP, RCX, RDX, RAX};
+    unsigned f = 0;
+    for (;;) {
+        int best = -1;
+        unsigned best_use = 0;
+        for (int k = 0; k < 8; k++) {
+            unsigned u = loop ? use[k] * 8 : use[k];
+            if (promo_host(k + 8) < 0 && u > best_use) {
+                best = k;
+                best_use = u;
+            }
+        }
+        if (best < 0 || best_use < 5)
+            break;
+        while (f < sizeof(free_order) && (low & (1u << free_order[f])))
+            f++;
+        if (f == sizeof(free_order))
+            break;
+        xpromo[best + 8] = (int8_t) (free_order[f] + 1);
+        x->pgr[x->npromo] = (int8_t) (best + 8);
+        x->ph[x->npromo] = free_order[f];
+        x->npromo++;
+        f++;
+    }
+    // operands planned into a scratch from their slot use the register instead
+    for (unsigned i = 0; i < total; i++) {
+        struct xi *xi = &xis[i];
+        if (xi->mode != M_NATIVE || xi->c.kind != K_GENERIC)
+            continue;
+        struct plan *p = &xi->p;
+        if (p->reg.slot >= 0 && promo_host(xi->g.reg) >= 0) {
+            p->reg.host = promo_host(xi->g.reg);
+            p->reg.slot = -1;
+        }
+        if (p->rm.slot >= 0 && promo_host(xi->g.rm) >= 0) {
+            p->rm.host = promo_host(xi->g.rm);
+            p->rm.slot = -1;
+        }
+    }
+}
+
 static bool plan_insn(struct xctx *x, const struct xinsn *in, struct xi *xi, unsigned n_left) {
     if (in->bad || !gdecode(in, &xi->g) || !classify(&xi->g, &xi->c))
         return false;
@@ -2817,6 +3296,9 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
         int32_t v32 = (int32_t) v;
         memcpy(field, &v32, 4);
     }
+    if (!fm_register(a, block, sec_base))
+        goto fail;
+    fm_npending = 0;
     for (unsigned i = 0; i < nentries; i++) {
         block->code[entry_slot[i]] = (uintptr_t) (mem + entry_off[i]);
         if (entry_slot[i] == 0)
@@ -2841,6 +3323,7 @@ static bool xlat_finish(struct xctx *x, struct fiber_block *block, unsigned *ent
     }
     return true;
 fail:
+    fm_npending = 0;
     code_free(mem);
     if (data != NULL)
         arena_free(&data_arena, data);
@@ -2872,6 +3355,12 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
     if (!xa_init(a))
         return false;
     struct xctx x = {.a = a, .block = block, .code = block->code, .plan = plan};
+    // The base goes into the code: a thread can run it before its own TLB has
+    // seen the window come (one that was in mem_ptr's lock upgrade while
+    // another moved the address space in).
+    x.fm_base = fm_xlat && xlog_tlb != NULL && xlog_tlb->mmu != NULL ? (uint64_t) (uintptr_t) xlog_tlb->mmu->fm_base : 0;
+    x.fm = x.fm_base != 0;
+    fm_npending = 0;
 
     // the stream past the last instruction (gen_exit()), as one more
     struct xinsn tail = {.ip = 0, .s0 = xlog[n - 1].s1, .s1 = xlog_size, .bad = true};
@@ -2936,7 +3425,9 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
         after_inb = xi->c.fr | (after_inb & ~xi->c.fw);
     }
 
-    if (!dbg_nogroup)
+    // (in the window an access's test costs next to nothing, and each needs
+    // a checked path of its own to fault to)
+    if (!dbg_nogroup && !x.fm)
         find_groups(xis, total, xlog, n, &tail);
     else
         for (unsigned i = 0; i < total; i++)
@@ -2968,6 +3459,7 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             break;
         }
     }
+    choose_promotions(&x, xis, total, loop_jcc >= 0);
     for (unsigned i = 0; i < total; i++) {
         const struct xinsn *in = i < n ? &xlog[i] : &tail;
         struct xi *xi = &xis[i];
@@ -2975,6 +3467,7 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             stream++;
             if (in_run) {
                 sync_dirty(&x);
+                e_promo_swap(&x, false);
                 e_to_stream(&x, in->s0);
                 in_run = false;
             }
@@ -2986,6 +3479,8 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             nentries++;
             in_run = true;
             x.valid = x.dirty = 0;
+            x.r9_fm = false;
+            e_promo_swap(&x, true);
             if (i == 0 && loop_jcc >= 0) {
                 // the loop's top: a pending interrupt leaves for the run loop
                 // at the block's start (the loop's stream slot has it)
@@ -2998,6 +3493,7 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
                 e_jcc_lab(a, 5, l_poke);
                 a->cur = SEC_COLD;
                 lbind(a, l_poke);
+                e_promo_swap(&x, false);
                 e_note_block(&x);
                 e_exit_slot(&x, xis[loop_jcc].taken);
                 a->cur = SEC_MAIN;
@@ -3009,9 +3505,13 @@ static bool xlat_translate(struct fiber_block *block, const uintptr_t *plan) {
             x.valid = 0;
             if (xi->terminal)
                 e_note_block(&x);
+            e_promo_swap(&x, false);
             e_tpl_range(&x, in->s0, in->s1);
+            x.r9_fm = false;   // the gadgets' _ip
             if (xi->terminal)
                 in_run = false;
+            else
+                e_promo_swap(&x, true);
             continue;
         }
         native++;
@@ -3398,6 +3898,10 @@ static bool xa_grow(struct xasm *a, unsigned nfix, unsigned nlab) {
 
 // Links a cached translation into block. True: done.
 static bool xc_link(struct fiber_block *block) {
+    // a cached translation checks its accesses: not for an address space with
+    // the window, whose translations go there
+    if (fm_xlat && xlog_tlb != NULL && xlog_tlb->mmu != NULL && xlog_tlb->mmu->fm_base != NULL)
+        return false;
     if (!xc_on || xs == NULL || !atomic_load_explicit(&xc_armed, memory_order_relaxed) ||
             !xlog_ok || xlog_n == 0 || !xc_file_code(block->addr, xlog_end()))
         return false;
@@ -3472,6 +3976,8 @@ static bool xc_link(struct fiber_block *block) {
 // Keeps what xlat_translate() just linked into block.
 static void xc_insert(const struct xctx *x, const struct fiber_block *block,
                       const unsigned *eslot, const uint32_t *eoff, unsigned nent) {
+    if (x->fm)
+        return;   // its faults are registered, not cached
     const struct xasm *a = x->a;
     if (!xc_on || xs == NULL || !atomic_load_explicit(&xc_armed, memory_order_relaxed) ||
             xdeps_overflow || !xlog_ok || xlog_n == 0 || nent == 0 || !xc_file_code(block->addr, xlog_end()))
@@ -3634,7 +4140,14 @@ static bool xlat_block(struct fiber_block *block) {
     return true;
 }
 
+static void xjit_promote_locked(struct fiber_block *block, struct fiber_block *tmp, const unsigned *skip, int nskip);
 void xjit_promote(struct fiber_block *block, struct fiber_block *tmp, const unsigned *skip, int nskip) {
+    mem_no_fill++;   // see fiber_block_compile()
+    xjit_promote_locked(block, tmp, skip, nskip);
+    mem_no_fill--;
+}
+
+static void xjit_promote_locked(struct fiber_block *block, struct fiber_block *tmp, const unsigned *skip, int nskip) {
     if (block->xjit_stub == NULL || block->code[0] != (uintptr_t) block->xjit_stub)
         return;
     // the counter stays at 0 from here: the stub won't ask twice
@@ -3707,6 +4220,7 @@ static void xlat_init(void) {
     dbg_nosucc = getenv("ISH_XLAT_NOSUCC") != NULL;
     dbg_allpoke = getenv("ISH_XLAT_ALLPOKE") != NULL;
     dbg_oldloop = getenv("ISH_XLAT_OLDLOOP") != NULL;
+    dbg_nopromo = getenv("ISH_XLAT_NOPROMO") != NULL;
     dbg_nogroup = getenv("ISH_XLAT_NOGROUP") != NULL;
     dbg_slowsync = getenv("ISH_XLAT_SLOWSYNC") != NULL;
     dbg_nospgroup = getenv("ISH_XLAT_NOSPGROUP") != NULL;
@@ -3738,6 +4252,16 @@ static void xlat_init(void) {
         have_bmi2 = false;
     e = getenv("ISH_XCACHE");
     xc_on = !(e && e[0] == '0');
+#ifdef _WIN32
+    e = getenv("ISH_FASTMEM");
+    fm_xlat = e != NULL && (e[0] == '1' || e[0] == '2');
+    if (fm_xlat)
+        px_fault_redirect(fm_redirect);
+    if ((e = getenv("ISH_FM_DEMOTE")) != NULL)
+        fm_demote = (unsigned) strtoul(e, NULL, 0);
+    if ((e = getenv("ISH_FASTMEM_TICKS")) != NULL)
+        fm_ticks = (unsigned) strtoul(e, NULL, 0);
+#endif
     if ((e = getenv("ISH_XCACHE_EAGER")) != NULL)
         xc_eager = e[0] != '0';
     if ((e = getenv("ISH_XCACHE_MB")) != NULL)

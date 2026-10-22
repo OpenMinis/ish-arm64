@@ -36,6 +36,21 @@ struct mmu {
     struct mmu_ops *ops;
     struct asbestos *asbestos;
     uint64_t changes;
+#ifdef GUEST_X86_64
+    // The guest window (kernel/memory.c FASTMEM): guest address a below 4 GB
+    // is host address fm_base + a, for the pages placed there. NULL: none.
+    char *fm_base;
+    // how long it has run without one (ticks of the run loop), and whether
+    // it should get one now (mem_window_migrate())
+    unsigned fm_ticks;
+    bool fm_want;
+    // the hypervisor VM running it (asbestos/guest-x86_64/vm.c), if any
+    void *vm;
+    // window pages unmapped but kept, to be zeroed and used again
+    // (kernel/memory.c fm_recycle): a bit each, and how many
+    uint64_t *fm_recycled;
+    unsigned fm_recycled_pages;
+#endif
 #ifdef GUEST_64BIT
     // The TLBs of the threads running guest code in this address space
     // (tlb_attach()); a change to the mappings marks them stale.
