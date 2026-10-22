@@ -65,6 +65,68 @@ void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook) {
     atomic_store_explicit(&g_timer_tick_hook, hook, memory_order_release);
 }
 
+// A program that catches SIGILL or SIGSEGV and returns to the instruction that
+// raised it traps again at once: .NET capturing a thread's context did that
+// tens of thousands of times a second, ten log lines each (13 GB in eleven
+// minutes). A thread's first trap at a place is logged in full, then a line a
+// second at most says how many more there were. TRAP_LOOP traps at one place
+// within TRAP_LOOP_MS is a loop the program won't leave: its process is killed.
+#define TRAP_LOOP 10000
+#define TRAP_LOOP_MS 10000
+enum trap_verdict { TRAP_LOG, TRAP_QUIET, TRAP_KILL };
+struct trap_run {
+    pid_t_ pid;
+    int sig;
+    addr_t ip, addr;
+    unsigned count; // since start_ms
+    unsigned long quiet; // not logged yet
+    uint64_t start_ms, said_ms;
+};
+static __thread struct trap_run trap_run;
+
+static uint64_t trap_now_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static void trap_run_said(struct trap_run *t, uint64_t now) {
+    if (t->quiet > 0)
+        printk("%d(%s) %lu more of signal %d at 0x%llx (address 0x%llx) not logged\n", t->pid, current->comm,
+               t->quiet, t->sig, (unsigned long long) t->ip, (unsigned long long) t->addr);
+    t->quiet = 0;
+    t->said_ms = now;
+}
+
+static enum trap_verdict trap_seen(int sig, addr_t ip, addr_t addr) {
+    struct trap_run *t = &trap_run;
+    uint64_t now = trap_now_ms();
+    if (t->pid != current->pid || t->sig != sig || t->ip != ip || t->addr != addr) {
+        if (t->pid == current->pid)
+            trap_run_said(t, now);
+        *t = (struct trap_run) {.pid = current->pid, .sig = sig, .ip = ip, .addr = addr,
+                .count = 1, .start_ms = now, .said_ms = now};
+        return TRAP_LOG;
+    }
+    if (now - t->start_ms >= TRAP_LOOP_MS) {
+        t->start_ms = now;
+        t->count = 0;
+    }
+    if (++t->count >= TRAP_LOOP) {
+        trap_run_said(t, now);
+        printk("%d(%s) trapped %u times in %llums at 0x%llx (signal %d): a loop it won't leave, killing it\n",
+               current->pid, current->comm, t->count, (unsigned long long) (now - t->start_ms),
+               (unsigned long long) ip, sig);
+        t->count = 0;
+        t->start_ms = now;
+        return TRAP_KILL;
+    }
+    t->quiet++;
+    if (now - t->said_ms >= 1000)
+        trap_run_said(t, now);
+    return TRAP_QUIET;
+}
+
 // A program that keeps calling a syscall we lack logged a line on every call:
 // log each number once.
 static void syscall_unhandled(unsigned num, const char *what) {
@@ -1265,47 +1327,63 @@ void handle_interrupt(int interrupt) {
                 dump_stack(8);
                 dump_maps();
             }
+            int segv = SIGSEGV_;
+#if defined(GUEST_X86_64)
+            if (trap_seen(SIGSEGV_, cpu->rip, cpu->segfault_addr) == TRAP_KILL)
+                segv = SIGKILL_;
+#elif !defined(GUEST_ARM64)
+            if (trap_seen(SIGSEGV_, cpu->eip, cpu->segfault_addr) == TRAP_KILL)
+                segv = SIGKILL_;
+#endif
 #ifdef GUEST_ARM64
             gpf_use_precise_pc(cpu);
 #endif
-            deliver_signal(current, SIGSEGV_, info);
+            deliver_signal(current, segv, info);
         }
 #ifdef GUEST_ARM64
         gpf_handled:;
         gpf_use_precise_pc(cpu);
 #endif
     } else if (interrupt == INT_UNDEFINED) {
-#if defined(GUEST_X86) || !defined(GUEST_ARM64)
-        printk("%d illegal instruction at 0x%x: ", current->pid, cpu->eip);
-        for (int i = 0; i < 8; i++) {
-            uint8_t b;
-            if (user_get(cpu->eip + i, b))
-                break;
-            printk("%02x ", b);
-        }
+#if defined(GUEST_X86_64)
+        addr_t ill_ip = cpu->rip;
+#elif defined(GUEST_X86) || !defined(GUEST_ARM64)
+        addr_t ill_ip = cpu->eip;
 #elif defined(GUEST_ARM64)
-        {
-            uint32_t ill_insn = 0;
-            for (int i = 0; i < 4; i++) {
-                uint8_t b;
-                if (user_get(cpu->pc + i, b))
-                    break;
-                ill_insn |= (uint32_t)b << (i * 8);
-            }
-            printk("%d illegal instruction at 0x%llx: insn=0x%08x\n", current->pid, (unsigned long long)cpu->pc, ill_insn);
-        }
+        addr_t ill_ip = cpu->pc;
 #endif
-        printk("\n");
-        dump_stack(8);
+        enum trap_verdict verdict = trap_seen(SIGILL_, ill_ip, ill_ip);
+        if (verdict == TRAP_LOG) {
+#if defined(GUEST_X86) || !defined(GUEST_ARM64)
+            printk("%d(%s) illegal instruction at 0x%llx: ", current->pid, current->comm,
+                   (unsigned long long) ill_ip);
+            for (int i = 0; i < 8; i++) {
+                uint8_t b;
+                if (user_get(ill_ip + i, b))
+                    break;
+                printk("%02x ", b);
+            }
+#elif defined(GUEST_ARM64)
+            {
+                uint32_t ill_insn = 0;
+                for (int i = 0; i < 4; i++) {
+                    uint8_t b;
+                    if (user_get(cpu->pc + i, b))
+                        break;
+                    ill_insn |= (uint32_t)b << (i * 8);
+                }
+                printk("%d(%s) illegal instruction at 0x%llx: insn=0x%08x\n", current->pid, current->comm,
+                       (unsigned long long)cpu->pc, ill_insn);
+            }
+#endif
+            printk("\n");
+            dump_stack(8);
+        }
         struct siginfo_ info = {
             .code = SI_KERNEL_,
-#if defined(GUEST_X86) || !defined(GUEST_ARM64)
-            .fault.addr = cpu->eip,
-#elif defined(GUEST_ARM64)
-            .fault.addr = cpu->pc,
-#endif
+            .fault.addr = ill_ip,
         };
-        deliver_signal(current, SIGILL_, info);
+        deliver_signal(current, verdict == TRAP_KILL ? SIGKILL_ : SIGILL_, info);
     } else if (interrupt == INT_BREAKPOINT) {
 #ifdef GUEST_ARM64
         {
@@ -1422,27 +1500,41 @@ void dump_maps(void) {
     free(orig_data);
 }
 
+// eight words a line, leaving out lines that are all zeros
 void dump_mem(addr_t start, uint_t len) {
-    const int width = 8;
-    for (addr_t addr = start; addr < start + len; addr += sizeof(dword_t)) {
-        unsigned from_left = (addr - start) / sizeof(dword_t) % width;
-        if (from_left == 0)
-#ifdef GUEST_ARM64
-            printk("%012llx: ", (unsigned long long)addr);
-#else
-            printk("%08x: ", addr);
-#endif
-        dword_t word;
-        if (user_get(addr, word))
+    enum { width = 8 };
+    for (addr_t line = start; line < start + len; line += width * sizeof(dword_t)) {
+        dword_t words[width];
+        int n = 0;
+        bool zeros = true;
+        for (; n < width && line + n * sizeof(dword_t) < start + len; n++) {
+            if (user_get(line + n * sizeof(dword_t), words[n]))
+                break;
+            zeros = zeros && words[n] == 0;
+        }
+        if (n == 0)
             break;
-        printk("%08x ", word);
-        if (from_left == width - 1)
-            printk("\n");
+        if (zeros)
+            continue;
+#if defined(GUEST_ARM64) || defined(GUEST_X86_64)
+        printk("%012llx: ", (unsigned long long)line);
+#else
+        printk("%08x: ", line);
+#endif
+        for (int i = 0; i < n; i++)
+            printk("%08x ", words[i]);
+        printk("\n");
+        if (n < width)
+            break;
     }
 }
 
 void dump_stack(int lines) {
-#if defined(GUEST_X86) || !defined(GUEST_ARM64)
+#if defined(GUEST_X86_64)
+    printk("stack at %llx, base at %llx, ip at %llx\n", (unsigned long long) current->cpu.rsp,
+           (unsigned long long) current->cpu.rbp, (unsigned long long) current->cpu.rip);
+    dump_mem(current->cpu.rsp, lines * sizeof(dword_t) * 8);
+#elif defined(GUEST_X86) || !defined(GUEST_ARM64)
     printk("stack at %x, base at %x, ip at %x\n", current->cpu.esp, current->cpu.ebp, current->cpu.eip);
     dump_mem(current->cpu.esp, lines * sizeof(dword_t) * 8);
 #elif defined(GUEST_ARM64)

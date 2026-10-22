@@ -7,6 +7,8 @@
 #include <string.h>
 #include <psapi.h>
 #include <bcrypt.h>
+#include <wchar.h>
+#include <wctype.h>
 
 NTSYSAPI LONG NTAPI NtSetTimerResolution(ULONG desired, BOOLEAN set, PULONG current);
 
@@ -466,8 +468,17 @@ void px_boot_mark(const char *what) {
     fprintf(stderr, "[boot] %-24s %7.2f ms\n", what, (b - a) / 1e4);
 }
 
+// The log file stays under LOG_MAX: past it the file becomes <name>.1 (the
+// one before goes) and a new one starts. Every ish of a session appends to
+// the same file, so the rotation happens under a mutex named for the path,
+// and an ish still writing to what is now .1 notices it is too big and
+// opens the new one. A process logs at most LOG_RATE lines a second to it.
+#define LOG_MAX (64ull << 20)
+#define LOG_RATE 500
 static INIT_ONCE log_once = INIT_ONCE_STATIC_INIT;
 static HANDLE log_file = INVALID_HANDLE_VALUE;
+static HANDLE log_mutex;
+static wchar_t *log_path, *log_path_old;
 static bool log_stderr;
 static int log_netdiag;
 
@@ -476,16 +487,33 @@ static bool env_on(const char *name) {
     return v != NULL && strcmp(v, "1") == 0;
 }
 
+static HANDLE log_open(void) {
+    // FILE_APPEND_DATA alone: each write lands whole at the end, with every
+    // ish of a session writing to the file
+    return CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
 static BOOL CALLBACK log_init(PINIT_ONCE once, void *param, void **ctx) {
     (void) once; (void) param; (void) ctx;
     log_stderr = env_on("ISH_LOG_STDERR");
     // a path in any language: the variable in UTF-16, as it was set
     const wchar_t *path = _wgetenv(L"ISH_LOG_FILE");
-    if (path != NULL && path[0] != L'\0')
-        // FILE_APPEND_DATA alone: each write lands whole at the end, even with
-        // every ish of a session writing to the same file
-        log_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (path != NULL && path[0] != L'\0') {
+        size_t len = wcslen(path);
+        log_path = _wcsdup(path);
+        log_path_old = malloc((len + 3) * sizeof(wchar_t));
+        if (log_path != NULL && log_path_old != NULL) {
+            swprintf(log_path_old, len + 3, L"%ls.1", path);
+            uint32_t hash = 2166136261u;
+            for (size_t i = 0; i < len; i++)
+                hash = (hash ^ towlower(path[i])) * 16777619u;
+            wchar_t name[64];
+            swprintf(name, 64, L"Local\\ish-log-%08x", hash);
+            log_mutex = CreateMutexW(NULL, FALSE, name);
+            log_file = log_open();
+        }
+    }
     log_netdiag = env_on("ISH_NETDIAG") ? 2 : log_file != INVALID_HANDLE_VALUE ? 1 : 0;
     return TRUE;
 }
@@ -504,12 +532,37 @@ int px_log_netdiag(void) {
     return log_netdiag;
 }
 
-void px_log_line(const char *line) {
-    log_setup();
-    if (log_stderr)
-        fprintf(stderr, "%s\n", line);
-    if (log_file == INVALID_HANDLE_VALUE)
-        return;
+static bool log_too_big(HANDLE h) {
+    LARGE_INTEGER size;
+    return GetFileSizeEx(h, &size) && (uint64_t) size.QuadPart >= LOG_MAX;
+}
+
+static void log_rotate(void) {
+    if (log_mutex != NULL)
+        WaitForSingleObject(log_mutex, 5000);
+    HANDLE h = log_open();
+    if (h != INVALID_HANDLE_VALUE && log_too_big(h)) {
+        CloseHandle(h);
+        if (!MoveFileExW(log_path, log_path_old, MOVEFILE_REPLACE_EXISTING)) {
+            // .1 is open where it can't be replaced: start the file over
+            h = CreateFileW(log_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE)
+                CloseHandle(h);
+        }
+        h = log_open();
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(log_file);
+        log_file = h;
+    }
+    if (log_mutex != NULL)
+        ReleaseMutex(log_mutex);
+}
+
+static void log_write(const char *line) {
+    if (log_too_big(log_file))
+        log_rotate();
     SYSTEMTIME t;
     GetLocalTime(&t);
     size_t len = strlen(line);
@@ -523,6 +576,38 @@ void px_log_line(const char *line) {
     DWORD put;
     WriteFile(log_file, buf, (DWORD) (n + len + 1), &put, NULL);
     free(buf);
+}
+
+// called with printk's lock held
+void px_log_line(const char *line) {
+    log_setup();
+    if (log_stderr)
+        fprintf(stderr, "%s\n", line);
+    if (log_file == INVALID_HANDLE_VALUE)
+        return;
+    static uint64_t second;
+    static unsigned lines;
+    static unsigned long dropped;
+    uint64_t now = GetTickCount64() / 1000;
+    if (now != second) {
+        if (dropped > 0) {
+            char note[96];
+            sprintf(note, "printk: %lu lines left out (more than %d a second)", dropped, LOG_RATE);
+            log_write(note);
+        }
+        second = now;
+        lines = 0;
+        dropped = 0;
+    }
+    if (++lines > LOG_RATE) {
+        if (dropped++ == 0) {
+            char note[96];
+            sprintf(note, "printk: more than %d lines a second, leaving out the rest of this one", LOG_RATE);
+            log_write(note);
+        }
+        return;
+    }
+    log_write(line);
 }
 
 void px_log_notice(const char *line) {

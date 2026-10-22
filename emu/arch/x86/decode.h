@@ -1149,6 +1149,31 @@ restart:
         case 0x8d: TRACEI("lea\t\t"); READMODRM_MEM;
                    MOV(addr, modrm_reg,oz); break;
 
+#ifdef GUEST_X86_64
+        // A segment register reads as what Linux gives every 64-bit process:
+        // cs 0x33, ss 0x2b, the rest 0 (.NET saves them all when it captures
+        // a thread's context). A register gets them zero-extended, memory
+        // gets 16 bits.
+        case 0x8c: TRACEI("mov seg, modrm\t"); READMODRM;
+            switch (modrm.reg & 7) {
+                case 1: imm = 0x33; break;
+                case 2: imm = 0x2b; break;
+                case 0: case 3: case 4: case 5: imm = 0; break;
+                default: UNDEFINED;
+            }
+            if (modrm.type == modrm_reg) {
+                MOV(imm, modrm_val,oz);
+            } else {
+                MOV(imm, modrm_val,16);
+            }
+            break;
+        // Loading one changes nothing a process can see (the fs and gs bases
+        // are set with arch_prctl); cs can't be loaded this way.
+        case 0x8e: TRACEI("mov modrm, seg\t"); READMODRM;
+            if ((modrm.reg & 7) == 1 || (modrm.reg & 7) > 5)
+                UNDEFINED;
+            break;
+#else
         // we only support fs and gs, and that too not very well.
         // gs does nothing: see comment in sys/tls.c
         // for fs, we discard writes. if anyone tries to read we trap
@@ -1163,6 +1188,7 @@ restart:
             } else {
                 UNDEFINED;
             }
+#endif
 
         case 0x8f: TRACEI("pop modrm");
                    READMODRM; POP(modrm_val,STK_Z(oz)); break;
