@@ -7,6 +7,8 @@
 #if __APPLE__
 #include <malloc/malloc.h>
 #endif
+#include "fs/path.h"
+#include "util/timer.h"
 #include "kernel/calls.h"
 #include "kernel/sctimes.h"
 #include "emu/tlb.h"
@@ -326,7 +328,12 @@ noreturn void do_exit_group(int status) {
         // Poll the thread count until only current thread remains
         int max_wait_ms = 500 + thread_count * 10;  // Scale with thread count
         if (max_wait_ms > 5000) max_wait_ms = 5000;  // Cap at 5s
-        int wait_interval_ms = 10;  // Check every 10ms
+        // They are usually gone within a millisecond: look again soon at
+        // first, then less and less often, up to every 10ms. (Each look 10ms
+        // apart, 15.6 on Windows, made every program with threads take some
+        // 60-80ms more to exit.)
+        long wait_interval_us = 50;
+        long waited_us = 0;
         int waited_ms = 0;
         int last_remaining = -1;
 
@@ -352,9 +359,12 @@ noreturn void do_exit_group(int status) {
             }
 
             // Sleep a bit to let threads exit
-            struct timespec ts = {0, wait_interval_ms * 1000000L};
+            struct timespec ts = {0, wait_interval_us * 1000L};
             nanosleep(&ts, NULL);
-            waited_ms += wait_interval_ms;
+            waited_us += wait_interval_us;
+            waited_ms = (int) (waited_us / 1000);
+            if (wait_interval_us < 10000)
+                wait_interval_us *= 2;
         }
 
         if (waited_ms >= max_wait_ms) {
@@ -450,8 +460,14 @@ noreturn void do_exit_group(int status) {
             // 2. TLS destructors run
             // 3. Host malloc/arena cleanup happens
             // 4. Stack unwinding completes (glibc on ARM64)
+#ifndef _WIN32
+            // (Not on Windows: what the threads have left once out of the
+            // group, the key destructors of task.c and vm.c, touches nothing
+            // of the group's, and every program with threads took 50ms more
+            // to exit.)
             struct timespec extra_delay = {0, 50 * 1000000L};  // 50ms for pthread cleanup
             nanosleep(&extra_delay, NULL);
+#endif
 
 #if __APPLE__
             // Force malloc zone cleanup to release thread-specific caches
@@ -762,9 +778,7 @@ retry:
         // Update last_progress_ns: waitpid is actively polling for a child,
         // this is real work (not a stuck thread). Prevents the poll_wait
         // safety valve from killing a parent waiting for a long-running child.
-        struct timespec _ts;
-        clock_gettime(CLOCK_MONOTONIC, &_ts);
-        uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+        uint64_t now = coarse_now_ns();
         current->last_unblocked_ns = now;
         atomic_store_explicit(&current->group->last_progress_ns, now,
                               memory_order_relaxed);

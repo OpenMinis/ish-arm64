@@ -213,6 +213,40 @@ dword_t sys_mknod(addr_t path_addr, mode_t_ mode, dev_t_ dev) {
     return sys_mknodat(AT_FDCWD_, path_addr, mode, dev);
 }
 
+// The bytes of a read or write on their way between the guest and the host:
+// a buffer each thread keeps (up to IO_BUF_KEEP), instead of one allocated
+// and freed each time. Windows gives a large allocation fresh pages each time,
+// and touching them first cost a 142KB read 0.2ms (a nested VM); Python reads
+// each module's .pyc whole.
+#ifdef _WIN32
+#define IO_BUF_KEEP ((1 << 20) + 64)   // (pread's asks for a byte more)
+static pthread_key_t io_buf_key;
+static pthread_once_t io_buf_once = PTHREAD_ONCE_INIT;
+static void io_buf_key_init(void) {
+    pthread_key_create(&io_buf_key, free);
+}
+static void *io_buf_get(size_t size) {
+    if (size > IO_BUF_KEEP)
+        return malloc(size);
+    pthread_once(&io_buf_once, io_buf_key_init);
+    void *buf = pthread_getspecific(io_buf_key);
+    if (buf == NULL) {
+        if ((buf = malloc(IO_BUF_KEEP)) == NULL)
+            return malloc(size);
+        pthread_setspecific(io_buf_key, buf);
+    }
+    return buf;
+}
+static void io_buf_put(void *buf) {
+    pthread_once(&io_buf_once, io_buf_key_init);
+    if (buf != pthread_getspecific(io_buf_key))
+        free(buf);
+}
+#else
+#define io_buf_get malloc
+#define io_buf_put free
+#endif
+
 static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
     struct fd *fd = f_get(fd_no);
     if (fd == NULL)
@@ -242,7 +276,7 @@ static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
 
 dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
     STRACE("read(%d, 0x%x, %d)", fd_no, buf_addr, size);
-    char *buf = (char *) malloc(size);
+    char *buf = io_buf_get(size);
     if (buf == NULL)
         return _ENOMEM;
     int_t res = sys_read_buf(fd_no, buf, size);
@@ -250,7 +284,7 @@ dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
         if (user_write(buf_addr, buf, res))
             res = _EFAULT;
     }
-    free(buf);
+    io_buf_put(buf);
     return res;
 }
 
@@ -352,7 +386,7 @@ static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
 
 dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
     // FIXME this is a DOS vector, should ideally use vectorized I/O
-    char *buf = malloc(size);
+    char *buf = io_buf_get(size);
     if (buf == NULL)
         return _ENOMEM;
     dword_t res = _EFAULT;
@@ -366,7 +400,7 @@ dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
     res = sys_write_buf(fd_no, buf, size);
 
 out:
-    free(buf);
+    io_buf_put(buf);
     return res;
 }
 
@@ -428,7 +462,7 @@ dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
     size_t io_size = iovec_size(iovec, iovec_count);
-    char *buf = malloc(io_size);
+    char *buf = io_buf_get(io_size);
     if (buf == NULL) {
         free(iovec);
         return _ENOMEM;
@@ -437,21 +471,25 @@ dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     if (res < 0)
         goto error;
 
+    // what was read, and no more (as preadv)
     size_t offset = 0;
-    for (unsigned i = 0; i < iovec_count; i++) {
-        size_t print_size = iovec[i].len;
+    size_t remaining = res;
+    for (unsigned i = 0; i < iovec_count && remaining > 0; i++) {
+        size_t chunk = iovec[i].len < remaining ? iovec[i].len : remaining;
+        size_t print_size = chunk;
         if (print_size > 100) print_size = 100;
         STRACE(" {\"%.*s\", %u}", print_size, buf + offset, iovec[i].len);
 
-        if (user_write(iovec[i].base, buf + offset, iovec[i].len)) {
+        if (user_write(iovec[i].base, buf + offset, chunk)) {
             res = _EFAULT;
             goto error;
         }
-        offset += iovec[i].len;
+        offset += chunk;
+        remaining -= chunk;
     }
 
 error:
-    free(buf);
+    io_buf_put(buf);
     free(iovec);
     return res;
 }
@@ -462,7 +500,7 @@ dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
     size_t io_size = iovec_size(iovec, iovec_count);
-    char *buf = malloc(io_size);
+    char *buf = io_buf_get(io_size);
     if (buf == NULL) {
         free(iovec);
         return _ENOMEM;
@@ -484,7 +522,7 @@ dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     res = sys_write_buf(fd_no, buf, io_size);
 
 error:
-    free(buf);
+    io_buf_put(buf);
     free(iovec);
     return res;
 }
@@ -543,7 +581,7 @@ dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
-    char *buf = malloc(size+1);
+    char *buf = io_buf_get(size+1);
     if (buf == NULL)
         return _ENOMEM;
     lock(&fd->lock);
@@ -571,7 +609,7 @@ dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     }
 out:
     unlock(&fd->lock);
-    free(buf);
+    io_buf_put(buf);
     return res;
 }
 
@@ -580,7 +618,7 @@ dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
-    char *buf = malloc(size+1);
+    char *buf = io_buf_get(size+1);
     if (buf == NULL)
         return _ENOMEM;
     if (user_read(buf_addr, buf, size))
@@ -602,7 +640,7 @@ dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
         }
     }
     unlock(&fd->lock);
-    free(buf);
+    io_buf_put(buf);
     return res;
 }
 
@@ -621,7 +659,7 @@ dword_t sys_preadv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count,
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
     size_t io_size = iovec_size(iovec, iovec_count);
-    char *buf = malloc(io_size);
+    char *buf = io_buf_get(io_size);
     if (buf == NULL) {
         free(iovec);
         return _ENOMEM;
@@ -658,7 +696,7 @@ dword_t sys_preadv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count,
     }
 
 error:
-    free(buf);
+    io_buf_put(buf);
     free(iovec);
     return res;
 }
@@ -674,7 +712,7 @@ dword_t sys_pwritev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count,
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
     size_t io_size = iovec_size(iovec, iovec_count);
-    char *buf = malloc(io_size);
+    char *buf = io_buf_get(io_size);
     if (buf == NULL) {
         free(iovec);
         return _ENOMEM;
@@ -706,7 +744,7 @@ dword_t sys_pwritev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count,
     unlock(&fd->lock);
 
 error:
-    free(buf);
+    io_buf_put(buf);
     free(iovec);
     return res;
 }
@@ -1126,7 +1164,11 @@ dword_t sys_utime(addr_t path_addr, addr_t times_addr) {
 static int generic_fsetattr(struct fd *fd, struct attr attr) {
     if (fd->mount->fs->fsetattr == NULL)
         return _EPERM;
-    return fd->mount->fs->fsetattr(fd, attr);
+    int err = fd->mount->fs->fsetattr(fd, attr);
+    // as generic_setattrat: what path walks know of a directory
+    if (err >= 0 && attr.type != attr_size)
+        path_cache_invalidate();
+    return err;
 }
 
 dword_t sys_fchmod(fd_t f, dword_t mode) {
