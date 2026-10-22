@@ -84,6 +84,9 @@ int_t sys_timer_settime(dword_t timer, int_t flags, addr_t new_value_addr, addr_
 int_t sys_timer_gettime(dword_t timer_id, addr_t curr_value_addr);
 int_t sys_timer_getoverrun(dword_t timer_id);
 int_t sys_timer_delete(dword_t timer_id);
+// A posix timer and the copy of its slot that its callback reads
+struct timer;
+void posix_timer_free(struct timer *timer);
 fd_t sys_timerfd_create(int_t clockid, int_t flags);
 int_t sys_timerfd_settime(fd_t f, int_t flags, addr_t new_value_addr, addr_t old_value_addr);
 int_t sys_timerfd_gettime(fd_t f, addr_t curr_value_addr);

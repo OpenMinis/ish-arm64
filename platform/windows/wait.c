@@ -161,11 +161,25 @@ int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms) {
 
 void (*px_about_to_block)(void);
 
+static void set_rem(struct timespec *rem, int64_t left) {
+    if (rem == NULL)
+        return;
+    if (left < 0)
+        left = 0;
+    rem->tv_sec = left / 1000000000;
+    rem->tv_nsec = left % 1000000000;
+}
+
 static int sleep_ns(int64_t ns, struct timespec *rem) {
     px_blocking();
     struct px_thread *t = self();
-    if (px_interrupted())
+    // a mark kept from an interrupt that came while the thread was not
+    // waiting: none of the sleep is spent, and a caller that goes on
+    // sleeping (no guest signal behind the mark) sleeps what rem says
+    if (px_interrupted()) {
+        set_rem(rem, ns);
         return px_fail(EINTR);
+    }
     if (ns <= 0)
         return 0;
     if (t->timer == NULL) {
@@ -183,15 +197,10 @@ static int sleep_ns(int64_t ns, struct timespec *rem) {
         CancelWaitableTimer(t->timer);
         atomic_store(&t->pending, false);
         drain(t);
-        if (rem != NULL) {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            QueryPerformanceFrequency(&freq);
-            int64_t spent = (now.QuadPart - start.QuadPart) * 1000000000 / freq.QuadPart;
-            int64_t left = ns - spent > 0 ? ns - spent : 0;
-            rem->tv_sec = left / 1000000000;
-            rem->tv_nsec = left % 1000000000;
-        }
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        set_rem(rem, ns - (now.QuadPart - start.QuadPart) * 1000000000 / freq.QuadPart);
         return px_fail(EINTR);
     }
     return 0;

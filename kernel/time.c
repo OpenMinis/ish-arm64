@@ -237,7 +237,7 @@ static dword_t nanosleep_interruptible(struct timespec *req, addr_t rem_addr) {
             interrupted = true;
             break;
         }
-        struct timespec rem;
+        struct timespec rem = left;
         if (nanosleep(&left, &rem) == 0 || errno != EINTR)
             break;
         left = rem;   // a wake with no guest signal behind it: sleep the rest
@@ -426,6 +426,15 @@ dword_t sys_settimeofday(addr_t UNUSED(tv), addr_t UNUSED(tz)) {
     return _EPERM;
 }
 
+// The callback reads a copy of the timer's slot, not the slot: a group that
+// exits takes its timers out and frees them once it has let go of pids_lock,
+// which the callback takes, and by then the group can be gone.
+void posix_timer_free(struct timer *timer) {
+    void *copy = timer->data;
+    timer_free(timer);
+    free(copy);
+}
+
 static void posix_timer_callback(struct posix_timer *timer) {
     if (timer->tgroup == NULL)
         return;
@@ -470,9 +479,10 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
 
     if (sigev.method == SIGEV_THREAD_ID_) {
         lock(&pids_lock);
-        if (pid_get_task(sigev.tid) == NULL)
-            return _EINVAL;
+        bool found = pid_get_task(sigev.tid) != NULL;
         unlock(&pids_lock);
+        if (!found)
+            return _EINVAL;
     }
 
     struct tgroup *group = current->group;
@@ -493,7 +503,6 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
 
     struct posix_timer *timer = &group->posix_timers[timer_id];
     timer->timer_id = timer_id;
-    timer->timer = timer_new(real_clockid, (timer_callback_t) posix_timer_callback, timer);
     timer->signal = sigev.signo;
     timer->sig_value = sigev.value;
     timer->tgroup = NULL;
@@ -510,6 +519,9 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
         timer->tgroup = group;
         timer->thread_pid = group->leader->pid;
     }
+    struct posix_timer *copy = malloc(sizeof(*copy));
+    *copy = *timer;
+    timer->timer = timer_new(real_clockid, (timer_callback_t) posix_timer_callback, copy);
     unlock(&group->lock);
     return 0;
 }
@@ -597,7 +609,7 @@ int_t sys_timer_delete(dword_t timer_id) {
         unlock(&current->group->lock);
         return _EINVAL;
     }
-    timer_free(timer->timer);
+    posix_timer_free(timer->timer);
     timer->timer = NULL;
     unlock(&current->group->lock);
     return 0;

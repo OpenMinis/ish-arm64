@@ -28,7 +28,9 @@ static void halt_system(int status);
 // this no-op prevents an undefined symbol error.
 __attribute__((weak)) void restore_termios(void) {}
 
-static bool exit_tgroup(struct task *task) {
+// A dead group's posix timers go to timers, to be freed once pids_lock is let
+// go: a timer's callback takes it.
+static bool exit_tgroup(struct task *task, struct timer *timers[TIMERS_MAX]) {
     struct tgroup *group = task->group;
     list_remove(&task->group_links);
     bool group_dead = list_empty(&group->threads);
@@ -38,6 +40,10 @@ static bool exit_tgroup(struct task *task) {
         // - locking pids_lock first, which do_exit did
         if (group->itimer)
             timer_free(group->itimer);
+        for (int i = 0; i < TIMERS_MAX; i++) {
+            timers[i] = group->posix_timers[i].timer;
+            group->posix_timers[i].timer = NULL;
+        }
 
         // The group will be removed from its group and session by reap_if_zombie,
         // because fish tries to set the pgid to that of an exited but not reaped
@@ -202,7 +208,8 @@ noreturn void do_exit(int status) {
         list_add(&new_parent->children, &child->siblings);
     }
 
-    if (exit_tgroup(current)) {
+    struct timer *timers[TIMERS_MAX] = {NULL};
+    if (exit_tgroup(current, timers)) {
         // If already marked zombie by do_exit_group force path, skip
         if (leader->zombie)
             goto skip_zombie_notify;
@@ -262,6 +269,9 @@ noreturn void do_exit(int status) {
         current = NULL;
     }
     unlock(&pids_lock);
+    for (int i = 0; i < TIMERS_MAX; i++)
+        if (timers[i] != NULL)
+            posix_timer_free(timers[i]);
 
     pthread_exit(NULL);
 }

@@ -1,6 +1,7 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stddef.h>
 #include <stdatomic.h>
 #include "util/timer.h"
@@ -178,6 +179,8 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
         unlock(&group->tty->lock);
     }
     group->itimer = NULL;
+    // timers are not inherited
+    memset(group->posix_timers, 0, sizeof(group->posix_timers));
     group->doing_group_exit = false;
     group->children_rusage = (struct rusage_) {};
     {
