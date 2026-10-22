@@ -199,7 +199,7 @@ static void anon_limit_report(const char *where, long requested_pages) {
         uint64_t limit = atomic_load(&ish_mem_limit_v);
         uint64_t avail = atomic_load(&ish_mem_avail_v);
         bool stale = now - atomic_load(&ish_mem_stamp_ms) > ISH_MEM_STALE_MS;
-        printk("mmap: memory brake refused %s — requested %ld pages, app footprint "
+        ish_printk_notice("mmap: memory brake refused %s — requested %ld pages, app footprint "
                "%lu MB / limit %lu MB (avail %lu MB)%s. Failing the guest allocation "
                "to keep the app below the jetsam line.\n",
                where, requested_pages,
@@ -222,7 +222,7 @@ static void anon_limit_report(const char *where, long requested_pages) {
     // the real footprint by 4x on a 16KB-page device and made the previous log
     // line agree with a cap that was itself wrong.
     long kb_per_page = (long)getpagesize() / 1024;
-    printk("mmap: anonymous page cap reached in %s — in use %ld pages (%ld MB host), "
+    ish_printk_notice("mmap: anonymous page cap reached in %s — in use %ld pages (%ld MB host), "
            "requested %ld pages (%ld MB host), cap %ld pages (%ld MB host, "
            "ceiling %ld MB host). Failing the guest allocation instead of "
            "letting the host app be killed by jetsam.\n",

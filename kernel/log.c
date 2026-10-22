@@ -135,7 +135,11 @@ void ish_printk(const char *msg, ...) {
     va_end(args);
 }
 
-#if LOG_HANDLER_DPRINTF
+#if LOG_HANDLER_DPRINTF && defined(_WIN32)
+static void log_line(const char *line) {
+    px_log_line(line);
+}
+#elif LOG_HANDLER_DPRINTF
 #define NEWLINE "\r\n"
 static void log_line(const char *line) {
     struct iovec output[2] = {{(void *) line, strlen(line)}, {"\n", 1}};
@@ -160,8 +164,34 @@ static void log_line(const char *line) {
 }
 #endif
 
+void ish_printk_notice(const char *msg, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, msg);
+    vsnprintf(buf, sizeof(buf), msg, args);
+    va_end(args);
+    printk("%s", buf);
+#if LOG_HANDLER_DPRINTF && defined(_WIN32)
+    buf[strcspn(buf, "\n")] = '\0';
+    px_log_notice(buf);
+#endif
+}
+
+int ish_netdiag(void) {
+#if LOG_HANDLER_DPRINTF && defined(_WIN32)
+    return px_log_netdiag();
+#else
+    return 2;
+#endif
+}
+
 static void default_die_handler(const char *msg) {
     printk("%s\n", msg);
+#if LOG_HANDLER_DPRINTF && defined(_WIN32)
+    // printk may have kept it off stderr; dying is never kept quiet
+    if (!px_log_stderr())
+        fprintf(stderr, "%s\n", msg);
+#endif
 }
 void (*die_handler)(const char *msg) = default_die_handler;
 _Noreturn void die(const char *msg, ...);

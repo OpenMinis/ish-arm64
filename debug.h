@@ -7,6 +7,20 @@ void ish_printk(const char *msg, ...);
 void ish_vprintk(const char *msg, va_list args);
 #undef printk
 #define printk ish_printk
+// a line the person at the terminal needs, such as why an allocation failed;
+// on Windows printk lines stay off stderr, these don't (a few at most)
+void ish_printk_notice(const char *msg, ...);
+// how much NETDIAG to log: 0 none, 1 what is out of the ordinary, 2 also the
+// routine (every blocking receive, refused or unreachable connects). Windows
+// logs none unless there is a log file (ISH_LOG_FILE) or ISH_NETDIAG=1.
+int ish_netdiag(void);
+// printk for a line a hot path can reach over and over: only the first n times
+#define printk_first(n, msg, ...) do { \
+    static int printk_seen_; \
+    if (__atomic_load_n(&printk_seen_, __ATOMIC_RELAXED) < (n) && \
+            __atomic_fetch_add(&printk_seen_, 1, __ATOMIC_RELAXED) < (n)) \
+        printk(msg, ##__VA_ARGS__); \
+} while (0)
 
 // debug output utilities
 // save me

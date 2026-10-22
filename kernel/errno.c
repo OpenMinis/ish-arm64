@@ -99,7 +99,7 @@ int err_map(int err) {
     if (err == EWOULDBLOCK)
         return _EAGAIN;
 #endif
-    printk("unknown error %d\n", err);
+    printk_first(16, "unknown error %d\n", err);
     return -(err | 0x1000);
 }
 

@@ -400,6 +400,15 @@ void px_mem_info(uint64_t *total, uint64_t *avail);
 uint64_t px_uptime_ms(void);
 // ISH_BOOT_TRACE: what happens when, in ms since the process was made (stderr)
 void px_boot_mark(const char *what);
+// Where printk lines go. Whoever runs ish shows its stderr to the person at
+// the terminal, so a line goes to ISH_LOG_FILE when that is set, and to stderr
+// only with ISH_LOG_STDERR=1. A notice is a line that person needs (why an
+// allocation failed): it goes to stderr too, at most once in 10 seconds.
+void px_log_line(const char *line);
+void px_log_notice(const char *line);
+bool px_log_stderr(void);
+// NETDIAG: 2 with ISH_NETDIAG=1, 1 when there is a log file, else 0
+int px_log_netdiag(void);
 // The process's private committed memory (its footprint, for the memory
 // governor), and a last-chance handler that reports host crashes.
 uint64_t px_process_footprint(void);

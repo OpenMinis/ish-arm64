@@ -606,7 +606,7 @@ dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2,
     // Loud diagnostic — these should be rare now that CMP_REQUEUE and WAKE_OP are implemented.
     // Returning _EINVAL instead of _ENOSYS lets most userspace libraries fall back to
     // FUTEX_WAKE/WAIT rather than treating it as "kernel too old" and aborting.
-    printk("SYS_FUTEX: unsupported op=%d (cmd=%d) uaddr=%#x val=%d uaddr2=%#x val3=%#x pid=%d comm=%s\n",
+    printk_first(16, "SYS_FUTEX: unsupported op=%d (cmd=%d) uaddr=%#x val=%d uaddr2=%#x val3=%#x pid=%d comm=%s\n",
            op, cmd, uaddr, val, uaddr2, val3, current->pid, current->comm);
     return _EINVAL;
 }

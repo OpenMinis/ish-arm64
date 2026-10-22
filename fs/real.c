@@ -346,7 +346,7 @@ int realfs_poll(struct fd *fd) {
         p.revents &= ~POLLPRI;
 
     if (p.revents & POLLNVAL) {
-        printk("pollnval %d flags %d events %d revents %d\n", fd->real_fd, flags, p.events, p.revents);
+        printk_first(16, "pollnval %d flags %d events %d revents %d\n", fd->real_fd, flags, p.events, p.revents);
         // Seriously, fuck Darwin. I just want to poll on POLLIN|POLLOUT|POLLPRI.
         // But if there's almost any kind of error, you just get POLLNVAL back,
         // and no information about the bits that are in fact set. So ask for each

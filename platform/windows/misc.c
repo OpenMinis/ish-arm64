@@ -466,6 +466,78 @@ void px_boot_mark(const char *what) {
     fprintf(stderr, "[boot] %-24s %7.2f ms\n", what, (b - a) / 1e4);
 }
 
+static INIT_ONCE log_once = INIT_ONCE_STATIC_INIT;
+static HANDLE log_file = INVALID_HANDLE_VALUE;
+static bool log_stderr;
+static int log_netdiag;
+
+static bool env_on(const char *name) {
+    const char *v = getenv(name);
+    return v != NULL && strcmp(v, "1") == 0;
+}
+
+static BOOL CALLBACK log_init(PINIT_ONCE once, void *param, void **ctx) {
+    (void) once; (void) param; (void) ctx;
+    log_stderr = env_on("ISH_LOG_STDERR");
+    // a path in any language: the variable in UTF-16, as it was set
+    const wchar_t *path = _wgetenv(L"ISH_LOG_FILE");
+    if (path != NULL && path[0] != L'\0')
+        // FILE_APPEND_DATA alone: each write lands whole at the end, even with
+        // every ish of a session writing to the same file
+        log_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    log_netdiag = env_on("ISH_NETDIAG") ? 2 : log_file != INVALID_HANDLE_VALUE ? 1 : 0;
+    return TRUE;
+}
+
+static void log_setup(void) {
+    InitOnceExecuteOnce(&log_once, log_init, NULL, NULL);
+}
+
+bool px_log_stderr(void) {
+    log_setup();
+    return log_stderr;
+}
+
+int px_log_netdiag(void) {
+    log_setup();
+    return log_netdiag;
+}
+
+void px_log_line(const char *line) {
+    log_setup();
+    if (log_stderr)
+        fprintf(stderr, "%s\n", line);
+    if (log_file == INVALID_HANDLE_VALUE)
+        return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    size_t len = strlen(line);
+    char *buf = malloc(len + 64);
+    if (buf == NULL)
+        return;
+    int n = sprintf(buf, "%04u-%02u-%02u %02u:%02u:%02u.%03u [%lu] ", t.wYear, t.wMonth, t.wDay,
+            t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, GetCurrentProcessId());
+    memcpy(buf + n, line, len);
+    buf[n + len] = '\n';
+    DWORD put;
+    WriteFile(log_file, buf, (DWORD) (n + len + 1), &put, NULL);
+    free(buf);
+}
+
+void px_log_notice(const char *line) {
+    if (px_log_stderr())
+        return; // px_log_line wrote it
+    static _Atomic uint64_t last;
+    uint64_t now = GetTickCount64();
+    uint64_t prev = atomic_load(&last);
+    if (prev != 0 && now - prev < 10000)
+        return;
+    if (!atomic_compare_exchange_strong(&last, &prev, now))
+        return;
+    fprintf(stderr, "ish: %s\n", line);
+}
+
 uint64_t px_uptime_ms(void) {
     return GetTickCount64();
 }

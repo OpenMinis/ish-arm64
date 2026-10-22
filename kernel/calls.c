@@ -65,6 +65,18 @@ void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook) {
     atomic_store_explicit(&g_timer_tick_hook, hook, memory_order_release);
 }
 
+// A program that keeps calling a syscall we lack logged a line on every call:
+// log each number once.
+static void syscall_unhandled(unsigned num, const char *what) {
+    static _Atomic uint32_t seen[1024 / 32];
+    if (num < 1024) {
+        uint32_t bit = 1u << (num % 32);
+        if (atomic_fetch_or(&seen[num / 32], bit) & bit)
+            return;
+    }
+    printk("%d(%s) %s syscall %d\n", current->pid, current->comm, what, num);
+}
+
 #ifdef GUEST_ARM64
 // [T-ish-precise-fault-pc] Deliver / resume a data fault at the faulting
 // instruction instead of the start of its block, unless a recovery heuristic
@@ -90,11 +102,11 @@ void handle_interrupt(int interrupt) {
         current->syscall_restart_pc = cpu->rip;
         current->syscall_restartable = false;
         if (syscall_num >= syscall_table_size || syscall_table[syscall_num] == NULL) {
-            printk("%d(%s) missing syscall %d\n", current->pid, current->comm, syscall_num);
+            syscall_unhandled(syscall_num, "missing");
             cpu->rax = (uint64_t) (int64_t) _ENOSYS;
         } else {
             if (syscall_table[syscall_num] == (syscall_t) syscall_stub) {
-                printk("%d(%s) stub syscall %d\n", current->pid, current->comm, syscall_num);
+                syscall_unhandled(syscall_num, "stub");
             }
             STRACE("%d call %-3d ", current->pid, syscall_num);
             static int systrace = -1;
@@ -190,11 +202,11 @@ void handle_interrupt(int interrupt) {
         current->syscall_restart_pc = cpu->eip;
         current->syscall_restartable = false;
         if (syscall_num >= syscall_table_size || syscall_table[syscall_num] == NULL) {
-            printk("%d(%s) missing syscall %d\n", current->pid, current->comm, syscall_num);
+            syscall_unhandled(syscall_num, "missing");
             cpu->eax = _ENOSYS;
         } else {
             if (syscall_table[syscall_num] == (syscall_t) syscall_stub) {
-                printk("%d(%s) stub syscall %d\n", current->pid, current->comm, syscall_num);
+                syscall_unhandled(syscall_num, "stub");
             }
             STRACE("%d call %-3d ", current->pid, syscall_num);
             static int systrace = -1;
@@ -291,11 +303,11 @@ void handle_interrupt(int interrupt) {
         } else {
             // === SLOW PATH: Full syscall ===
             if (syscall_num >= syscall_table_size || syscall_table[syscall_num] == NULL) {
-                printk("%d(%s) missing syscall %d\n", current->pid, current->comm, syscall_num);
+                syscall_unhandled(syscall_num, "missing");
                 cpu->regs[0] = (uint64_t)(int64_t)(int32_t)_ENOSYS;
             } else {
                 if (syscall_table[syscall_num] == (syscall_t) syscall_stub) {
-                    printk("%d(%s) stub syscall %d\n", current->pid, current->comm, syscall_num);
+                    syscall_unhandled(syscall_num, "stub");
                 }
                 STRACE("%d call %-3d ", current->pid, syscall_num);
                 // env-gated full syscall trace for golden-diff vs native strace.

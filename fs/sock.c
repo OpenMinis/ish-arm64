@@ -615,10 +615,18 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (err < 0) {
         int ce = errno;
         // Log connect failures except the routine nonblock in-progress case,
-        // so VPN / routing issues are visible in user-shared logs.
-        if (ce != EINPROGRESS && ce != EALREADY) {
-            printk("NETDIAG connect(pid=%d comm=%s fd=%d) errno=%d\n",
-                   current->pid, current->comm, sock_fd, ce);
+        // so VPN / routing issues are visible in user-shared logs. Refused and
+        // unreachable are routine too (no IPv6 route, nobody on that port):
+        // the program goes on to the next address: log the first few.
+        bool routine = ce == ENETUNREACH || ce == EHOSTUNREACH || ce == ECONNREFUSED;
+        int diag = ish_netdiag();
+        if (ce != EINPROGRESS && ce != EALREADY && diag > 0) {
+            if (routine && diag < 2)
+                printk_first(8, "NETDIAG connect(pid=%d comm=%s fd=%d) errno=%d\n",
+                             current->pid, current->comm, sock_fd, ce);
+            else
+                printk("NETDIAG connect(pid=%d comm=%s fd=%d) errno=%d\n",
+                       current->pid, current->comm, sock_fd, ce);
         }
         errno = ce;
         return errno_map();
@@ -960,8 +968,9 @@ static int sock_wait_for(int real_fd, short events, int timeout_opt) {
         if (deadline_ms > 0) {
             int64_t remaining = deadline_ms - monotonic_ms();
             if (remaining <= 0) {
-                printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) deadline-expired after %lldms\n",
-                       current->pid, current->comm, real_fd, events, (long long) timeout_ms);
+                if (ish_netdiag() >= 2)
+                    printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) deadline-expired after %lldms\n",
+                           current->pid, current->comm, real_fd, events, (long long) timeout_ms);
                 return _EAGAIN;
             }
             if (remaining < poll_ms)
@@ -978,7 +987,7 @@ static int sock_wait_for(int real_fd, short events, int timeout_opt) {
             return 0;
         if (pr == 0) {
             // Log once if we're stuck > 3 seconds without any ready event
-            if (!slow_logged && (monotonic_ms() - start_ms) >= 3000) {
+            if (!slow_logged && (monotonic_ms() - start_ms) >= 3000 && ish_netdiag() >= 2) {
                 printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) no-event for 3s (timeout_opt_ms=%ld)\n",
                        current->pid, current->comm, real_fd, events, timeout_ms);
                 slow_logged = true;
@@ -988,8 +997,9 @@ static int sock_wait_for(int real_fd, short events, int timeout_opt) {
         if (saved_errno == EINTR)
             continue;
         errno = saved_errno;
-        printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) poll err=%d\n",
-               current->pid, current->comm, real_fd, events, saved_errno);
+        if (ish_netdiag() >= 1)
+            printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) poll err=%d\n",
+                   current->pid, current->comm, real_fd, events, saved_errno);
         return errno_map();
     }
 }
@@ -1038,10 +1048,11 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
         // Diagnostic: a blocking recv is exceptional for most network
         // programs (Node, Go, Python asyncio all use nonblock). Log it so
         // we can see the guest/host fd state in user-shared logs.
-        printk("NETDIAG recvfrom-block(pid=%d comm=%s fd=%d real=%d len=%u gflags=%#x hflags=%#x sflags=%#x)\n",
-               current->pid, current->comm, sock_fd, sock->real_fd,
-               (unsigned)len, (unsigned)flags,
-               host_flags, sock->flags);
+        if (ish_netdiag() >= 2)
+            printk("NETDIAG recvfrom-block(pid=%d comm=%s fd=%d real=%d len=%u gflags=%#x hflags=%#x sflags=%#x)\n",
+                   current->pid, current->comm, sock_fd, sock->real_fd,
+                   (unsigned)len, (unsigned)flags,
+                   host_flags, sock->flags);
         for (;;) {
             res = recvfrom(sock->real_fd, buffer, len, real_flags | MSG_DONTWAIT,
                     sockaddr_addr != 0 ? (void *) sockaddr : NULL,
@@ -1591,9 +1602,10 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     ssize_t res = -1;
     int err = 0;
     if (should_wait_rm) {
-        printk("NETDIAG recvmsg-block(pid=%d comm=%s fd=%d real=%d gflags=%#x hflags=%#x sflags=%#x)\n",
-               current->pid, current->comm, sock_fd, sock->real_fd,
-               (unsigned)flags, host_flags_rm, sock->flags);
+        if (ish_netdiag() >= 2)
+            printk("NETDIAG recvmsg-block(pid=%d comm=%s fd=%d real=%d gflags=%#x hflags=%#x sflags=%#x)\n",
+                   current->pid, current->comm, sock_fd, sock->real_fd,
+                   (unsigned)flags, host_flags_rm, sock->flags);
         for (;;) {
             res = recvmsg(sock->real_fd, &msg, real_flags | MSG_DONTWAIT);
             if (res >= 0)
@@ -1827,7 +1839,7 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
         }
         // no guest signal — retry the host read
     }
-    if (eintr_count >= 3) {
+    if (eintr_count >= 3 && ish_netdiag() >= 1) {
         printk("NETDIAG sock_read-eintr(pid=%d comm=%s fd=%d) count=%d err=%d\n",
                current->pid, current->comm, fd->real_fd, eintr_count, err);
     }
@@ -1854,7 +1866,7 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
             if (pending) { err = _EINTR; break; }
         }
     }
-    if (eintr_count >= 3) {
+    if (eintr_count >= 3 && ish_netdiag() >= 1) {
         printk("NETDIAG sock_write-eintr(pid=%d comm=%s fd=%d) count=%d err=%d\n",
                current->pid, current->comm, fd->real_fd, eintr_count, err);
     }

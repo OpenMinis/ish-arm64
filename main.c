@@ -474,8 +474,10 @@ int main(int argc, char *const argv[]) {
         }
     }
 
+#ifndef _WIN32
     // Redirect printk output (fd 666) to stderr
     dup2(STDERR_FILENO, 666);
+#endif
 
     static char altstack[SIGSTKSZ];
     stack_t ss = {.ss_sp = altstack, .ss_size = SIGSTKSZ};
