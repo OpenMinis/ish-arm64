@@ -209,7 +209,10 @@ bool px_vm_verbose = true;
 #define CK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { if (px_vm_verbose) fprintf(stderr, "[vm] %s: 0x%08lx\n", #x, (unsigned long) hr_); goto fail; } } while (0)
 
 static bool load_(void) {
-    HMODULE m = LoadLibraryW(L"WinHvPlatform.dll");
+    // System32 only: not one planted next to ish.exe or in the current
+    // directory. Missing (the Windows Hypervisor Platform feature off): NULL,
+    // and no dialog, as for any LoadLibrary.
+    HMODULE m = LoadLibraryExW(L"WinHvPlatform.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (m == NULL)
         return false;
 #define GET(name) if ((p_##name = (void *) GetProcAddress(m, #name)) == NULL) return false
