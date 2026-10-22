@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "util/timer.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/memory.h"
@@ -93,9 +94,7 @@ struct task *task_create_(struct task *parent) {
     // Initialize blocking state for deadlock detection.
     task->blocking = false;
     {
-        struct timespec _ts;
-        clock_gettime(CLOCK_MONOTONIC, &_ts);
-        task->last_unblocked_ns = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+        task->last_unblocked_ns = coarse_now_ns();
     }
     list_init(&task->children);
     list_init(&task->siblings);

@@ -1,3 +1,4 @@
+#include "util/timer.h"
 #include "kernel/task.h"
 #include <string.h>
 #include <poll.h>
@@ -443,9 +444,7 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         // loop is just cycling. This prevents the deadlock detector from being
         // fooled by idle poll_wait loops during exit cleanup.
         if (err > 0) {
-            struct timespec _ts;
-            clock_gettime(CLOCK_MONOTONIC, &_ts);
-            uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+            uint64_t now = coarse_now_ns();
             current->last_unblocked_ns = now;
             atomic_store_explicit(&current->group->last_progress_ns, now,
                                   memory_order_relaxed);
@@ -472,9 +471,8 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
             //   - processes with a controlling TTY: interactive shells idle
             //     waiting for user input and must not be killed
             if (current->pid != 1 && current->group->tty == NULL) {
-                struct timespec _now;
-                clock_gettime(CLOCK_MONOTONIC, &_now);
-                uint64_t now_ns = (uint64_t)_now.tv_sec * 1000000000ULL + _now.tv_nsec;
+                // the clock the progress marks are taken with
+                uint64_t now_ns = coarse_now_ns();
                 uint64_t last = atomic_load_explicit(
                     &current->group->last_progress_ns, memory_order_relaxed);
                 int64_t idle_s = (int64_t)(now_ns - last) / 1000000000LL;

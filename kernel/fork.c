@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include "util/timer.h"
 #include "debug.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -180,10 +181,7 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     group->doing_group_exit = false;
     group->children_rusage = (struct rusage_) {};
     {
-        struct timespec _ts;
-        clock_gettime(CLOCK_MONOTONIC, &_ts);
-        atomic_store_explicit(&group->last_progress_ns,
-            (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec,
+        atomic_store_explicit(&group->last_progress_ns, coarse_now_ns(),
             memory_order_relaxed);
     }
     cond_init(&group->child_exit);

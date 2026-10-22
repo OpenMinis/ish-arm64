@@ -2,6 +2,7 @@
 #define UTIL_TIMER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
 #include <pthread.h>
 #include <assert.h>
@@ -12,6 +13,20 @@ static inline struct timespec timespec_now(clockid_t clockid) {
     struct timespec now;
     clock_gettime(clockid, &now); // can't fail, according to posix spec
     return now;
+}
+
+// Monotonic nanoseconds for timestamps that only need to be good to a few
+// milliseconds (progress marks, cache ages). On Windows the precise clock is a
+// system call in a VM without an invariant TSC (3.5us a call); the tick count
+// is read from shared memory.
+static inline uint64_t coarse_now_ns(void) {
+#ifdef _WIN32
+    return px_uptime_ms() * 1000000ull;
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000000000ull + (uint64_t) now.tv_nsec;
+#endif
 }
 
 static inline struct timespec timespec_add(struct timespec x, struct timespec y) {

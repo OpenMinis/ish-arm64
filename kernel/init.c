@@ -2,6 +2,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "util/timer.h"
 #include "fs/dev.h"
 #include "fs/devices.h"
 #include "fs/fd.h"
@@ -66,10 +67,7 @@ static struct task *construct_task(struct task *parent) {
     group->leader = task;
     group->personality = ADDR_NO_RANDOMIZE_;
     {
-        struct timespec _ts;
-        clock_gettime(CLOCK_MONOTONIC, &_ts);
-        atomic_store_explicit(&group->last_progress_ns,
-            (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec,
+        atomic_store_explicit(&group->last_progress_ns, coarse_now_ns(),
             memory_order_relaxed);
     }
     list_add(&group->threads, &task->group_links);

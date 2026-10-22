@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <stdatomic.h>
+#include "util/timer.h"
 #include "debug.h"
 #include "kernel/calls.h"
 #include "emu/interrupt.h"
@@ -166,9 +167,7 @@ void handle_interrupt(int interrupt) {
             case 7: case 271: case 23: case 270: case 34: case 130:
                 break;
             default: {
-                struct timespec _ts;
-                clock_gettime(CLOCK_MONOTONIC, &_ts);
-                uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+                uint64_t now = coarse_now_ns();
                 current->last_unblocked_ns = now;
                 atomic_store_explicit(&current->group->last_progress_ns, now,
                                       memory_order_relaxed);
@@ -229,9 +228,7 @@ void handle_interrupt(int interrupt) {
             case 308: case 284: case 114: case 7: case 162: case 267:
                 break;
             default: {
-                struct timespec _ts;
-                clock_gettime(CLOCK_MONOTONIC, &_ts);
-                uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+                uint64_t now = coarse_now_ns();
                 current->last_unblocked_ns = now;
                 atomic_store_explicit(&current->group->last_progress_ns, now,
                                       memory_order_relaxed);
@@ -405,9 +402,7 @@ void handle_interrupt(int interrupt) {
         // don't represent real forward progress.
         if (syscall_num != 22 && syscall_num != 73 && syscall_num != 95 &&
             syscall_num != 98 && syscall_num != 101) {
-            struct timespec _ts;
-            clock_gettime(CLOCK_MONOTONIC, &_ts);
-            uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+            uint64_t now = coarse_now_ns();
             current->last_unblocked_ns = now;
             atomic_store_explicit(&current->group->last_progress_ns, now,
                                   memory_order_relaxed);
