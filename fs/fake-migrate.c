@@ -48,8 +48,11 @@ int fakefs_migrate(struct fakefs_db *fs, int UNUSED(root_fd)) {
     int version = sqlite3_column_int(user_version, 0);
     FINALIZE(user_version);
 
-    EXEC("begin");
     int versions = sizeof(migrations)/sizeof(migrations[0]);
+    // up to date: no write (it would cost every start a sync of the WAL)
+    if (version >= versions)
+        return 0;
+    EXEC("begin");
     while (version < versions) {
         struct migration m = migrations[version];
         if (m.sql != NULL)

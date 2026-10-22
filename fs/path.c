@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include "kernel/calls.h"
 #include "util/sync.h"
+#include "util/timer.h"
 #include "fs/path.h"
 
 // === Path Normalize Cache ===
@@ -85,11 +86,9 @@ static inline uint32_t path_hash(const char *str) {
     return hash;
 }
 
-// Get current time in nanoseconds
+// Get current time in nanoseconds (a cache age: the coarse clock will do)
 static inline uint64_t get_time_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    return coarse_now_ns();
 }
 
 // Try to get cached normalized path
@@ -129,6 +128,86 @@ static void path_cache_set(const char *full_path, int flags, const char *normali
     entry->gen = gen;   // the snapshot taken before the walk, not now
     entry->valid = true;
     unlock(&path_cache_lock);
+}
+
+// === Component cache ===
+//
+// The cache above is keyed by whole paths, so a walk over many different files
+// (find, grep -r, an import searching sys.path) never hits it, and then every
+// component of every path costs a fakefs readlink (a meta.db transaction) and
+// every directory on the way a stat on top (another one, and a host stat):
+// some 16 transactions for one lstat deep in /usr/lib. This caches what the
+// walk learns about each normalized prefix on fakefs: a symlink and its
+// target, a directory and the mode and owner its search check needs, or
+// something that is neither. Same rules as above: the namespace generation
+// (bumped by every mutation that can change these, and chmod/chown) and the
+// TTL for what happens behind the kernel's back (bind mounts). Failures are
+// never cached.
+#define DC_SIZE 4096
+#define DC_KEY 240
+#define DC_TARGET 200
+enum { DC_EMPTY, DC_SYMLINK, DC_DIR, DC_FILE, DC_NOTLINK };   // NOTLINK: exists, type not looked at
+struct dentry_cache_entry {
+    uint64_t gen, stamp;
+    uint32_t hash;
+    uint16_t kind, target_len;
+    dword_t mode, uid, gid;
+    char key[DC_KEY];
+    char target[DC_TARGET];
+};
+static struct dentry_cache_entry dentry_cache[DC_SIZE];
+static lock_t dentry_cache_lock = LOCK_INITIALIZER;
+static _Atomic uint64_t dc_hits, dc_misses;
+
+void dentry_cache_stats(uint64_t out[2]) {
+    out[0] = atomic_load(&dc_hits);
+    out[1] = atomic_load(&dc_misses);
+}
+
+static bool dentry_cache_get(const char *key, uint64_t gen, struct dentry_cache_entry *out) {
+    size_t len = strlen(key);
+    if (len >= DC_KEY)
+        return false;
+    uint32_t h = path_hash(key);
+    struct dentry_cache_entry *e = &dentry_cache[h % DC_SIZE];
+    uint64_t now = get_time_ns();
+    lock(&dentry_cache_lock);
+    bool hit = e->kind != DC_EMPTY && e->hash == h && e->gen == gen && now - e->stamp <= PATH_CACHE_TTL_NS &&
+               strcmp(e->key, key) == 0;
+    if (hit) {
+        out->kind = e->kind;
+        out->mode = e->mode;
+        out->uid = e->uid;
+        out->gid = e->gid;
+        out->target_len = e->target_len;
+        memcpy(out->target, e->target, e->target_len);
+    }
+    unlock(&dentry_cache_lock);
+    atomic_fetch_add_explicit(hit ? &dc_hits : &dc_misses, 1, memory_order_relaxed);
+    return hit;
+}
+
+static void dentry_cache_set(const char *key, uint64_t gen, int kind, const struct statbuf *stat,
+                             const char *target, size_t target_len) {
+    size_t len = strlen(key);
+    if (len >= DC_KEY || target_len > DC_TARGET)
+        return;
+    uint32_t h = path_hash(key);
+    struct dentry_cache_entry *e = &dentry_cache[h % DC_SIZE];
+    uint64_t now = get_time_ns();
+    lock(&dentry_cache_lock);
+    e->kind = kind;
+    e->hash = h;
+    e->gen = gen;
+    e->stamp = now;
+    memcpy(e->key, key, len + 1);
+    e->mode = stat ? stat->mode : 0;
+    e->uid = stat ? stat->uid : 0;
+    e->gid = stat ? stat->gid : 0;
+    e->target_len = (uint16_t) target_len;
+    if (target_len)
+        memcpy(e->target, target, target_len);
+    unlock(&dentry_cache_lock);
 }
 
 static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
@@ -220,13 +299,40 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
             char possible_symlink[MAX_PATH];
             *o = '\0';
             strcpy(possible_symlink, out);
-            struct mount *mount = find_mount_and_trim_path(possible_symlink);
-            assert(path_is_normalized(possible_symlink));
+            // a slash after this component: it must be a directory we may search
+            bool need_dir = *(p - 1) == '/';
+            uint64_t gen = path_cache_snapshot();
+            struct dentry_cache_entry known;
+            bool cached = dentry_cache_get(out, gen, &known) && (known.kind != DC_NOTLINK || !need_dir);
+            // the key, before readlink writes the target over the component
+            char key[DC_KEY];
+            if ((size_t) (o - out) < sizeof(key))
+                memcpy(key, out, o - out + 1);
+            else
+                gen = 0;
+            struct mount *mount = NULL;
             int res = _EINVAL;
-            if (mount->fs->readlink)
-                res = mount->fs->readlink(mount, possible_symlink, c, MAX_PATH - (c - out));
+            if (cached) {
+                if (known.kind == DC_SYMLINK) {
+                    if ((size_t) known.target_len > (size_t) (MAX_PATH - (c - out)))
+                        return _ENAMETOOLONG;
+                    memcpy(c, known.target, known.target_len);
+                    res = known.target_len;
+                }
+            } else {
+                mount = find_mount_and_trim_path(possible_symlink);
+                assert(path_is_normalized(possible_symlink));
+                if (mount->fs->readlink)
+                    res = mount->fs->readlink(mount, possible_symlink, c, MAX_PATH - (c - out));
+                if (mount->fs != &fakefs)
+                    gen = 0;   // procfs (/proc/self) and the like: not for keeping
+            }
             if (res >= 0) {
-                mount_release(mount);
+                if (mount != NULL) {
+                    mount_release(mount);
+                    if (gen != 0)
+                        dentry_cache_set(key, gen, DC_SYMLINK, NULL, c, res);
+                }
                 if (levels >= 5)
                     return _ELOOP;
                 // readlink does not null terminate
@@ -243,13 +349,24 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
                 return __path_normalize(NULL, expanded_path, out, flags, levels + 1);
             }
 
-            // if there's a slash after this component, ensure that if it
-            // exists, it's a directory and that we have execute perms on it
-            if (*(p - 1) == '/') {
+            if (cached) {
+                if (need_dir) {
+                    if (known.kind != DC_DIR)
+                        return _ENOTDIR;
+                    struct statbuf stat = {.mode = known.mode, .uid = known.uid, .gid = known.gid};
+                    int err = access_check(&stat, AC_X);
+                    if (err < 0)
+                        return err;
+                }
+            } else if (need_dir) {
+                // if there's a slash after this component, ensure that if it
+                // exists, it's a directory and that we have execute perms on it
                 struct statbuf stat;
                 int err = mount->fs->stat(mount, possible_symlink, &stat);
                 mount_release(mount);
                 if (err >= 0) {
+                    if (res == _EINVAL && gen != 0)
+                        dentry_cache_set(key, gen, S_ISDIR(stat.mode) ? DC_DIR : DC_FILE, &stat, NULL, 0);
                     if (!S_ISDIR(stat.mode))
                         return _ENOTDIR;
                     err = access_check(&stat, AC_X);
@@ -258,6 +375,8 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
                 }
             } else {
                 mount_release(mount);
+                if (res == _EINVAL && gen != 0)
+                    dentry_cache_set(key, gen, DC_NOTLINK, NULL, NULL, 0);
             }
         }
     }

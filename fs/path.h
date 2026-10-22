@@ -32,6 +32,7 @@ bool path_is_normalized(const char *path);
 void path_cache_invalidate(void);
 // [T-ish-cpu-top] Cumulative counters: {hits, miss_slot, miss_gen, miss_ttl, miss_flags, invalidations}.
 void path_cache_stats(uint64_t out[6]);
+void dentry_cache_stats(uint64_t out[2]);
 
 // Helper function for iterating through a normalized path.
 //

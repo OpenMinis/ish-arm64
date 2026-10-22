@@ -25,8 +25,17 @@ struct fakefs_db {
         sqlite3_stmt *try_cleanup_inode;
         sqlite3_stmt *orphan_note;
         sqlite3_stmt *orphan_clear;
+        sqlite3_stmt *data_version;
     } stmt;
     sqlite3_mutex *lock;
+    // under lock: the transaction db_begin_read has yet to open, if any
+    // statement needs it, and what the lookups below remember (fake-db.c)
+    int txn;
+    bool txn_wrote;
+    uint64_t gen;
+    struct meta_cache *cache;
+    int64_t data_version;
+    uint64_t data_version_seen;
 };
 
 int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd);
@@ -56,6 +65,7 @@ inode_t path_create(struct fakefs_db *fs, const char *path, struct ish_stat *sta
 
 bool inode_read_stat_if_exist(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat);
 void inode_read_stat_or_die(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat);
+void inode_try_cleanup(struct fakefs_db *fs, inode_t inode);
 void inode_write_stat(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat);
 
 void path_link(struct fakefs_db *fs, const char *src, const char *dst);

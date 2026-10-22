@@ -387,7 +387,47 @@ static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount
 // this exists only to override readdir to fix the returned inode numbers
 static struct fd_ops fakefs_fdops;
 
+// [T-ish-fakefs-path-locks] On Windows creating or removing a file takes the
+// host 0.1-0.4ms. Removing one used to be done holding fs->lock (in the
+// meta.db transaction), so the threads of a program writing many files (npm's
+// libuv workers) took turns. Now the host call and the meta.db change that goes
+// with it are done under a lock of that path's, one of PATH_LOCKS by hash, and
+// fs->lock is only taken for the change: another path's host call goes on
+// meanwhile, and a create and a remove of the same path still come one after
+// the other, as host file and row. (Not elsewhere: an O_CREAT open of a FIFO
+// waits for the other end, and that holding the path's lock could deadlock.)
+#ifdef _WIN32
+#define PATH_LOCKS 64
+static lock_t path_locks[PATH_LOCKS];
+static pthread_once_t path_locks_once = PTHREAD_ONCE_INIT;
+static void path_locks_init(void) {
+    for (int i = 0; i < PATH_LOCKS; i++)
+        lock_init(&path_locks[i]);
+}
+static lock_t *path_lock_of(const char *path) {
+    pthread_once(&path_locks_once, path_locks_init);
+    uint32_t h = 2166136261u;
+    for (const char *p = path; *p; p++)
+        h = (h ^ (uint8_t) *p) * 16777619u;
+    return &path_locks[h % PATH_LOCKS];
+}
+#endif
+
+static struct fd *fakefs_open_(struct mount *mount, const char *path, int flags, int mode);
 static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, int mode) {
+#ifdef _WIN32
+    if (flags & O_CREAT_) {
+        lock_t *pl = path_lock_of(path);
+        lock(pl);
+        struct fd *fd = fakefs_open_(mount, path, flags, mode);
+        unlock(pl);
+        return fd;
+    }
+#endif
+    return fakefs_open_(mount, path, flags, mode);
+}
+
+static struct fd *fakefs_open_(struct mount *mount, const char *path, int flags, int mode) {
     struct fakefs_db *fs = &mount->fakefs;
 
     /* Reject any write-intent open under a read-only bind mount.
@@ -563,6 +603,27 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
         return 0;
     }
     (void)src_bind; (void)dst_bind;
+#ifdef _WIN32
+    // As in unlink: Windows takes ~0.8 ms for a hard link (git makes one per
+    // object), so it goes outside fs->lock, under the locks of both paths
+    lock_t *la = path_lock_of(src), *lb = path_lock_of(dst);
+    if (la > lb) {
+        lock_t *t = la; la = lb; lb = t;
+    }
+    lock(la);
+    if (lb != la)
+        lock(lb);
+    int err = realfs.link(mount, src, dst);
+    if (err == 0) {
+        db_begin_write(fs);
+        path_link(fs, src, dst);
+        db_commit(fs);
+    }
+    if (lb != la)
+        unlock(lb);
+    unlock(la);
+    return err;
+#else
     db_begin_write(fs);
     int err = realfs.link(mount, src, dst);
     if (err < 0) {
@@ -572,6 +633,7 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
     path_link(fs, src, dst);
     db_commit(fs);
     return 0;
+#endif
 }
 
 static int fakefs_unlink(struct mount *mount, const char *path) {
@@ -601,6 +663,21 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
      * (bind_mount_ensure_inode), so the brief gap between the two is benign. */
     if (via_bind && unlink(host_abs) < 0)
         return errno_map();
+#ifdef _WIN32
+    lock_t *pl = path_lock_of(path);
+    lock(pl);
+    if (!via_bind) {
+        int err = realfs.unlink(mount, path);
+        if (err < 0) {
+            unlock(pl);
+            return err;
+        }
+    }
+    db_begin_write(fs);
+    ino_t ino = path_unlink(fs, path);
+    db_commit(fs);
+    unlock(pl);
+#else
     db_begin_write(fs);
     if (!via_bind) {
         int err = realfs.unlink(mount, path);
@@ -611,6 +688,7 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
     }
     ino_t ino = path_unlink(fs, path);
     db_commit(fs);
+#endif
     if (via_bind)
         fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     inode_check_orphaned(mount, ino);
@@ -635,6 +713,21 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
     /* [T-ish-bind-host-op-unlocked] Host call first, outside fs->lock. */
     if (via_bind && rmdir(host_abs) < 0)
         return errno_map();
+#ifdef _WIN32
+    lock_t *pl = path_lock_of(path);
+    lock(pl);
+    if (!via_bind) {
+        int err = realfs.rmdir(mount, path);
+        if (err < 0) {
+            unlock(pl);
+            return err;
+        }
+    }
+    db_begin_write(fs);
+    ino_t ino = path_unlink(fs, path);
+    db_commit(fs);
+    unlock(pl);
+#else
     db_begin_write(fs);
     if (!via_bind) {
         int err = realfs.rmdir(mount, path);
@@ -645,6 +738,7 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
     }
     ino_t ino = path_unlink(fs, path);
     db_commit(fs);
+#endif
     if (via_bind)
         fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     inode_check_orphaned(mount, ino);
@@ -1039,6 +1133,26 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     /* [T-ish-bind-host-op-unlocked] Host call first, outside fs->lock. */
     if (via_bind && mkdir(host_abs, 0777) < 0)
         return errno_map();
+    struct ish_stat ishstat;
+    ishstat.mode = mode | S_IFDIR;
+    ishstat.uid = current->euid;
+    ishstat.gid = current->egid;
+    ishstat.rdev = 0;
+#ifdef _WIN32
+    lock_t *pl = path_lock_of(path);
+    lock(pl);
+    if (!via_bind) {
+        int err = realfs.mkdir(mount, path, 0777);
+        if (err < 0) {
+            unlock(pl);
+            return err;
+        }
+    }
+    db_begin_write(fs);
+    path_create(fs, path, &ishstat);
+    db_commit(fs);
+    unlock(pl);
+#else
     db_begin_write(fs);
     if (!via_bind) {
         int err = realfs.mkdir(mount, path, 0777);
@@ -1047,13 +1161,9 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
             return err;
         }
     }
-    struct ish_stat ishstat;
-    ishstat.mode = mode | S_IFDIR;
-    ishstat.uid = current->euid;
-    ishstat.gid = current->egid;
-    ishstat.rdev = 0;
     path_create(fs, path, &ishstat);
     db_commit(fs);
+#endif
     if (via_bind)
         fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
     return 0;
@@ -1492,8 +1602,7 @@ static int fakefs_umount(struct mount *mount) {
 static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
     struct fakefs_db *fs = &mount->fakefs;
     db_begin_write(fs);
-    sqlite3_bind_int64(fs->stmt.try_cleanup_inode, 1, inode);
-    db_exec_reset(fs, fs->stmt.try_cleanup_inode);
+    inode_try_cleanup(fs, inode);
     inode_clear_orphan(fs, inode);
     db_commit(fs);
 }

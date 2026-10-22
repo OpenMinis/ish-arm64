@@ -277,6 +277,9 @@ int generic_setattrat(struct fd *at, const char *path_raw, struct attr attr, boo
     if (mount->fs->setattr)
         err = mount->fs->setattr(mount, path, attr);
     mount_release(mount);
+    // a directory's mode and owner decide who may walk through it
+    if (err >= 0 && attr.type != attr_size)
+        path_cache_invalidate();
     return err;
 }
 

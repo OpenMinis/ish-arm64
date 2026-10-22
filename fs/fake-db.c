@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -7,6 +8,13 @@
 #include "fs/fake-db.h"
 #include "util/signpost.h"
 #include "kernel/sctimes.h"
+#include "util/timer.h"
+
+// what the lookups' memory (below) did, for ISH_XJIT_STATS
+static _Atomic uint64_t mc_hits, mc_misses, mc_writes, mc_others;
+void meta_cache_stats(uint64_t out[4]) {
+    out[0] = mc_hits; out[1] = mc_misses; out[2] = mc_writes; out[3] = mc_others;
+}
 
 static void db_check_error(struct fakefs_db *fs) {
     int errcode = sqlite3_errcode(fs->db);
@@ -131,11 +139,29 @@ static int db_exec_oneshot(struct fakefs_db *fs, const char *sql) {
     return (rc == SQLITE_DONE || rc == SQLITE_ROW || rc == SQLITE_OK) ? SQLITE_OK : rc;
 }
 
-bool db_exec(struct fakefs_db *fs, sqlite3_stmt *stmt) {
+static void db_txn_open(struct fakefs_db *fs);
+
+static bool db_exec_noting(struct fakefs_db *fs, sqlite3_stmt *stmt, bool stale_all) {
+    db_txn_open(fs);
+    if (!sqlite3_stmt_readonly(stmt)) {
+        if (stale_all)
+            fs->gen++;
+        fs->txn_wrote = true;
+        mc_writes++;
+    }
     ISH_SIGNPOST_SCOPE_BEGIN(fs, "db_exec", _dbe_spid);
     bool r = db_exec_retry(fs, stmt);
     ISH_SIGNPOST_SCOPE_END(fs, "db_exec", _dbe_spid);
     return r;
+}
+// anything that writes makes what the lookups remember stale, except the
+// writes below that put right what they change themselves (db_exec_kept)
+bool db_exec(struct fakefs_db *fs, sqlite3_stmt *stmt) {
+    return db_exec_noting(fs, stmt, true);
+}
+static void db_exec_kept(struct fakefs_db *fs, sqlite3_stmt *stmt) {
+    db_exec_noting(fs, stmt, false);
+    db_reset(fs, stmt);
 }
 void db_reset(struct fakefs_db *fs, sqlite3_stmt *stmt) {
     db_reset_retry(fs, stmt);
@@ -154,21 +180,170 @@ void db_exec_reset(struct fakefs_db *fs, sqlite3_stmt *stmt) {
         if (_on) sctimes_end(&_m, nr); \
     } while (0)
 
+// A read transaction is opened by the first statement that needs it: when
+// the lookups below answer from what they remember, there is none to begin
+// and commit (on Windows, each locks and unlocks the WAL's shared memory).
+enum { TXN_NONE, TXN_PENDING, TXN_OPEN };
+static void db_txn_stmt(struct fakefs_db *fs, sqlite3_stmt *stmt) {
+    db_exec_retry(fs, stmt);
+    db_reset_retry(fs, stmt);
+}
+static void db_txn_open(struct fakefs_db *fs) {
+    if (fs->txn != TXN_PENDING)
+        return;
+    fs->txn = TXN_OPEN;
+    SCT_SPAN(SCT_DB_BEGIN, db_txn_stmt(fs, fs->stmt.begin_deferred));
+}
 void db_begin_read(struct fakefs_db *fs) {
     SCT_SPAN(SCT_FAKEFS_LOCK, sqlite3_mutex_enter(fs->lock));
-    SCT_SPAN(SCT_DB_BEGIN, db_exec_reset(fs, fs->stmt.begin_deferred));
+    fs->txn = TXN_PENDING;
+    fs->txn_wrote = false;
 }
 void db_begin_write(struct fakefs_db *fs) {
     SCT_SPAN(SCT_FAKEFS_LOCK, sqlite3_mutex_enter(fs->lock));
-    SCT_SPAN(SCT_DB_BEGIN, db_exec_reset(fs, fs->stmt.begin_immediate));
+    SCT_SPAN(SCT_DB_BEGIN, db_txn_stmt(fs, fs->stmt.begin_immediate));
+    fs->txn = TXN_OPEN;
+    fs->txn_wrote = false;
 }
 void db_commit(struct fakefs_db *fs) {
-    SCT_SPAN(SCT_DB_COMMIT, db_exec_reset(fs, fs->stmt.commit));
+    if (fs->txn == TXN_OPEN)
+        SCT_SPAN(SCT_DB_COMMIT, db_txn_stmt(fs, fs->stmt.commit));
+    fs->txn = TXN_NONE;
     sqlite3_mutex_leave(fs->lock);
 }
 void db_rollback(struct fakefs_db *fs) {
-    db_exec_reset(fs, fs->stmt.rollback);
+    if (fs->txn == TXN_OPEN) {
+        db_txn_stmt(fs, fs->stmt.rollback);
+        if (fs->txn_wrote)
+            fs->gen++;   // what was read since the write is undone
+    }
+    fs->txn = TXN_NONE;
     sqlite3_mutex_leave(fs->lock);
+}
+
+// === What the lookups remember ===
+//
+// [T-ish-meta-cache] Paths and inodes as meta.db last said, so that walking a
+// tree (find, grep -r: a readdir lookup, then an lstat of the same path) or
+// searching for modules asks sqlite once. Everything is under fs->lock. A
+// path entry knows the inode (0: no such path), an inode entry the stat. An
+// entry is good while fs->gen is what it was: writes through this connection
+// that change a path or stat put the entries for it right instead (creating,
+// linking and unlinking a path, writing a stat, removing an inode); any other
+// write (renames: a whole subtree moves) bumps fs->gen, and so does a rollback
+// of a transaction that wrote, and a write by another process sharing
+// meta.db, which `pragma data_version` tells, asked every MC_OTHERS_NS at most.
+#define MC_PATHS 8192
+#define MC_INODES 4096
+#define MC_KEY 232
+#define MC_OTHERS_NS 100000000ull
+struct mc_path {
+    uint64_t gen;
+    uint32_t hash;
+    bool known;
+    inode_t inode;    // 0: no such path
+    char key[MC_KEY];
+};
+struct mc_inode {
+    uint64_t gen;
+    inode_t inode;    // 0: empty
+    bool exists;
+    struct ish_stat stat;
+};
+struct meta_cache {
+    struct mc_path paths[MC_PATHS];
+    struct mc_inode inodes[MC_INODES];
+};
+
+static uint32_t mc_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    while (*s)
+        h = (h ^ (uint8_t) *s++) * 16777619u;
+    return h;
+}
+
+// what other processes wrote shows in data_version
+static void mc_check_others(struct fakefs_db *fs) {
+    uint64_t now = coarse_now_ns();
+    if (now - fs->data_version_seen < MC_OTHERS_NS || fs->stmt.data_version == NULL)
+        return;
+    fs->data_version_seen = now;
+    sqlite3_stmt *s = fs->stmt.data_version;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        int64_t v = sqlite3_column_int64(s, 0);
+        if (v != fs->data_version) {
+            fs->gen++;
+            mc_others++;
+        }
+        fs->data_version = v;
+    }
+    sqlite3_reset(s);
+}
+
+// the entry for path if it is there and good, or NULL
+static struct mc_path *mc_path_get(struct fakefs_db *fs, const char *path) {
+    if (fs->cache == NULL)
+        return NULL;
+    mc_check_others(fs);
+    uint32_t h = mc_hash(path);
+    struct mc_path *e = &fs->cache->paths[h % MC_PATHS];
+    if (e->known && e->hash == h && e->gen == fs->gen && strcmp(e->key, path) == 0) {
+        mc_hits++;
+        return e;
+    }
+    mc_misses++;
+    return NULL;
+}
+
+// path is inode (0: no such path) from now on. A path too long to keep may
+// still be in the slot it would have: that one is emptied.
+static void mc_path_put(struct fakefs_db *fs, const char *path, inode_t inode) {
+    if (fs->cache == NULL)
+        return;
+    size_t len = strlen(path);
+    uint32_t h = mc_hash(path);
+    struct mc_path *e = &fs->cache->paths[h % MC_PATHS];
+    if (len >= MC_KEY) {
+        if (e->hash == h)
+            e->known = false;
+        return;
+    }
+    e->known = true;
+    e->hash = h;
+    memcpy(e->key, path, len + 1);
+    e->inode = inode;
+    e->gen = fs->gen;
+}
+
+static struct mc_inode *mc_inode_slot(struct fakefs_db *fs, inode_t inode) {
+    if (fs->cache == NULL)
+        return NULL;
+    return &fs->cache->inodes[(inode * 0x9e3779b97f4a7c15ull >> 32) % MC_INODES];
+}
+
+// inode has stat from now on (NULL: there is no such inode)
+static void mc_inode_put(struct fakefs_db *fs, inode_t inode, const struct ish_stat *stat) {
+    struct mc_inode *e = mc_inode_slot(fs, inode);
+    if (e == NULL)
+        return;
+    e->inode = inode;
+    e->exists = stat != NULL;
+    if (stat != NULL)
+        e->stat = *stat;
+    e->gen = fs->gen;
+}
+
+static bool mc_inode_get(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat, bool *exists) {
+    struct mc_inode *e = mc_inode_slot(fs, inode);
+    if (e == NULL)
+        return false;
+    mc_check_others(fs);
+    if (e->inode != inode || inode == 0 || e->gen != fs->gen)
+        return false;
+    if (e->exists && stat != NULL)
+        *stat = e->stat;
+    *exists = e->exists;
+    return true;
 }
 
 static void bind_path(sqlite3_stmt *stmt, int i, const char *path) {
@@ -176,35 +351,65 @@ static void bind_path(sqlite3_stmt *stmt, int i, const char *path) {
 }
 
 inode_t path_get_inode(struct fakefs_db *fs, const char *path) {
+    struct mc_path *e = mc_path_get(fs, path);
+    if (e != NULL)
+        return e->inode;
+    // the stat too, for the lstat that tends to follow (readdir, then stat)
+    inode_t inode = 0;
+    if (fs->cache != NULL) {
+        path_read_stat(fs, path, NULL, &inode);
+        return inode;
+    }
     // select inode from paths where path = ?
     bind_path(fs->stmt.path_get_inode, 1, path);
-    inode_t inode = 0;
     if (db_exec(fs, fs->stmt.path_get_inode))
         inode = sqlite3_column_int64(fs->stmt.path_get_inode, 0);
     db_reset(fs, fs->stmt.path_get_inode);
     return inode;
 }
 bool path_read_stat(struct fakefs_db *fs, const char *path, struct ish_stat *stat, inode_t *inode) {
+    struct mc_path *e = mc_path_get(fs, path);
+    if (e != NULL) {
+        if (inode)
+            *inode = e->inode;
+        if (e->inode == 0)
+            return false;
+        if (stat == NULL)
+            return true;
+        if (inode_read_stat_if_exist(fs, e->inode, stat))
+            return true;
+        // a path to no inode: as the join below would say
+        if (inode)
+            *inode = 0;
+        return false;
+    }
     // select inode, stat from stats natural join paths where path = ?
     bind_path(fs->stmt.path_read_stat, 1, path);
     bool exists = db_exec(fs, fs->stmt.path_read_stat);
+    inode_t found = 0;
     if (exists) {
-        if (inode)
-            *inode = sqlite3_column_int64(fs->stmt.path_read_stat, 0);
+        found = sqlite3_column_int64(fs->stmt.path_read_stat, 0);
+        const struct ish_stat *st = sqlite3_column_blob(fs->stmt.path_read_stat, 1);
         if (stat)
-            *stat = *(struct ish_stat *) sqlite3_column_blob(fs->stmt.path_read_stat, 1);
+            *stat = *st;
+        mc_inode_put(fs, found, st);
     }
+    if (inode)
+        *inode = found;
     db_reset(fs, fs->stmt.path_read_stat);
+    mc_path_put(fs, path, found);
     return exists;
 }
 inode_t path_create(struct fakefs_db *fs, const char *path, struct ish_stat *stat) {
     // insert into stats (stat) values (?)
     sqlite3_bind_blob(fs->stmt.path_create_stat, 1, stat, sizeof(*stat), SQLITE_TRANSIENT);
-    db_exec_reset(fs, fs->stmt.path_create_stat);
+    db_exec_kept(fs, fs->stmt.path_create_stat);
     inode_t inode = sqlite3_last_insert_rowid(fs->db);
+    mc_inode_put(fs, inode, stat);
     // insert or replace into paths values (?, last_insert_rowid())
     bind_path(fs->stmt.path_create_path, 1, path);
-    db_exec_reset(fs, fs->stmt.path_create_path);
+    db_exec_kept(fs, fs->stmt.path_create_path);
+    mc_path_put(fs, path, inode);
     return inode;
 }
 
@@ -213,19 +418,37 @@ void inode_read_stat_or_die(struct fakefs_db *fs, inode_t inode, struct ish_stat
         die("inode_read_stat(%llu): missing inode", (unsigned long long) inode);
 }
 bool inode_read_stat_if_exist(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat) {
+    bool exist;
+    if (mc_inode_get(fs, inode, stat, &exist))
+        return exist;
     // select stat from stats where inode = ?
     sqlite3_bind_int64(fs->stmt.inode_read_stat, 1, inode);
-    bool exist = db_exec(fs, fs->stmt.inode_read_stat);
+    exist = db_exec(fs, fs->stmt.inode_read_stat);
     if (exist)
         *stat = *(struct ish_stat *) sqlite3_column_blob(fs->stmt.inode_read_stat, 0);
     db_reset(fs, fs->stmt.inode_read_stat);
+    mc_inode_put(fs, inode, exist ? stat : NULL);
     return exist;
 }
 void inode_write_stat(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat) {
     // update stats set stat = ? where inode = ?
     sqlite3_bind_blob(fs->stmt.inode_write_stat, 1, stat, sizeof(*stat), SQLITE_TRANSIENT);
     sqlite3_bind_int64(fs->stmt.inode_write_stat, 2, inode);
-    db_exec_reset(fs, fs->stmt.inode_write_stat);
+    db_exec_kept(fs, fs->stmt.inode_write_stat);
+    // (an update of no row leaves no inode, as before)
+    if (sqlite3_changes(fs->db) > 0)
+        mc_inode_put(fs, inode, stat);
+    else
+        mc_inode_put(fs, inode, NULL);
+}
+
+// try_cleanup_inode: the stats of inode go if no path has it any more
+void inode_try_cleanup(struct fakefs_db *fs, inode_t inode) {
+    // delete from stats where inode = ? and not exists (select 1 from paths where inode = stats.inode)
+    sqlite3_bind_int64(fs->stmt.try_cleanup_inode, 1, inode);
+    db_exec_kept(fs, fs->stmt.try_cleanup_inode);
+    if (sqlite3_changes(fs->db) > 0)
+        mc_inode_put(fs, inode, NULL);
 }
 
 void path_link(struct fakefs_db *fs, const char *src, const char *dst) {
@@ -235,7 +458,8 @@ void path_link(struct fakefs_db *fs, const char *src, const char *dst) {
     // insert or replace into paths (path, inode) values (?, ?)
     bind_path(fs->stmt.path_link, 1, dst);
     sqlite3_bind_int64(fs->stmt.path_link, 2, inode);
-    db_exec_reset(fs, fs->stmt.path_link);
+    db_exec_kept(fs, fs->stmt.path_link);
+    mc_path_put(fs, dst, inode);
 }
 inode_t path_unlink(struct fakefs_db *fs, const char *path) {
     inode_t inode = path_get_inode(fs, path);
@@ -243,19 +467,20 @@ inode_t path_unlink(struct fakefs_db *fs, const char *path) {
         return 0;  // Path not in meta.db — already gone or never tracked
     // delete from paths where path = ?
     bind_path(fs->stmt.path_unlink, 1, path);
-    db_exec_reset(fs, fs->stmt.path_unlink);
+    db_exec_kept(fs, fs->stmt.path_unlink);
+    mc_path_put(fs, path, 0);
     inode_note_orphan(fs, inode);
     return inode;
 }
 
 void inode_note_orphan(struct fakefs_db *fs, inode_t inode) {
     sqlite3_bind_int64(fs->stmt.orphan_note, 1, inode);
-    db_exec_reset(fs, fs->stmt.orphan_note);
+    db_exec_kept(fs, fs->stmt.orphan_note);   // (nothing remembered is about orphans)
 }
 
 void inode_clear_orphan(struct fakefs_db *fs, inode_t inode) {
     sqlite3_bind_int64(fs->stmt.orphan_clear, 1, inode);
-    db_exec_reset(fs, fs->stmt.orphan_clear);
+    db_exec_kept(fs, fs->stmt.orphan_clear);
 }
 void path_rename(struct fakefs_db *fs, const char *src, const char *dst) {
     // update or replace paths set path = change_prefix(path, ? [len(src)], ? [dst])
@@ -339,6 +564,13 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
         "pragma cache_size=-65536",     // 64 MB in-process page cache
         "pragma synchronous=NORMAL",
         "pragma temp_store=MEMORY",
+#ifdef _WIN32
+        // a checkpoint (and its syncs) every 10000 pages of WAL rather than
+        // 1000: creating many files (an untar, a clone) synced every second
+        // or so on Windows. Commits are as durable as before; the WAL is
+        // checkpointed when the last connection closes anyway.
+        "pragma wal_autocheckpoint=10000",
+#endif
     };
     for (size_t ti = 0; ti < sizeof(tuning)/sizeof(tuning[0]); ti++) {
         // Tuning pragmas are best-effort: a failure here only loses a perf knob,
@@ -363,9 +595,11 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     if (stat(db_path, &statbuf) < 0) ERRNO_DIE("stat database");
     ino_t db_inode = statbuf.st_ino;
     sqlite3_stmt *statement = NULL;
+    bool inode_saved = false;   // then nothing to write (a write costs the start a WAL sync)
     if (db_prepare_checked(fs, "select db_inode from meta", &statement) != SQLITE_OK) goto init_fail;
     if (db_step_checked(fs, statement, "select db_inode from meta") == SQLITE_ROW) {
-        if ((uint64_t) sqlite3_column_int64(statement, 0) != db_inode) {
+        inode_saved = (uint64_t) sqlite3_column_int64(statement, 0) == db_inode;
+        if (!inode_saved) {
             sqlite3_finalize(statement);
             statement = NULL;
             int err = fakefs_rebuild(fs, root_fd);
@@ -378,27 +612,39 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
         sqlite3_finalize(statement);
 
     // save current inode
-    if (db_prepare_checked(fs, "update meta set db_inode = ?", &statement) != SQLITE_OK) goto init_fail;
-    sqlite3_bind_int64(statement, 1, (int64_t) db_inode);
-    int meta_rc = db_step_checked(fs, statement, "update meta set db_inode = ?");
-    if (meta_rc != SQLITE_DONE && meta_rc != SQLITE_ROW && meta_rc != SQLITE_OK) {
+    if (!inode_saved) {
+        if (db_prepare_checked(fs, "update meta set db_inode = ?", &statement) != SQLITE_OK) goto init_fail;
+        sqlite3_bind_int64(statement, 1, (int64_t) db_inode);
+        int meta_rc = db_step_checked(fs, statement, "update meta set db_inode = ?");
+        if (meta_rc != SQLITE_DONE && meta_rc != SQLITE_ROW && meta_rc != SQLITE_OK) {
+            sqlite3_finalize(statement);
+            goto init_fail;
+        }
         sqlite3_finalize(statement);
-        goto init_fail;
     }
-    sqlite3_finalize(statement);
 
     // [T-ish-fakefs-mount-orphans] Delete orphaned stats. Only inodes that lost
     // a path and whose cleanup never ran (the process died while the file was
     // still open) can be orphans, and those are listed in `orphans` -- the
     // full-table `not exists` sweep this replaces cost ~0.3 s per mount on a
     // 1.5M-row stats table. Migration 4 did one last full sweep.
-    if (db_exec_oneshot(fs, "delete from stats where inode in (select inode from orphans) "
-                            "and not exists (select 1 from paths where inode = stats.inode)") != SQLITE_OK)
-        goto init_fail;
-    if (db_exec_oneshot(fs, "delete from orphans") != SQLITE_OK)
-        goto init_fail;
+    bool orphans = true;
+    if (db_prepare_checked(fs, "select exists (select 1 from orphans)", &statement) != SQLITE_OK) goto init_fail;
+    if (db_step_checked(fs, statement, "select exists (select 1 from orphans)") == SQLITE_ROW)
+        orphans = sqlite3_column_int(statement, 0) != 0;
+    sqlite3_finalize(statement);
+    if (orphans) {
+        if (db_exec_oneshot(fs, "delete from stats where inode in (select inode from orphans) "
+                                "and not exists (select 1 from paths where inode = stats.inode)") != SQLITE_OK)
+            goto init_fail;
+        if (db_exec_oneshot(fs, "delete from orphans") != SQLITE_OK)
+            goto init_fail;
+    }
 
     fs->lock = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+    fs->txn = TXN_NONE;
+    fs->gen = 1;
+    fs->cache = calloc(1, sizeof(struct meta_cache));   // NULL: nothing remembered
     // [T-fakefs-db-init-no-die] Each cached statement must prepare successfully;
     // a NULL would crash later at runtime. On any failure, fail the mount.
 #define PREPARE_OR_FAIL(field, sql) \
@@ -407,6 +653,7 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     PREPARE_OR_FAIL(begin_immediate, "begin immediate");
     PREPARE_OR_FAIL(commit, "commit");
     PREPARE_OR_FAIL(rollback, "rollback");
+    PREPARE_OR_FAIL(data_version, "pragma data_version");
     PREPARE_OR_FAIL(path_get_inode, "select inode from paths where path = ?");
     PREPARE_OR_FAIL(path_read_stat, "select inode, stat from stats natural join paths where path = ?");
     PREPARE_OR_FAIL(path_create_stat, "insert into stats (stat) values (?)");
@@ -455,6 +702,9 @@ int fake_db_deinit(struct fakefs_db *fs) {
         sqlite3_finalize(fs->stmt.try_cleanup_inode);
         sqlite3_finalize(fs->stmt.orphan_note);
         sqlite3_finalize(fs->stmt.orphan_clear);
+        sqlite3_finalize(fs->stmt.data_version);
+        free(fs->cache);
+        fs->cache = NULL;
         return sqlite3_close(fs->db);
     }
     return SQLITE_OK;
