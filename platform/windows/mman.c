@@ -165,7 +165,10 @@ void *px_mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off) 
         errno = ENODEV;
         goto out;
     }
-    int64_t size = file_size(d->h);
+    HANDLE h = px_desc_handle(d);
+    if (h == INVALID_HANDLE_VALUE)
+        goto out;
+    int64_t size = file_size(h);
     bool shared_write = (flags & PX_MAP_SHARED) && (prot & PX_PROT_WRITE);
     if (shared_write && (d->flags & PX_O_ACCMODE) == 0) {
         errno = EACCES;
@@ -188,7 +191,7 @@ void *px_mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off) 
         size_t avail = off < size ? (size_t) (size - off) : 0;
         if (avail > len)
             avail = len;
-        read_into(d->h, addr, avail, off);
+        read_into(h, addr, avail, off);
         memset((char *) addr + avail, 0, len - avail);
         DWORD old;
         VirtualProtect(addr, len, page_prot(prot, false), &old);
@@ -214,7 +217,7 @@ void *px_mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off) 
         // its first write instead (pt_set_flags).
         bool copy = !(flags & PX_MAP_SHARED) && (prot & PX_PROT_WRITE);
         DWORD mprot = copy ? PAGE_WRITECOPY : shared_write ? PAGE_READWRITE : PAGE_READONLY;
-        HANDLE fm = CreateFileMappingW(d->h, NULL, mprot, 0, 0, NULL);
+        HANDLE fm = CreateFileMappingW(h, NULL, mprot, 0, 0, NULL);
         if (fm != NULL) {
             DWORD access = copy ? FILE_MAP_COPY : shared_write ? FILE_MAP_WRITE : FILE_MAP_READ;
             char *base = MapViewOfFile(fm, access, (DWORD) (aligned >> 32), (DWORD) aligned, view_len);
@@ -241,12 +244,12 @@ void *px_mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off) 
     size_t avail = off < size ? (size_t) (size - off) : 0;
     if (avail > len)
         avail = len;
-    read_into(d->h, p, avail, off);
+    read_into(h, p, avail, off);
     struct mapping *m = calloc(1, sizeof(*m));
     m->user = m->base = p;
     m->len = len;
     if (shared_write && avail > 0) {
-        DuplicateHandle(GetCurrentProcess(), d->h, GetCurrentProcess(), &m->wb, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &m->wb, 0, FALSE, DUPLICATE_SAME_ACCESS);
         m->wb_off = off;
         m->wb_len = avail;
     }

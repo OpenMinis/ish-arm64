@@ -481,6 +481,17 @@ static struct fd *fakefs_open_(struct mount *mount, const char *path, int flags,
         fd->real_fd = fd_no;
         fd->dir = NULL;
     } else {
+        // A path meta.db doesn't have can only be created: no host open to
+        // find out it isn't there (searches for modules, libraries and
+        // configuration try many). The lookup is remembered either way,
+        // for the one below.
+        if (!(flags & O_CREAT_) && !is_under_bind_mount(path)) {
+            db_begin_read(fs);
+            inode_t inode = path_get_inode(fs, path);
+            db_commit(fs);
+            if (inode == 0)
+                return ERR_PTR(_ENOENT);
+        }
         fd = realfs.open(mount, path, flags, 0666);
         if (IS_ERR(fd))
             return fd;

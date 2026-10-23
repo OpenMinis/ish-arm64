@@ -103,7 +103,9 @@ struct px_desc *px_desc_new(enum px_kind kind) {
 static void desc_free(struct px_desc *d) {
     switch (d->kind) {
         case PX_FILE:
-            CloseHandle(d->h);
+            if (d->h != INVALID_HANDLE_VALUE)
+                CloseHandle(d->h);
+            px_fc_put(d->fc);
             break;
         case PX_SOCK:
             closesocket(d->s);
@@ -227,6 +229,8 @@ int px_fd_path(int fd, char *buf, size_t size) {
 static ssize_t file_pread(struct px_desc *d, void *buf, size_t n, int64_t off) {
     if (d->is_dir)
         return px_fail(EISDIR);
+    if (d->fc != NULL)
+        return px_fc_pread(d->fc, buf, n, off);
     if (n > (1u << 30))
         n = 1u << 30;
     OVERLAPPED ov = {.Offset = (DWORD) off, .OffsetHigh = (DWORD) (off >> 32)};
@@ -243,6 +247,8 @@ static ssize_t file_pread(struct px_desc *d, void *buf, size_t n, int64_t off) {
 static ssize_t file_pwrite(struct px_desc *d, const void *buf, size_t n, int64_t off, bool append) {
     if (d->is_dir)
         return px_fail(EISDIR);
+    if (d->fc != NULL)
+        return px_fail(EBADF);   // opened read-only
     if (n > (1u << 30))
         n = 1u << 30;
     OVERLAPPED ov = {.Offset = (DWORD) off, .OffsetHigh = (DWORD) (off >> 32)};
@@ -263,6 +269,10 @@ ssize_t px_read(int fd, void *buf, size_t n) {
         case PX_FILE:
             AcquireSRWLockExclusive(&d->lock);
             res = file_pread(d, buf, n, d->pos);
+            // short from the start: that was all of it
+            if (d->fc_fill && d->pos == 0 && res >= 0 && (size_t) res < n)
+                px_fc_offer(d, buf, res);
+            d->fc_fill = false;
             if (res > 0)
                 d->pos += res;
             ReleaseSRWLockExclusive(&d->lock);
@@ -416,7 +426,9 @@ int64_t px_lseek(int fd, int64_t off, int whence) {
             case SEEK_SET: base = 0; break;
             case SEEK_CUR: base = d->pos; break;
             case SEEK_END:
-                if (!GetFileSizeEx(d->h, &size))
+                if (d->fc != NULL)
+                    size.QuadPart = px_fc_size(d->fc);
+                else if (!GetFileSizeEx(d->h, &size))
                     res = px_fail_win();
                 base = size.QuadPart;
                 break;
@@ -439,7 +451,7 @@ int px_fsync(int fd) {
     if (d == NULL)
         return -1;
     int res = 0;
-    if (d->kind == PX_FILE && !d->is_dir && !FlushFileBuffers(d->h))
+    if (d->kind == PX_FILE && !d->is_dir && d->fc == NULL && !FlushFileBuffers(d->h))
         res = px_fail_win();
     px_put(d);
     return res;
@@ -454,7 +466,9 @@ int px_ftruncate(int fd, int64_t len) {
         res = px_fail(EINVAL);
     } else {
         FILE_END_OF_FILE_INFO info = {.EndOfFile.QuadPart = len};
-        if (!SetFileInformationByHandle(d->h, FileEndOfFileInfo, &info, sizeof(info)))
+        if (d->fc != NULL)
+            res = px_fail(EINVAL);   // opened read-only
+        else if (!SetFileInformationByHandle(d->h, FileEndOfFileInfo, &info, sizeof(info)))
             res = px_fail_win();
     }
     px_put(d);
@@ -481,21 +495,26 @@ int px_flock(int fd, int op) {
         res = px_fail(EINVAL);
         goto out;
     }
+    HANDLE h = px_desc_handle(d);
+    if (h == INVALID_HANDLE_VALUE) {
+        res = -1;
+        goto out;
+    }
     OVERLAPPED ov = {0};
     if (op & 8 /* LOCK_UN */) {
-        if (!UnlockFileEx(d->h, 0, MAXDWORD, MAXDWORD, &ov) && GetLastError() != ERROR_NOT_LOCKED)
+        if (!UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov) && GetLastError() != ERROR_NOT_LOCKED)
             res = px_fail_win();
         goto out;
     }
     // Windows locks do not convert in place: drop ours first, like flock.
-    UnlockFileEx(d->h, 0, MAXDWORD, MAXDWORD, &ov);
+    UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov);
     DWORD flags = LOCKFILE_FAIL_IMMEDIATELY;
     if (op & 2 /* LOCK_EX */)
         flags |= LOCKFILE_EXCLUSIVE_LOCK;
     // Poll for a blocking lock so a guest signal can still interrupt it.
     for (;;) {
         ov = (OVERLAPPED) {0};
-        if (LockFileEx(d->h, flags, 0, MAXDWORD, MAXDWORD, &ov))
+        if (LockFileEx(h, flags, 0, MAXDWORD, MAXDWORD, &ov))
             break;
         DWORD err = GetLastError();
         if (err != ERROR_LOCK_VIOLATION && err != ERROR_IO_PENDING) {
@@ -563,8 +582,8 @@ int px_describe(int fd, char *buf, size_t size, int *local_port, int *peer_port)
             break;
         }
         case PX_FILE:
-            len = snprintf(buf, size, "%s %s%s pos=%lld", d->is_dir ? "dir" : "file", d->path ? d->path : "?",
-                           d->is_tty ? " (tty)" : "", (long long) d->pos);
+            len = snprintf(buf, size, "%s %s%s%s pos=%lld", d->is_dir ? "dir" : "file", d->path ? d->path : "?",
+                           d->is_tty ? " (tty)" : "", d->fc != NULL ? " (cached)" : "", (long long) d->pos);
             break;
         case PX_CONSOLE_OUT: {
             DWORD type = GetFileType(d->h);
@@ -663,7 +682,11 @@ int px_ioctl(int fd, unsigned long req, ...) {
                 res = px_sock_ioctl_fionread(d, &avail);
             } else if (d->kind == PX_FILE && !d->is_dir) {
                 LARGE_INTEGER size;
-                if (GetFileSizeEx(d->h, &size) && size.QuadPart > d->pos)
+                if (d->fc != NULL)
+                    size.QuadPart = px_fc_size(d->fc);
+                else if (!GetFileSizeEx(d->h, &size))
+                    size.QuadPart = 0;
+                if (size.QuadPart > d->pos)
                     avail = (int) (size.QuadPart - d->pos);
             }
             // callers pass int or size_t; both hold this little-endian

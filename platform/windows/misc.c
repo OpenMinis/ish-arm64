@@ -270,7 +270,9 @@ static HANDLE child_stdio(int fd, bool input, HANDLE *relay_out) {
         return NULL;
     HANDLE h = NULL;
     if (d->kind == PX_FILE || d->kind == PX_CONSOLE_OUT) {
-        DuplicateHandle(GetCurrentProcess(), d->h, GetCurrentProcess(), &h, 0, TRUE, DUPLICATE_SAME_ACCESS);
+        HANDLE dh = d->kind == PX_FILE ? px_desc_handle(d) : d->h;
+        if (dh != INVALID_HANDLE_VALUE)
+            DuplicateHandle(GetCurrentProcess(), dh, GetCurrentProcess(), &h, 0, TRUE, DUPLICATE_SAME_ACCESS);
     } else if (d->kind == PX_SOCK && d->is_stdin && px_stdin_handle() != INVALID_HANDLE_VALUE) {
         // the child inherits our stdin itself, as on POSIX, instead of a relay
         // that would read (and drain) it whether or not the child wants it

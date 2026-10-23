@@ -578,6 +578,14 @@ static void halt_system(int status) {
         fprintf(stderr, "[meta] %llu hits, %llu misses; %llu writes, made stale %llu times by others\n",
                 (unsigned long long) mc[0], (unsigned long long) mc[1], (unsigned long long) mc[2],
                 (unsigned long long) mc[3]);
+#ifdef _WIN32
+        extern void px_fc_stats(uint64_t out[4]);
+        uint64_t fc[4];
+        px_fc_stats(fc);
+        fprintf(stderr, "[fcache] %llu opens from it, %llu stale; %llu files kept, %llu KB\n",
+                (unsigned long long) fc[0], (unsigned long long) fc[1], (unsigned long long) fc[2],
+                (unsigned long long) fc[3] >> 10);
+#endif
     }
 
     if (halt_hook != NULL)

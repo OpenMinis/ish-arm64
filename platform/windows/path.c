@@ -264,7 +264,10 @@ int px_fstat(int fd, struct px_stat *st) {
     memset(st, 0, sizeof(*st));
     switch (d->kind) {
         case PX_FILE:
-            res = px_fstat_handle(d->h, st);
+            if (d->fc != NULL)
+                px_stat_from_info(st, &d->fc_info, 0);
+            else
+                res = px_fstat_handle(d->h, st);
             break;
         case PX_SOCK:
             st->st_mode = d->is_tty ? PX_S_IFCHR | 0620 : d->is_pipe ? PX_S_IFIFO | 0600 : PX_S_IFSOCK | 0777;
@@ -297,14 +300,7 @@ int px_fstat(int fd, struct px_stat *st) {
 // GetFileInformationByName(FileStatBasicByNameInfo), Windows 11 24H2+:
 // a stat without opening a handle (CreateFile, a query and CloseHandle each
 // cost a trip through the filter drivers: ~55 us of a 74 us guest stat).
-// Looked up at run time; the struct is declared here because the SDK only
-// declares it for NTDDI_WIN11_ZN.
-struct px_stat_basic {
-    LARGE_INTEGER FileId, CreationTime, LastAccessTime, LastWriteTime, ChangeTime, AllocationSize, EndOfFile;
-    DWORD FileAttributes, ReparseTag, NumberOfLinks, DeviceType, DeviceCharacteristics, Reserved;
-    LARGE_INTEGER VolumeSerialNumber;
-    BYTE FileId128[16];
-};
+// Looked up at run time.
 typedef BOOL (WINAPI *get_info_by_name_t)(PCWSTR, int, PVOID, ULONG);
 #define PX_FileStatBasicByNameInfo 3
 
@@ -322,35 +318,47 @@ static get_info_by_name_t info_by_name(void) {
     return fn;
 }
 
-// 1 with *st filled, 0 when the caller must stat through a handle (no API,
-// a reparse point, which a handle resolves or not as asked, or an error
-// other than "not there"), -1/errno for a path that does not exist.
-static int stat_by_name(const char *abs, struct px_stat *st) {
+int px_stat_basic(const char *abs, struct px_stat_basic *b) {
     get_info_by_name_t fn = info_by_name();
     if (fn == NULL)
         return 0;
     wchar_t *w = px_wpath(abs);
-    struct px_stat_basic b;
-    BOOL ok = fn(w, PX_FileStatBasicByNameInfo, &b, sizeof(b));
+    BOOL ok = fn(w, PX_FileStatBasicByNameInfo, b, sizeof(*b));
     DWORD err = ok ? 0 : GetLastError();
     free(w);
     if (!ok)
         return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? px_fail(px_errno_win(err)) : 0;
+    return 1;
+}
+
+void px_info_from_basic(BY_HANDLE_FILE_INFORMATION *info, const struct px_stat_basic *b) {
+    *info = (BY_HANDLE_FILE_INFORMATION) {
+        .dwFileAttributes = b->FileAttributes,
+        .ftCreationTime = {b->CreationTime.LowPart, (DWORD) b->CreationTime.HighPart},
+        .ftLastAccessTime = {b->LastAccessTime.LowPart, (DWORD) b->LastAccessTime.HighPart},
+        .ftLastWriteTime = {b->LastWriteTime.LowPart, (DWORD) b->LastWriteTime.HighPart},
+        // GetFileInformationByHandle's 32-bit serial is the low half
+        .dwVolumeSerialNumber = b->VolumeSerialNumber.LowPart,
+        .nFileSizeHigh = (DWORD) b->EndOfFile.HighPart,
+        .nFileSizeLow = b->EndOfFile.LowPart,
+        .nNumberOfLinks = b->NumberOfLinks,
+        .nFileIndexHigh = (DWORD) b->FileId.HighPart,
+        .nFileIndexLow = b->FileId.LowPart,
+    };
+}
+
+// 1 with *st filled, 0 when the caller must stat through a handle (no API,
+// a reparse point, which a handle resolves or not as asked, or an error
+// other than "not there"), -1/errno for a path that does not exist.
+static int stat_by_name(const char *abs, struct px_stat *st) {
+    struct px_stat_basic b;
+    int res = px_stat_basic(abs, &b);
+    if (res <= 0)
+        return res;
     if (b.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
         return 0;
-    BY_HANDLE_FILE_INFORMATION info = {
-        .dwFileAttributes = b.FileAttributes,
-        .ftCreationTime = {b.CreationTime.LowPart, (DWORD) b.CreationTime.HighPart},
-        .ftLastAccessTime = {b.LastAccessTime.LowPart, (DWORD) b.LastAccessTime.HighPart},
-        .ftLastWriteTime = {b.LastWriteTime.LowPart, (DWORD) b.LastWriteTime.HighPart},
-        // GetFileInformationByHandle's 32-bit serial is the low half
-        .dwVolumeSerialNumber = b.VolumeSerialNumber.LowPart,
-        .nFileSizeHigh = (DWORD) b.EndOfFile.HighPart,
-        .nFileSizeLow = b.EndOfFile.LowPart,
-        .nNumberOfLinks = b.NumberOfLinks,
-        .nFileIndexHigh = (DWORD) b.FileId.HighPart,
-        .nFileIndexLow = b.FileId.LowPart,
-    };
+    BY_HANDLE_FILE_INFORMATION info;
+    px_info_from_basic(&info, &b);
     px_stat_from_info(st, &info, 0);
     return 1;
 }
@@ -419,6 +427,22 @@ int px_openat(int dirfd, const char *path, int flags, ...) {
     if (flags & PX_O_NOFOLLOW)
         f |= FILE_FLAG_OPEN_REPARSE_POINT;
 
+    bool reading = access == GENERIC_READ && disposition == OPEN_EXISTING && !(flags & PX_O_DIRECTORY);
+    if (reading) {
+        BY_HANDLE_FILE_INFORMATION info;
+        struct px_fc *fc = px_fc_get(abs, &info);
+        if (fc != NULL) {
+            struct px_desc *d = px_desc_new(PX_FILE);
+            d->fc = fc;
+            d->fc_info = info;
+            d->flags = flags & (PX_O_ACCMODE | _O_APPEND | PX_O_NONBLOCK);
+            d->path = abs;
+            return px_install(d, 0, flags & PX_O_CLOEXEC);
+        }
+    } else if (access != FILE_READ_ATTRIBUTES) {
+        px_fc_drop(abs);
+    }
+
     HANDLE h = px_open_handle(abs, access, disposition, f);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
@@ -457,6 +481,11 @@ int px_openat(int dirfd, const char *path, int flags, ...) {
     d->is_dir = is_dir;
     d->flags = flags & (PX_O_ACCMODE | _O_APPEND | PX_O_NONBLOCK);
     d->path = abs;
+    if (reading && !is_dir && !(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        d->fc_fill = true;
+        d->fc_write = info.LastWriteTime.QuadPart;
+        d->fc_change = info.ChangeTime.QuadPart;
+    }
     return px_install(d, 0, flags & PX_O_CLOEXEC);
 }
 

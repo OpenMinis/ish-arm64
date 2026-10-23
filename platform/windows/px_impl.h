@@ -79,6 +79,15 @@ struct px_desc {
     SRWLOCK lock;       // pos
     int64_t pos;        // files: the offset, kept here (all I/O is positional)
     char *path;         // files: the absolute host path it was opened by, '/'
+    // Files opened from the file cache (fcache.c): what is read comes from
+    // fc, h is opened only when something needs it (px_desc_handle), and
+    // fstat says fc_info, from the stat that found fc still good.
+    struct px_fc *fc;
+    BY_HANDLE_FILE_INFORMATION fc_info;
+    // Other read-only files: a read from the start to the end is offered to
+    // the cache, with the times the file had when opened.
+    bool fc_fill;
+    int64_t fc_write, fc_change;
 };
 
 // Takes a reference; NULL (errno EBADF) for a bad fd.
@@ -111,6 +120,36 @@ char *px_name_from_w(const wchar_t *name, size_t len);
 HANDLE px_open_handle(const char *abs, DWORD access, DWORD disposition, DWORD flags);
 void px_stat_from_info(struct px_stat *st, const BY_HANDLE_FILE_INFORMATION *info, DWORD reparse_tag);
 int px_fstat_handle(HANDLE h, struct px_stat *st);
+// GetFileInformationByName(FileStatBasicByNameInfo), Windows 11 24H2+. The
+// struct is declared here because the SDK only declares it for
+// NTDDI_WIN11_ZN.
+struct px_stat_basic {
+    LARGE_INTEGER FileId, CreationTime, LastAccessTime, LastWriteTime, ChangeTime, AllocationSize, EndOfFile;
+    DWORD FileAttributes, ReparseTag, NumberOfLinks, DeviceType, DeviceCharacteristics, Reserved;
+    LARGE_INTEGER VolumeSerialNumber;
+    BYTE FileId128[16];
+};
+// 1 with *b filled, 0 when there is no such API or it failed other than with
+// "not there", -1/errno for a path that does not exist
+int px_stat_basic(const char *abs, struct px_stat_basic *b);
+void px_info_from_basic(BY_HANDLE_FILE_INFORMATION *info, const struct px_stat_basic *b);
+
+// file cache (fcache.c)
+struct px_fc;
+// What is kept for abs if the file is still what it was then (a reference),
+// with its stat now in *info; else NULL.
+struct px_fc *px_fc_get(const char *abs, BY_HANDLE_FILE_INFORMATION *info);
+void px_fc_put(struct px_fc *fc);
+// d (opened read-only, fc_fill) read all of its file into data
+void px_fc_offer(struct px_desc *d, const void *data, size_t len);
+// abs may change: what is kept for it goes
+void px_fc_drop(const char *abs);
+// Reads from what is kept, as ReadFile at off would
+ssize_t px_fc_pread(struct px_fc *fc, void *buf, size_t n, int64_t off);
+int64_t px_fc_size(struct px_fc *fc);
+// d->h, opened now if d came from the cache (INVALID_HANDLE_VALUE, errno set,
+// if that fails)
+HANDLE px_desc_handle(struct px_desc *d);
 
 // sockets (net.c)
 // A connected pair over loopback TCP (stream) or UDP (dgram), non-blocking.
