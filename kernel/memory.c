@@ -878,6 +878,12 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) != NULL)
             pt_unmap(mem, page, 1);
+#ifdef FASTMEM
+        // the page unmapped just now (or before) may have been kept to use
+        // again (fm_recycle_put): it isn't, now that something else is there
+        if (page < FM_PAGES)
+            fm_recycle_take(mem, page, 1);
+#endif
         data->refcount++;
         struct pt_entry *pt = mem_pt_new(mem, page);
         pt->data = data;
@@ -930,6 +936,9 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
                 fm_prot(pt->flags) == (PROT_READ | PROT_WRITE) && fm_recycle_put(mem, page)) {
             // kept (fm_recycle_put)
         } else if ((data->window || (mem->mmu.vm != NULL && page < FM_PAGES)) && !fm_destroying) {
+            // decommitted: not to be used again as it is
+            if (page < FM_PAGES)
+                fm_recycle_take(mem, page, 1);
             char *host = data->window ? (char *) data->data + pt->offset
                                       : mem->mmu.fm_base + ((size_t) page << PAGE_BITS);
             if (fm_run != NULL && fm_run + fm_len != host) {
