@@ -187,6 +187,8 @@ int px_describe(int fd, char *buf, size_t size, int *local_port, int *peer_port)
 // could not be made.
 bool px_state_watch(void (*fn)(void));
 uint64_t px_tick_ms(void);
+// An x64 ish running on ARM64 Windows, under its x64 emulator (Prism)
+bool px_emulated(void);
 unsigned long px_host_pid(void);
 // rename(), replacing `to` if it exists.
 int px_rename_replace(const char *from, const char *to);

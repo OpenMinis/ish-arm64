@@ -377,6 +377,14 @@ static void tpl_prepare(struct tpl *t, const struct tpl_entry *e) {
 static void xjit_init(void) {
     const char *e = getenv("ISH_XJIT");
     xjit_on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+#ifdef _WIN32
+    // Under Windows' x64 emulator on ARM64 every block generated here is
+    // translated once more, which costs far more than it saves: a command
+    // runs as gadgets there (python3 -c pass 3.6s -> 0.4s, import httpx 9s
+    // -> 3.5s; a long pure-Python loop 1.4x slower). ISH_XJIT=1 has it back.
+    if (e == NULL && px_emulated())
+        xjit_on = false;
+#endif
     e = getenv("ISH_XJIT_STATS");
     stats_on = e && e[0] != '\0' && e[0] != '0';
     // anything but 1 names a file to write them to

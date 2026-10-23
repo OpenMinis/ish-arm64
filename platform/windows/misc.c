@@ -906,6 +906,21 @@ uint64_t px_tick_ms(void) {
     return GetTickCount64();
 }
 
+bool px_emulated(void) {
+#if defined(__x86_64__)
+    static volatile LONG emulated = -1;
+    if (emulated < 0) {
+        typedef BOOL (WINAPI *wow64_t)(HANDLE, USHORT *, USHORT *);
+        wow64_t fn = (wow64_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2");
+        USHORT process = 0, native = 0;
+        emulated = fn != NULL && fn(GetCurrentProcess(), &process, &native) && native == IMAGE_FILE_MACHINE_ARM64;
+    }
+    return emulated;
+#else
+    return false;
+#endif
+}
+
 unsigned long px_host_pid(void) {
     return GetCurrentProcessId();
 }
