@@ -17,9 +17,7 @@ static int proc_show_stat(struct proc_entry *UNUSED(entry), struct proc_data *bu
     proc_printf(buf, "cpu  %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64"\n", usage.user_ticks, usage.nice_ticks, usage.system_ticks, usage.idle_ticks);
 
     // calculate btime (boot time in seconds since epoch) by subtracting uptime from current time
-    struct uptime_info uptime = get_uptime();
-    struct timespec uptime_ts = {.tv_sec = uptime.uptime_ticks / 100, .tv_nsec = uptime.uptime_ticks % 100};
-    struct timespec boot_time = timespec_subtract(timespec_now(CLOCK_REALTIME), uptime_ts);
+    struct timespec boot_time = timespec_subtract(timespec_now(CLOCK_REALTIME), timespec_now(CLOCK_MONOTONIC));
     proc_printf(buf, "btime %ld\n", boot_time.tv_sec);
 
     return 0;
@@ -85,10 +83,13 @@ static int proc_show_meminfo(struct proc_entry *UNUSED(entry), struct proc_data 
     return 0;
 }
 
+// Seconds since boot, to the hundredth, as CLOCK_BOOTTIME counts them for the
+// guest (sys_clock_gettime). (get_uptime() counts whole seconds: read as
+// hundredths, the clock ran 100 times slow.)
 static int proc_show_uptime(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    struct uptime_info uptime_info = get_uptime();
-    unsigned long uptime = uptime_info.uptime_ticks;
-    proc_printf(buf, "%lu.%lu %lu.%lu\n", uptime / 100, uptime % 100, uptime / 100, uptime % 100);
+    struct timespec up = timespec_now(CLOCK_MONOTONIC);
+    unsigned long sec = (unsigned long) up.tv_sec, hundredths = (unsigned long) (up.tv_nsec / 10000000);
+    proc_printf(buf, "%lu.%02lu %lu.%02lu\n", sec, hundredths, sec, hundredths);
     return 0;
 }
 
