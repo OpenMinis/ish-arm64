@@ -138,6 +138,9 @@ int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms) {
     }
     if (px_interrupted())
         return px_fail(EINTR);
+    // a wait: a hypervisor VM's processor stops spinning for the answer
+    if (timeout_ms != 0)
+        px_blocking();
     WSAPOLLFD stack[32];
     WSAPOLLFD *all = n + 1 <= 32 ? stack : malloc((n + 1) * sizeof(*all));
     if (n)

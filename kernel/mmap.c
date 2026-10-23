@@ -41,9 +41,15 @@ static _Atomic uint64_t ish_mem_stamp_ms;
 #define ISH_MEM_STALE_MS 2000
 
 static uint64_t ish_monotonic_ms(void) {
+#ifdef _WIN32
+    // asked on every anonymous mmap: the tick count is enough for seconds,
+    // and QueryPerformanceCounter costs ~4us in a nested VM
+    return px_uptime_ms();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+#endif
 }
 
 bool ish_footprint_mode(void) {

@@ -63,6 +63,10 @@ struct tlb {
     // ISH_XLAT_SITESTATS: flushes, C misses, site checks, lookups after a site missed
     uint64_t xs_flush, xs_miss, xs_check, xs_lookup, xs_check_sp, xs_member;
     bool xsite_inited;   // every entry was emptied once; later flushes empty the used ones
+    // An entry was filled since the last flush. Sites learn pages only from
+    // entries, so without one there is nothing to empty: a thread in a
+    // hypervisor VM barely uses its TLB, and mappings change all the time.
+    bool filled;
     struct { uint64_t page, data_minus_addr; } xsite[1 << 13];
 #endif
 };

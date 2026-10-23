@@ -242,6 +242,15 @@ static bool fm_recycle_take(struct mem *mem, page_t start, pages_t pages) {
 
 // mem_destroy: unmapping everything before the window goes back emptied
 static __thread bool fm_destroying;
+// pt_map_window: window pages to leave as they are while their mapping goes,
+// a bit each from fm_keep_start (fm_keep_pages of them)
+static __thread const uint64_t *fm_keep;
+static __thread page_t fm_keep_start;
+static __thread pages_t fm_keep_pages;
+static bool fm_kept(page_t page) {
+    return fm_keep != NULL && page >= fm_keep_start && page - fm_keep_start < fm_keep_pages &&
+        (fm_keep[(page - fm_keep_start) / 64] >> ((page - fm_keep_start) % 64)) & 1;
+}
 
 // Hypervisor VMs (asbestos/guest-x86_64/vm.c), where a page missed costs a
 // VM exit: files mapped are read in at once, up to FM_EAGER
@@ -347,7 +356,13 @@ void mem_destroy(struct mem *mem) {
            current ? current->pid : -1, (void *) mem,
            (unsigned long long) MM_OF_MEM(mem)->seq, mem->lock.val, mem->lock.pid);
     write_wrlock(&mem->lock);
+#ifdef FASTMEM
+    fm_destroying = mem->mmu.fm_base != NULL;   // px_fm_release empties the window at once
+#endif
     pt_unmap_always(mem, 0, MEM_PAGES);
+#ifdef FASTMEM
+    fm_destroying = false;
+#endif
     while (mem->reservations) {
         struct mem_reservation *r = mem->reservations;
         mem->reservations = r->next;
@@ -855,6 +870,24 @@ bool pt_is_hole(struct mem *mem, page_t start, pages_t pages) {
     return true;
 }
 
+// What is mapped in [start, start + pages) goes, a run of mapped pages at a
+// time: a page at a time is a call to the host per page (in a hypervisor VM,
+// one that changes the VM's memory too), and the dynamic loader maps every
+// library whole and then its segments over that.
+static void pt_unmap_mapped(struct mem *mem, page_t start, pages_t pages) {
+    for (page_t page = start; page < start + pages;) {
+        if (mem_pt(mem, page) == NULL) {
+            page++;
+            continue;
+        }
+        page_t end = page + 1;
+        while (end < start + pages && mem_pt(mem, end) != NULL)
+            end++;
+        pt_unmap_always(mem, page, end - page);
+        page = end;
+    }
+}
+
 int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t offset, unsigned flags) {
     if (memory == MAP_FAILED)
         return errno_map();
@@ -875,15 +908,14 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
 #endif
     };
 
-    for (page_t page = start; page < start + pages; page++) {
-        if (mem_pt(mem, page) != NULL)
-            pt_unmap(mem, page, 1);
+    pt_unmap_mapped(mem, start, pages);
 #ifdef FASTMEM
-        // the page unmapped just now (or before) may have been kept to use
-        // again (fm_recycle_put): it isn't, now that something else is there
-        if (page < FM_PAGES)
-            fm_recycle_take(mem, page, 1);
+    // pages unmapped just now (or before) may have been kept to use again
+    // (fm_recycle_put): they aren't, now that something else is there
+    if (start < FM_PAGES)
+        fm_recycle_take(mem, start, pages < FM_PAGES - start ? pages : FM_PAGES - start);
 #endif
+    for (page_t page = start; page < start + pages; page++) {
         data->refcount++;
         struct pt_entry *pt = mem_pt_new(mem, page);
         pt->data = data;
@@ -931,7 +963,9 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
 #ifdef FASTMEM
         // (a page kept elsewhere may have a read-only copy in the window, for
         // a hypervisor VM: asbestos/guest-x86_64/vm.c)
-        if (data->window && !fm_destroying && pages <= FM_RECYCLE_RUN && fm_eager() &&
+        if (data->window && fm_kept(page)) {
+            // stays (pt_map_window)
+        } else if (data->window && !fm_destroying && pages <= FM_RECYCLE_RUN && fm_eager() &&
                 (pt->flags & P_ANONYMOUS) && !(pt->flags & (P_SHARED | P_COW)) &&
                 fm_prot(pt->flags) == (PROT_READ | PROT_WRITE) && fm_recycle_put(mem, page)) {
             // kept (fm_recycle_put)
@@ -1148,6 +1182,27 @@ void mem_window_migrate(struct mem *mem) {
 #endif
 
 #ifdef FASTMEM
+// The pages of [start, start + pages) that a file mapping at offset would
+// read in again: mapped already from the same file at the same offsets, read
+// in and never writable since (the dynamic loader maps a library whole, then
+// each segment over it). NULL if none (or no memory to say).
+static uint64_t *fm_same_file_pages(struct mem *mem, page_t start, pages_t pages, struct fd *file, int64_t offset) {
+    if (file->inode == NULL)
+        return NULL;
+    uint64_t *keep = NULL;
+    for (pages_t i = 0; i < pages; i++) {
+        struct pt_entry *e = mem_pt(mem, start + i);
+        if (e == NULL || !e->data->window || e->data->lazy_fd == NULL || e->data->lazy_fd->inode != file->inode ||
+                (e->flags & (P_LAZY | P_WRITE | P_SHARED | P_COW | P_ANONYMOUS)) ||
+                e->data->lazy_off + (int64_t) e->offset != offset + (int64_t) ((size_t) i << PAGE_BITS))
+            continue;
+        if (keep == NULL && (keep = calloc((pages + 63) / 64, 8)) == NULL)
+            return NULL;
+        keep[i / 64] |= 1ull << (i % 64);
+    }
+    return keep;
+}
+
 int pt_map_window(struct mem *mem, page_t start, pages_t pages, unsigned flags,
                   struct fd *file, int64_t offset) {
     if (!fm_fits(mem, start, pages))
@@ -1160,15 +1215,30 @@ int pt_map_window(struct mem *mem, page_t start, pages_t pages, unsigned flags,
         return 1;
     }
     FS_BEGIN;
-    for (page_t page = start; page < start + pages; page++)
-        if (mem_pt(mem, page) != NULL)
-            pt_unmap(mem, page, 1);
     char *memory = mem->mmu.fm_base + ((size_t) start << PAGE_BITS);
     size_t len = (size_t) pages << PAGE_BITS;
+    uint64_t *keep = file != NULL && fm_eager() ? fm_same_file_pages(mem, start, pages, file, offset) : NULL;
+    fm_keep = keep;
+    fm_keep_start = start;
+    fm_keep_pages = pages;
+    pt_unmap_mapped(mem, start, pages);
+    fm_keep = NULL;
     if (file != NULL) {
         atomic_fetch_add_explicit(&fm_pages_file, pages, memory_order_relaxed);
         fm_recycle_take(mem, start, pages);
-        px_fm_decommit(memory, len);
+        if (keep == NULL) {
+            px_fm_decommit(memory, len);
+        } else {
+            for (pages_t i = 0; i < pages;) {
+                bool k = (keep[i / 64] >> (i % 64)) & 1;
+                pages_t j = i + 1;
+                while (j < pages && ((keep[j / 64] >> (j % 64)) & 1) == k)
+                    j++;
+                if (!k)
+                    px_fm_decommit(memory + ((size_t) i << PAGE_BITS), (size_t) (j - i) << PAGE_BITS);
+                i = j;
+            }
+        }
         flags |= P_LAZY;
     } else if (fm_prot(flags) == (PROT_READ | PROT_WRITE) && mem->mmu.fm_recycled_pages > 0) {
         // the pages kept zeroed (committed and filled already), the rest
@@ -1198,6 +1268,7 @@ int pt_map_window(struct mem *mem, page_t start, pages_t pages, unsigned flags,
     int err = pt_map(mem, start, pages, memory, 0, flags);
     if (err < 0) {
         px_fm_decommit(memory, len);
+        free(keep);
         return err;
     }
     struct data *data = mem_pt(mem, start)->data;
@@ -1205,6 +1276,14 @@ int pt_map_window(struct mem *mem, page_t start, pages_t pages, unsigned flags,
     if (file != NULL) {
         data->lazy_fd = fd_retain(file);
         data->lazy_off = offset;
+    }
+    if (keep != NULL) {
+        // what was kept is read in already: protected as this mapping is
+        for (pages_t i = 0; i < pages; i++)
+            if ((keep[i / 64] >> (i % 64)) & 1)
+                mem_pt(mem, start + i)->flags &= ~P_LAZY;
+        fm_protect_pages(mem, memory, start, pages);
+        free(keep);
     }
     FS_END(FS_MAP);
     if (file != NULL && pages <= FM_EAGER && fm_eager()) {

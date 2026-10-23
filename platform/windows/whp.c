@@ -878,10 +878,17 @@ void px_vm_populate(void *addr, size_t len, bool write) {
         WHV_ADVISE_GPA_RANGE adv;
         memset(&adv, 0, sizeof(adv));
         adv.Populate.AccessType = write ? WHvMemoryAccessWrite : WHvMemoryAccessRead;
-        LARGE_INTEGER t0, t1;
-        QueryPerformanceCounter(&t0);
+        // timed only for the stats: QueryPerformanceCounter costs ~4us in a
+        // nested VM
+        static int timed = -1;
+        if (timed < 0)
+            timed = getenv("ISH_XJIT_STATS") != NULL;
+        LARGE_INTEGER t0 = {0}, t1 = {0};
+        if (timed)
+            QueryPerformanceCounter(&t0);
         p_WHvAdviseGpaRange(part, &r, 1, WHvAdviseGpaRangeCodePopulate, &adv, sizeof(adv));
-        QueryPerformanceCounter(&t1);
+        if (timed)
+            QueryPerformanceCounter(&t1);
         InterlockedIncrement64(&pop_calls);
         InterlockedAdd64(&pop_bytes, (LONG64) len);
         InterlockedAdd64(&pop_ticks, t1.QuadPart - t0.QuadPart);

@@ -78,6 +78,13 @@ void mmu_tlbs_stale(struct mmu *mmu) {
 
 void tlb_flush(struct tlb *tlb) {
     tlb->mem_changes = tlb->mmu->changes;
+#ifdef GUEST_X86_64
+    if (!tlb->filled && tlb->xsite_inited) {
+        tlb->xs_flush++;
+        return;
+    }
+    tlb->filled = false;
+#endif
     for (unsigned i = 0; i < TLB_SIZE; i++)
         tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
 #ifdef GUEST_X86_64
@@ -175,6 +182,9 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     tlb->dirty_page = TLB_PAGE(addr);
 
     struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
+#ifdef GUEST_X86_64
+    tlb->filled = true;
+#endif
     tlb_ent->page = TLB_PAGE(addr);
     tlb_ent->data_minus_addr = (uintptr_t) ptr - TLB_PAGE(addr);
 #ifdef GUEST_64BIT
