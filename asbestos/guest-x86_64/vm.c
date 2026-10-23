@@ -17,7 +17,7 @@
 #include "kernel/task.h"
 static int vm_state;   // 0: not looked, 1: on, -1: off (no hypervisor)
 #define FM_GUEST_PAGES (1ull << (32 - PAGE_BITS))   // the window: the low 4GB
-#define FAULT_AROUND 64   // pages mapped with one faulted on above the window
+#define FAULT_AROUND 512   // pages mapped with one faulted on outside the window
 
 // An address space's slot in the VM. They are kept for the next address space
 // when theirs goes away, and never freed: a thread can tell from gen whether
@@ -57,6 +57,20 @@ static uint64_t vm_now_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t) t.tv_sec * 1000000000ull + (uint64_t) t.tv_nsec;
 }
+// After a page ish keeps outside the window was mapped in the VM's page
+// tables, the pages around it ish has already, of the same mapping: an exit
+// each would cost far more (~100-400 us on the nested test host; a 1MB
+// MAP_SHARED buffer written through took 256).
+static void vm_map_around(struct px_vm *vm, struct mem *mem, struct pt_entry *pe, page_t at) {
+    for (page_t q = at > FAULT_AROUND / 2 ? at - FAULT_AROUND / 2 : 0; q < at + FAULT_AROUND / 2; q++) {
+        struct pt_entry *qe = q != at ? mem_pt(mem, q) : NULL;
+        if (qe == NULL || qe->data != pe->data || (qe->flags & P_LAZY))
+            continue;
+        px_vm_map_page(vm, (uint64_t) q << PAGE_BITS, (char *) qe->data->data + qe->offset,
+                       qe->data->data, qe->data->size, P_WRITABLE(qe->flags), qe->flags & P_EXEC);
+    }
+}
+
 // what the memory exits were for: a file page not read in yet, a write to a
 // page shared with a fork, nothing mapped there, anything else
 static _Atomic uint64_t vm_mem_lazy, vm_mem_cow, vm_mem_none, vm_mem_other;
@@ -501,6 +515,7 @@ static int vm_run(struct cpu_state *cpu) {
                 struct pt_entry *pe = mem_pt(container_of(cpu->mmu, struct mem, mmu), PAGE(page));
                 if (pe != NULL && px_vm_map_page(vm, page, p, pe->data->data, pe->data->size,
                                                  P_WRITABLE(pe->flags), pe->flags & P_EXEC)) {
+                    vm_map_around(vm, mem, pe, PAGE(page));
                     px_vm_go(vm, vp);
                     continue;
                 }
@@ -574,16 +589,7 @@ static int vm_run(struct cpu_state *cpu) {
                 atomic_fetch_add_explicit(&vm_high_faults, 1, memory_order_relaxed);
                 if (px_vm_map_page(vm, page, p, pe->data->data, pe->data->size,
                                    P_WRITABLE(pe->flags), pe->flags & P_EXEC)) {
-                    // and the pages around it ish has already, of the same
-                    // mapping: an exit each would cost far more
-                    page_t at = PAGE(page);
-                    for (page_t q = at > FAULT_AROUND / 2 ? at - FAULT_AROUND / 2 : 0; q < at + FAULT_AROUND / 2; q++) {
-                        struct pt_entry *qe = q != at ? mem_pt(mem, q) : NULL;
-                        if (qe == NULL || qe->data != pe->data || (qe->flags & P_LAZY))
-                            continue;
-                        px_vm_map_page(vm, (uint64_t) q << PAGE_BITS, (char *) qe->data->data + qe->offset,
-                                       qe->data->data, qe->data->size, P_WRITABLE(qe->flags), qe->flags & P_EXEC);
-                    }
+                    vm_map_around(vm, mem, pe, PAGE(page));
                     atomic_fetch_add_explicit(&vm_ns_high, vm_now_ns() - t_exit, memory_order_relaxed);
                     px_vm_go(vm, vp);
                     continue;
