@@ -911,9 +911,16 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
     pt_unmap_mapped(mem, start, pages);
 #ifdef FASTMEM
     // pages unmapped just now (or before) may have been kept to use again
-    // (fm_recycle_put): they aren't, now that something else is there
-    if (start < FM_PAGES)
-        fm_recycle_take(mem, start, pages < FM_PAGES - start ? pages : FM_PAGES - start);
+    // (fm_recycle_put): they aren't, now that something else is there. If
+    // that is kept outside the window (MAP_SHARED), they go too: a VM would
+    // read and write them (zeros) without a fault to map it.
+    if (start < FM_PAGES) {
+        pages_t n = pages < FM_PAGES - start ? pages : FM_PAGES - start;
+        fm_recycle_take(mem, start, n);
+        char *w = mem->mmu.fm_base + ((size_t) start << PAGE_BITS);
+        if (mem->mmu.fm_base != NULL && fm_eager() && (char *) memory + offset != w)
+            px_fm_decommit(w, (size_t) n << PAGE_BITS);
+    }
 #endif
     for (page_t page = start; page < start + pages; page++) {
         data->refcount++;
