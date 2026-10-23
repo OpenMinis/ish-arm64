@@ -401,8 +401,36 @@ static void ish_cli_memory_governor_start(void) {
 void state_dump_init(void); // kernel/state_dump.c
 #endif
 
+#ifdef _WIN32
+#include "kernel/serve.h"
+#endif
+
 int main(int argc, char *const argv[]) {
 #ifdef _WIN32
+    // --serve-proto: which ish.exe --serve protocol this one speaks.
+    // --serve: one kernel for many commands, its control channel on stdin and
+    // stdout (kernel/serve.c), which nothing else may then touch.
+    char **args = malloc((argc + 1) * sizeof(*args));
+    int nargs = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--serve-proto") == 0) {
+            printf("serve-proto=1\n");
+            return 0;
+        }
+        if (strcmp(argv[i], "--serve") == 0)
+            ish_serve_mode = true;
+        else
+            args[nargs++] = argv[i];
+    }
+    args[nargs] = NULL;
+    if (ish_serve_mode) {
+        argc = nargs;
+        argv = args;
+        if (!px_serve_take_stdio()) {
+            fprintf(stderr, "ish: --serve needs stdin and stdout\n");
+            return 1;
+        }
+    }
     px_boot_mark("main");
     // The guest snapshot Minis asks for when a command looks stuck
     // (ISH_STATE_DIR; nothing at all without it).
@@ -555,5 +583,9 @@ int main(int argc, char *const argv[]) {
     }
     do_mount(&procfs, "proc", "/proc", "", 0);
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
+#ifdef _WIN32
+    if (ish_serve_mode)
+        serve_main();
+#endif
     task_run_current();
 }

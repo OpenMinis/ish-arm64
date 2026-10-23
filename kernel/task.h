@@ -296,9 +296,13 @@ void ish_fork_rate_stats(uint64_t *throttled, uint64_t *bypassed, uint64_t *slee
 // the host is out of thread resources) -- callers must not assume success.
 __attribute__((warn_unused_result))
 int task_start(struct task *task);
+int task_start_first(struct task *task, void (*first)(void *), void *arg);
 void task_run_current(void);
 
 extern void (*exit_hook)(struct task *task, int code);
+// called when init's end has stopped every process and unmounted, just
+// before the host process exits
+extern void (*halt_hook)(void);
 
 typedef int (*ish_timer_tick_hook_t)(void);
 void ish_set_timer_tick_hook(ish_timer_tick_hook_t hook);

@@ -10,5 +10,7 @@ int become_first_process(void);
 int become_new_init_child(void);
 int create_stdio(const char *file, int major, int minor);
 int create_piped_stdio(void);
+// a guest fd for a host one (it takes it)
+struct fd *open_fd_from_actual_fd(int fd_no);
 
 #endif

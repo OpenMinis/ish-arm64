@@ -158,7 +158,7 @@ int create_stdio(const char *file, int major, int minor) {
     return 0;
 }
 
-static struct fd *open_fd_from_actual_fd(int fd_no) {
+struct fd *open_fd_from_actual_fd(int fd_no) {
     struct fd *fd = adhoc_fd_create(&realfs_fdops);
     if (fd == NULL) {
         return NULL;

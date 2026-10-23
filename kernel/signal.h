@@ -148,6 +148,8 @@ void deliver_signal(struct task *task, int sig, struct siginfo_ info);
 bool try_self_signal(int sig);
 // send a signal to all processes in a group, could return ESRCH
 int send_group_signal(dword_t pgid, int sig, struct siginfo_ info);
+int send_session_signal(dword_t sid, int sig, struct siginfo_ info);
+int send_all_signal(int sig, struct siginfo_ info);
 // check for and deliver pending signals on current
 // must be called without pids_lock, current->group->lock, or current->sighand->lock
 void receive_signals(void);

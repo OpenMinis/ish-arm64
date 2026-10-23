@@ -189,6 +189,24 @@ bool px_state_watch(void (*fn)(void));
 uint64_t px_tick_ms(void);
 // An x64 ish running on ARM64 Windows, under its x64 emulator (Prism)
 bool px_emulated(void);
+
+// ish.exe --serve (kernel/serve.c): its control channel, ish.exe's own stdin
+// and stdout (nothing else may use them: they are swapped for NUL), and what
+// it needs of the host.
+bool px_serve_take_stdio(void);
+char *px_serve_read_line(void);          // malloc'd, without the newline; NULL at EOF
+void px_serve_write(const char *buf, size_t len);
+void px_serve_host_stats(uint64_t *private_kb, uint64_t *ws_kb, uint64_t *cpu_ms);
+// CPU time of a thread so far
+uint64_t px_pthread_cpu_ms(pthread_t thread);
+// A guest-usable fd (px's) for a handle value another process gave us, an
+// input pumped as stdin is or an output written as is. Takes the handle.
+int px_fd_from_handle(void *handle, bool input);
+void px_handle_close(void *handle);
+// GetTickCount64() of the last write to such an output
+extern _Atomic uint64_t px_output_tick;
+// ISH_LOG_FILE from now on (UTF-8; NULL or "": none)
+void px_log_set_file(const char *path);
 unsigned long px_host_pid(void);
 // rename(), replacing `to` if it exists.
 int px_rename_replace(const char *from, const char *to);

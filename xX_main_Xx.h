@@ -12,6 +12,9 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "kernel/native_offload.h"
+#ifdef _WIN32
+#include "kernel/serve.h"
+#endif
 #ifdef __APPLE__
 #include <sys/resource.h>
 #define IOPOL_TYPE_VFS_HFS_CASE_SENSITIVITY 1
@@ -160,6 +163,13 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
         }
         fs_chdir(current->fs, pwd);
     }
+#ifdef _WIN32
+    // pid 1 runs no guest program: the commands come later (kernel/serve.c)
+    if (ish_serve_mode) {
+        ish_serve_rootfs = root;
+        return 0;
+    }
+#endif
 
     int i = optind;
     size_t p = 0;

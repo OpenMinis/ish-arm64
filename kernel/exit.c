@@ -54,6 +54,7 @@ static bool exit_tgroup(struct task *task, struct timer *timers[TIMERS_MAX]) {
 }
 
 void (*exit_hook)(struct task *task, int code) = NULL;
+void (*halt_hook)(void) = NULL;
 
 static struct task *find_new_parent(struct task *task) {
     struct task *new_parent;
@@ -578,6 +579,9 @@ static void halt_system(int status) {
                 (unsigned long long) mc[0], (unsigned long long) mc[1], (unsigned long long) mc[2],
                 (unsigned long long) mc[3]);
     }
+
+    if (halt_hook != NULL)
+        halt_hook();
 
     // Force exit the entire host process. Orphaned guest threads
     // (stuck in JIT loops after do_exit_group force cleanup) keep

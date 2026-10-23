@@ -330,6 +330,11 @@ static bool is_under_bind_mount(const char *path) {
  * modifications with EROFS. Root bypasses the DAC access_check path, so
  * relying on the meta.db 0555 mode bits alone is insufficient — we enforce
  * it here instead. */
+static _Atomic(fakefs_path_readonly_hook_t) g_path_readonly_hook = NULL;
+void fakefs_set_path_readonly_hook(fakefs_path_readonly_hook_t hook) {
+    atomic_store_explicit(&g_path_readonly_hook, hook, memory_order_release);
+}
+
 static bool is_under_readonly_bind_mount(const char *path) {
     char normalized[MAX_PATH];
     const char *cmp_path = path;
@@ -337,6 +342,10 @@ static bool is_under_readonly_bind_mount(const char *path) {
         snprintf(normalized, sizeof(normalized), "/%s", path);
         cmp_path = normalized;
     }
+    fakefs_path_readonly_hook_t hook = atomic_load_explicit(&g_path_readonly_hook, memory_order_acquire);
+    if (hook != NULL && current != NULL && current->group != NULL &&
+            hook(cmp_path, current->group->fs_context))
+        return true;
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
         if (!g_bind_mounts[i].active || !g_bind_mounts[i].read_only)
             continue;

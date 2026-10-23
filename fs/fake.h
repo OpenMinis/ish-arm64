@@ -111,6 +111,11 @@ typedef bool (*fakefs_path_translate_hook_t)(
 
 void fakefs_set_path_translate_hook(fakefs_path_translate_hook_t hook);
 
+/* With the translate hook: whether guest_path is under a read-only mapping of
+ * this fs_context (writes there fail with EROFS). Same contract. */
+typedef bool (*fakefs_path_readonly_hook_t)(const char *guest_path, uint64_t fs_context);
+void fakefs_set_path_readonly_hook(fakefs_path_readonly_hook_t hook);
+
 /* Optional reverse counterpart to the forward path-translate hook. Called
  * from realfs_getpath() to map a host APFS path (as returned by F_GETPATH
  * on a bind-mounted fd) back to its guest path. iSH consults this hook

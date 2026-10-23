@@ -84,6 +84,8 @@ void ish_set_memory_status(uint64_t limit_bytes, uint64_t avail_bytes, bool pres
                pressure_critical ? " [OS pressure critical]" : "");
 }
 
+void (*ish_mem_braked_hook)(void) = NULL;
+
 bool ish_mem_commit_ok(uint64_t bytes) {
     uint64_t stamp = atomic_load(&ish_mem_stamp_ms);
     if (stamp == 0)
@@ -96,7 +98,11 @@ bool ish_mem_commit_ok(uint64_t bytes) {
         return false;
     if (ish_monotonic_ms() - stamp > ISH_MEM_STALE_MS)
         return false;  // dead sampler fails closed
-    return atomic_load(&ish_mem_state_v) == ISH_MEM_OK;
+    if (atomic_load(&ish_mem_state_v) == ISH_MEM_OK)
+        return true;
+    if (ish_mem_braked_hook != NULL)
+        ish_mem_braked_hook();
+    return false;
 }
 
 // Check-and-add under the runtime limit. CAS loop rather than fetch_add so a

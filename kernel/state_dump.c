@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -163,7 +164,8 @@ static void describe_fd(struct out *o, struct task *t, int n, struct fd *fd) {
     }
 }
 
-static void describe_task(struct out *o, struct out *summary, struct task *t, uint64_t now) {
+static void describe_task(struct out *o, struct out *summary, struct task *t, uint64_t now,
+                          void (*tag)(struct task *t, char *buf, size_t size)) {
     pid_t_ ppid = t->parent ? t->parent->pid : 0;
     pid_t_ pgid = t->group ? t->group->pgid : 0;
     const char *state = t->zombie     ? "zombie"
@@ -190,6 +192,12 @@ static void describe_task(struct out *o, struct out *summary, struct task *t, ui
         if (secs >= 1)
             outf(summary, "%s pid %d (%s) %s %llus", summary->len ? ";" : "", t->pid, comm,
                  name ? name : "syscall", (unsigned long long) secs);
+    }
+    if (tag != NULL) {
+        char label[160] = "";
+        tag(t, label, sizeof(label));
+        if (label[0] != 0)
+            outf(o, " %s", label);
     }
     outf(o, "\n");
     // argv, for a process (threads share it).
@@ -253,12 +261,14 @@ static void pipes_table(struct out *o) {
     }
 }
 
-static void state_dump(void) {
-    const char *dir = getenv("ISH_STATE_DIR");
-    if (dir == NULL || *dir == 0)
-        return;
+// The snapshot as text (malloc'd), each task's line ending with what tag
+// writes for it (ish.exe --serve: its command), if tag is given.
+static pthread_mutex_t dump_lock = PTHREAD_MUTEX_INITIALIZER;
+
+char *state_dump_text(void (*tag)(struct task *t, char *buf, size_t size)) {
     uint64_t now = px_tick_ms();
-    struct out body = {0}, summary = {0};
+    struct out body = {0}, summary = {0}, all = {0};
+    pthread_mutex_lock(&dump_lock);
     nends = 0;
     bool locked = false;
     for (int i = 0; i < 200 && !locked; i++) {
@@ -272,29 +282,47 @@ static void state_dump(void) {
         struct pid *p = pid_get(id);
         if (p == NULL || p->task == NULL)
             continue;
-        describe_task(&body, &summary, p->task, now);
+        describe_task(&body, &summary, p->task, now, tag);
         tasks++;
     }
     pipes_table(&body);
     if (locked)
         unlock(&pids_lock);
+    pthread_mutex_unlock(&dump_lock);
 
+    outf(&all, "summary: %d tasks%s%s%s\n", tasks, summary.len ? "; in a syscall 1s+:" : "",
+         summary.buf ? summary.buf : "", locked ? "" : " (read without pids_lock: it was held)");
+    outf(&all, "ish guest snapshot, host pid %lu, uptime %llus\n\n", px_host_pid(),
+         (unsigned long long) (now / 1000));
+    if (body.buf)
+        outf(&all, "%s", body.buf);
+    free(body.buf);
+    free(summary.buf);
+    return all.buf;
+}
+
+static void (*dump_tag)(struct task *t, char *buf, size_t size);
+
+void state_dump_set_tag(void (*tag)(struct task *t, char *buf, size_t size)) {
+    dump_tag = tag;
+}
+
+static void state_dump(void) {
+    const char *dir = getenv("ISH_STATE_DIR");
+    if (dir == NULL || *dir == 0)
+        return;
+    char *text = state_dump_text(dump_tag);
     char tmp[1024], path[1024];
     snprintf(path, sizeof(path), "%s\\ish-state-%lu.txt", dir, px_host_pid());
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
     if (f != NULL) {
-        fprintf(f, "summary: %d tasks%s%s%s\n", tasks, summary.len ? "; in a syscall 1s+:" : "",
-                summary.buf ? summary.buf : "", locked ? "" : " (read without pids_lock: it was held)");
-        fprintf(f, "ish guest snapshot, host pid %lu, uptime %llus\n\n", px_host_pid(),
-                (unsigned long long) (now / 1000));
-        if (body.buf)
-            fwrite(body.buf, 1, body.len, f);
+        if (text != NULL)
+            fwrite(text, 1, strlen(text), f);
         fclose(f);
         px_rename_replace(tmp, path);
     }
-    free(body.buf);
-    free(summary.buf);
+    free(text);
 }
 
 void state_dump_init(void) {

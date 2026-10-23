@@ -578,11 +578,50 @@ static void log_write(const char *line) {
     free(buf);
 }
 
+// the file, against px_log_set_file() changing it
+static SRWLOCK log_switch = SRWLOCK_INIT;
+
+static void log_line(const char *line);
+
 // called with printk's lock held
 void px_log_line(const char *line) {
     log_setup();
     if (log_stderr)
         fprintf(stderr, "%s\n", line);
+    AcquireSRWLockExclusive(&log_switch);
+    log_line(line);
+    ReleaseSRWLockExclusive(&log_switch);
+}
+
+void px_log_set_file(const char *path) {
+    log_setup();
+    AcquireSRWLockExclusive(&log_switch);
+    if (log_file != INVALID_HANDLE_VALUE)
+        CloseHandle(log_file);
+    log_file = INVALID_HANDLE_VALUE;
+    if (log_mutex != NULL)
+        CloseHandle(log_mutex);
+    log_mutex = NULL;
+    free(log_path);
+    free(log_path_old);
+    log_path = log_path_old = NULL;
+    int n = path != NULL && path[0] != '\0' ? MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0) : 0;
+    if (n > 0 && (log_path = malloc(n * sizeof(wchar_t))) != NULL &&
+            (log_path_old = malloc((n + 2) * sizeof(wchar_t))) != NULL) {
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, log_path, n);
+        swprintf(log_path_old, n + 2, L"%ls.1", log_path);
+        uint32_t hash = 2166136261u;
+        for (int i = 0; log_path[i] != L'\0'; i++)
+            hash = (hash ^ towlower(log_path[i])) * 16777619u;
+        wchar_t name[64];
+        swprintf(name, 64, L"Local\\ish-log-%08x", hash);
+        log_mutex = CreateMutexW(NULL, FALSE, name);
+        log_file = log_open();
+    }
+    ReleaseSRWLockExclusive(&log_switch);
+}
+
+static void log_line(const char *line) {
     if (log_file == INVALID_HANDLE_VALUE)
         return;
     static uint64_t second;

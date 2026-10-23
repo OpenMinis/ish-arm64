@@ -125,6 +125,9 @@ enum ish_mem_state { ISH_MEM_OK = 0, ISH_MEM_BRAKE = 1 };
 // jetsam allowance); `avail_bytes` = os_proc_available_memory();
 // `pressure_critical` = the OS sent a critical memory-pressure event.
 void ish_set_memory_status(uint64_t limit_bytes, uint64_t avail_bytes, bool pressure_critical);
+// Called (from any thread, with memory locks held: it must only take note)
+// each time the brake refuses an allocation.
+extern void (*ish_mem_braked_hook)(void);
 // True once the host feed has been installed (footprint mode active).
 bool ish_footprint_mode(void);
 // Admission check for `bytes` of new anonymous commitment. In legacy mode

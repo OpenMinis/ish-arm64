@@ -111,6 +111,9 @@ static void desc_free(struct px_desc *d) {
                 closesocket(d->icmp_tx);
             break;
         case PX_CONSOLE_OUT:
+            if (d->own_h)
+                CloseHandle(d->h);
+            break;
         case PX_NUL:
             break;
     }
@@ -309,6 +312,8 @@ ssize_t px_write(int fd, const void *buf, size_t n) {
             if (n > (1u << 30))
                 n = 1u << 30;
             res = WriteFile(d->h, buf, (DWORD) n, &put, NULL) ? (ssize_t) put : px_fail_win();
+            if (d->own_h)
+                px_output_tick = GetTickCount64();
             break;
         }
         case PX_NUL:
@@ -761,6 +766,76 @@ static DWORD WINAPI stdin_pump(void *param) {
     shutdown(out, SD_SEND);
     closesocket(out);
     return 0;
+}
+
+// A handle another process gave us (ish.exe --serve's commands get their
+// stdio so): the reading end of an input is pumped into a socket as stdin
+// is, eagerly, until it ends or the guest closes its end.
+struct handle_pump {
+    HANDLE in;
+    SOCKET out;
+};
+
+static DWORD WINAPI handle_pump(void *param) {
+    struct handle_pump *p = param;
+    char buf[16384];
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(p->in, buf, sizeof(buf), &got, NULL) || got == 0)
+            break;
+        if (!send_all(p->out, buf, (int) got))
+            break;
+    }
+    shutdown(p->out, SD_SEND);
+    closesocket(p->out);
+    CloseHandle(p->in);
+    free(p);
+    return 0;
+}
+
+_Atomic uint64_t px_output_tick;
+
+int px_fd_from_handle(void *handle, bool input) {
+    HANDLE h = handle;
+    DWORD hflags;
+    if (h == NULL || h == INVALID_HANDLE_VALUE || !GetHandleInformation(h, &hflags))
+        return px_fail(EBADF);
+    bool pipe = GetFileType(h) == FILE_TYPE_PIPE;
+    if (!input) {
+        struct px_desc *d = px_desc_new(PX_CONSOLE_OUT);
+        if (d == NULL) {
+            CloseHandle(h);
+            return px_fail(ENOMEM);
+        }
+        d->h = h;
+        d->own_h = true;
+        d->is_pipe = pipe;
+        d->flags = PX_O_WRONLY;
+        return px_install(d, 0, true);
+    }
+    SOCKET s[2];
+    struct handle_pump *p = malloc(sizeof(*p));
+    if (p == NULL || px_sock_pair(1, s) < 0) {
+        free(p);
+        CloseHandle(h);
+        return -1;
+    }
+    p->in = h;
+    p->out = s[1];
+    HANDLE thread = CreateThread(NULL, 64 << 10, handle_pump, p, 0, NULL);
+    if (thread == NULL) {
+        closesocket(s[0]);
+        closesocket(s[1]);
+        CloseHandle(h);
+        free(p);
+        return px_fail(EAGAIN);
+    }
+    CloseHandle(thread);
+    struct px_desc *d = px_desc_new(PX_SOCK);
+    d->s = s[0];
+    d->is_pipe = true;
+    d->domain = d->type = 1;
+    return px_install(d, 0, true);
 }
 
 static struct px_desc *stdio_desc(DWORD which) {

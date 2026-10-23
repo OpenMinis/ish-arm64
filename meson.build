@@ -97,9 +97,17 @@ if host_windows
             'platform/windows/mman.c',
             'platform/windows/misc.c',
             'platform/windows/whp.c',
+            'platform/windows/serve_io.c',
         ],
         c_args: ['-DPX_IMPL', '-D_WIN32_WINNT=0x0A00', '-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX', '-DUNICODE', '-D_UNICODE'],
         dependencies: threads)
+    # the commit ish.exe --serve reports (-Dcommit=, or git's when built from a checkout)
+    ish_commit = get_option('commit')
+    if ish_commit == ''
+        git_rev = run_command('git', '-C', meson.current_source_dir(), 'rev-parse', '--short=8', 'HEAD', check: false)
+        ish_commit = git_rev.returncode() == 0 ? git_rev.stdout().strip() : 'unknown'
+    endif
+    configure_file(output: 'ish_commit.h', configuration: {'ISH_COMMIT': '"' + ish_commit + '"'})
     dependencies += declare_dependency(link_with: libpx,
         dependencies: [cc.find_library('ws2_32'), cc.find_library('bcrypt'),
                        cc.find_library('ntdll'), cc.find_library('psapi'), cc.find_library('iphlpapi'),
@@ -1790,6 +1798,7 @@ if get_option('kernel') == 'ish'
         'kernel/tls.c',
         'kernel/futex.c',
         'kernel/state_dump.c',
+        'kernel/serve.c',
         'kernel/sctimes.c',
         'kernel/getset.c',
         'kernel/signal.c',

@@ -361,6 +361,43 @@ static void reap_self(void) {
 }
 #endif
 
+// task_start, its thread running first(arg) as the task before the guest's
+// code (ish.exe --serve's exec happens there: a failure exits the task)
+struct task_first {
+    struct task *task;
+    void (*first)(void *);
+    void *arg;
+};
+static void *task_thread_first(void *v) {
+    struct task_first f = *(struct task_first *) v;
+    free(v);
+    current = f.task;
+    update_thread_name();
+#ifdef _WIN32
+    px_prof_register();
+#endif
+    f.first(f.arg);
+    task_run_current();
+    die("task_thread returned");
+}
+
+int task_start_first(struct task *task, void (*first)(void *), void *arg) {
+#ifdef _WIN32
+    static pthread_once_t reaper_once = PTHREAD_ONCE_INIT;
+    pthread_once(&reaper_once, reaper_start);
+#endif
+    struct task_first *f = malloc(sizeof(*f));
+    if (f == NULL)
+        return _ENOMEM;
+    *f = (struct task_first) {task, first, arg};
+    int err = pthread_create(&task->thread, &task_thread_attr, task_thread_first, f);
+    if (err != 0) {
+        free(f);
+        return err == EAGAIN ? _EAGAIN : _ENOMEM;
+    }
+    return 0;
+}
+
 int task_start(struct task *task) {
     // pthread_create returns an errno directly and never -1, so the old
     // "< 0" test never fired and a failure fell through to a task whose

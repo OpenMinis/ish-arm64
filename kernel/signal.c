@@ -172,6 +172,39 @@ int send_group_signal(dword_t pgid, int sig, struct siginfo_ info) {
     return 0;
 }
 
+// every process of session sid (ish.exe --serve's commands)
+int send_session_signal(dword_t sid, int sig, struct siginfo_ info) {
+    lock(&pids_lock);
+    struct pid *pid = pid_get(sid);
+    int sent = 0;
+    if (pid != NULL) {
+        struct tgroup *tgroup;
+        list_for_each_entry(&pid->session, tgroup, session) {
+            if (tgroup->leader->zombie)
+                continue;
+            send_signal(process_signal_target(tgroup->leader, sig), sig, info);
+            sent++;
+        }
+    }
+    unlock(&pids_lock);
+    return sent > 0 ? 0 : _ESRCH;
+}
+
+// every process but init
+int send_all_signal(int sig, struct siginfo_ info) {
+    lock(&pids_lock);
+    int sent = 0;
+    for (dword_t id = 2; id <= MAX_PID; id++) {
+        struct task *task = pid_get_task(id);
+        if (task == NULL || task->zombie || task != task->group->leader)
+            continue;
+        send_signal(process_signal_target(task, sig), sig, info);
+        sent++;
+    }
+    unlock(&pids_lock);
+    return sent > 0 ? 0 : _ESRCH;
+}
+
 static addr_t sigreturn_trampoline(const char *name) {
     addr_t sigreturn_addr = vdso_symbol(name);
     if (sigreturn_addr == 0) {

@@ -67,6 +67,7 @@ struct px_desc {
     bool is_tty;        // isatty(): the console, or stdin bridged from it
     bool is_pipe;       // a pipe() end: EPIPE rather than ECONNRESET
     bool is_stdin;      // the stdin bridge: reading or polling it asks the pump for more
+    bool own_h;         // PX_CONSOLE_OUT: h was given to us (px_fd_from_handle), closed with it
     int domain, type, protocol; // sockets, Linux values
     // An emulated ICMP datagram ("ping") socket: s reads the replies that
     // the IcmpSendEcho2 workers write into icmp_tx (see net.c).

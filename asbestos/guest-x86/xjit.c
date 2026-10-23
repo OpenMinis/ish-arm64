@@ -638,6 +638,13 @@ static void xjit_splice(struct fiber_block *block);
 
 // ---------------------------------------------------------------- blocks
 
+static void xjit_init_all(void);
+
+bool xjit_enabled(void) {
+    pthread_once(&init_once, xjit_init_all);
+    return xjit_on && region != NULL;
+}
+
 static void xjit_init_all(void) {
     xjit_init();
     if (xjit_on)
