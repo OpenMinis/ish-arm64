@@ -62,6 +62,14 @@ static bool loop_off;     // ISH_JIT_LOOP=0: no register promotion in self-loops
 static bool simd_on;      // ISH_JIT_SIMD=0: leave SIMD/FP instructions to the gadgets
 static bool pin_on;       // ISH_JIT_PIN=0: no guest registers pinned in host registers
 static bool pic_on;       // ISH_JIT_PIC=1: position-independent code (see "PIC" below)
+// ISH_JIT_HOT=<n>: translate a block when it runs the n-th time (1: at once).
+// Windows waits: start-up code that runs a few times costs more to translate
+// there (code faulted in through two views, a system call per icache flush).
+#ifdef _WIN32
+static unsigned hot_after = 16;
+#else
+static unsigned hot_after = 1;
+#endif
 static bool aot_only;     // ISH_JIT_AOT_ONLY=1: install AOT translations, translate nothing
                           // (what a build without the JIT would run)
 
@@ -90,6 +98,7 @@ static double jit_ticks_ms(uint64_t ticks) {
 static _Atomic uint64_t st_unsupported_insns, st_fail_regs;
 static _Atomic uint64_t st_block_ends, st_block_end_fail, st_links, st_loops;
 static _Atomic uint64_t st_shared, st_aot, st_aot_moved, st_aot_busy, st_aot_fixed;
+static _Atomic uint64_t st_deferred;   // blocks whose translation waited to get hot (jit_block_heat)
 static _Atomic uint64_t st_find_ticks;   // jit_ticks() spent in aot_lookup()
 
 // ---------------------------------------------------------------- code region
@@ -2241,6 +2250,8 @@ static bool one_mapping(const struct jit_units *U, int mod, uint64_t base) {
 }
 
 void jit_block_free(struct fiber_block *b) {
+    free(b->jit_pending);
+    b->jit_pending = NULL;
     struct jit_ctx *ctx = b->jit_ctx;
     if (!ctx || !pic_on)
         return;
@@ -3503,9 +3514,11 @@ void jit_report(void) {
     fprintf(stderr,
             "🛠  JIT(%s): blocks %llu, segments %llu, units %llu, code %llu KB, compile %.1f ms | "
             "block ends %llu (not translated %llu), direct links %llu, loop blocks %llu | "
-            "unsupported insns %llu, out of regs %llu | shared %llu, AOT %llu (%u images)\n",
+            "unsupported insns %llu, out of regs %llu | shared %llu, AOT %llu (%u images) | "
+            "waited to get hot %llu (ISH_JIT_HOT=%u)\n",
             dual_map ? (pic_on ? "dual-map, PIC" : "dual-map") : (pic_on ? "MAP_JIT, PIC" : "MAP_JIT"), st_blocks, st_segments, st_units, st_bytes / 1024, jit_ticks_ms(st_ticks),
-            st_block_ends, st_block_end_fail, st_links, st_loops, st_unsupported_insns, st_fail_regs, st_shared, st_aot, aot_nimages);
+            st_block_ends, st_block_end_fail, st_links, st_loops, st_unsupported_insns, st_fail_regs, st_shared, st_aot, aot_nimages,
+            st_deferred, hot_after);
 }
 
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
@@ -3528,11 +3541,22 @@ static void jit_init(void) {
     }
     link_off = env_off("ISH_JIT_LINK");
     loop_off = env_off("ISH_JIT_LOOP");
+    const char *hot = getenv("ISH_JIT_HOT");
+    if (hot && atoi(hot) >= 1)
+        hot_after = atoi(hot) < 65535 ? (unsigned) atoi(hot) : 65535;   // jit_heat is 16 bits
     simd_on = !env_off("ISH_JIT_SIMD");
     pin_on = !env_off("ISH_JIT_PIN");
     // AOT images are PIC code, so PIC is the default once one is linked in.
     const char *pic = getenv("ISH_JIT_PIC");
+#ifdef _WIN32
+    // Windows: PIC by default even without images. Its registry hands a
+    // translation to every process of the kernel that runs the same code, so
+    // the second python of a resident ish.exe starts like it had AOT images,
+    // and the code region does not fill up with copies of the same blocks.
+    pic_on = pic ? pic[0] == '1' : true;
+#else
     pic_on = pic ? pic[0] == '1' : have_images;
+#endif
     if (!have_region)
         pic_on = true;
     pin_init(pin_on);
@@ -3580,6 +3604,11 @@ static struct jit_scratch *get_scratch(void) {
     return scratch;
 }
 
+bool jit_enabled(void) {
+    pthread_once(&init_once, jit_init);
+    return jit_on;
+}
+
 struct jit_units *jit_units_begin(void) {
     pthread_once(&init_once, jit_init);
     if (!jit_on)
@@ -3619,11 +3648,51 @@ void jit_block_init(struct fiber_block *b) {
     b->native_entry = 0;
     b->jit_ctx = NULL;
     b->jit_idx = 0;
+    b->jit_pending = NULL;
+    b->jit_heat = 0;
 }
+
+static void jit_block_now(struct fiber_block *b, struct jit_units *U);
 
 void jit_block(struct fiber_block *b, struct jit_units *U) {
     if (!U || U->n > JIT_MAX_UNITS)
         return;
+    // Most blocks run a few times (start-up code): translating them costs more
+    // than it saves, so a block waits until it has run hot_after times. AOT
+    // images and recordings translate (look up) every block at once.
+    if (hot_after > 1 && !aot_nimages && !rec_file) {
+        size_t size = offsetof(struct jit_units, u) + U->n * sizeof(U->u[0]);
+        struct jit_units *keep = malloc(size);
+        if (keep) {
+            memcpy(keep, U, size);
+            b->jit_pending = keep;
+            atomic_fetch_add_explicit(&st_deferred, 1, memory_order_relaxed);
+            return;
+        }
+    }
+    jit_block_now(b, U);
+}
+
+bool jit_block_heat_due(struct fiber_block *b) {
+    uint16_t heat = __atomic_load_n(&b->jit_heat, __ATOMIC_RELAXED);
+    if (heat < 65535)
+        __atomic_store_n(&b->jit_heat, ++heat, __ATOMIC_RELAXED);   // a lost count only delays it
+    return heat >= hot_after;
+}
+
+void jit_block_heat(struct fiber_block *b, struct tlb *tlb) {
+    struct jit_units *U = b->jit_pending;
+    b->jit_pending = NULL;
+    if (!U || !get_scratch())
+        return;
+    struct tlb *saved = cm_tlb;
+    cm_tlb = tlb;
+    jit_block_now(b, U);
+    cm_tlb = saved;
+    free(U);
+}
+
+static void jit_block_now(struct fiber_block *b, struct jit_units *U) {
     uint64_t t0 = jit_ticks();
     if (cm_on)
         cm_block(b);

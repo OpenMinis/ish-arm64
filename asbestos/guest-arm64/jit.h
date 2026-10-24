@@ -67,6 +67,13 @@ static inline struct jit_step jit_step_begin(const struct gen_state *state) {
 void jit_step_end(struct jit_units *units, const struct jit_step *step,
                   const struct gen_state *state, bool more, struct tlb *tlb);
 void jit_block(struct fiber_block *block, struct jit_units *units);
+// A block whose translation waits for it to get hot (jit_block() kept its
+// units, block->jit_pending) runs as gadgets and is not chained, so every
+// entry comes back to the run loop: jit_block_heat_due() counts it, true on the
+// ISH_JIT_HOT-th time, and then jit_block_heat() translates it (asbestos lock
+// held by the caller).
+bool jit_block_heat_due(struct fiber_block *block);
+void jit_block_heat(struct fiber_block *block, struct tlb *tlb);
 
 // Per-block state, set up by gen_start().
 void jit_block_init(struct fiber_block *block);
@@ -92,6 +99,9 @@ bool jit_chain_ok(struct fiber_block *from, int i, struct fiber_block *to);
 // true: from's native code now enters `to` itself; the caller records the
 // relation so that `to` leaving the cache unlinks it (jit_unlink()).
 bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to);
+
+// The translator is on (ISH_JIT unset or not 0, and it could map its code region).
+bool jit_enabled(void);
 
 // Leave the thread's JIT write mode (if a compile or link entered it) before
 // running guest code.

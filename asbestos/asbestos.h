@@ -77,6 +77,11 @@ struct fiber_block {
     // links for free list
     struct list jetsam;
     bool is_jetsam;
+#ifdef ISH_JIT
+    // times the run loop entered it while jit_pending (in is_jetsam's padding:
+    // the gadgets reach addr from code with a 9-bit offset, so code stays <= 256)
+    uint16_t jit_heat;
+#endif
 
 #ifdef ISH_JIT
     // Native code (guest-arm64/jit.c). native_link[i]: the patchable
@@ -88,6 +93,7 @@ struct fiber_block {
     uintptr_t native_entry;     // hot entry of the native code at code[0], 0 if none
     void *jit_ctx;              // PIC: module context the native code runs with (x29)
     unsigned jit_idx;           // PIC: its translation's slot in that context
+    void *jit_pending;          // units kept until the block has run ISH_JIT_HOT times (jit_heat), or NULL
 #endif
 #ifdef ISH_XJIT
     void *xjit_code;            // native runs of this block (guest-x86/xjit.c)

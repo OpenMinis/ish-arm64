@@ -1130,9 +1130,23 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         }
         if (no_retcache)
             memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
+#ifdef ISH_JIT
+        // Not translated yet: count this entry (jit_block_heat). A block keeps
+        // coming back here until it is translated: neither it nor a block
+        // leading into it is chained meanwhile.
+        if (block != NULL && block->jit_pending != NULL && jit_block_heat_due(block)) {
+            lock(&asbestos->lock);
+            if (block->jit_pending != NULL && !block->is_jetsam)
+                jit_block_heat(block, tlb);
+            unlock(&asbestos->lock);
+        }
+#endif
         struct fiber_block *last_block = no_chain ? NULL : frame->last_block;
         if (block != NULL && last_block != NULL &&
                 !last_block->is_jetsam && !block->is_jetsam &&
+#ifdef ISH_JIT
+                last_block->jit_pending == NULL && block->jit_pending == NULL &&
+#endif
                 (last_block->jump_ip[0] != NULL ||
                  last_block->jump_ip[1] != NULL)) {
             {
