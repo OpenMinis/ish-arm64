@@ -417,6 +417,11 @@ int main(int argc, char *const argv[]) {
             printf("serve-proto=1\n");
             return 0;
         }
+        // --arch: what this ish.exe runs, without booting a kernel
+        if (strcmp(argv[i], "--arch") == 0) {
+            printf("guest_arch=%s host_arch=%s engine=%s\n", ish_guest_arch(), ish_host_arch(), ish_engine());
+            return 0;
+        }
         if (strcmp(argv[i], "--serve") == 0)
             ish_serve_mode = true;
         else
