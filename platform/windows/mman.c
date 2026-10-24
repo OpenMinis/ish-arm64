@@ -719,3 +719,35 @@ void px_reserve_lazy_free(void *p) {
     ReleaseSRWLockExclusive(&lazy_lock);
     VirtualFree(p, 0, MEM_RELEASE);
 }
+
+#if defined(__aarch64__)
+// Host faults in guest code (asbestos/guest-arm64): the arm64 build's
+// SIGSEGV handler on Apple, as a vectored handler. Lazy memory (above) is
+// committed first: a fault there is not the guest's.
+static bool (*a64_fault_fn)(struct px_fault *f);
+static LONG CALLBACK a64_fault_veh(PEXCEPTION_POINTERS ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (lazy_veh(ep) == EXCEPTION_CONTINUE_EXECUTION)
+        return EXCEPTION_CONTINUE_EXECUTION;
+    CONTEXT *c = ep->ContextRecord;
+    struct px_fault f;
+    memcpy(f.x, c->X, sizeof(f.x));
+    f.sp = c->Sp;
+    f.pc = c->Pc;
+    f.addr = er->ExceptionInformation[1];
+    f.is_write = er->ExceptionInformation[0] == 1;
+    if (!a64_fault_fn(&f))
+        return EXCEPTION_CONTINUE_SEARCH;
+    c->Sp = f.sp;
+    c->Pc = f.pc;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void px_fault_hook(bool (*fn)(struct px_fault *f)) {
+    if (a64_fault_fn == NULL)
+        AddVectoredExceptionHandler(1, a64_fault_veh);
+    a64_fault_fn = fn;
+}
+#endif

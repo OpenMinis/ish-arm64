@@ -114,7 +114,9 @@ int jit_prof_locate(struct tlb *tlb, addr_t pc, uint64_t *off);
 void jit_module_path(int mod, char *buf, size_t size);
 
 // Host fault in native code: sync pinned guest registers into cpu_state.
-bool jit_crash_sync(void *ucontext);
+bool jit_crash_sync(void *ucontext);   // Apple: from a signal's ucontext
+// The same from the faulting pc and x0..x30 (Windows: a vectored handler's CONTEXT).
+bool jit_crash_sync_regs(uintptr_t pc, const uint64_t *x);
 
 // Guest init is exiting: ISH_JIT_STATS=1 prints counters, ISH_JIT_DUMP=<file>
 // writes the code region.

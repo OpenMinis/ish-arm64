@@ -2992,20 +2992,14 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
 // Host fault inside native code: the pinned guest registers only live in host
 // registers, so copy them from the signal context into cpu_state before the
 // crash-recovery path re-runs the block.
-bool jit_crash_sync(void *ucontext) {
-#ifndef __APPLE__
-    (void) ucontext;
-    return false;   // Windows: no fault recovery in native code yet (needs a VEH, CONTEXT.X[])
-#else
+bool jit_crash_sync_regs(uintptr_t pc, const uint64_t *x) {
     if (!region || n_pinned <= 0)
         return false;
-    ucontext_t *uc = ucontext;
-    uintptr_t pc = uc->uc_mcontext->__ss.__pc;
     const struct aot_module *img = NULL;
     bool in_region = pc >= (uintptr_t) region && pc < (uintptr_t) region + REGION_SIZE;
     if (!in_region && !in_aot_text(pc, &img))
         return false;
-    char *cpu = (char *) uc->uc_mcontext->__ss.__x[1];
+    char *cpu = (char *) x[1];
     // Faults only happen at guest accesses, which in a loop block are all in
     // the promoted body. (Blocking lock: this runs in a signal handler, but
     // only for faults inside native code, never from within loopmap_add.)
@@ -3029,13 +3023,24 @@ bool jit_crash_sync(void *ucontext) {
         bool donor = false;
         for (unsigned k = 0; k < lm.n; k++) donor |= lm.d[k] == pin_guest[i];
         if (!donor)
-            *(uint64_t *) (cpu + greg_off(pin_guest[i])) = uc->uc_mcontext->__ss.__x[pin_host[i]];
+            *(uint64_t *) (cpu + greg_off(pin_guest[i])) = x[pin_host[i]];
     }
     for (unsigned k = 0; k < lm.n; k++)
-        *(uint64_t *) (cpu + greg_off(lm.g[k])) = uc->uc_mcontext->__ss.__x[lm.h[k]];
+        *(uint64_t *) (cpu + greg_off(lm.g[k])) = x[lm.h[k]];
     return true;
-#endif
 }
+
+#ifdef __APPLE__
+bool jit_crash_sync(void *ucontext) {
+    ucontext_t *uc = ucontext;
+    uint64_t x[31];
+    for (int i = 0; i < 29; i++)
+        x[i] = uc->uc_mcontext->__ss.__x[i];
+    x[29] = uc->uc_mcontext->__ss.__fp;
+    x[30] = uc->uc_mcontext->__ss.__lr;
+    return jit_crash_sync_regs(uc->uc_mcontext->__ss.__pc, x);
+}
+#endif
 
 
 // ================================================================ code map

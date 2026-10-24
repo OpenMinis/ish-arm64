@@ -374,6 +374,13 @@ void px_icache_flush(void *addr, size_t len);
 // it is first touched (a vectored handler commits on the access violation).
 void *px_reserve_lazy(size_t len);
 void px_reserve_lazy_free(void *p);
+// arm64 hosts: fn sees each access violation (x0..x30, sp, pc, the address,
+// write or not) and may move sp/pc and return true to continue there.
+struct px_fault {
+    uint64_t x[31], sp, pc, addr;
+    bool is_write;
+};
+void px_fault_hook(bool (*fn)(struct px_fault *f));
 // This executable's path (UTF-8, '/' separated), or NULL.
 const char *px_self_exe(void);
 // Brings [addr, addr + len) of a mapping in with one call (PrefetchVirtualMemory)
