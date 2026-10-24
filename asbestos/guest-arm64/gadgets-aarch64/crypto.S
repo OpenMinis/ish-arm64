@@ -367,8 +367,8 @@
     // Execute native SHA512SU0 instruction
     // SHA512SU0 V0.2D, V1.2D
     // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
-    adrp x8, NAME(ish_host_sha512)@PAGE
-    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    adrp x8, PAGE(NAME(ish_host_sha512))
+    ldrb w8, [x8, PAGEOFF(NAME(ish_host_sha512))]
     cbz w8, sha512su0_soft
     .inst 0xcec08020         // sha512su0 v0.2d, v1.2d
 
@@ -422,8 +422,8 @@ sha512su0_soft:
     // Execute native SHA512SU1 instruction
     // SHA512SU1 V0.2D, V1.2D, V2.2D
     // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
-    adrp x8, NAME(ish_host_sha512)@PAGE
-    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    adrp x8, PAGE(NAME(ish_host_sha512))
+    ldrb w8, [x8, PAGEOFF(NAME(ish_host_sha512))]
     cbz w8, sha512su1_soft
     .inst 0xce628820         // sha512su1 v0.2d, v1.2d, v2.2d
 
@@ -478,8 +478,8 @@ sha512su1_soft:
     // Execute native SHA512H instruction
     // SHA512H Qd, Qn, Vm.2D -> SHA512H Q0, Q1, V2.2D
     // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
-    adrp x8, NAME(ish_host_sha512)@PAGE
-    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    adrp x8, PAGE(NAME(ish_host_sha512))
+    ldrb w8, [x8, PAGEOFF(NAME(ish_host_sha512))]
     cbz w8, sha512h_soft
     .inst 0xce628020         // sha512h q0, q1, v2.2d
 
@@ -534,8 +534,8 @@ sha512h_soft:
     // Execute native SHA512H2 instruction
     // SHA512H2 Q0, Q1, V2.2D
     // A11/A12 hosts have no SHA512 instructions (FEAT_SHA512): software
-    adrp x8, NAME(ish_host_sha512)@PAGE
-    ldrb w8, [x8, NAME(ish_host_sha512)@PAGEOFF]
+    adrp x8, PAGE(NAME(ish_host_sha512))
+    ldrb w8, [x8, PAGEOFF(NAME(ish_host_sha512))]
     cbz w8, sha512h2_soft
     .inst 0xce628420         // sha512h2 q0, q1, v2.2d
 
