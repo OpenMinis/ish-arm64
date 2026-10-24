@@ -68,3 +68,15 @@ aarch64-linux-musl-gcc -static -O0 -o <rootfs>/tmp/regress_syscall \
 
 All four run from `tests/regress/run_fs_perf.sh -i build-native/ish -r <fakefs rootfs> [-b]`,
 which works on a COPY of the rootfs so the meta.db orphan check is reproducible.
+
+## poll waits woken for nothing (2026-10-08)
+
+| Fix | What broke before it | Covered by |
+| --- | --- | --- |
+| poll spin guards (T-ish-poll-spin-guard) | A guest poll that wants only hangups (`events=0`, as the Rust runtime probes fds 0-2 before `main()`) registered the fd with kqueue `EVFILT_READ` + `NOTE_LOWAT=INT_MAX`. xnu ignores that low-water mark for regular files and clamps it to the buffer size for pipes, so a full pipe or a file with unread bytes fired forever while the guest check found nothing. With timeout 0 `poll_wait` never returned; otherwise it spun at 100% of a host core. `head -n 7604 big.py \| rg ...` hung (rg never read, head stayed blocked) and, backgrounded, got the app killed for its CPU budget. | `regress_poll_spurious.c` |
+
+`regress_poll_spurious.c` runs each case in a child under a 3 s watchdog and
+also checks CPU time inside timed waits. `/proc/ish/poll_spin` switches the four
+guards (`regfile`, `hupedge`, `deadline`, `backoff`) off one by one, e.g.
+`echo hupedge 0 > /proc/ish/poll_spin`; with all four off the test must fail
+(5 of 7 cases hang), which proves it catches the bug.
