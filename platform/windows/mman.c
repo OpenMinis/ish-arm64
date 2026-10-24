@@ -628,7 +628,10 @@ void px_vm_populate(void *addr, size_t len, bool write) { (void) addr; (void) le
 #endif
 
 void *px_jit_map_dual(size_t size, void **rw) {
-    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+    // reserved only: px_jit_commit() commits what the JIT gets to, so a
+    // process (and the job Minis caps its memory with) is charged for the
+    // code there is, not the whole region
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
                                         (DWORD) ((uint64_t) size >> 32), (DWORD) size, NULL);
     if (section == NULL)
         return NULL;
@@ -644,6 +647,75 @@ void *px_jit_map_dual(size_t size, void **rw) {
     return x;
 }
 
+bool px_jit_commit_dual(void *rx, void *rw, size_t len) {
+    return VirtualAlloc(rw, len, MEM_COMMIT, PAGE_READWRITE) != NULL &&
+        VirtualAlloc(rx, len, MEM_COMMIT, PAGE_EXECUTE_READ) != NULL;
+}
+
 void px_icache_flush(void *addr, size_t len) {
     FlushInstructionCache(GetCurrentProcess(), addr, len);
+}
+
+// Address space committed on first touch, like an anonymous POSIX mapping
+// that is never written in full (asbestos/guest-arm64/jit.c's per-module
+// contexts reserve 20 MB each and touch a few pages): committing all of it
+// would count against the job Minis caps ish.exe's memory with.
+#define LAZY_MAX 256
+static struct { char *base; size_t len; } lazy[LAZY_MAX];
+static SRWLOCK lazy_lock = SRWLOCK_INIT;
+static LONG CALLBACK lazy_veh(PEXCEPTION_POINTERS ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    char *a = (char *) er->ExceptionInformation[1];
+    LONG r = EXCEPTION_CONTINUE_SEARCH;
+    AcquireSRWLockShared(&lazy_lock);
+    for (int i = 0; i < LAZY_MAX; i++) {
+        if (lazy[i].base == NULL || a < lazy[i].base || a >= lazy[i].base + lazy[i].len)
+            continue;
+        // 64 KB around it, within the range
+        char *lo = lazy[i].base + (((size_t) (a - lazy[i].base)) & ~(size_t) 0xffff);
+        size_t n = lazy[i].base + lazy[i].len - lo < 0x10000 ? (size_t) (lazy[i].base + lazy[i].len - lo) : 0x10000;
+        if (VirtualAlloc(lo, n, MEM_COMMIT, PAGE_READWRITE) != NULL)
+            r = EXCEPTION_CONTINUE_EXECUTION;
+        break;
+    }
+    ReleaseSRWLockShared(&lazy_lock);
+    return r;
+}
+
+void *px_reserve_lazy(size_t len) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending) {
+        AddVectoredExceptionHandler(1, lazy_veh);
+        InitOnceComplete(&once, 0, NULL);
+    }
+    void *p = VirtualAlloc(NULL, len, MEM_RESERVE, PAGE_READWRITE);
+    if (p == NULL)
+        return NULL;
+    AcquireSRWLockExclusive(&lazy_lock);
+    int i;
+    for (i = 0; i < LAZY_MAX && lazy[i].base != NULL; i++) {}
+    if (i < LAZY_MAX) {
+        lazy[i].base = p;
+        lazy[i].len = len;
+    }
+    ReleaseSRWLockExclusive(&lazy_lock);
+    if (i == LAZY_MAX) {   // no slot to commit it from: commit it all, as before
+        if (!VirtualAlloc(p, len, MEM_COMMIT, PAGE_READWRITE)) {
+            VirtualFree(p, 0, MEM_RELEASE);
+            return NULL;
+        }
+    }
+    return p;
+}
+
+void px_reserve_lazy_free(void *p) {
+    AcquireSRWLockExclusive(&lazy_lock);
+    for (int i = 0; i < LAZY_MAX; i++)
+        if (lazy[i].base == p)
+            lazy[i].base = NULL;
+    ReleaseSRWLockExclusive(&lazy_lock);
+    VirtualFree(p, 0, MEM_RELEASE);
 }

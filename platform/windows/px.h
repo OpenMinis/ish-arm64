@@ -364,10 +364,16 @@ void px_vm_populate(void *addr, size_t len, bool write);   // fresh window pages
 // path is UTF-8; directories are created.
 void *px_shared_file_map(const char *path, size_t size);
 // JIT code (asbestos/guest-arm64/jit.c): size bytes of one pagefile section,
-// mapped twice -- executable (returned) and writable (*rw). NULL on failure.
+// reserved and mapped twice -- executable (returned) and writable (*rw). NULL on failure.
 void *px_jit_map_dual(size_t size, void **rw);
+// Commits [rx, rx + len) of those views and the same range of the writable one (rw).
+bool px_jit_commit_dual(void *rx, void *rw, size_t len);
 // Makes code just written at [addr, addr + len) visible to instruction fetch.
 void px_icache_flush(void *addr, size_t len);
+// len bytes of zeroed read-write memory, committed a 64 KB piece at a time as
+// it is first touched (a vectored handler commits on the access violation).
+void *px_reserve_lazy(size_t len);
+void px_reserve_lazy_free(void *p);
 // This executable's path (UTF-8, '/' separated), or NULL.
 const char *px_self_exe(void);
 // Brings [addr, addr + len) of a mapping in with one call (PrefetchVirtualMemory)

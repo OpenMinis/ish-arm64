@@ -169,12 +169,39 @@ static bool map_jit(void) {
 }
 #endif
 
+#ifdef _WIN32
+// The section is only reserved: commit it 1 MB at a time ahead of region_used.
+#define REGION_COMMIT_STEP (1u << 20)
+static size_t region_committed;
+static pthread_mutex_t region_commit_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool region_commit(size_t end) {
+    if (__atomic_load_n(&region_committed, __ATOMIC_ACQUIRE) >= end)
+        return true;
+    pthread_mutex_lock(&region_commit_lock);
+    bool ok = true;
+    while (ok && region_committed < end) {
+        size_t step = REGION_SIZE - region_committed < REGION_COMMIT_STEP ? REGION_SIZE - region_committed : REGION_COMMIT_STEP;
+        ok = px_jit_commit_dual(region + region_committed, region + region_committed + rw_delta, step);
+        if (ok)
+            __atomic_store_n(&region_committed, region_committed + step, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&region_commit_lock);
+    return ok;
+}
+#endif
+
 static uint8_t *region_alloc(size_t bytes) {
     size_t off = atomic_fetch_add(&region_used, (bytes + 15) & ~(size_t) 15);
     if (off + bytes > REGION_SIZE) {
         region_full = true;
         return NULL;
     }
+#ifdef _WIN32
+    if (!region_commit(off + bytes)) {
+        region_full = true;   // out of commit (a job's memory limit): what comes after runs as gadgets
+        return NULL;
+    }
+#endif
     return region + off;
 }
 
@@ -2195,8 +2222,13 @@ static struct jit_ctx *ctx_get(struct asbestos *a, int mod, uint64_t base, const
         // An image knows how many it uses.
         size_t nidx = owner ? owner->nidx : CTX_MAX;
         size_t far = CTX_FAR * nidx, bytes = far + CTX_BLK + CTX_SLOT * nidx;
+#ifdef _WIN32
+        void *p = px_reserve_lazy(bytes);   // Windows commits an anonymous mmap at once
+        if (p == NULL) {
+#else
         void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (p == MAP_FAILED) {
+#endif
             free(n);
             n = NULL;
         } else {
@@ -2222,7 +2254,11 @@ void jit_asbestos_free(struct asbestos *a) {
     pthread_mutex_unlock(&ctx_lock);
     while (n) {
         struct ctx_node *next = n->next;
+#ifdef _WIN32
+        px_reserve_lazy_free(n->map);
+#else
         munmap(n->map, n->bytes);
+#endif
         free(n);
         n = next;
     }
