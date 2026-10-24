@@ -1,15 +1,39 @@
 // Native JIT for the ARM64 guest -- see jit.h. Built only with -Djit=true.
 
-#if !defined(__APPLE__) || !defined(__aarch64__)
-#error "the ARM64 JIT needs an Apple arm64 host (MAP_JIT)"
+#if !defined(__aarch64__) || !(defined(__APPLE__) || defined(_WIN32))
+#error "the ARM64 JIT needs an arm64 host: Apple (MAP_JIT / dual mapping) or Windows (dual mapping)"
 #endif
 
+#ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <dlfcn.h>
 #include <fnmatch.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <sys/ucontext.h>
+#else
+// Windows: one pagefile section mapped twice (px_jit_map_dual), like iOS.
+#define TARGET_OS_OSX 0
+#define sys_icache_invalidate px_icache_flush
+// '*' and '?' only: what AOT family patterns use
+static int fnmatch(const char *p, const char *s, int flags) {
+    (void) flags;
+    for (; *p; p++, s++) {
+        if (*p == '*') {
+            for (const char *t = s;; t++) {
+                if (fnmatch(p + 1, t, 0) == 0)
+                    return 0;
+                if (!*t)
+                    return 1;
+            }
+        }
+        if (!*s || (*p != '?' && *p != *s))
+            return 1;
+    }
+    return *s ? 1 : 0;
+}
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -17,7 +41,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/ucontext.h>
 #include "asbestos/guest-arm64/jit.h"
 #include "asbestos/guest-arm64/aot.h"
 #include "asbestos/asbestos.h"
@@ -89,6 +112,16 @@ static _Atomic bool region_full;   // an allocation failed: what came after runs
 
 #ifndef ISH_JIT_NO_EMIT   // AOT-only builds never map executable memory
 static bool map_dual(void) {
+#ifdef _WIN32
+    void *rw;
+    void *rx = px_jit_map_dual(REGION_SIZE, &rw);
+    if (rx == NULL)
+        return false;
+    region = rx;
+    rw_delta = (intptr_t) rw - (intptr_t) rx;
+    dual_map = true;
+    return true;
+#else
     void *rw = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (rw == MAP_FAILED)
         return false;
@@ -109,6 +142,7 @@ static bool map_dual(void) {
     rw_delta = (intptr_t) rw - (intptr_t) rx;
     dual_map = true;
     return true;
+#endif
 }
 
 static bool map_jit(void) {
@@ -1167,7 +1201,7 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
         }
     if (e->record)
         e->last_rec = record_segment(e);
-    b->code[first_pos] = (unsigned long) dst;
+    b->code[first_pos] = (uintptr_t) dst;
     if (first_pos == 0 && n_pinned)
         __atomic_store_n(&b->native_entry, (uintptr_t) dst + entry_off(), __ATOMIC_RELEASE);
     return dst;
@@ -1240,7 +1274,7 @@ bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to) 
         __atomic_load_n(&ctx->slot[from->jit_idx].blk, __ATOMIC_ACQUIRE) != from)
         return false;
     __atomic_store_n(&ctx_far(ctx, from->jit_idx)->alt[i], (uintptr_t) to->code, __ATOMIC_RELEASE);
-    __atomic_store_n(from->jump_ip[i], *from->jump_ip[i] | 1UL << 62, __ATOMIC_RELEASE);
+    __atomic_store_n(from->jump_ip[i], *from->jump_ip[i] | 1ULL << 62, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -1348,7 +1382,7 @@ static void emit_native_dispatch_ex(struct em *e, bool block_start) {
 // swaps them back first.
 static void emit_refused_edge(struct em *e, unsigned generic, int link);
 
-static void emit_chain_ex(struct em *e, struct fiber_block *b, unsigned long *slot, int link, bool self_loop) {
+static void emit_chain_ex(struct em *e, struct fiber_block *b, uintptr_t *slot, int link, bool self_loop) {
     bool reg_cycle = n_pinned > 0;
     unsigned generic = 0;   // PIC: chained successor in x9, entered natively or through its gadgets
     unsigned slot_off = (unsigned) ((char *) slot - (char *) b);
@@ -1458,7 +1492,7 @@ static void emit_chain_ex(struct em *e, struct fiber_block *b, unsigned long *sl
     emit_exit(e, (uintptr_t) jit_fiber_ret_chain);
 }
 
-static void emit_chain(struct em *e, struct fiber_block *b, unsigned long *slot, int link) {
+static void emit_chain(struct em *e, struct fiber_block *b, uintptr_t *slot, int link) {
     emit_chain_ex(e, b, slot, link, false);
 }
 
@@ -2109,7 +2143,7 @@ static void reg_install(struct fiber_block *b, struct jit_ctx *ctx, const struct
     b->native_link[0] = r->link[0];
     b->native_link[1] = r->link[1];
     for (unsigned i = 0; i < r->nseg; i++) {
-        b->code[r->seg[i].pos] = (unsigned long) r->seg[i].code;
+        b->code[r->seg[i].pos] = (uintptr_t) r->seg[i].code;
         if (r->seg[i].pos == 0 && n_pinned)
             __atomic_store_n(&b->native_entry, (uintptr_t) r->seg[i].code + entry_off(), __ATOMIC_RELEASE);
     }
@@ -2571,7 +2605,7 @@ static bool aot_install(struct fiber_block *b, struct jit_ctx *ctx, const struct
     const struct aot_seg *seg = aot_rel(&t->seg);
     for (unsigned i = 0; i < t->nseg; i++) {
         uintptr_t code = (uintptr_t) aot_rel(&seg[i].code);
-        b->code[seg[i].pos] = (unsigned long) code;
+        b->code[seg[i].pos] = (uintptr_t) code;
         if (seg[i].pos == 0 && n_pinned)
             __atomic_store_n(&b->native_entry, code + (uintptr_t) entry, __ATOMIC_RELEASE);
     }
@@ -2775,6 +2809,10 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
 // registers, so copy them from the signal context into cpu_state before the
 // crash-recovery path re-runs the block.
 bool jit_crash_sync(void *ucontext) {
+#ifndef __APPLE__
+    (void) ucontext;
+    return false;   // Windows: no fault recovery in native code yet (needs a VEH, CONTEXT.X[])
+#else
     if (!region || n_pinned <= 0)
         return false;
     ucontext_t *uc = ucontext;
@@ -2812,6 +2850,7 @@ bool jit_crash_sync(void *ucontext) {
     for (unsigned k = 0; k < lm.n; k++)
         *(uint64_t *) (cpu + greg_off(lm.g[k])) = uc->uc_mcontext->__ss.__x[lm.h[k]];
     return true;
+#endif
 }
 
 
@@ -3011,16 +3050,29 @@ static bool module_path_has(int mod, const char *sub) {
 // the code region); a direct link resolves to the translation it went to.
 
 static void rec_sym(FILE *f, uintptr_t p) {
+#ifndef __APPLE__
+    // No dladdr: "=<rva>" for an address in ish.exe, named afterwards from its
+    // symbol table (tools/jit_aot on Windows), "?<address>" for anything else.
+    extern char __ImageBase;
+    uintptr_t base = (uintptr_t) &__ImageBase;
+    if (p == (uintptr_t) region)
+        fputs("\"@region\"", f);
+    else if (p >= base && p - base < (256u << 20))
+        fprintf(f, "\"=%llx\"", (unsigned long long) (p - base));
+    else
+        fprintf(f, "\"?%llx\"", (unsigned long long) p);
+#else
     Dl_info info;
     if (p == (uintptr_t) region) {
         fputs("\"@region\"", f);
     } else if (dladdr((void *) p, &info) && info.dli_sname && (uintptr_t) info.dli_saddr == p) {
         fprintf(f, "\"%s\"", info.dli_sname);
     } else if (dladdr((void *) p, &info) && info.dli_sname) {
-        fprintf(f, "\"%s+%lu\"", info.dli_sname, (unsigned long) (p - (uintptr_t) info.dli_saddr));
+        fprintf(f, "\"%s+%lu\"", info.dli_sname, (uintptr_t) (p - (uintptr_t) info.dli_saddr));
     } else {
-        fprintf(f, "\"?%lx\"", (unsigned long) p);
+        fprintf(f, "\"?%lx\"", (uintptr_t) p);
     }
+#endif
 }
 
 struct rec_where { uintptr_t lo, hi; unsigned t, seg; };
@@ -3058,7 +3110,7 @@ static void rec_write(const char *path) {
     // region_full: the code region filled up, so the recording misses what ran after that.
     fprintf(f, "{\"header\": {\"abi\": %u, \"prologue_words\": %d, \"entry_off\": %lu, \"n_pinned\": %d, "
             "\"region_full\": %s, \"region_used\": %zu, \"exit_stub\": [",
-            jit_abi(), prologue_words, (unsigned long) entry_off(), n_pinned, region_full ? "true" : "false",
+            jit_abi(), prologue_words, (uintptr_t) entry_off(), n_pinned, region_full ? "true" : "false",
             region_full ? (size_t) REGION_SIZE : (size_t) region_used);
     for (unsigned i = 0; i < exit_stub_words; i++)
         fprintf(f, "%s%u", i ? ", " : "", ((uint32_t *) exit_stub)[i]);
@@ -3088,7 +3140,7 @@ static void rec_write(const char *path) {
             const struct rec_seg *rs = r->seg[i].rec;
             if (!rs) continue;
             fprintf(f, "%s{\"pos\": %u, \"code\": %lu, \"words\": [", i ? ", " : "", r->seg[i].pos,
-                    (unsigned long) r->seg[i].code);
+                    (uintptr_t) r->seg[i].code);
             for (unsigned j = 0; j < rs->nwords; j++)
                 fprintf(f, "%s%u", j ? ", " : "", rs->words[j]);
             fprintf(f, "], \"rel\": [");

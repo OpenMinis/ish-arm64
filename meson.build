@@ -47,8 +47,8 @@ if ish_xjit
     add_project_arguments('-DISH_XJIT=1', language: 'c')
 endif
 if ish_jit
-    if host_machine.system() != 'darwin' or host_machine.cpu_family() != 'aarch64'
-        error('-Djit=true needs guest_arch=arm64 on an Apple arm64 host')
+    if host_machine.system() not in ['darwin', 'windows'] or host_machine.cpu_family() != 'aarch64'
+        error('-Djit=true needs guest_arch=arm64 on an Apple or Windows arm64 host')
     endif
     add_project_arguments('-DISH_JIT=1', language: 'c')
     if not get_option('jit_emit')
@@ -96,10 +96,9 @@ if host_windows
             'platform/windows/wait.c',
             'platform/windows/mman.c',
             'platform/windows/misc.c',
-            'platform/windows/whp.c',
             'platform/windows/serve_io.c',
             'platform/windows/fcache.c',
-        ],
+        ] + (host_machine.cpu_family() == 'x86_64' ? ['platform/windows/whp.c'] : []),
         c_args: ['-DPX_IMPL', '-D_WIN32_WINNT=0x0A00', '-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX', '-DUNICODE', '-D_UNICODE'],
         dependencies: threads)
     # the commit ish.exe --serve reports (-Dcommit=, or git's when built from a checkout)

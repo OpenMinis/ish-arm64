@@ -70,7 +70,7 @@ static_assert(CRASH_LOCAL_jit_exit_sp      == LOCAL_jit_exit_sp,      "cpu-offse
 #endif
 
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
-#if defined(__aarch64__) && defined(GUEST_ARM64)
+#if defined(__aarch64__) && defined(GUEST_ARM64) && defined(__APPLE__)
     // If we're inside JIT code and got SIGSEGV/SIGBUS, recover by redirecting
     // execution to jit_crash_trampoline via ucontext PC manipulation.
     // This avoids the overhead of _setjmp on every block entry.

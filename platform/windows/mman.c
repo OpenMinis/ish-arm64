@@ -519,6 +519,7 @@ bool px_fm_committed_until(void *addr, char **end) {
     return mbi.State == MEM_COMMIT;
 }
 
+#if defined(__x86_64__)
 static uintptr_t (*fault_redirect)(uintptr_t pc, uintptr_t r11);
 static LONG CALLBACK fault_redirect_veh(PEXCEPTION_POINTERS ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || fault_redirect == NULL)
@@ -535,6 +536,7 @@ void px_fault_redirect(uintptr_t (*fn)(uintptr_t pc, uintptr_t r11)) {
         AddVectoredExceptionHandler(1, fault_redirect_veh);
     fault_redirect = fn;
 }
+#endif
 
 // ---- the translation cache's file (asbestos/guest-x86_64/xlat.c)
 static wchar_t *px_utf8_to_w(const char *s) {
@@ -617,4 +619,31 @@ const char *px_local_appdata(void) {
         path = px_w_to_utf8(w);
     }
     return path;
+}
+
+#if !defined(__x86_64__)
+// No WHP backend here (whp.c is x86_64-only): nothing can have the window mapped.
+void px_vm_forget(void *window) { (void) window; }
+void px_vm_populate(void *addr, size_t len, bool write) { (void) addr; (void) len; (void) write; }
+#endif
+
+void *px_jit_map_dual(size_t size, void **rw) {
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+                                        (DWORD) ((uint64_t) size >> 32), (DWORD) size, NULL);
+    if (section == NULL)
+        return NULL;
+    void *w = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, size);
+    void *x = w != NULL ? MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, size) : NULL;
+    CloseHandle(section);   // the views keep it
+    if (x == NULL) {
+        if (w != NULL)
+            UnmapViewOfFile(w);
+        return NULL;
+    }
+    *rw = w;
+    return x;
+}
+
+void px_icache_flush(void *addr, size_t len) {
+    FlushInstructionCache(GetCurrentProcess(), addr, len);
 }
