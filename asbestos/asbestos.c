@@ -1301,12 +1301,24 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 }
             }
         }
-        // A tick every 1024 cycles: counted here, or by chained code (gadgets'
-        // inline_chain, JIT code's back edges), which comes back with the
-        // count at a multiple of 1024 -- JIT code chains so long that the
-        // count here alone would take ~1M of its exits per tick.
-        if (interrupt == INT_NONE && ((frame->cpu.cycle & ((1 << 10) - 1)) == 0 ||
-                                      (++frame->cpu.cycle & ((1 << 10) - 1)) == 0)) {
+        // A tick every 1024 cycles counted here. JIT code chains blocks
+        // natively and counts its back edges in the same field, coming back
+        // here rarely and with the count at a multiple of 1024: that is a
+        // tick too, or the count here alone would take ~1M of its exits per
+        // tick. (Not for gadgets: their chained exits come back that way every
+        // 1024 blocks, and a tick there costs ~12% of an import httpx.) The
+        // count moves on either way, so the next pass does not tick again.
+        bool tick_due = false;
+        if (interrupt == INT_NONE) {
+#ifdef ISH_JIT
+            static int jit_ticks = -1;
+            if (jit_ticks < 0)
+                jit_ticks = jit_enabled();
+            tick_due = jit_ticks && (frame->cpu.cycle & ((1 << 10) - 1)) == 0;
+#endif
+            tick_due |= (++frame->cpu.cycle & ((1 << 10) - 1)) == 0;
+        }
+        if (tick_due) {
             interrupt = INT_TIMER;
 #if defined(ISH_XJIT) && defined(GUEST_X86_64)
             xjit_tick(asbestos);
