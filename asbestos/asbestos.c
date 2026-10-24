@@ -1301,7 +1301,12 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 }
             }
         }
-        if (interrupt == INT_NONE && (++frame->cpu.cycle & ((1 << 10) - 1)) == 0) {
+        // A tick every 1024 cycles: counted here, or by chained code (gadgets'
+        // inline_chain, JIT code's back edges), which comes back with the
+        // count at a multiple of 1024 -- JIT code chains so long that the
+        // count here alone would take ~1M of its exits per tick.
+        if (interrupt == INT_NONE && ((frame->cpu.cycle & ((1 << 10) - 1)) == 0 ||
+                                      (++frame->cpu.cycle & ((1 << 10) - 1)) == 0)) {
             interrupt = INT_TIMER;
 #if defined(ISH_XJIT) && defined(GUEST_X86_64)
             xjit_tick(asbestos);
