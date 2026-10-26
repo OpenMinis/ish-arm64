@@ -4,6 +4,7 @@
 #include "emu/mmu.h"
 #include "util/list.h"
 #include "util/sync.h"
+#include "util/macopt.h"
 
 #define FIBER_INITIAL_HASH_SIZE (1 << 10)
 #define FIBER_CACHE_SIZE (1 << 12)  // 4096 entries
@@ -12,7 +13,7 @@
 struct asbestos {
     // there is one asbestos per address space
     struct mmu *mmu;
-#ifdef ISH_JIT
+#if defined(ISH_JIT) && ISH_MAC_OPT
     struct list all_link;   // every asbestos, for a flush of the JIT code region
 #endif
     size_t mem_used;

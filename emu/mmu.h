@@ -2,6 +2,7 @@
 #define EMU_CPU_MEM_H
 
 #include "misc.h"
+#include "util/macopt.h"
 #ifdef GUEST_ARM64
 #include "util/list.h"
 #include "util/sync.h"
@@ -41,8 +42,9 @@ struct mmu {
     // (tlb_attach()); a change to the mappings marks them stale.
     lock_t tlbs_lock;
     struct list tlbs;
+#if ISH_MAC_OPT
     // Shadow-backed address space (kernel/sba.h), NULL when off: guest
-    // address A at sba_base + A where sba_map[A >> 14] allows it.
+    // address A at sba_base + A where sba_map[A >> 12] allows it.
     char *sba_base;
     uint8_t *sba_map;
     // What the last changes changed: change number `gen` (mmu->changes after
@@ -54,8 +56,9 @@ struct mmu {
         uint64_t start, pages;
     } log[MMU_LOG];
 #endif
+#endif
 };
-#ifdef GUEST_ARM64
+#if defined(GUEST_ARM64) && ISH_MAC_OPT
 void sba_populate(struct mmu *mmu, addr_t addr);
 #endif
 

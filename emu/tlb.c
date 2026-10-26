@@ -6,6 +6,7 @@
 #include "util/sync.h"
 
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
+#if ISH_MAC_OPT
     if (tlb->mmu == mmu) {
         uint64_t changes = __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE);
         if (tlb->mem_changes != (unsigned) changes) {
@@ -15,6 +16,11 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
         return;
     }
     {
+#else
+    if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
+        return;
+    if (tlb->mmu != mmu) {
+#endif
         // Address space changed (execve); block cache and ret_cache are invalid
         memset(tlb->block_cache, 0, sizeof(tlb->block_cache));
         tlb->block_cache_gen = 0;
@@ -24,7 +30,7 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
         }
     }
     tlb->mmu = mmu;
-#ifdef GUEST_ARM64
+#if ISH_SBA
     tlb->sba_base = mmu->sba_base;
     tlb->sba_map = mmu->sba_map;
 #endif
@@ -73,6 +79,7 @@ void tlb_flush(struct tlb *tlb) {
         tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
 }
 
+#if ISH_MAC_OPT
 // Most changes are an mmap, munmap, mprotect or a page marked as code: a few
 // pages each, while a flush rewrites all TLB_SIZE entries (256KB) and every
 // page used afterwards misses once. Python's startup makes ~800 of them.
@@ -108,6 +115,7 @@ flush:
         tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
     tlb->mem_changes = (unsigned) target;
 }
+#endif
 
 void tlb_free(struct tlb *tlb) {
     if (tlb->frame != NULL)
@@ -166,7 +174,13 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
         __atomic_store_n(&tlb->stale, 0, __ATOMIC_SEQ_CST);
 #endif
         gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_SEQ_CST);
+#if ISH_MAC_OPT
         tlb_sync(tlb, gen);
+#else
+        if (gen != tlb->mem_changes)
+            tlb_flush(tlb);
+        tlb->mem_changes = gen;
+#endif
         ptr = mmu_translate(tlb->mmu, TLB_PAGE(addr), type);
         // Re-read after translate; if unchanged, ptr is consistent with `gen`.
         if (__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE) == gen)
@@ -184,7 +198,7 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
         tlb->segfault_addr = addr;
         return NULL;
     }
-#ifdef GUEST_ARM64
+#if ISH_SBA
     if (tlb->sba_map)
         sba_populate(tlb->mmu, addr);
 #endif

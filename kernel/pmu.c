@@ -6,7 +6,8 @@
 // pmu_report() prints the calling thread's counts; kernel/exit.c calls it
 // when guest pid 1 exits, which covers the thread that ran it.
 
-#ifdef __APPLE__
+#include "kernel/pmu.h"
+#if ISH_MAC_OPT   // the private kperf frameworks: macOS only, nothing at all elsewhere
 
 #include <dlfcn.h>
 #include <stdint.h>
@@ -135,8 +136,4 @@ void pmu_report(void) {
         fprintf(stderr, "   %-34s %16llu\n", event_names[i], (unsigned long long) buf[counter_map[i]]);
 }
 
-#else
-void pmu_start(void) {}
-void pmu_thread_init(void) {}
-void pmu_report(void) {}
 #endif

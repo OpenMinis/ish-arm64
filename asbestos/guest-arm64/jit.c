@@ -27,6 +27,7 @@
 #include "kernel/fs.h"
 #include "kernel/memory.h"
 #include "kernel/sba.h"
+#include "util/macopt.h"
 #include "cpu-offsets.h"
 
 extern void jit_fiber_ret(void) __asm("fiber_ret");
@@ -40,7 +41,9 @@ static bool loop_off;     // ISH_JIT_LOOP=0: no register promotion in self-loops
 static bool simd_on;      // ISH_JIT_SIMD=0: leave SIMD/FP instructions to the gadgets
 static bool pin_on;       // ISH_JIT_PIN=0: no guest registers pinned in host registers
 static bool pic_on;       // ISH_JIT_PIC=1: position-independent code (see "PIC" below)
-static bool sba_jit;      // ISH_SBA=1: memory accesses try the shadow window first (kernel/sba.h)
+#if ISH_MAC_OPT
+static bool sba_jit;      // ISH_SBA=0 turns off: memory accesses try the shadow window first (kernel/sba.h)
+#endif
 static bool aot_only;     // ISH_JIT_AOT_ONLY=1: install AOT translations, translate nothing
                           // (what a build without the JIT would run)
 
@@ -128,6 +131,7 @@ static bool map_jit(void) {
 }
 #endif
 
+#if ISH_MAC_OPT
 static size_t region_start;           // what the stubs take, kept by a flush
 static _Atomic bool flush_wanted;       // full: start over once no guest code runs
 static _Atomic unsigned region_flushes;
@@ -149,6 +153,16 @@ static uint8_t *region_alloc(size_t bytes) {
 bool jit_flush_pending(void) {
     return atomic_load_explicit(&flush_wanted, memory_order_acquire);
 }
+#else
+static uint8_t *region_alloc(size_t bytes) {
+    size_t off = atomic_fetch_add(&region_used, (bytes + 15) & ~(size_t) 15);
+    if (off + bytes > REGION_SIZE) {
+        region_full = true;
+        return NULL;
+    }
+    return region + off;
+}
+#endif
 
 // MAP_JIT W^X is per thread and only this thread's fiber runs its native
 // code, so a thread stays writable across the compiles and links of one
@@ -211,8 +225,13 @@ static inline bool fits(int64_t v, int bits) { return v >= -(1LL << (bits - 1)) 
 #define ENC_B(off) (0x14000000u | ((uint32_t) ((off) >> 2) & 0x3ffffff))
 #define NOP 0xD503201Fu
 
+#if ISH_MAC_OPT
 static void jit_segment_installed(struct fiber_block *b, const struct jit_units *U, unsigned first,
                                   unsigned end, const uint8_t *code, unsigned words, const uint8_t *roles);
+#else
+static void jit_segment_installed(struct fiber_block *b, const struct jit_units *U, unsigned first,
+                                  unsigned end, const uint8_t *code, unsigned words);
+#endif
 
 // ================================================================ native
 
@@ -253,7 +272,11 @@ static void pin_init(bool on) {
     // load_pinned(); PIC adds x9 = &code[0] before it and the link entry
     // (x29 = x9 - code) as its last word
     // x9 = &code[0] (2 words), load_pinned(), cross-module entry (1 word)
+#if ISH_MAC_OPT
     prologue_words = n_pinned + (n_pinned ? 1 : 0) + (sba_jit ? 1 : 0) + (pic_on ? 3 : 0);
+#else
+    prologue_words = n_pinned + (n_pinned ? 1 : 0) + (pic_on ? 3 : 0);
+#endif
     memset(pin_of, -1, sizeof(pin_of));
     for (int i = 0; i < n_pinned; i++)
         pin_of[pin_guest[i]] = pin_host[i];
@@ -281,9 +304,11 @@ struct em {
     uint64_t base;         // PIC: guest address the module's constants are relative to
     uint32_t buf[8192];
     unsigned n;
+#if ISH_MAC_OPT
     // What each word is for (ISH_JIT_MAP writes it out for profiles): ROLE_*
     uint8_t role[8192];
     uint8_t cur_role;
+#endif
     int8_t host[33];
     uint8_t npool;
     int8_t owner[32];      // host register -> guest register (lazy pool), -1 free
@@ -292,10 +317,12 @@ struct em {
     // bailout / exit sites: branch at buf[at] must go to the stub for stream position spos
     struct { unsigned at; unsigned spos; uint8_t kind, stub; uintptr_t abs; } fix[1024];
     unsigned nfix;
+#if ISH_MAC_OPT
     // Shadow window accesses (tlb_lookup()): the TLB lookup each falls back
     // to, emitted after the body (finish_native()) and branching back.
     struct { unsigned at[3], back, spos; uint8_t nat, bytes; bool write; } oop[512];
     unsigned noop;
+#endif
     bool fail;
     bool hflags;   // host NZCV currently equals the guest flags
     int link_at[2];        // buffer index of the patchable direct-link nop per jump_ip slot
@@ -323,7 +350,9 @@ struct em {
 
 static void put(struct em *e, uint32_t x) {
     if (e->n >= sizeof(e->buf) / 4) { e->fail = true; return; }
+#if ISH_MAC_OPT
     e->role[e->n] = e->cur_role;
+#endif
     e->buf[e->n++] = x;
 }
 
@@ -339,10 +368,15 @@ enum {
     ROLE_IND = 'I',       // block end: br / blr through the block cache
     ROLE_SLOW = 'x',      // bail-out stubs back to the gadgets
 };
-static uint8_t set_role(struct em *e, uint8_t r) {
+static inline uint8_t set_role(struct em *e, uint8_t r) {
+#if ISH_MAC_OPT
     uint8_t old = e->cur_role;
     e->cur_role = r;
     return old;
+#else
+    (void) e; (void) r;   // not kept on iOS (util/macopt.h)
+    return 0;
+#endif
 }
 
 static unsigned greg_off(int g) {
@@ -400,11 +434,13 @@ static void load_pinned(struct em *e) {
         put(e, 0xF9400000u | ((greg_off(pin_guest[i]) / 8) << 10) | (1u << 5) | (uint32_t) pin_host[i]);
     if (n_pinned)
         put(e, 0xB9400000u | ((CPU_cycle / 4) << 10) | (1u << 5) | H_CYC);   // ldr w15, [x1, #cycle]
+#if ISH_MAC_OPT
     if (sba_jit) {
         // x30 = the shadow window (kernel/sba.h) for as long as native code runs
         int off = (int) offsetof(struct tlb, sba_base) - (int) offsetof(struct tlb, entries);
         put(e, 0xF8400000u | ((uint32_t) (off & 0x1ff) << 12) | (2u << 5) | SBA_REG);   // ldur x30, [x2, #sba_base]
     }
+#endif
 }
 
 // loop block: promoted registers <-> canonical pinned state
@@ -722,11 +758,16 @@ static uint32_t remap(struct em *e, uint32_t x, int kd, int kn, int km, int ka, 
 
 // Inline TLB lookup for guest address in T_A (bytes = access size); leaves
 // the host address in T_A. Branches to the unit's stub on a miss or crossing.
+#if ISH_MAC_OPT
 static void patch_here(struct em *e, unsigned at);
+#define TLB_LOOKUP_INLINE tlb_lookup_inline
+#else
+#define TLB_LOOKUP_INLINE tlb_lookup
+#endif
 
 // Inline TLB lookup for guest address in T_A (bytes = access size); leaves
 // the host address in T_A. Branches to the unit's stub on a miss or crossing.
-static void tlb_lookup_inline(struct em *e, unsigned bytes, bool write, unsigned spos) {
+static void TLB_LOOKUP_INLINE(struct em *e, unsigned bytes, bool write, unsigned spos) {
     e->hflags = false;   // the checks below use cmp
     uint8_t role = set_role(e, ROLE_TLB);
     put(e, 0x9240BC00u | (T_A << 5) | T_A);                    // and x9, x9, #0xffffffffffff
@@ -752,6 +793,7 @@ static void tlb_lookup_inline(struct em *e, unsigned bytes, bool write, unsigned
     set_role(e, role);
 }
 
+#if ISH_MAC_OPT
 // Guest address in T_A -> host address in T_A.
 // With the shadow window (kernel/sba.h): below SBA_SPAN, a page the map
 // allows, accessed without crossing into the next one, is at x30 + address,
@@ -795,6 +837,7 @@ static void emit_window_slow_paths(struct em *e) {
     }
     e->noop = 0;
 }
+#endif
 
 // Load/store translation. Returns false if the form is unsupported.
 // ---- SIMD & FP: guest V registers live in cpu->fp; an instruction loads the
@@ -1312,8 +1355,10 @@ static struct rec_seg *record_segment(const struct em *e) {
 // Resolve stub branches and append stubs: x28 = &code[spos + 1]; b code[spos].
 // Returns the installed code, NULL if the segment could not be installed.
 static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t orig_first, unsigned first_pos) {
-    e->cur_role = ROLE_TLB;
+#if ISH_MAC_OPT
+    set_role(e, ROLE_TLB);
     emit_window_slow_paths(e);
+#endif
     // one stub per distinct stream position
     unsigned stub_pos[256], stub_at[256], ns = 0;
     for (unsigned i = 0; i < e->nfix; i++) {
@@ -1326,7 +1371,7 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
             stub_pos[ns++] = e->fix[i].spos;
         }
     }
-    e->cur_role = ROLE_SLOW;
+    set_role(e, ROLE_SLOW);
     for (unsigned s = 0; s < ns; s++) {
         stub_at[s] = e->n;
         if (e->loop) emit_canon(e);
@@ -1802,8 +1847,12 @@ static void emit_chain(struct em *e, struct fiber_block *b, unsigned long *slot,
 static void emit_ret(struct em *e, struct fiber_block *b, int rn) {
     int h = rn == 31 ? 31 : hreg(e, rn);
     put(e, 0x9240BC00u | ((uint32_t) h << 5) | 10);                              // and x10, xh, #0xffffffffffff
+#if ISH_MAC_OPT
     // pc is stored on the ways out to the run loop below, not when the return
     // continues in native code (see emit_indirect())
+#else
+    put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
+#endif
     unsigned miss0 = ~0u;
     if (n_pinned) {
         // ret counts a cycle: with forward edges uncounted, a loop closed by
@@ -1840,14 +1889,18 @@ static void emit_ret(struct em *e, struct fiber_block *b, int rn) {
     }
     emit_native_dispatch_ex(e, true);
     patch_here(e, unch);
+#if ISH_MAC_OPT
     put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
+#endif
     put(e, 0xF9400188u);                                                         // ldr x8, [x12]
     put(e, 0xF9000000u | ((LOCAL_last_block / 8) << 10) | (1u << 5) | 8);        // str x8, [x1, #last_block]
     emit_exit(e, (uintptr_t) jit_fiber_ret);
     patch_here(e, miss1);
     patch_here(e, miss2);
     if (miss0 != ~0u) patch_here(e, miss0);
+#if ISH_MAC_OPT
     put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
+#endif
     set_last_block(e, b);
     emit_exit(e, (uintptr_t) jit_fiber_ret);
 }
@@ -1884,6 +1937,17 @@ static void store_ret_cache(struct em *e, int h, uint64_t ret, int base) {
 // jetsam blocks instead of comparing the cache's generation with the
 // address space's, which took three dependent loads.
 static void emit_block_cache_lookup(struct em *e, unsigned *miss1, unsigned *miss2, unsigned *miss3) {
+#if !ISH_MAC_OPT
+    // stale cache? tlb->block_cache_gen != mmu->asbestos->invalidate_gen
+    int mmu_off = (int) offsetof(struct tlb, mmu) - (int) offsetof(struct tlb, entries);
+    put(e, 0xF8400000u | ((uint32_t) (mmu_off & 0x1ff) << 12) | (2u << 5) | 12);  // ldur x12, [x2, #mmu]
+    put(e, 0xF9400000u | ((offsetof(struct mmu, asbestos) / 8) << 10) | (12u << 5) | 12);  // ldr x12, [x12, #asbestos]
+    put(e, 0xB9400000u | ((offsetof(struct asbestos, invalidate_gen) / 4) << 10) | (12u << 5) | 12);  // ldr w12, [x12, #gen]
+    emit_add_x2(e, 11, offsetof(struct tlb, block_cache_gen) - offsetof(struct tlb, entries));
+    put(e, 0xB9400000u | (11u << 5) | 11);                                       // ldr w11, [x11]
+    put(e, 0x6B0C017Fu);                                                         // cmp w11, w12
+    *miss1 = e->n; put(e, 0x54000001u);                                  // b.ne miss
+#endif
     // x9 = block_cache[(ip ^ (ip >> 12)) & 4095]
     put(e, 0xCA4A314Bu);                                                         // eor x11, x10, x10, lsr #12
     put(e, 0x92402D6Bu);                                                         // and x11, x11, #0xfff
@@ -1893,8 +1957,10 @@ static void emit_block_cache_lookup(struct em *e, unsigned *miss1, unsigned *mis
     put(e, 0xF9400000u | ((FIBER_BLOCK_addr / 8) << 10) | (9u << 5) | 12);       // ldr x12, [x9, #addr]
     put(e, 0xEB0A019Fu);                                                         // cmp x12, x10
     *miss3 = e->n; put(e, 0x54000001u);                                  // b.ne miss
+#if ISH_MAC_OPT
     put(e, 0x39400000u | ((uint32_t) offsetof(struct fiber_block, is_jetsam) << 10) | (9u << 5) | 12);  // ldrb w12, [x9, #is_jetsam]
     *miss1 = e->n; put(e, 0x3500000Cu);                                  // cbnz w12, miss
+#endif
 }
 
 // PIC, at a block end's `unchained` exit with the slot in x9: a slot
@@ -1924,6 +1990,9 @@ static void emit_indirect(struct em *e, struct fiber_block *b, const struct jit_
         put(e, 0x91000000u | (LOCAL_ret_cache << 10) | (1u << 5) | 12);          // add x12, x1, #ret_cache
         store_ret_cache(e, h30, ret, 12);
     }
+#if !ISH_MAC_OPT
+    put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
+#endif
     unsigned miss1, miss2, miss3;
     emit_block_cache_lookup(e, &miss1, &miss2, &miss3);
     // hit: same bookkeeping as a chained branch
@@ -1961,9 +2030,11 @@ static void emit_indirect(struct em *e, struct fiber_block *b, const struct jit_
     patch_here(e, miss1); patch_here(e, miss2); patch_here(e, miss3);
     patch_here(e, miss4);
     if (miss5 != miss4) patch_here(e, miss5);
+#if ISH_MAC_OPT
     // pc only for the run loop: a successor entered natively needs none
     // (direct links store none either; every exit to the gadgets does)
     put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
+#endif
     set_last_block(e, b);
     emit_exit(e, (uintptr_t) jit_fiber_ret);
 }
@@ -1989,12 +2060,12 @@ static bool emit_block_end(struct em *e, struct fiber_block *b, const struct jit
     if (e->loop && ((x & 0xFFFFFC1Fu) == 0xD65F0000u || (x & 0xFFFFFC1Fu) == 0xD61F0000u || (x & 0xFFFFFC1Fu) == 0xD63F0000u))
         return false;
     if ((x & 0xFFFFFC1Fu) == 0xD65F0000u) {                                 // ret
-        e->cur_role = ROLE_RET;
+        set_role(e, ROLE_RET);
         emit_ret(e, b, (x >> 5) & 31);
         return !e->fail;
     }
     if ((x & 0xFFFFFC1Fu) == 0xD61F0000u || (x & 0xFFFFFC1Fu) == 0xD63F0000u) {   // br / blr
-        e->cur_role = ROLE_IND;
+        set_role(e, ROLE_IND);
         emit_indirect(e, b, u, (x >> 5) & 31, (x & 0x00200000u) != 0, pc + 4);
         return !e->fail;
     }
@@ -2077,7 +2148,9 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
     e->n = 0;
     e->nfix = 0;
     e->nrel = 0;
+#if ISH_MAC_OPT
     e->noop = 0;
+#endif
     e->link_at[0] = e->link_at[1] = -1;
     e->fail = false;
     e->hflags = false;
@@ -2086,7 +2159,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
     unsigned covered = 0, real = 0;   // real: units that emitted code
     bool ended = false;
     e->b = b;
-    e->cur_role = ROLE_ENTRY;
+    set_role(e, ROLE_ENTRY);
     // Cold entry: load pinned; hot entry = +prologue_words. PIC: x9 = &code[0]
     // from x28 (= &code[first + 1] here) first, and the cross-module entry --
     // the last prologue word -- loads x29 from the block.
@@ -2104,18 +2177,22 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
         emit_promote(e);
         e->loop_head = (int) e->n;
     }
-    e->cur_role = ROLE_GUEST;
+    set_role(e, ROLE_GUEST);
     while (ui < U->n) {
         const struct jit_unit *u = &U->u[ui];
         if (u->last) {
+#if ISH_MAC_OPT
             unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel, noop0 = e->noop;
+#else
+            unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel;
+#endif
             uint8_t npool0 = e->npool, victim0 = e->victim;
             bool hf0 = e->hflags;
             int8_t host0[33], owner0[32];
             memcpy(host0, e->host, sizeof(host0));
             memcpy(owner0, e->owner, sizeof(owner0));
             e->body_end = (int) e->n;
-            e->cur_role = ROLE_END;
+            set_role(e, ROLE_END);
             if (emit_block_end(e, b, u) && !e->fail) {
                 covered++;
                 real++;
@@ -2123,7 +2200,10 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
                 ended = true;
             } else {
                 e->link_at[0] = e->link_at[1] = -1;   // only the block end sets them
-                e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->noop = noop0; e->npool = npool0; e->fail = false; e->hflags = hf0;
+#if ISH_MAC_OPT
+                e->noop = noop0;
+#endif
+                e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->npool = npool0; e->fail = false; e->hflags = hf0;
                 e->victim = victim0;
                 memcpy(e->host, host0, sizeof(host0));
                 memcpy(e->owner, owner0, sizeof(owner0));
@@ -2133,7 +2213,11 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
         if (!u->follow && (u->n == 0 || u->start == u->end))
             break;
         // snapshot for rollback
+#if ISH_MAC_OPT
         unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel, noop0 = e->noop;
+#else
+        unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel;
+#endif
         uint8_t npool0 = e->npool, victim0 = e->victim;
         bool hf0 = e->hflags;
         int8_t host0[33], owner0[32];
@@ -2151,7 +2235,10 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
                 atomic_fetch_add_explicit(&st_unsupported_insns, 1, memory_order_relaxed);
         }
         if (!ok) {
-            e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->noop = noop0; e->npool = npool0; e->fail = false; e->hflags = hf0;
+#if ISH_MAC_OPT
+            e->noop = noop0;
+#endif
+            e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->npool = npool0; e->fail = false; e->hflags = hf0;
             e->victim = victim0;
             memcpy(e->host, host0, sizeof(host0));
             memcpy(e->owner, owner0, sizeof(owner0));
@@ -2162,7 +2249,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
             real++;
         ui++;
     }
-    e->cur_role = ROLE_END;
+    set_role(e, ROLE_END);
     *ended_out = ended;
     *covered_out = covered;
     *real_out = real;
@@ -2253,7 +2340,11 @@ static void jit_native(struct fiber_block *b, const struct jit_units *U, struct 
             e->last_rec = NULL;
             uint8_t *code = e->fail ? NULL : finish_native(e, b, orig_first, U->u[first].start);
             if (code) {
+#if ISH_MAC_OPT
                 jit_segment_installed(b, U, first, ui, code, e->n, e->role);
+#else
+                jit_segment_installed(b, U, first, ui, code, e->n);
+#endif
                 if (e->ninst < sizeof(e->inst) / sizeof(e->inst[0])) {
                     e->inst[e->ninst].pos = U->u[first].start;
                     e->inst[e->ninst].code = code;
@@ -2477,6 +2568,7 @@ static uint64_t *mod_blocks, *mod_hits, *mod_moved;   // per module: blocks tran
                                                      // of which from an image of another version
 static unsigned mod_next_cap;
 
+#if ISH_MAC_OPT
 // Every block is gone (asbestos.c, no thread in guest code): forget every
 // translation and start the region over.
 void jit_region_reset(void) {
@@ -2502,6 +2594,7 @@ void jit_region_reset(void) {
     atomic_fetch_add(&region_flushes, 1);
     atomic_store_explicit(&flush_wanted, false, memory_order_release);
 }
+#endif
 
 // ---- AOT images (asbestos/guest-arm64/aot.h)
 //
@@ -2532,7 +2625,11 @@ void ish_aot_register(const struct aot_module *m) {
 
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
+#if ISH_MAC_OPT
 #define JIT_CODE_VERSION 11
+#else
+#define JIT_CODE_VERSION 10
+#endif
 
 // Everything the emitted code bakes in besides the gadgets it names: the
 // conventions, the struct layouts it loads from and the TLB / block cache
@@ -2542,7 +2639,9 @@ void ish_aot_register(const struct aot_module *m) {
 static uint32_t jit_abi(void) {
     const uint64_t v[] = {
         JIT_CODE_VERSION, (uint64_t) prologue_words, entry_off(), (uint64_t) n_pinned, CTX_BLK, CTX_SLOT, CTX_FAR,
+#if ISH_MAC_OPT
         (uint64_t) sba_jit, offsetof(struct tlb, sba_base),
+#endif
         FIBER_BLOCK_code, FIBER_BLOCK_addr, offsetof(struct fiber_block, native_entry),
         offsetof(struct fiber_block, jit_ctx),
         CPU_pc, CPU_cycle, CPU_poked_ptr, CPU_tls_ptr, offsetof(struct cpu_state, sp),
@@ -3204,7 +3303,11 @@ struct cm_module {
     uint8_t id[20], id_len;      // NT_GNU_BUILD_ID, id_len 0 if none
     uint64_t blocks, units, segments, bytes;
 };
+#if ISH_MAC_OPT
 struct cm_segment { uint64_t code, off, pc; uint32_t words, units, insn; int mod; char *roles; };
+#else
+struct cm_segment { uint64_t code, off, pc; uint32_t words, units, insn; int mod; };
+#endif
 static bool cm_on;
 static pthread_mutex_t cm_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct cm_module *cm_mods;
@@ -3545,6 +3648,7 @@ static void cm_block(struct fiber_block *b) {
     pthread_mutex_unlock(&cm_lock);
 }
 
+#if ISH_MAC_OPT
 static void cm_segment(const struct jit_units *U, unsigned first, unsigned end,
                        const uint8_t *code, unsigned words, const uint8_t *roles) {
     char *r = malloc(words + 1);
@@ -3552,6 +3656,10 @@ static void cm_segment(const struct jit_units *U, unsigned first, unsigned end,
         memcpy(r, roles, words);
         r[words] = 0;
     }
+#else
+static void cm_segment(const struct jit_units *U, unsigned first, unsigned end,
+                       const uint8_t *code, unsigned words) {
+#endif
     pthread_mutex_lock(&cm_lock);
     uint64_t off;
     int mod = cm_locate(U->u[first].pc, &off, NULL);
@@ -3571,7 +3679,11 @@ static void cm_segment(const struct jit_units *U, unsigned first, unsigned end,
         cm_capsegs = cap;
     }
     cm_segs[cm_nsegs++] = (struct cm_segment) {
+#if ISH_MAC_OPT
         (uint64_t) (uintptr_t) code, off, U->u[first].pc, words, end - first, U->u[first].w[0], mod, r};
+#else
+        (uint64_t) (uintptr_t) code, off, U->u[first].pc, words, end - first, U->u[first].w[0], mod};
+#endif
     pthread_mutex_unlock(&cm_lock);
 }
 
@@ -3588,9 +3700,11 @@ static void cm_write(const char *path) {
         fprintf(f, "S %llx %u %d %llx %llx %u %08x\n", (unsigned long long) cm_segs[i].code, cm_segs[i].words,
                 cm_segs[i].mod, (unsigned long long) cm_segs[i].off, (unsigned long long) cm_segs[i].pc,
                 cm_segs[i].units, cm_segs[i].insn);
+#if ISH_MAC_OPT
     for (size_t i = 0; i < cm_nsegs; i++)
         if (cm_segs[i].roles)
             fprintf(f, "R %llx %s\n", (unsigned long long) cm_segs[i].code, cm_segs[i].roles);
+#endif
     pthread_mutex_unlock(&cm_lock);
     fclose(f);
 }
@@ -3620,9 +3734,15 @@ size_t jit_describe(char *buf, size_t size) {
                        pic_on ? "JIT, position-independent" : "JIT";
     OUT("mode: %s\n", mode);
     if (jit_on && !aot_only)
+#if ISH_MAC_OPT
         OUT("code region: %.1f of %u MB used%s, started over %u times\n",
             (region_full ? REGION_SIZE : (size_t) region_used) / 1048576.0, REGION_SIZE >> 20,
             region_full ? " (full: blocks compiled since run as gadgets)" : "", region_flushes);
+#else
+        OUT("code region: %.1f of %u MB used%s\n",
+            (region_full ? REGION_SIZE : (size_t) region_used) / 1048576.0, REGION_SIZE >> 20,
+            region_full ? " (full: blocks compiled since run as gadgets)" : "");
+#endif
     OUT("AOT: %s (echo on|off > /proc/ish/jit; affects blocks compiled afterwards, i.e. new processes)\n",
         aot_off ? "off" : "on");
     OUT("blocks translated or looked up: %llu, AOT installs: %llu (moved: %llu, with pc-relative immediates "
@@ -3690,8 +3810,10 @@ void jit_report(void) {
             fprintf(stderr, "❌ JIT: the %u MB code region filled up: %s misses what ran after that\n",
                     REGION_SIZE >> 20, rec_file);
     }
+#if ISH_MAC_OPT
     if (sba_jit && getenv("ISH_SBA_STATS"))
         sba_stats();
+#endif
     if (!getenv("ISH_JIT_STATS"))
         return;
     fprintf(stderr,
@@ -3724,7 +3846,9 @@ static void jit_init(void) {
     loop_off = env_off("ISH_JIT_LOOP");
     simd_on = !env_off("ISH_JIT_SIMD");
     pin_on = !env_off("ISH_JIT_PIN");
+#if ISH_MAC_OPT
     sba_jit = sba_on() && pin_on;   // the window base lives in x30, loaded with the pinned registers
+#endif
     // AOT images are PIC code, so PIC is the default once one is linked in.
     // On macOS it is the default anyway: translations are shared by every
     // process that maps the same code, so a new process (each shell command,
@@ -3745,10 +3869,12 @@ static void jit_init(void) {
         if (pic_on && n_pinned && !env_off("ISH_JIT_STUBS"))
             make_stubs();
         jit_exec_ready();
+#if ISH_MAC_OPT
         region_start = region_used;
         const char *mb = getenv("ISH_JIT_REGION_MB");
         if (mb && atoi(mb) > 0 && ((size_t) atoi(mb) << 20) < REGION_SIZE)
             region_limit = (size_t) atoi(mb) << 20;
+#endif
     }
     if (pic_on)
         aot_init();
@@ -3840,11 +3966,20 @@ void jit_block(struct fiber_block *b, struct jit_units *U) {
 // A native segment covering units [first, end) of block b is installed at
 // code (words instructions, stubs included). This is where a recording mode
 // hooks in to capture translations.
+#if ISH_MAC_OPT
 static void jit_segment_installed(struct fiber_block *b, const struct jit_units *U, unsigned first,
                                   unsigned end, const uint8_t *code, unsigned words, const uint8_t *roles) {
+#else
+static void jit_segment_installed(struct fiber_block *b, const struct jit_units *U, unsigned first,
+                                  unsigned end, const uint8_t *code, unsigned words) {
+#endif
     (void) b;
     atomic_fetch_add_explicit(&st_segments, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&st_units, end - first, memory_order_relaxed);
     if (cm_on)
+#if ISH_MAC_OPT
         cm_segment(U, first, end, code, words, roles);
+#else
+        cm_segment(U, first, end, code, words);
+#endif
 }

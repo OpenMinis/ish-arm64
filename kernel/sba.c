@@ -1,3 +1,5 @@
+#include "util/macopt.h"
+#if ISH_SBA   // util/macopt.h: nothing at all on iOS, nothing calls in
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +11,6 @@
 #include "fs/fd.h"
 #include "kernel/memory.h"
 
-#if defined(GUEST_ARM64) && defined(__APPLE__) && defined(__aarch64__)
 
 static int sba_state = -1;
 static _Atomic uint64_t st_calls, st_ok_rw, st_ok_r, st_unmapped, st_foreign, st_unreadable, st_raced;
@@ -304,26 +305,5 @@ void sba_populate(struct mmu *mmu, addr_t addr) {
     }
     read_wrunlock(&mem->lock);
 }
-
-#else
-
-bool sba_on(void) { return false; }
-void sba_init(struct mem *mem) { (void) mem; }
-void sba_destroy(struct mem *mem) { (void) mem; }
-void *sba_anon(struct mem *mem, page_t start, pages_t pages, struct sba_region **region) {
-    (void) mem; (void) start; (void) pages; (void) region;
-    return NULL;
-}
-void sba_region_put(struct sba_region *r) { (void) r; }
-void sba_release(struct mem *mem, page_t start, pages_t pages) { (void) mem; (void) start; (void) pages; }
-void sba_invalidate(struct mem *mem, page_t start, pages_t pages) { (void) mem; (void) start; (void) pages; }
-struct sba_fork *sba_fork_begin(struct mem *src, struct mem *dst) { (void) src; (void) dst; return NULL; }
-struct data *sba_fork_page(struct sba_fork *f, struct data *src_data, page_t page) {
-    (void) f; (void) src_data; (void) page;
-    return NULL;
-}
-void sba_fork_finish(struct sba_fork *f) { (void) f; }
-void sba_populate(struct mmu *mmu, addr_t addr) { (void) mmu; (void) addr; }
-void sba_stats(void) {}
 
 #endif

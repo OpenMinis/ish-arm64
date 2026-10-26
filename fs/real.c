@@ -387,7 +387,7 @@ int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off
     int mmap_prot = PROT_READ;
     if (prot & P_WRITE) mmap_prot |= PROT_WRITE;
 
-#ifdef GUEST_ARM64
+#if ISH_SBA
     // Shadow-backed address space (kernel/sba.h): a private mapping lives in
     // the shadow, where native code reaches it directly. Where the guest
     // address and the file offset agree modulo the host page (ELF segments

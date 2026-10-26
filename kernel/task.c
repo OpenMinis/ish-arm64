@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include "kernel/calls.h"
+#include "kernel/pmu.h"
 #include "kernel/task.h"
 #include "kernel/memory.h"
 #include "emu/tlb.h"
@@ -259,7 +260,9 @@ static void *task_thread(void *vtask) {
     sigaddset(&wake, SIGUSR1);
     pthread_sigmask(SIG_UNBLOCK, &wake, NULL);
     update_thread_name();
-    { extern void pmu_thread_init(void); pmu_thread_init(); }
+#if ISH_MAC_OPT
+    pmu_thread_init();
+#endif
     task_run_current();
     die("task_thread returned"); // above function call should never return
 }

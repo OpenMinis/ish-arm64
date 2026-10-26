@@ -38,7 +38,7 @@ struct tlb {
     // this is basically one of the return values of tlb_handle_miss, tlb_{read,write}, and __tlb_{read,write}_cross_page
     // yes, this sucks
     addr_t segfault_addr;
-#ifdef GUEST_ARM64
+#if defined(GUEST_ARM64) && ISH_MAC_OPT
     // mmu->sba_base / sba_map, for native code (kernel/sba.h)
     char *sba_base;
     uint8_t *sba_map;
@@ -84,9 +84,11 @@ void mmu_tlbs_stale(struct mmu *mmu);
 #endif
 void tlb_free(struct tlb *tlb);
 void tlb_flush(struct tlb *tlb);
+#if ISH_MAC_OPT
 // Catch up with mmu->changes (read as `target`): drop the entries the
 // changes since the last catch-up made stale, or all of them.
 void tlb_sync(struct tlb *tlb, uint64_t target);
+#endif
 void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type);
 
 forceinline __no_instrument void *__tlb_read_ptr(struct tlb *tlb, addr_t addr) {

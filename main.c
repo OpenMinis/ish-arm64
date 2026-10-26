@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <execinfo.h>
 #include "util/signpost.h"
+#include "kernel/pmu.h"
 #include <termios.h>
 #include <unistd.h>
 #include <mach/mach.h>
@@ -465,7 +466,9 @@ int main(int argc, char *const argv[]) {
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
-    { extern void pmu_start(void); pmu_start(); }
+#if ISH_MAC_OPT
+    pmu_start();
+#endif
     char envp[512] = {0};
     size_t p = 0;
     if (getenv("TERM")) {

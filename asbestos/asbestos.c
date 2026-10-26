@@ -1,8 +1,6 @@
 #define DEFAULT_CHANNEL instr
 #include "debug.h"
-#include <pthread.h>
 #include <signal.h>
-#include <unistd.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -383,7 +381,9 @@ static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *bloc
 static void fiber_free_jetsam(struct asbestos *asbestos);
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size);
 
-#ifdef ISH_JIT
+#if defined(ISH_JIT) && ISH_MAC_OPT
+#include <pthread.h>
+#include <unistd.h>
 // ---- flushing the JIT code region (jit_flush_pending())
 //
 // Threads count themselves in while they run guest code (cpu_run_to_interrupt).
@@ -448,7 +448,7 @@ static void world_leave(void) {
 struct asbestos *asbestos_new(struct mmu *mmu) {
     struct asbestos *asbestos = calloc(1, sizeof(struct asbestos));
     asbestos->mmu = mmu;
-#ifdef ISH_JIT
+#if defined(ISH_JIT) && ISH_MAC_OPT
     pthread_mutex_lock(&all_asbestos_lock);
     list_add(&all_asbestos, &asbestos->all_link);
     pthread_mutex_unlock(&all_asbestos_lock);
@@ -464,7 +464,7 @@ struct asbestos *asbestos_new(struct mmu *mmu) {
 }
 
 void asbestos_free(struct asbestos *asbestos) {
-#ifdef ISH_JIT
+#if defined(ISH_JIT) && ISH_MAC_OPT
     pthread_mutex_lock(&all_asbestos_lock);
     list_remove(&asbestos->all_link);
     pthread_mutex_unlock(&all_asbestos_lock);
@@ -814,11 +814,13 @@ static struct fiber_block *fiber_block_compile_protected(struct asbestos *asbest
             return block;
         if (attempt >= 16) {
             atomic_fetch_add_explicit(&st_wx_giveups, 1, memory_order_relaxed);
+#if ISH_MAC_OPT
             // keep "a page with blocks is P_CODE" true: unmapping and stores
             // only look for blocks on P_CODE pages
             mmu_mark_code_page(mmu, PAGE(ip));
             if (crossed)
                 mmu_mark_code_page(mmu, PAGE(block->end_addr));
+#endif
             return block;  // pathological churn; accept (pre-W^X behavior)
         }
         atomic_fetch_add_explicit(&st_wx_retries, 1, memory_order_relaxed);
@@ -1217,6 +1219,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         // (debug trace removed)
 
         // Check if page table changed (mmap/munmap by another thread) EVERY BLOCK.
+#if ISH_MAC_OPT
         // The block and return caches only hold blocks, which a change that
         // invalidates them takes out through invalidate_gen (checked at the
         // top of the loop); the TLB drops what the changes touched.
@@ -1225,6 +1228,15 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
             tlb_sync(tlb, changes);
             frame->last_block = NULL;
         }
+#else
+        if (tlb->mem_changes != __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE)) {
+            tlb_flush(tlb);
+            memset(cache, 0, sizeof(tlb->block_cache));
+            tlb->block_cache_gen = asbestos->invalidate_gen;
+            memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
+            frame->last_block = NULL;
+        }
+#endif
 
         if (interrupt == INT_NONE && __atomic_exchange_n(frame->cpu.poked_ptr, false, __ATOMIC_ACQUIRE)) {
             interrupt = INT_TIMER;
@@ -1366,7 +1378,7 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     // and by context switches / signal delivery.
 #endif
     struct asbestos *asbestos = cpu->mmu->asbestos;
-#ifdef ISH_JIT
+#if defined(ISH_JIT) && ISH_MAC_OPT
     world_enter();
 #endif
     __atomic_add_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
@@ -1374,7 +1386,7 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     int interrupt = (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
     cpu->trapno = interrupt;
     __atomic_sub_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
-#ifdef ISH_JIT
+#if defined(ISH_JIT) && ISH_MAC_OPT
     world_leave();
 #endif
 

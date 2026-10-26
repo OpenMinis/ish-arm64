@@ -358,7 +358,7 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
 #endif
         if (addr != 0 && !(flags & MMAP_FIXED) && !pt_is_hole(current->mem, page, pages))
             addr = 0;
-#ifdef GUEST_ARM64
+#if ISH_SBA
         // Shadow window (kernel/sba.h): V8 asks for its heap pages at random
         // 48-bit addresses (NORESERVE, never MAP_FIXED), out of the window's
         // reach; the hint is only a hint, so they go in the window instead.

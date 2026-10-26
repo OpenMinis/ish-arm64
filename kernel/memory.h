@@ -8,6 +8,7 @@
 #include "util/list.h"
 #include "util/sync.h"
 #include "misc.h"
+#include "util/macopt.h"
 
 // Lazy reservation for MAP_NORESERVE regions (JSC heap cage, etc.).
 // Records address range and permissions without allocating page table entries.
@@ -53,9 +54,11 @@ struct mem {
     wrlock_t lock;
     lock_t cow_lock;
 
+#if ISH_MAC_OPT
     struct sba_region *sba;   // kernel/sba.h, NULL when off
     bool sba_dying;           // mem_destroy(): the shadow goes as a whole
     bool sba_keep;            // pt_map() replacing pages: the shadow holds the new ones
+#endif
 };
 
 // Address space layout for ARM64 guest.
@@ -73,7 +76,12 @@ struct mem {
 // shared slots (0xffffc000 and 0xefff4000 both index 0x1f83), so a busybox
 // shell loop missed the TLB ~37 times per iteration. From 0xeff75 down, the
 // top 8000 mmap pages miss every index of the top 128 stack pages.
+// (iOS keeps the old start, see util/macopt.h.)
+#if ISH_MAC_OPT
 #define MMAP_HOLE_START   0xeff75ULL
+#else
+#define MMAP_HOLE_START   0xefffdULL        // mmap search starts here (same as x86)
+#endif
 #define MMAP_HOLE_END     0x100ULL          // mmap search ends here (above guard pages)
 // Upper bound for valid user addresses (page number, 48-bit / 4K = 36-bit)
 #define USER_ADDR_MAX_PAGE  0xFFFFFFFFFULL
@@ -129,8 +137,10 @@ struct data {
     // Guest module id + 1 for the ARM64 JIT (asbestos/guest-arm64/jit.c), 0
     // until looked up. Not under ISH_JIT: app code sees this struct too.
     int jit_mod;
+#if ISH_MAC_OPT
     // The shadow region data lives in (kernel/sba.h), NULL for host memory.
     struct sba_region *sba;
+#endif
 #if LEAK_DEBUG
     int pid;
     addr_t dest;

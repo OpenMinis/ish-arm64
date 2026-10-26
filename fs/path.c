@@ -7,6 +7,7 @@
 #include "kernel/calls.h"
 #include "util/sync.h"
 #include "fs/path.h"
+#include "util/macopt.h"
 
 // === Path Normalize Cache ===
 //
@@ -131,6 +132,7 @@ static void path_cache_set(const char *full_path, int flags, const char *normali
     unlock(&path_cache_lock);
 }
 
+#if ISH_MAC_OPT
 // === Component cache ===
 //
 // A walk resolves every component of a path: a readlink to see whether it
@@ -183,9 +185,12 @@ static void comp_cache_set(const char *path, int kind, uint64_t gen) {
     e->kind = kind;
     unlock(&comp_cache_lock);
 }
+#endif
 
 static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
+#if ISH_MAC_OPT
     uint64_t gen = path_cache_snapshot();
+#endif
     // you must choose one
     if (flags & N_SYMLINK_FOLLOW)
         assert(!(flags & N_SYMLINK_NOFOLLOW));
@@ -268,11 +273,12 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
             return _ENAMETOOLONG;
 
         if ((flags & N_SYMLINK_FOLLOW) || *p != '\0') {
-            bool more = *(p - 1) == '/';
+#if ISH_MAC_OPT
             *o = '\0';
             int known = comp_cache_get(out, gen);
-            if (known == COMP_DIR_OK || (known == COMP_NOT_LINK && !more))
+            if (known == COMP_DIR_OK || (known == COMP_NOT_LINK && *(p - 1) != '/'))
                 continue;
+#endif
             // this buffer is used to store the path that we're readlinking, then
             // if it turns out to point to a symlink it's reused as the buffer
             // passed to the next path_normalize call
@@ -304,7 +310,7 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
 
             // if there's a slash after this component, ensure that if it
             // exists, it's a directory and that we have execute perms on it
-            if (more) {
+            if (*(p - 1) == '/') {
                 struct statbuf stat;
                 int err = mount->fs->stat(mount, possible_symlink, &stat);
                 mount_release(mount);
@@ -314,13 +320,17 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
                     err = access_check(&stat, AC_X);
                     if (err < 0)
                         return err;
+#if ISH_MAC_OPT
                     if (res == _EINVAL)
                         comp_cache_set(out, COMP_DIR_OK, gen);
+#endif
                 }
             } else {
                 mount_release(mount);
+#if ISH_MAC_OPT
                 if (res == _EINVAL)
                     comp_cache_set(out, COMP_NOT_LINK, gen);
+#endif
             }
         }
     }
