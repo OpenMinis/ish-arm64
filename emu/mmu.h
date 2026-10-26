@@ -41,6 +41,14 @@ struct mmu {
     // (tlb_attach()); a change to the mappings marks them stale.
     lock_t tlbs_lock;
     struct list tlbs;
+    // What the last changes changed: change number `gen` (mmu->changes after
+    // it) touched pages [start, start + pages) -- ~0 pages: anything. A TLB
+    // catching up with a few changes drops just those pages (tlb_sync()).
+#define MMU_LOG 64
+    struct mmu_change {
+        uint64_t gen;   // __atomic_* accessed
+        uint64_t start, pages;
+    } log[MMU_LOG];
 #endif
 };
 

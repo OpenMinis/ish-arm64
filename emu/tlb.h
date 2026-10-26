@@ -79,6 +79,9 @@ void mmu_tlbs_stale(struct mmu *mmu);
 #endif
 void tlb_free(struct tlb *tlb);
 void tlb_flush(struct tlb *tlb);
+// Catch up with mmu->changes (read as `target`): drop the entries the
+// changes since the last catch-up made stale, or all of them.
+void tlb_sync(struct tlb *tlb, uint64_t target);
 void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type);
 
 forceinline __no_instrument void *__tlb_read_ptr(struct tlb *tlb, addr_t addr) {

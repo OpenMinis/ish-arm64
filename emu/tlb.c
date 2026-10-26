@@ -6,9 +6,15 @@
 #include "util/sync.h"
 
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
-    if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
+    if (tlb->mmu == mmu) {
+        uint64_t changes = __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE);
+        if (tlb->mem_changes != (unsigned) changes) {
+            tlb->dirty_page = TLB_PAGE_EMPTY;
+            tlb_sync(tlb, changes);
+        }
         return;
-    if (tlb->mmu != mmu) {
+    }
+    {
         // Address space changed (execve); block cache and ret_cache are invalid
         memset(tlb->block_cache, 0, sizeof(tlb->block_cache));
         tlb->block_cache_gen = 0;
@@ -61,6 +67,42 @@ void tlb_flush(struct tlb *tlb) {
     tlb->mem_changes = tlb->mmu->changes;
     for (unsigned i = 0; i < TLB_SIZE; i++)
         tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+}
+
+// Most changes are an mmap, munmap, mprotect or a page marked as code: a few
+// pages each, while a flush rewrites all TLB_SIZE entries (256KB) and every
+// page used afterwards misses once. Python's startup makes ~800 of them.
+void tlb_sync(struct tlb *tlb, uint64_t target) {
+    if ((unsigned) target == tlb->mem_changes)
+        return;
+#ifdef GUEST_ARM64
+    struct mmu *mmu = tlb->mmu;
+    uint64_t from = target - (unsigned) ((unsigned) target - tlb->mem_changes);
+    if (target - from <= MMU_LOG) {
+        uint64_t total = 0;
+        for (uint64_t g = from + 1; g <= target; g++) {
+            struct mmu_change *c = &mmu->log[g % MMU_LOG];
+            if (__atomic_load_n(&c->gen, __ATOMIC_ACQUIRE) != g)
+                goto flush;   // not written yet, or overwritten by a later change
+            uint64_t start = c->start, pages = c->pages;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&c->gen, __ATOMIC_RELAXED) != g || pages > 64 || (total += pages) > 256)
+                goto flush;
+            for (uint64_t p = start; p < start + pages; p++) {
+                addr_t addr = (addr_t) p << PAGE_BITS;
+                struct tlb_entry *e = &tlb->entries[TLB_INDEX(addr)];
+                if (e->page == TLB_PAGE(addr) || e->page_if_writable == TLB_PAGE(addr))
+                    *e = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+            }
+        }
+        tlb->mem_changes = (unsigned) target;
+        return;
+    }
+flush:
+#endif
+    for (unsigned i = 0; i < TLB_SIZE; i++)
+        tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+    tlb->mem_changes = (unsigned) target;
 }
 
 void tlb_free(struct tlb *tlb) {
@@ -120,9 +162,7 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
         __atomic_store_n(&tlb->stale, 0, __ATOMIC_SEQ_CST);
 #endif
         gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_SEQ_CST);
-        if (gen != tlb->mem_changes)
-            tlb_flush(tlb);
-        tlb->mem_changes = gen;
+        tlb_sync(tlb, gen);
         ptr = mmu_translate(tlb->mmu, TLB_PAGE(addr), type);
         // Re-read after translate; if unchanged, ptr is consistent with `gen`.
         if (__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE) == gen)

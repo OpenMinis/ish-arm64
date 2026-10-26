@@ -22,6 +22,7 @@
 
 // increment the change count
 static void mem_changed(struct mem *mem);
+static void mem_changed_range(struct mem *mem, page_t start, pages_t pages);
 static struct mmu_ops mem_mmu_ops;
 
 #include "kernel/mm.h"
@@ -56,7 +57,7 @@ int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
     res->flags = flags | P_ANONYMOUS;
     res->next = mem->reservations;
     mem->reservations = res;
-    mem_changed(mem);
+    mem_changed_range(mem, start, pages);
     return 0;
 }
 
@@ -657,7 +658,7 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
             free(data);
         }
     }
-    mem_changed(mem);
+    mem_changed_range(mem, start, pages);
     return 0;
 }
 
@@ -970,7 +971,7 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
                 return errno_map();
         }
     }
-    mem_changed(mem);
+    mem_changed_range(mem, start, pages);
     return 0;
 }
 
@@ -1024,11 +1025,24 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
     return 0;
 }
 
-static void mem_changed(struct mem *mem) {
-    __atomic_add_fetch(&mem->mmu.changes, 1, __ATOMIC_SEQ_CST);
+// Every thread's TLB must drop what it caches of [start, start + pages).
+static void mem_changed_range(struct mem *mem, page_t start, pages_t pages) {
+    uint64_t gen = __atomic_add_fetch(&mem->mmu.changes, 1, __ATOMIC_SEQ_CST);
 #ifdef GUEST_ARM64
+    struct mmu_change *c = &mem->mmu.log[gen % MMU_LOG];
+    __atomic_store_n(&c->gen, 0, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    c->start = start;
+    c->pages = pages;
+    __atomic_store_n(&c->gen, gen, __ATOMIC_RELEASE);
     mmu_tlbs_stale(&mem->mmu);
+#else
+    (void) start; (void) pages;
 #endif
+}
+
+static void mem_changed(struct mem *mem) {
+    mem_changed_range(mem, 0, ~(pages_t) 0);
 }
 
 // Public wrapper: bump the memory-change generation so other threads' TLB
@@ -1330,7 +1344,7 @@ have_entry:
         if (__atomic_load_n(&entry->flags, __ATOMIC_RELAXED) & P_CODE) {
             __atomic_fetch_and(&entry->flags, ~P_CODE, __ATOMIC_ACQ_REL);
             atomic_fetch_add_explicit(&st_wx_clears, 1, memory_order_relaxed);
-            mem_changed(mem);
+            mem_changed_range(mem, page, 1);
             // Order the bump before the caller's store: a compiling thread
             // that observes the (torn) store bytes must also observe the
             // bump when it verifies.
@@ -1371,7 +1385,7 @@ have_entry:
                     atomic_fetch_add(&anon_page_count, 1);
 #endif
                 pt_map(mem, page, 1, copy, 0, entry->flags &~ P_COW);
-                mem_changed(mem);
+                mem_changed_range(mem, page, 1);
             } else {
                 munmap(copy, PAGE_SIZE);
             }
@@ -1419,7 +1433,7 @@ int mmu_mark_code_page(struct mmu *mmu, page_t page) {
     unsigned old = __atomic_fetch_or(&entry->flags, P_CODE, __ATOMIC_ACQ_REL);
     if (old & P_CODE)
         return 0;
-    mem_changed(mem);
+    mem_changed_range(mem, page, 1);
     return 1;
 }
 

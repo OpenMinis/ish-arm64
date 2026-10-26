@@ -1138,11 +1138,12 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         // (debug trace removed)
 
         // Check if page table changed (mmap/munmap by another thread) EVERY BLOCK.
-        if (tlb->mem_changes != __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE)) {
-            tlb_flush(tlb);
-            memset(cache, 0, sizeof(tlb->block_cache));
-            tlb->block_cache_gen = asbestos->invalidate_gen;
-            memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
+        // The block and return caches only hold blocks, which a change that
+        // invalidates them takes out through invalidate_gen (checked at the
+        // top of the loop); the TLB drops what the changes touched.
+        uint64_t changes = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
+        if (tlb->mem_changes != (unsigned) changes) {
+            tlb_sync(tlb, changes);
             frame->last_block = NULL;
         }
 
