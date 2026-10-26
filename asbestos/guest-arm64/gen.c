@@ -1484,7 +1484,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                         state->ip += 4;
                         gen(state, (unsigned long) gadget_fused_adrp_ldr64);
                         gen(state, ldr_rt | ((uint64_t)rd << 5) | ((uint64_t)ldr_offset << 16));
-                        gen(state, target & 0xffffffffffffULL);
+                        gen(state, target);
                         return 1;
                     }
                 }
@@ -1498,11 +1498,24 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                         state->ip += 4;
                         gen(state, (unsigned long) gadget_fused_adrp_add);
                         gen(state, rd | ((uint64_t)add_imm12 << 8));
-                        gen(state, target & 0xffffffffffffULL);
+                        gen(state, target);
                         return 1;
                     }
                 }
             }
+        }
+
+        // ADR/ADRP is plain 64-bit arithmetic on the PC, not an address
+        // that must be valid: a JIT running in the guest (QEMU/Unicorn TCG)
+        // uses ADRP+ADD to materialize any constant within 4 GB of its code
+        // buffer, e.g. 0xFFFFFFFFF4BE74D7 from a buffer below 4 GB. A target
+        // that does not fit the 48-bit packed form goes through the fused
+        // ADRP+ADD gadget with imm12 = 0, which carries all 64 bits.
+        if ((target >> 48) != 0 && rd != 31) {
+            gen(state, (unsigned long) gadget_fused_adrp_add);
+            gen(state, rd);
+            gen(state, target);
+            return 1;
         }
 
         // Generate: store immediate to register
