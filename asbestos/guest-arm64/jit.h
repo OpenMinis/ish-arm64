@@ -97,6 +97,12 @@ bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to);
 // running guest code.
 void jit_exec_ready(void);
 
+// The code region filled up: once no thread runs guest code, every block
+// of every address space goes (asbestos.c) and jit_region_reset() starts the
+// region and the translation registry over.
+bool jit_flush_pending(void);
+void jit_region_reset(void);
+
 // Module and file offset of guest address pc in the address space of tlb, the
 // same in every process (-1: not in a module), and a module's path: the block
 // profiler (ISH_BLOCK_PROF_FILE) counts by these.

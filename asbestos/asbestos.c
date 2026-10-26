@@ -1,6 +1,8 @@
 #define DEFAULT_CHANNEL instr
 #include "debug.h"
+#include <pthread.h>
 #include <signal.h>
+#include <unistd.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -381,9 +383,76 @@ static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *bloc
 static void fiber_free_jetsam(struct asbestos *asbestos);
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size);
 
+#ifdef ISH_JIT
+// ---- flushing the JIT code region (jit_flush_pending())
+//
+// Threads count themselves in while they run guest code (cpu_run_to_interrupt).
+// Once the region is full, new ones wait at the door and the last one out
+// frees the blocks of every address space -- nothing can be running them --
+// and resets the region; everything is compiled again from there.
+static struct list all_asbestos = LIST_INITIALIZER(all_asbestos);
+static pthread_mutex_t all_asbestos_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t flush_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int world_users;
+static _Atomic uint64_t st_flushes;
+
+static void world_enter(void) {
+    for (;;) {
+        while (jit_flush_pending())
+            usleep(50);
+        atomic_fetch_add(&world_users, 1);
+        if (!jit_flush_pending())
+            return;
+        atomic_fetch_sub(&world_users, 1);
+    }
+}
+
+static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *block);
+static void fiber_free_jetsam(struct asbestos *asbestos);
+
+static void asbestos_drop_all_blocks(struct asbestos *asbestos) {
+    lock(&asbestos->lock);
+    for (size_t i = 0; i < asbestos->hash_size; i++) {
+        struct fiber_block *block, *tmp;
+        if (list_null(&asbestos->hash[i]))
+            continue;
+        list_for_each_entry_safe(&asbestos->hash[i], block, tmp, chain)
+            fiber_block_free(asbestos, block);
+    }
+    fiber_free_jetsam(asbestos);
+    asbestos->invalidate_gen++;   // the threads' block and return caches
+    unlock(&asbestos->lock);
+    jit_asbestos_free(asbestos);
+}
+
+static void world_leave(void) {
+    atomic_fetch_sub(&world_users, 1);
+    if (!jit_flush_pending())
+        return;
+    pthread_mutex_lock(&flush_lock);
+    if (jit_flush_pending()) {
+        while (atomic_load(&world_users) > 0)
+            usleep(50);
+        pthread_mutex_lock(&all_asbestos_lock);
+        struct asbestos *a;
+        list_for_each_entry(&all_asbestos, a, all_link)
+            asbestos_drop_all_blocks(a);
+        pthread_mutex_unlock(&all_asbestos_lock);
+        jit_region_reset();
+        atomic_fetch_add(&st_flushes, 1);
+    }
+    pthread_mutex_unlock(&flush_lock);
+}
+#endif
+
 struct asbestos *asbestos_new(struct mmu *mmu) {
     struct asbestos *asbestos = calloc(1, sizeof(struct asbestos));
     asbestos->mmu = mmu;
+#ifdef ISH_JIT
+    pthread_mutex_lock(&all_asbestos_lock);
+    list_add(&all_asbestos, &asbestos->all_link);
+    pthread_mutex_unlock(&all_asbestos_lock);
+#endif
     fiber_resize_hash(asbestos, FIBER_INITIAL_HASH_SIZE);
     asbestos->page_hash = calloc(FIBER_PAGE_HASH_SIZE, sizeof(*asbestos->page_hash));
     list_init(&asbestos->jetsam);
@@ -395,6 +464,11 @@ struct asbestos *asbestos_new(struct mmu *mmu) {
 }
 
 void asbestos_free(struct asbestos *asbestos) {
+#ifdef ISH_JIT
+    pthread_mutex_lock(&all_asbestos_lock);
+    list_remove(&asbestos->all_link);
+    pthread_mutex_unlock(&all_asbestos_lock);
+#endif
     for (size_t i = 0; i < asbestos->hash_size; i++) {
         struct fiber_block *block, *tmp;
         if (list_null(&asbestos->hash[i]))
@@ -1287,11 +1361,17 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     // and by context switches / signal delivery.
 #endif
     struct asbestos *asbestos = cpu->mmu->asbestos;
+#ifdef ISH_JIT
+    world_enter();
+#endif
     __atomic_add_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
     tlb_refresh(tlb, cpu->mmu);
     int interrupt = (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
     cpu->trapno = interrupt;
     __atomic_sub_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
+#ifdef ISH_JIT
+    world_leave();
+#endif
 
     lock(&asbestos->lock);
     if (!list_empty(&asbestos->jetsam)) {

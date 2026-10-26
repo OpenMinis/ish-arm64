@@ -128,13 +128,26 @@ static bool map_jit(void) {
 }
 #endif
 
+static size_t region_start;           // what the stubs take, kept by a flush
+static _Atomic bool flush_wanted;       // full: start over once no guest code runs
+static _Atomic unsigned region_flushes;
+
+static size_t region_limit = REGION_SIZE;   // ISH_JIT_REGION_MB: less, to test flushes
+
 static uint8_t *region_alloc(size_t bytes) {
     size_t off = atomic_fetch_add(&region_used, (bytes + 15) & ~(size_t) 15);
-    if (off + bytes > REGION_SIZE) {
+    if (off + bytes > region_limit) {
         region_full = true;
+        // A recording keeps pointers to what it recorded: no flush then.
+        if (region_start && !getenv("ISH_JIT_RECORD"))
+            flush_wanted = true;
         return NULL;
     }
     return region + off;
+}
+
+bool jit_flush_pending(void) {
+    return atomic_load_explicit(&flush_wanted, memory_order_acquire);
 }
 
 // MAP_JIT W^X is per thread and only this thread's fiber runs its native
@@ -2457,6 +2470,32 @@ static uint64_t *mod_blocks, *mod_hits, *mod_moved;   // per module: blocks tran
                                                      // of which from an image of another version
 static unsigned mod_next_cap;
 
+// Every block is gone (asbestos.c, no thread in guest code): forget every
+// translation and start the region over.
+void jit_region_reset(void) {
+    pthread_mutex_lock(&reg_lock);
+    for (unsigned i = 0; reg_table && i < REG_BUCKETS; i++) {
+        struct reg_entry *r = reg_table[i];
+        reg_table[i] = NULL;
+        while (r) {
+            struct reg_entry *next = r->next;
+            free(r->seg);
+            free(r);
+            r = next;
+        }
+    }
+    for (unsigned m = 0; m < mod_next_cap; m++)
+        mod_next_idx[m] = 0;
+    pthread_mutex_unlock(&reg_lock);
+    pthread_mutex_lock(&loopmap_lock);
+    nloopmaps = 0;
+    pthread_mutex_unlock(&loopmap_lock);
+    region_used = region_start;
+    region_full = false;
+    atomic_fetch_add(&region_flushes, 1);
+    atomic_store_explicit(&flush_wanted, false, memory_order_release);
+}
+
 // ---- AOT images (asbestos/guest-arm64/aot.h)
 //
 // Translations of a module recorded from this PIC code and linked into the
@@ -3574,9 +3613,9 @@ size_t jit_describe(char *buf, size_t size) {
                        pic_on ? "JIT, position-independent" : "JIT";
     OUT("mode: %s\n", mode);
     if (jit_on && !aot_only)
-        OUT("code region: %.1f of %u MB used%s\n",
+        OUT("code region: %.1f of %u MB used%s, started over %u times\n",
             (region_full ? REGION_SIZE : (size_t) region_used) / 1048576.0, REGION_SIZE >> 20,
-            region_full ? " (full: blocks compiled since run as gadgets)" : "");
+            region_full ? " (full: blocks compiled since run as gadgets)" : "", region_flushes);
     OUT("AOT: %s (echo on|off > /proc/ish/jit; affects blocks compiled afterwards, i.e. new processes)\n",
         aot_off ? "off" : "on");
     OUT("blocks translated or looked up: %llu, AOT installs: %llu (moved: %llu, with pc-relative immediates "
@@ -3699,6 +3738,10 @@ static void jit_init(void) {
         if (pic_on && n_pinned && !env_off("ISH_JIT_STUBS"))
             make_stubs();
         jit_exec_ready();
+        region_start = region_used;
+        const char *mb = getenv("ISH_JIT_REGION_MB");
+        if (mb && atoi(mb) > 0 && ((size_t) atoi(mb) << 20) < REGION_SIZE)
+            region_limit = (size_t) atoi(mb) << 20;
     }
     if (pic_on)
         aot_init();

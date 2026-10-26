@@ -12,6 +12,9 @@
 struct asbestos {
     // there is one asbestos per address space
     struct mmu *mmu;
+#ifdef ISH_JIT
+    struct list all_link;   // every asbestos, for a flush of the JIT code region
+#endif
     size_t mem_used;
     size_t num_blocks;
 
