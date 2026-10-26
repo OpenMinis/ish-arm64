@@ -37,12 +37,39 @@ LINE = re.compile(r'^([ +!:|]*)(\d+) (.+?)  \(in ([^)]+)\)')
 THREAD = re.compile(r'^\s+(\d+) Thread_\d+(?::\s*(.*))?')
 
 
+FS = re.compile(r'^(realfs_|fakefs_|generic_|path_|__path|sys_open|sys_openat|sys_stat|sys_fstat|sys_lstat|'
+                r'sys_newfstatat|sys_statx|sys_read|sys_pread|sys_write|sys_pwrite|sys_getdents|sys_readlink|'
+                r'sys_access|sys_faccessat|sys_close|sys_unlink|sys_rename|sys_mkdir|sys_rmdir|fd_|file_|'
+                r'mount_|sqlite3)')
+
+
+FALLBACK = [(c, re.compile(r)) for c, r in [
+    ('exit/mm teardown', r'^(reaper|region_free|do_exit_group|sys_exit_group|sys_exit)$'),
+    ('exec', r'^(format_exec|load_entry)$'),
+    ('mmap/munmap', r'^(pt_|sba_|do_mmap|asbestos_free|mmu_mark_code_page|mem_remove_reservations)'),
+    ('compile:jit', r'^(reg_install|reg_|emit_|ctx_get|jit_)'),
+    ('compile:gadget', r'^(gen|gen_)'),
+    ('syscall', r'^(sys_|generic_|realfs_|fakefs_)'),
+    ('dispatch', r'^(task_run_current|task_thread)$'),
+]]
+
+
 def classify(stack):
     if RULES[0][1].search(stack[-1][0]):
         return 'wait'
-    for fn, lib in stack:
+    for i, (fn, lib) in enumerate(stack):
         for cat, rx in RULES:
             if rx.search(fn):
+                # file system work under a syscall: its own line
+                if cat == 'syscall' and any(FS.search(f) for f, _ in stack[i + 1:]):
+                    return 'syscall:fs'
+                return cat
+    # handle_interrupt and other frames inlined away: go by what is left
+    for i, (fn, lib) in enumerate(stack):
+        for cat, rx in FALLBACK:
+            if rx.search(fn):
+                if cat == 'syscall' and any(FS.search(f) for f, _ in stack[i:]):
+                    return 'syscall:fs'
                 return cat
     fn, lib = stack[-1]
     if fn == '???':
@@ -61,16 +88,22 @@ def main():
     args = ap.parse_args()
     want = re.compile(args.threads) if args.threads else None
 
+    cats, leaves, detail = analyze(args.file, want, args.detail)
+    report(cats, leaves, detail, args)
+
+
+def analyze(path, want=None, want_detail=''):
+    """Samples per category, per leaf frame, and per leaf in want_detail."""
     cats, leaves, detail = Counter(), Counter(), Counter()
     stack, counts, keep = [], [], False
-    text = open(args.file, errors='replace').read()
+    text = open(path, errors='replace').read()
     text = text.split('Sort by top of stack')[0]
     for line in text.splitlines():
         t = THREAD.match(line)
         if t:
             name = t.group(2) or ''
             while stack:
-                flush(stack, counts, cats, leaves, detail, args.detail)
+                flush(stack, counts, cats, leaves, detail, want_detail)
             keep = not want or bool(want.search(name))
             continue
         m = LINE.match(line)
@@ -83,14 +116,17 @@ def main():
         # Close the frames this line is not inside of; their self time is
         # what their children do not account for.
         while counts and counts[-1][2] >= depth:
-            flush(stack, counts, cats, leaves, detail, args.detail)
+            flush(stack, counts, cats, leaves, detail, want_detail)
         if counts:
             counts[-1][1] += n
         stack.append((fn, lib))
         counts.append([n, 0, depth])
     while stack:
-        flush(stack, counts, cats, leaves, detail, args.detail)
+        flush(stack, counts, cats, leaves, detail, want_detail)
+    return cats, leaves, detail
 
+
+def report(cats, leaves, detail, args):
     total = sum(v for c, v in cats.items() if c != 'wait')
     if not total:
         sys.exit('no samples')
