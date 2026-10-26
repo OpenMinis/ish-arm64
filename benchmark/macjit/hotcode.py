@@ -21,7 +21,8 @@ LEAF = re.compile(r'^[ +!:|]*(\d+) \?\?\?  \(in <unknown binary>\)  \[(0x[0-9a-f
 
 
 ROLES = {'g': 'guest instructions', 't': 'TLB lookup', 's': 'shadow window check', 'r': 'unpinned register load/store',
-         'p': 'cold entry', 'd': 'block end / dispatch', 'x': 'bail-out stubs'}
+         'p': 'cold entry', 'd': 'block end: direct successor', 'R': 'block end: ret',
+         'I': 'block end: br / blr', 'x': 'bail-out stubs'}
 
 
 def load_map(path):

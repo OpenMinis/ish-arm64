@@ -334,7 +334,9 @@ enum {
     ROLE_SBA = 's',       // shadow window check before it (kernel/sba.h)
     ROLE_REG = 'r',       // loads and write-backs of unpinned guest registers
     ROLE_ENTRY = 'p',     // cold-entry prologue
-    ROLE_END = 'd',       // block end: chaining, ret / br dispatch, cycle count
+    ROLE_END = 'd',       // block end: chaining to a direct successor, cycle count
+    ROLE_RET = 'R',       // block end: ret through the return cache
+    ROLE_IND = 'I',       // block end: br / blr through the block cache
     ROLE_SLOW = 'x',      // bail-out stubs back to the gadgets
 };
 static uint8_t set_role(struct em *e, uint8_t r) {
@@ -1987,10 +1989,12 @@ static bool emit_block_end(struct em *e, struct fiber_block *b, const struct jit
     if (e->loop && ((x & 0xFFFFFC1Fu) == 0xD65F0000u || (x & 0xFFFFFC1Fu) == 0xD61F0000u || (x & 0xFFFFFC1Fu) == 0xD63F0000u))
         return false;
     if ((x & 0xFFFFFC1Fu) == 0xD65F0000u) {                                 // ret
+        e->cur_role = ROLE_RET;
         emit_ret(e, b, (x >> 5) & 31);
         return !e->fail;
     }
     if ((x & 0xFFFFFC1Fu) == 0xD61F0000u || (x & 0xFFFFFC1Fu) == 0xD63F0000u) {   // br / blr
+        e->cur_role = ROLE_IND;
         emit_indirect(e, b, u, (x >> 5) & 31, (x & 0x00200000u) != 0, pc + 4);
         return !e->fail;
     }
