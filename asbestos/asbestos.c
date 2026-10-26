@@ -814,6 +814,11 @@ static struct fiber_block *fiber_block_compile_protected(struct asbestos *asbest
             return block;
         if (attempt >= 16) {
             atomic_fetch_add_explicit(&st_wx_giveups, 1, memory_order_relaxed);
+            // keep "a page with blocks is P_CODE" true: unmapping and stores
+            // only look for blocks on P_CODE pages
+            mmu_mark_code_page(mmu, PAGE(ip));
+            if (crossed)
+                mmu_mark_code_page(mmu, PAGE(block->end_addr));
             return block;  // pathological churn; accept (pre-W^X behavior)
         }
         atomic_fetch_add_explicit(&st_wx_retries, 1, memory_order_relaxed);

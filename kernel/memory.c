@@ -679,6 +679,13 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
         if (pt == NULL)
             continue;
 
+#ifdef GUEST_ARM64
+        // Only pages blocks were compiled from are P_CODE, and every such
+        // page is. Looking at the others walked a page-hash bucket holding
+        // the blocks of every page congruent to it: node's 128MB munmaps
+        // spent 9% of its startup there.
+        if (pt->flags & P_CODE)
+#endif
         asbestos_invalidate_page(mem->mmu.asbestos, page);
         struct data *data = pt->data;
 #if ANON_MMAP_LIMIT_PAGES > 0
@@ -1465,7 +1472,11 @@ have_entry:
             // TODO: Is P_WRITE really correct? The page shouldn't be writable without ptrace.
             entry->flags |= P_WRITE | P_COW;
         }
-        // get rid of any compiled blocks in this page
+        // get rid of any compiled blocks in this page (only P_CODE pages
+        // have any, see pt_unmap_always)
+#ifdef GUEST_ARM64
+        if (entry->flags & P_CODE)
+#endif
         asbestos_invalidate_page(mem->mmu.asbestos, page);
         // W^X: the page holds compiled guest code. Unprotect it and bump
         // mmu->changes so every thread's cached writable TLB entry for the
