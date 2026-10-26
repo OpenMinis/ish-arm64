@@ -11,6 +11,7 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "kernel/native_offload.h"
+#include "kernel/calls.h"
 #ifdef __APPLE__
 #include <sys/resource.h>
 #define IOPOL_TYPE_VFS_HFS_CASE_SENSITIVITY 1
@@ -120,12 +121,23 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
         fs_chdir(current->fs, pwd);
     }
 
-    char argv_copy[4096];
-    int i = optind;
-    size_t p = 0;
-    size_t exec_argc = 0;
     if (argv[optind] == NULL)
 	    return _ENOENT;
+    // [ish#42] The guest argv, NUL-separated, sized from the real arguments.
+    // It used to be a fixed 4096-byte stack buffer filled with unchecked
+    // strcpy, so a command line of ~16 KB (a long `sh -c` script) overran it,
+    // smashed main's frame and crashed the host. Like the kernel's execve,
+    // the arguments themselves (every string's NUL plus the final one) may
+    // take at most ARGV_MAX bytes; past that the exec fails with E2BIG.
+    size_t user_bytes = 1;
+    for (int k = optind; k < argc; k++)
+        user_bytes += strlen(argv[k]) + 1;
+    if (user_bytes > ARGV_MAX) {
+        fprintf(stderr, "%s: argument list too long (%zu bytes, limit %d)\n",
+                argv[optind], user_bytes, (int) ARGV_MAX);
+        return _E2BIG;
+    }
+    size_t argv_bytes = user_bytes;
 #ifdef GUEST_ARM64
     // Inject V8 flags for node to work around scope corruption in emulation.
     // --jitless: disable JIT (avoids V8 code gen incompatible with our JIT)
@@ -133,60 +145,67 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     // --no-lazy: eager compilation (avoids Zone reuse patterns that corrupt scopes)
     // --single-generation: skip young gen (reduces GC-triggered Zone resets)
     // This is needed here because the initial do_execve bypasses sys_execve.
+    static const char *v8_flags[] = {
+        "--jitless",
+        "--no-lazy",
+        "--no-expose-wasm",
+        "--max-old-space-size=512",
+        // Force single-threaded V8: in jitless mode worker threads
+        // have no JIT to do, but V8 still creates them and they
+        // block on futex/epoll waiting for the slow main thread.
+        // Cuts `node -e 0` from 2.3s → 0.65s on iSH ARM64.
+        // Validated 2026-05-05 via syscall profile.
+        "--no-concurrent-marking",
+        "--no-concurrent-recompilation",
+        "--no-lazy-compile-dispatcher",
+        // --predictable forces V8 into deterministic single-threaded
+        // mode: disables concurrent GC, parallel scavenger, and
+        // background compilation. Empirically yields the biggest
+        // single speedup on iSH ARM64 (reduces wall time another
+        // 30-40% on top of the no-concurrent-* flags above).
+        "--predictable",
+    };
+    const size_t v8_flag_count = sizeof(v8_flags) / sizeof(v8_flags[0]);
+    bool inject_v8 = false;
     {
         const char *base = strrchr(argv[optind], '/');
         base = base ? base + 1 : argv[optind];
         if (strcmp(base, "node") == 0) {
-            // Copy argv[0] first
-            strcpy(&argv_copy[p], argv[optind]);
-            p += strlen(argv[optind]) + 1;
-            exec_argc++;
-            // Inject V8 flags to work around scope corruption
-            static const char *v8_flags[] = {
-                "--jitless",
-                "--no-lazy",
-                "--no-expose-wasm",
-                "--max-old-space-size=512",
-                // Force single-threaded V8: in jitless mode worker threads
-                // have no JIT to do, but V8 still creates them and they
-                // block on futex/epoll waiting for the slow main thread.
-                // Cuts `node -e 0` from 2.3s → 0.65s on iSH ARM64.
-                // Validated 2026-05-05 via syscall profile.
-                "--no-concurrent-marking",
-                "--no-concurrent-recompilation",
-                "--no-lazy-compile-dispatcher",
-                // --predictable forces V8 into deterministic single-threaded
-                // mode: disables concurrent GC, parallel scavenger, and
-                // background compilation. Empirically yields the biggest
-                // single speedup on iSH ARM64 (reduces wall time another
-                // 30-40% on top of the no-concurrent-* flags above).
-                "--predictable",
-            };
-            for (int fi = 0; fi < (int)(sizeof(v8_flags)/sizeof(v8_flags[0])); fi++) {
-                strcpy(&argv_copy[p], v8_flags[fi]);
-                p += strlen(v8_flags[fi]) + 1;
-                exec_argc++;
+            size_t flag_bytes = 0;
+            for (size_t fi = 0; fi < v8_flag_count; fi++)
+                flag_bytes += strlen(v8_flags[fi]) + 1;
+            // Like sys_execve's injection: only when it still fits.
+            if (argv_bytes + flag_bytes <= ARGV_MAX) {
+                inject_v8 = true;
+                argv_bytes += flag_bytes;
             }
-            // Copy remaining args (skip argv[optind])
-            for (i = optind + 1; i < argc; i++) {
-                strcpy(&argv_copy[p], argv[i]);
-                p += strlen(argv[i]) + 1;
-                exec_argc++;
-            }
-            argv_copy[p] = '\0';
-            goto do_exec;
         }
     }
 #endif
-    while (i < argc) {
-        strcpy(&argv_copy[p], argv[i]);
-        p += strlen(argv[i]) + 1;
+    char *argv_copy = malloc(argv_bytes);
+    if (argv_copy == NULL)
+        return _ENOMEM;
+    size_t p = 0;
+    size_t exec_argc = 0;
+    for (int k = optind; k < argc; k++) {
+        size_t len = strlen(argv[k]) + 1;
+        memcpy(&argv_copy[p], argv[k], len);
+        p += len;
         exec_argc++;
-        i++;
+#ifdef GUEST_ARM64
+        // The flags go right after argv[0].
+        if (k == optind && inject_v8) {
+            for (size_t fi = 0; fi < v8_flag_count; fi++) {
+                size_t flen = strlen(v8_flags[fi]) + 1;
+                memcpy(&argv_copy[p], v8_flags[fi], flen);
+                p += flen;
+                exec_argc++;
+            }
+        }
+#endif
     }
     argv_copy[p] = '\0';
 #ifdef GUEST_ARM64
-do_exec:
     // Inject environment variables for the initial exec.
     // sys_execve has its own injection, but the initial do_execve bypasses it.
     {
@@ -254,6 +273,7 @@ do_exec:
 #else
     err = do_execve(argv[optind], exec_argc, argv_copy, envp == NULL ? "\0" : envp);
 #endif
+    free(argv_copy); // do_execve copied it into the guest
     if (err < 0)
         return err;
     tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;

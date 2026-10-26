@@ -21,7 +21,6 @@
 #include "kernel/native_offload.h"
 #include "tools/ptraceomatic-config.h"
 
-#define ARGV_MAX 32 * PAGE_SIZE
 
 // Use architecture-appropriate ELF structures
 #if defined(GUEST_ARM64)

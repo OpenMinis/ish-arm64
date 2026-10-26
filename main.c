@@ -69,6 +69,17 @@ static_assert(CRASH_CPU_segfault_addr      == CPU_segfault_addr,      "cpu-offse
 static_assert(CRASH_CPU_segfault_was_write == CPU_segfault_was_write, "cpu-offsets drift: segfault_was_write");
 static_assert(CRASH_LOCAL_jit_exit_sp      == LOCAL_jit_exit_sp,      "cpu-offsets drift: jit_exit_sp");
 
+// [ish#42] Seconds the non-JIT crash report may take before the process exits
+// anyway: the report must never be what keeps a crashed process alive.
+#define CRASH_REPORT_TIMEOUT_S 3
+
+static void crash_report_timeout(int sig) {
+    (void) sig;
+    static const char msg[] = "\n=== HOST CRASH: report timed out, exiting ===\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(139);
+}
+
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
 #if defined(__aarch64__) && defined(GUEST_ARM64)
     // If we're inside JIT code and got SIGSEGV/SIGBUS, recover by redirecting
@@ -130,7 +141,22 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     }
 #endif
 
-    // Non-JIT crash: dump state and exit
+    // Non-JIT crash: dump state and exit.
+    //
+    // [ish#42] Arm a watchdog first. The report below symbolizes frames with
+    // backtrace_symbols_fd -> dladdr, which is not async-signal-safe; with a
+    // smashed stack (a 16 KB command line overrunning argv_copy put
+    // 0x616161616161 in main's return address) dladdr spun inside dyld
+    // forever and the crashed CLI never exited.
+    struct sigaction watchdog = {0};
+    watchdog.sa_handler = crash_report_timeout;
+    sigaction(SIGALRM, &watchdog, NULL);
+    sigset_t alrm;
+    sigemptyset(&alrm);
+    sigaddset(&alrm, SIGALRM);
+    sigprocmask(SIG_UNBLOCK, &alrm, NULL);
+    alarm(CRASH_REPORT_TIMEOUT_S);
+
     char buf[512];
     int len;
     ucontext_t *uc = (ucontext_t *)ctx;
@@ -150,8 +176,43 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
 #endif
     void *bt[20];
     int n = backtrace(bt, 20);
-    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+    // Symbolize frames up to the first one that cannot be a return address;
+    // past a smashed frame the chain is garbage, so print the rest raw
+    // instead of handing it to dladdr.
+    int good = 0;
+    while (good < n) {
+        uintptr_t a = (uintptr_t) bt[good];
+#ifdef __aarch64__
+        if (a == 0 || (a & 3) != 0) // an arm64 return address is 4-byte aligned
+            break;
+#else
+        if (a == 0)
+            break;
+#endif
+        good++;
+    }
+    backtrace_symbols_fd(bt, good, STDERR_FILENO);
+    for (int i = good; i < n; i++) {
+        len = snprintf(buf, sizeof(buf), "%-3d ??? 0x%016lx (not a code address)\n", i, (unsigned long) (uintptr_t) bt[i]);
+        write(STDERR_FILENO, buf, len);
+    }
     _exit(139);
+}
+
+// [ish#42] Append "name=value" and its NUL to the NUL-separated list in
+// envp[cap], keeping room for the list's final NUL; an entry that does not fit
+// is left out. The previous `p += snprintf(...) + 1` advanced p by the length
+// it WANTED to write, so a long host TERM pushed p past the buffer and the
+// next `sizeof(envp) - p` wrapped around to a huge size.
+static size_t envp_put(char *envp, size_t cap, size_t p, const char *name, const char *value) {
+    size_t nlen = strlen(name), vlen = strlen(value);
+    size_t need = nlen + 1 + vlen + 1;
+    if (p + need + 1 > cap)
+        return p;
+    memcpy(envp + p, name, nlen);
+    envp[p + nlen] = '=';
+    memcpy(envp + p + nlen + 1, value, vlen + 1);
+    return p + need;
 }
 
 static struct termios saved_termios;
@@ -524,14 +585,12 @@ int main(int argc, char *const argv[]) {
     sigaction(SIGTRAP, &sa, NULL);
     char envp[512] = {0};
     size_t p = 0;
-    if (getenv("TERM")) {
-        const char *term = getenv("TERM");
-        p += snprintf(envp + p, sizeof(envp) - p, "TERM=%s", term) + 1;
-    }
-    p += snprintf(envp + p, sizeof(envp) - p, "HOME=/root") + 1;
-    p += snprintf(envp + p, sizeof(envp) - p, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") + 1;
+    if (getenv("TERM"))
+        p = envp_put(envp, sizeof(envp), p, "TERM", getenv("TERM"));
+    p = envp_put(envp, sizeof(envp), p, "HOME", "/root");
+    p = envp_put(envp, sizeof(envp), p, "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
 #ifdef GUEST_ARM64
-    p += snprintf(envp + p, sizeof(envp) - p, "PYTHONMALLOC=malloc") + 1;
+    p = envp_put(envp, sizeof(envp), p, "PYTHONMALLOC", "malloc");
 #endif
     // [T-ish-cli-memory-governor] Put the CLI on the same memory governor the
     // iOS app uses, instead of leaving it on the legacy compile-time ledger.

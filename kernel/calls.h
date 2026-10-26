@@ -34,6 +34,10 @@ dword_t sys_clone3(addr_t args_addr, dword_t size);
 dword_t sys_fork(void);
 dword_t sys_vfork(void);
 dword_t sys_execve(addr_t file, addr_t argv, addr_t envp);
+// Most bytes an exec's argv (or envp) may take: every string with its NUL,
+// plus the final NUL. More fails with E2BIG. The CLI's initial exec
+// (xX_main_Xx.h) holds itself to the same limit.
+#define ARGV_MAX (32 * PAGE_SIZE)
 int do_execve(const char *file, size_t argc, const char *argv, const char *envp);
 dword_t sys_exit(dword_t status);
 noreturn void do_exit(int status);
