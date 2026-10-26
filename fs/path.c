@@ -131,7 +131,61 @@ static void path_cache_set(const char *full_path, int flags, const char *normali
     unlock(&path_cache_lock);
 }
 
+// === Component cache ===
+//
+// A walk resolves every component of a path: a readlink to see whether it
+// is a symlink and, for one with more path after it, a stat to see that it
+// is a directory the process may search -- two host calls per component. A
+// directory walk (find, node's fs.readdir + stat) stats thousands of
+// different paths under the same few directories, so the whole-path cache
+// above misses while the components repeat. This cache remembers, per
+// normalized prefix, "not a symlink" and "a directory, searchable by this
+// euid/egid", under the same generation and TTL rules as the path cache.
+
+#define COMP_CACHE_SIZE 2048
+#define COMP_PATH_MAX 192   // longer prefixes are not cached
+#define COMP_NOT_LINK 1     // readlink said: not a symlink
+#define COMP_DIR_OK 2       // ... and a directory with search permission
+
+struct comp_cache_entry {
+    char path[COMP_PATH_MAX];
+    uint64_t timestamp, gen;
+    uid_t_ euid, egid;
+    int kind;
+};
+static struct comp_cache_entry comp_cache[COMP_CACHE_SIZE];
+static lock_t comp_cache_lock = LOCK_INITIALIZER;
+
+static int comp_cache_get(const char *path, uint64_t gen) {
+    if (strlen(path) >= COMP_PATH_MAX)
+        return 0;
+    struct comp_cache_entry *e = &comp_cache[path_hash(path) % COMP_CACHE_SIZE];
+    uint64_t now = get_time_ns();
+    int kind = 0;
+    lock(&comp_cache_lock);
+    if (e->kind && e->gen == gen && now - e->timestamp <= PATH_CACHE_TTL_NS &&
+            e->euid == current->euid && e->egid == current->egid && strcmp(e->path, path) == 0)
+        kind = e->kind;
+    unlock(&comp_cache_lock);
+    return kind;
+}
+
+static void comp_cache_set(const char *path, int kind, uint64_t gen) {
+    if (strlen(path) >= COMP_PATH_MAX)
+        return;
+    struct comp_cache_entry *e = &comp_cache[path_hash(path) % COMP_CACHE_SIZE];
+    lock(&comp_cache_lock);
+    strcpy(e->path, path);
+    e->timestamp = get_time_ns();
+    e->gen = gen;
+    e->euid = current->euid;
+    e->egid = current->egid;
+    e->kind = kind;
+    unlock(&comp_cache_lock);
+}
+
 static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
+    uint64_t gen = path_cache_snapshot();
     // you must choose one
     if (flags & N_SYMLINK_FOLLOW)
         assert(!(flags & N_SYMLINK_NOFOLLOW));
@@ -214,6 +268,11 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
             return _ENAMETOOLONG;
 
         if ((flags & N_SYMLINK_FOLLOW) || *p != '\0') {
+            bool more = *(p - 1) == '/';
+            *o = '\0';
+            int known = comp_cache_get(out, gen);
+            if (known == COMP_DIR_OK || (known == COMP_NOT_LINK && !more))
+                continue;
             // this buffer is used to store the path that we're readlinking, then
             // if it turns out to point to a symlink it's reused as the buffer
             // passed to the next path_normalize call
@@ -245,7 +304,7 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
 
             // if there's a slash after this component, ensure that if it
             // exists, it's a directory and that we have execute perms on it
-            if (*(p - 1) == '/') {
+            if (more) {
                 struct statbuf stat;
                 int err = mount->fs->stat(mount, possible_symlink, &stat);
                 mount_release(mount);
@@ -255,9 +314,13 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
                     err = access_check(&stat, AC_X);
                     if (err < 0)
                         return err;
+                    if (res == _EINVAL)
+                        comp_cache_set(out, COMP_DIR_OK, gen);
                 }
             } else {
                 mount_release(mount);
+                if (res == _EINVAL)
+                    comp_cache_set(out, COMP_NOT_LINK, gen);
             }
         }
     }
