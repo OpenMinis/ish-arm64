@@ -63,7 +63,13 @@ struct mem {
 #define STACK_TOP_PAGE    0xffffeULL        // guard page at 0xffffe000
 #define STACK_INIT_PAGE   0xffffdULL        // initial stack page (growsdown)
 #define STACK_TOP_ADDR    0xffffe000ULL     // SP starts here
-#define MMAP_HOLE_START   0xefffdULL        // mmap search starts here (same as x86)
+// mmap search starts here. Not 0xefffd like x86: the software TLB is direct
+// mapped (TLB_INDEX), and with the stack at 0xffffd the top stack pages and
+// the top mmap pages -- the executable, ld.so and the first heap, all hot --
+// shared slots (0xffffc000 and 0xefff4000 both index 0x1f83), so a busybox
+// shell loop missed the TLB ~37 times per iteration. From 0xeff75 down, the
+// top 8000 mmap pages miss every index of the top 128 stack pages.
+#define MMAP_HOLE_START   0xeff75ULL
 #define MMAP_HOLE_END     0x100ULL          // mmap search ends here (above guard pages)
 // Upper bound for valid user addresses (page number, 48-bit / 4K = 36-bit)
 #define USER_ADDR_MAX_PAGE  0xFFFFFFFFFULL
