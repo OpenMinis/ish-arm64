@@ -26,6 +26,7 @@
 #include "emu/tlb.h"
 #include "kernel/fs.h"
 #include "kernel/memory.h"
+#include "kernel/sba.h"
 #include "cpu-offsets.h"
 
 extern void jit_fiber_ret(void) __asm("fiber_ret");
@@ -39,6 +40,7 @@ static bool loop_off;     // ISH_JIT_LOOP=0: no register promotion in self-loops
 static bool simd_on;      // ISH_JIT_SIMD=0: leave SIMD/FP instructions to the gadgets
 static bool pin_on;       // ISH_JIT_PIN=0: no guest registers pinned in host registers
 static bool pic_on;       // ISH_JIT_PIC=1: position-independent code (see "PIC" below)
+static bool sba_jit;      // ISH_SBA=1: memory accesses try the shadow window first (kernel/sba.h)
 static bool aot_only;     // ISH_JIT_AOT_ONLY=1: install AOT translations, translate nothing
                           // (what a build without the JIT would run)
 
@@ -213,6 +215,7 @@ static const int8_t pin_guest[] = {0, G_SP, 1, 2, 19, 3, 4, 21, 20, 22, 23, 30, 
 static const int8_t pin_host[]  = {19, 20, 21, 22, 23, 24, 25, 26, 27, 3, 4, 5, 6, 7, 13, 14};
 static const uint8_t lazy_pool[] = {16, 17, 0};
 #define H_CYC 15   // pinned mode: cpu->cycle lives in w15 between cold entry and exit
+#define SBA_REG 30 // shadow window base (kernel/sba.h) while native code runs
 static const uint8_t pool_nopin[] = {0, 3, 4, 5, 6, 7, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27};
 static int n_pinned;               // 0 when pinning is off
 static int prologue_words;          // cold-entry prologue length (hot entry offset)
@@ -237,7 +240,7 @@ static void pin_init(bool on) {
     // load_pinned(); PIC adds x9 = &code[0] before it and the link entry
     // (x29 = x9 - code) as its last word
     // x9 = &code[0] (2 words), load_pinned(), cross-module entry (1 word)
-    prologue_words = n_pinned + (n_pinned ? 1 : 0) + (pic_on ? 3 : 0);
+    prologue_words = n_pinned + (n_pinned ? 1 : 0) + (sba_jit ? 1 : 0) + (pic_on ? 3 : 0);
     memset(pin_of, -1, sizeof(pin_of));
     for (int i = 0; i < n_pinned; i++)
         pin_of[pin_guest[i]] = pin_host[i];
@@ -276,6 +279,10 @@ struct em {
     // bailout / exit sites: branch at buf[at] must go to the stub for stream position spos
     struct { unsigned at; unsigned spos; uint8_t kind, stub; uintptr_t abs; } fix[1024];
     unsigned nfix;
+    // Shadow window accesses (tlb_lookup()): the TLB lookup each falls back
+    // to, emitted after the body (finish_native()) and branching back.
+    struct { unsigned at[3], back, spos; uint8_t nat, bytes; bool write; } oop[512];
+    unsigned noop;
     bool fail;
     bool hflags;   // host NZCV currently equals the guest flags
     int link_at[2];        // buffer index of the patchable direct-link nop per jump_ip slot
@@ -378,6 +385,11 @@ static void load_pinned(struct em *e) {
         put(e, 0xF9400000u | ((greg_off(pin_guest[i]) / 8) << 10) | (1u << 5) | (uint32_t) pin_host[i]);
     if (n_pinned)
         put(e, 0xB9400000u | ((CPU_cycle / 4) << 10) | (1u << 5) | H_CYC);   // ldr w15, [x1, #cycle]
+    if (sba_jit) {
+        // x30 = the shadow window (kernel/sba.h) for as long as native code runs
+        int off = (int) offsetof(struct tlb, sba_base) - (int) offsetof(struct tlb, entries);
+        put(e, 0xF8400000u | ((uint32_t) (off & 0x1ff) << 12) | (2u << 5) | SBA_REG);   // ldur x30, [x2, #sba_base]
+    }
 }
 
 // loop block: promoted registers <-> canonical pinned state
@@ -695,7 +707,11 @@ static uint32_t remap(struct em *e, uint32_t x, int kd, int kn, int km, int ka, 
 
 // Inline TLB lookup for guest address in T_A (bytes = access size); leaves
 // the host address in T_A. Branches to the unit's stub on a miss or crossing.
-static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) {
+static void patch_here(struct em *e, unsigned at);
+
+// Inline TLB lookup for guest address in T_A (bytes = access size); leaves
+// the host address in T_A. Branches to the unit's stub on a miss or crossing.
+static void tlb_lookup_inline(struct em *e, unsigned bytes, bool write, unsigned spos) {
     e->hflags = false;   // the checks below use cmp
     uint8_t role = set_role(e, ROLE_TLB);
     put(e, 0x9240BC00u | (T_A << 5) | T_A);                    // and x9, x9, #0xffffffffffff
@@ -719,6 +735,50 @@ static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) 
     put(e, 0xF9400000u | ((offsetof(struct tlb_entry, data_minus_addr) / 8) << 10) | (T_I << 5) | T_E);  // ldr x11, [x10, #dma]
     put(e, 0x8B000000u | (T_A << 16) | (T_E << 5) | T_A);      // add x9, x11, x9
     set_role(e, role);
+}
+
+// Guest address in T_A -> host address in T_A.
+// With the shadow window (kernel/sba.h): below SBA_SPAN, a page the map
+// allows, accessed without crossing into the next one, is at x30 + address,
+// which is all the address waits for; the map byte is at x30 - map + page and the
+// checks are predicted branches. Anything else takes the TLB lookup, out of
+// line (finish_native()), which comes back here.
+static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) {
+    if (!sba_jit || e->noop == sizeof(e->oop) / sizeof(e->oop[0])) {
+        tlb_lookup_inline(e, bytes, write, spos);
+        return;
+    }
+    e->hflags = false;   // subs / cmp below
+    uint8_t role = set_role(e, ROLE_SBA);
+    unsigned k = e->noop++, nat = 0;
+    put(e, 0xD34CFD2Au);                                    // lsr x10, x9, #12
+    put(e, 0xF140014Au | (uint32_t) (SBA_MAP_ENTRIES >> 12) << 10);   // subs x10, x10, #entries, lsl #12 (page - map size)
+    e->oop[k].at[nat++] = e->n; put(e, 0x54000005u);        // b.pl slow (not in the window)
+    put(e, 0x386A6BCAu);                                    // ldrb w10, [x30, x10]
+    e->oop[k].at[nat++] = e->n; put(e, 0x3600000Au | (write ? 1u << 19 : 0));   // tbz w10, #(SBA_R or SBA_W), slow
+    if (bytes > 1) {
+        put(e, 0x92402D28u);                                // and x8, x9, #0xfff
+        put(e, 0xF100011Fu | ((0x1000 - bytes) << 10));     // cmp x8, #(0x1000 - bytes)
+        e->oop[k].at[nat++] = e->n; put(e, 0x54000008u);    // b.hi slow (crosses into the next page)
+    }
+    e->oop[k].nat = nat;
+    put(e, 0x8B0903C9u);                                    // add x9, x30, x9
+    e->oop[k].back = e->n;
+    e->oop[k].spos = spos;
+    e->oop[k].bytes = (uint8_t) bytes;
+    e->oop[k].write = write;
+    set_role(e, role);
+}
+
+// The TLB lookups the window accesses fall back to (tlb_lookup()).
+static void emit_window_slow_paths(struct em *e) {
+    for (unsigned k = 0; k < e->noop && !e->fail; k++) {
+        for (unsigned i = 0; i < e->oop[k].nat; i++)
+            patch_here(e, e->oop[k].at[i]);
+        tlb_lookup_inline(e, e->oop[k].bytes, e->oop[k].write, e->oop[k].spos);
+        put(e, ENC_B(4 * ((int64_t) e->oop[k].back - (int64_t) e->n)));   // b back
+    }
+    e->noop = 0;
 }
 
 // Load/store translation. Returns false if the form is unsupported.
@@ -1237,6 +1297,8 @@ static struct rec_seg *record_segment(const struct em *e) {
 // Resolve stub branches and append stubs: x28 = &code[spos + 1]; b code[spos].
 // Returns the installed code, NULL if the segment could not be installed.
 static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t orig_first, unsigned first_pos) {
+    e->cur_role = ROLE_TLB;
+    emit_window_slow_paths(e);
     // one stub per distinct stream position
     unsigned stub_pos[256], stub_at[256], ns = 0;
     for (unsigned i = 0; i < e->nfix; i++) {
@@ -1995,6 +2057,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
     e->n = 0;
     e->nfix = 0;
     e->nrel = 0;
+    e->noop = 0;
     e->link_at[0] = e->link_at[1] = -1;
     e->fail = false;
     e->hflags = false;
@@ -2025,7 +2088,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
     while (ui < U->n) {
         const struct jit_unit *u = &U->u[ui];
         if (u->last) {
-            unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel;
+            unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel, noop0 = e->noop;
             uint8_t npool0 = e->npool, victim0 = e->victim;
             bool hf0 = e->hflags;
             int8_t host0[33], owner0[32];
@@ -2040,7 +2103,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
                 ended = true;
             } else {
                 e->link_at[0] = e->link_at[1] = -1;   // only the block end sets them
-                e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->npool = npool0; e->fail = false; e->hflags = hf0;
+                e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->noop = noop0; e->npool = npool0; e->fail = false; e->hflags = hf0;
                 e->victim = victim0;
                 memcpy(e->host, host0, sizeof(host0));
                 memcpy(e->owner, owner0, sizeof(owner0));
@@ -2050,7 +2113,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
         if (!u->follow && (u->n == 0 || u->start == u->end))
             break;
         // snapshot for rollback
-        unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel;
+        unsigned n0 = e->n, nfix0 = e->nfix, nrel0 = e->nrel, noop0 = e->noop;
         uint8_t npool0 = e->npool, victim0 = e->victim;
         bool hf0 = e->hflags;
         int8_t host0[33], owner0[32];
@@ -2068,7 +2131,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
                 atomic_fetch_add_explicit(&st_unsupported_insns, 1, memory_order_relaxed);
         }
         if (!ok) {
-            e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->npool = npool0; e->fail = false; e->hflags = hf0;
+            e->n = n0; e->nfix = nfix0; e->nrel = nrel0; e->noop = noop0; e->npool = npool0; e->fail = false; e->hflags = hf0;
             e->victim = victim0;
             memcpy(e->host, host0, sizeof(host0));
             memcpy(e->owner, owner0, sizeof(owner0));
@@ -2433,6 +2496,7 @@ void ish_aot_register(const struct aot_module *m) {
 static uint32_t jit_abi(void) {
     const uint64_t v[] = {
         JIT_CODE_VERSION, (uint64_t) prologue_words, entry_off(), (uint64_t) n_pinned, CTX_BLK, CTX_SLOT, CTX_FAR,
+        (uint64_t) sba_jit, offsetof(struct tlb, sba_base),
         FIBER_BLOCK_code, FIBER_BLOCK_addr, offsetof(struct fiber_block, native_entry),
         offsetof(struct fiber_block, jit_ctx),
         CPU_pc, CPU_cycle, CPU_poked_ptr, CPU_tls_ptr, offsetof(struct cpu_state, sp),
@@ -3580,6 +3644,8 @@ void jit_report(void) {
             fprintf(stderr, "❌ JIT: the %u MB code region filled up: %s misses what ran after that\n",
                     REGION_SIZE >> 20, rec_file);
     }
+    if (sba_jit && getenv("ISH_SBA_STATS"))
+        sba_stats();
     if (!getenv("ISH_JIT_STATS"))
         return;
     fprintf(stderr,
@@ -3612,6 +3678,7 @@ static void jit_init(void) {
     loop_off = env_off("ISH_JIT_LOOP");
     simd_on = !env_off("ISH_JIT_SIMD");
     pin_on = !env_off("ISH_JIT_PIN");
+    sba_jit = sba_on() && pin_on;   // the window base lives in x30, loaded with the pinned registers
     // AOT images are PIC code, so PIC is the default once one is linked in.
     // On macOS it is the default anyway: translations are shared by every
     // process that maps the same code, so a new process (each shell command,

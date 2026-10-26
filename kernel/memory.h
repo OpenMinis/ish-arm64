@@ -52,6 +52,10 @@ struct mem {
 
     wrlock_t lock;
     lock_t cow_lock;
+
+    struct sba_region *sba;   // kernel/sba.h, NULL when off
+    bool sba_dying;           // mem_destroy(): the shadow goes as a whole
+    bool sba_keep;            // pt_map() replacing pages: the shadow holds the new ones
 };
 
 // Address space layout for ARM64 guest.
@@ -125,6 +129,8 @@ struct data {
     // Guest module id + 1 for the ARM64 JIT (asbestos/guest-arm64/jit.c), 0
     // until looked up. Not under ISH_JIT: app code sees this struct too.
     int jit_mod;
+    // The shadow region data lives in (kernel/sba.h), NULL for host memory.
+    struct sba_region *sba;
 #if LEAK_DEBUG
     int pid;
     addr_t dest;

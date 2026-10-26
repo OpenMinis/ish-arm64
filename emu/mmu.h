@@ -41,6 +41,10 @@ struct mmu {
     // (tlb_attach()); a change to the mappings marks them stale.
     lock_t tlbs_lock;
     struct list tlbs;
+    // Shadow-backed address space (kernel/sba.h), NULL when off: guest
+    // address A at sba_base + A where sba_map[A >> 14] allows it.
+    char *sba_base;
+    uint8_t *sba_map;
     // What the last changes changed: change number `gen` (mmu->changes after
     // it) touched pages [start, start + pages) -- ~0 pages: anything. A TLB
     // catching up with a few changes drops just those pages (tlb_sync()).
@@ -51,6 +55,9 @@ struct mmu {
     } log[MMU_LOG];
 #endif
 };
+#ifdef GUEST_ARM64
+void sba_populate(struct mmu *mmu, addr_t addr);
+#endif
 
 #define MEM_READ 0
 #define MEM_WRITE 1

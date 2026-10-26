@@ -19,6 +19,7 @@
 #include "kernel/task.h"
 #include "kernel/resource.h"
 #include "fs/fd.h"
+#include "kernel/sba.h"
 
 // increment the change count
 static void mem_changed(struct mem *mem);
@@ -46,6 +47,7 @@ void mem_init(struct mem *mem) {
     list_init(&mem->mmu.tlbs);
     wrlock_init(&mem->lock);
     lock_init(&mem->cow_lock);
+    sba_init(mem);
 }
 
 int pt_map_lazy(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
@@ -85,6 +87,7 @@ void mem_destroy(struct mem *mem) {
            current ? current->pid : -1, (void *) mem,
            (unsigned long long) MM_OF_MEM(mem)->seq, mem->lock.val, mem->lock.pid);
     write_wrlock(&mem->lock);
+    mem->sba_dying = true;   // no point giving pages of the shadow back one by one
     pt_unmap_always(mem, 0, MEM_PAGES);
     while (mem->reservations) {
         struct mem_reservation *r = mem->reservations;
@@ -97,6 +100,7 @@ void mem_destroy(struct mem *mem) {
     mem->mmu.asbestos = NULL;
     pt_node_free(mem->pgdir, 0);
     mem->pgdir = NULL;
+    sba_destroy(mem);
     write_wrunlock(&mem->lock);
     wrlock_destroy(&mem->lock);
 }
@@ -313,8 +317,30 @@ static page_t pt_find_hole_high(struct mem *mem, pages_t size) {
 //    pointer and V8's later deref lands on an unmapped page. Placing
 //    the heap above 4GB makes such values obviously non-canonical so
 //    V8's own null-checks catch them.
+page_t sba_find_hole(struct mem *mem, pages_t size) {
+    if (mem->sba == NULL)
+        return BAD_PAGE;
+    page_t start = (page_t) (SBA_SPAN >> PAGE_BITS) - 1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        page_t result = pt_find_hole_from(mem, size, start);
+        if (result == BAD_PAGE || result < 0x100000)
+            return BAD_PAGE;
+        struct mem_reservation *r;
+        for (r = mem->reservations; r; r = r->next)
+            if (r->start < result + size && r->start + r->pages > result)
+                break;
+        if (r == NULL)
+            return result;
+        start = r->start - 1;
+    }
+    return BAD_PAGE;
+}
+
 static page_t pt_find_hole_impl(struct mem *mem, pages_t size, bool prefer_high) {
     if (prefer_high) {
+        page_t in_window = sba_find_hole(mem, size);
+        if (in_window != BAD_PAGE)
+            return in_window;
         page_t result = pt_find_hole_high(mem, size);
         if (result != BAD_PAGE && !hole_overlaps_reservation(mem, result, size))
             return result;
@@ -375,6 +401,15 @@ static page_t pt_find_hole_impl(struct mem *mem, pages_t size, bool prefer_high)
 }
 
 page_t pt_find_hole(struct mem *mem, pages_t size) {
+    // Shadow-backed address space (kernel/sba.h): put mappings of 64KB or
+    // more on 64KB boundaries, as Linux on arm64 with 64KB pages would. An
+    // ELF is linked for that (its segments' addresses and file offsets agree
+    // modulo 64KB), so its file mappings can then be host mappings of the
+    // file, page for page, instead of copies.
+    if (mem->sba && size >= 16) {
+        page_t p = pt_find_hole_impl(mem, size + 15, /*prefer_high=*/false);
+        return p == BAD_PAGE ? p : (p + 15) & ~(page_t) 15;
+    }
     return pt_find_hole_impl(mem, size, /*prefer_high=*/false);
 }
 
@@ -583,7 +618,13 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
         return errno_map();
 
     // If this fails, the munmap in pt_unmap would probably fail.
+#ifdef GUEST_ARM64
+    assert((uintptr_t) memory % real_page_size == 0 || memory == vdso_data ||
+           (mem->sba && (char *) memory >= mem->sba->base && (char *) memory < mem->sba->base + SBA_SPAN));
+    sba_invalidate(mem, start, pages);
+#else
     assert((uintptr_t) memory % real_page_size == 0 || memory == vdso_data);
+#endif
 
     struct data *data = malloc(sizeof(struct data));
     if (data == NULL)
@@ -598,6 +639,9 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
 #endif
     };
 
+#ifdef GUEST_ARM64
+    mem->sba_keep = true;
+#endif
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) != NULL)
             pt_unmap(mem, page, 1);
@@ -608,6 +652,9 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
         pt->flags = flags;
 
     }
+#ifdef GUEST_ARM64
+    mem->sba_keep = false;
+#endif
     return 0;
 }
 
@@ -625,6 +672,7 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
         mem->mmap_hint = start + pages - 1;
 
     mem_remove_reservations(mem, start, pages);
+    sba_invalidate(mem, start, pages);
 
     for (page_t page = start; page < start + pages; mem_next_page(mem, &page)) {
         struct pt_entry *pt = mem_pt(mem, page);
@@ -649,7 +697,9 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
         mem_pt_del(mem, page);
         if (--data->refcount == 0) {
             // vdso wasn't allocated with mmap, it's just in our data segment
-            if (data->data != vdso_data) {
+            if (data->sba) {
+                sba_region_put(data->sba);   // its pages: sba_release() below
+            } else if (data->data != vdso_data) {
                 munmap(data->data, data->size);
             }
             if (data->fd != NULL) {
@@ -658,6 +708,10 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
             free(data);
         }
     }
+#ifdef GUEST_ARM64
+    if (!mem->sba_dying && !mem->sba_keep)
+        sba_release(mem, start, pages);
+#endif
     mem_changed_range(mem, start, pages);
     return 0;
 }
@@ -678,7 +732,10 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
     if (!(flags & P_READ) && !(flags & P_WRITE) && !(flags & P_EXEC))
         host_prot = PROT_NONE;
     size_t map_size = (size_t)pages * PAGE_SIZE;
-    void *memory = mmap(NULL, map_size, host_prot, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+    struct sba_region *sba = NULL;
+    void *memory = host_prot != PROT_NONE ? sba_anon(mem, start, pages, &sba) : NULL;
+    if (memory == NULL)
+        memory = mmap(NULL, map_size, host_prot, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (memory == MAP_FAILED)
         return _ENOMEM;
     if (host_prot != PROT_NONE) {
@@ -689,6 +746,12 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
                                   memory_order_relaxed);
     }
     int err = pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
+    if (sba) {
+        if (err >= 0)
+            mem_pt(mem, start)->data->sba = sba;
+        else
+            sba_region_put(sba);
+    }
 #if ANON_MMAP_LIMIT_PAGES > 0
     // [T-ish-anon-count-negative] Charge HERE, not at the call sites.
     //
@@ -867,7 +930,52 @@ _Atomic uint64_t st_wx_clears = 0;
 // need to invalidate its blocks on the first store.
 #define P_META_FLAGS (P_ANONYMOUS | P_GROWSDOWN | P_COW | P_SHARED | P_CODE)
 
+#ifdef GUEST_ARM64
+// Shadow window (kernel/sba.h): private anonymous pages that mprotect makes
+// accessible move into the shadow, contents and all. V8 reserves its heap
+// PROT_NONE -- host PROT_NONE memory, outside the shadow, since that is what
+// makes a guest access fault -- and commits it by mprotect.
+static bool sba_adoptable(struct mem *mem, struct pt_entry *e) {
+    return e != NULL && e->data->sba == NULL && e->data->fd == NULL && e->data->data != vdso_data &&
+           (e->flags & P_ANONYMOUS) && !(e->flags & (P_SHARED | P_COW)) &&
+           (e->flags & (P_READ | P_WRITE | P_EXEC));
+}
+
+static void sba_adopt(struct mem *mem, page_t start, pages_t pages) {
+    if (mem->sba == NULL)
+        return;
+    page_t end = start + pages, lim = (page_t) (SBA_SPAN >> PAGE_BITS);
+    if (end > lim)
+        end = lim;
+    page_t page = start;
+    while (page < end) {
+        struct pt_entry *e = mem_pt(mem, page);
+        if (!sba_adoptable(mem, e)) {
+            page++;
+            continue;
+        }
+        unsigned flags = e->flags;
+        page_t run = page;
+        while (page < end && (e = mem_pt(mem, page)) != NULL && sba_adoptable(mem, e) && e->flags == flags) {
+            memcpy(mem->sba->base + ((uint64_t) page << PAGE_BITS), (char *) e->data->data + e->offset, PAGE_SIZE);
+            page++;
+        }
+        pages_t n = page - run;
+        if (pt_map(mem, run, n, mem->sba->base + ((uint64_t) run << PAGE_BITS), 0, flags) < 0)
+            continue;
+        mem_pt(mem, run)->data->sba = mem->sba;
+        atomic_fetch_add(&mem->sba->refs, 1);
+#if ANON_MMAP_LIMIT_PAGES > 0
+        // pt_map took the old pages' charge back; they are still mapped
+        if (anon_page_is_charged(flags))
+            atomic_fetch_add(&anon_page_count, (long) n);
+#endif
+    }
+}
+#endif
+
 int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
+    sba_invalidate(mem, start, pages);
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) == NULL) {
             if (mem_find_reservation(mem, page) != NULL)
@@ -971,6 +1079,10 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
                 return errno_map();
         }
     }
+#ifdef GUEST_ARM64
+    if (flags & (P_READ | P_WRITE | P_EXEC))
+        sba_adopt(mem, start, pages);
+#endif
     mem_changed_range(mem, start, pages);
     return 0;
 }
@@ -979,14 +1091,34 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 #if ANON_MMAP_LIMIT_PAGES > 0
     long anon_copied = 0;
 #endif
+    struct sba_fork *sba_fork = sba_fork_begin(src, dst);
     for (page_t page = start; page < start + pages; mem_next_page(src, &page)) {
         struct pt_entry *entry = mem_pt(src, page);
         if (entry == NULL)
             continue;
-        if (pt_unmap_always(dst, page, 1) < 0)
+        if (pt_unmap_always(dst, page, 1) < 0) {
+            sba_fork_finish(sba_fork);
             return -1;
-        if (!(entry->flags & P_SHARED))
+        }
+        // Shadow memory (kernel/sba.h): the child's own copy, not shared.
+        struct data *copy = entry->flags & P_SHARED ? NULL : sba_fork_page(sba_fork, entry->data, page);
+        if (copy != NULL) {
+            copy->refcount++;
+            struct pt_entry *dst_entry = mem_pt_new(dst, page);
+            dst_entry->data = copy;
+            dst_entry->offset = entry->offset;
+            dst_entry->flags = entry->flags & ~P_CODE;
+#if ANON_MMAP_LIMIT_PAGES > 0
+            if ((entry->flags & P_ANONYMOUS) && anon_page_is_charged(entry->flags))
+                anon_copied++;
+#endif
+            continue;
+        }
+        if (!(entry->flags & P_SHARED)) {
             entry->flags |= P_COW;
+            if (entry->data->sba)
+                sba_invalidate(src, page, 1);   // a store must copy it now
+        }
         entry->data->refcount++;
         struct pt_entry *dst_entry = mem_pt_new(dst, page);
         dst_entry->data = entry->data;
@@ -1020,6 +1152,7 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
             dst->reservations = copy;
         }
     }
+    sba_fork_finish(sba_fork);
     mem_changed(src);
     mem_changed(dst);
     return 0;
@@ -1433,6 +1566,7 @@ int mmu_mark_code_page(struct mmu *mmu, page_t page) {
     unsigned old = __atomic_fetch_or(&entry->flags, P_CODE, __ATOMIC_ACQ_REL);
     if (old & P_CODE)
         return 0;
+    sba_invalidate(mem, page, 1);
     mem_changed_range(mem, page, 1);
     return 1;
 }

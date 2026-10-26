@@ -8,6 +8,7 @@
 #include "kernel/task.h"
 #include "fs/fd.h"
 #include "kernel/memory.h"
+#include "kernel/sba.h"
 #include "util/verbosetrace.h"
 #include "kernel/mm.h"
 
@@ -357,6 +358,18 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
 #endif
         if (addr != 0 && !(flags & MMAP_FIXED) && !pt_is_hole(current->mem, page, pages))
             addr = 0;
+#ifdef GUEST_ARM64
+        // Shadow window (kernel/sba.h): V8 asks for its heap pages at random
+        // 48-bit addresses (NORESERVE, never MAP_FIXED), out of the window's
+        // reach; the hint is only a hint, so they go in the window instead.
+        // Go's arena hints (no NORESERVE) stay where asked.
+        if (addr != 0 && !(flags & MMAP_FIXED) && (flags & MMAP_NORESERVE) &&
+                page >= 0x100000 && ((uint64_t) page + pages) << PAGE_BITS > SBA_SPAN) {
+            page_t in_window = sba_find_hole(current->mem, pages);
+            if (in_window != BAD_PAGE)
+                page = in_window;
+        }
+#endif
     }
     if (addr == 0) {
 #ifdef GUEST_ARM64

@@ -24,6 +24,7 @@
 #include "fs/dev.h"
 #include "fs/devices.h"
 #include "fs/real.h"
+#include "kernel/sba.h"
 #define ISH_INTERNAL
 #include "fs/fake.h"
 #include "fs/tty.h"
@@ -386,6 +387,51 @@ int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off
     int mmap_prot = PROT_READ;
     if (prot & P_WRITE) mmap_prot |= PROT_WRITE;
 
+#ifdef GUEST_ARM64
+    // Shadow-backed address space (kernel/sba.h): a private mapping lives in
+    // the shadow, where native code reaches it directly. Where the guest
+    // address and the file offset agree modulo the host page (ELF segments
+    // placed by pt_find_hole() do), the whole host pages are a host mapping
+    // of the file; the rest is read in.
+    if (!(flags & MMAP_SHARED)) {
+        struct sba_region *sba = NULL;
+        char *memory = sba_anon(mem, start, pages, &sba);
+        if (memory != NULL) {
+            struct stat st;
+            uint64_t len = (uint64_t) pages * PAGE_SIZE, file = 0;
+            if (fstat(fd->real_fd, &st) == 0 && st.st_size > offset)
+                file = (uint64_t) st.st_size - (uint64_t) offset;
+            if (file > len)
+                file = len;
+            uint64_t lo = 0, hi = 0;   // [lo, hi): mapped from the file
+            uintptr_t at = (uintptr_t) memory;
+            if (((at - (uint64_t) offset) & (real_page_size - 1)) == 0) {
+                lo = ((at + real_page_size - 1) & ~(uintptr_t) (real_page_size - 1)) - at;
+                hi = ((at + file) & ~(uintptr_t) (real_page_size - 1)) - at;
+                if (lo >= hi || mmap(memory + lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED,
+                                     fd->real_fd, offset + (off_t) lo) == MAP_FAILED)
+                    lo = hi = 0;
+            }
+            for (int part = 0; part < 2; part++) {
+                uint64_t from = part == 0 ? 0 : hi, to = part == 0 ? (lo < hi ? lo : file) : file;
+                if (part == 1 && lo >= hi)
+                    break;
+                while (from < to) {
+                    ssize_t n = pread(fd->real_fd, memory + from, to - from, offset + (off_t) from);
+                    if (n <= 0)
+                        break;
+                    from += n;
+                }
+            }
+            int err = pt_map(mem, start, pages, memory, 0, prot);
+            if (err >= 0)
+                mem_pt(mem, start)->data->sba = sba;
+            else
+                sba_region_put(sba);
+            return err;
+        }
+    }
+#endif
     off_t real_offset = (offset / real_page_size) * real_page_size;
     off_t correction = offset - real_offset;
     size_t map_size = (pages * PAGE_SIZE) + correction;

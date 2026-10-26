@@ -38,6 +38,11 @@ struct tlb {
     // this is basically one of the return values of tlb_handle_miss, tlb_{read,write}, and __tlb_{read,write}_cross_page
     // yes, this sucks
     addr_t segfault_addr;
+#ifdef GUEST_ARM64
+    // mmu->sba_base / sba_map, for native code (kernel/sba.h)
+    char *sba_base;
+    uint8_t *sba_map;
+#endif
 
     struct tlb_entry entries[TLB_SIZE];
 

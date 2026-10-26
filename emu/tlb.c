@@ -24,6 +24,10 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
         }
     }
     tlb->mmu = mmu;
+#ifdef GUEST_ARM64
+    tlb->sba_base = mmu->sba_base;
+    tlb->sba_map = mmu->sba_map;
+#endif
     tlb->dirty_page = TLB_PAGE_EMPTY;
     tlb->mem_changes = mmu->changes;
     tlb_flush(tlb);
@@ -180,6 +184,10 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
         tlb->segfault_addr = addr;
         return NULL;
     }
+#ifdef GUEST_ARM64
+    if (tlb->sba_map)
+        sba_populate(tlb->mmu, addr);
+#endif
 
     tlb->dirty_page = TLB_PAGE(addr);
 
