@@ -259,6 +259,7 @@ static void *task_thread(void *vtask) {
     sigaddset(&wake, SIGUSR1);
     pthread_sigmask(SIG_UNBLOCK, &wake, NULL);
     update_thread_name();
+    { extern void pmu_thread_init(void); pmu_thread_init(); }
     task_run_current();
     die("task_thread returned"); // above function call should never return
 }

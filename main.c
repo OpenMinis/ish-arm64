@@ -465,6 +465,7 @@ int main(int argc, char *const argv[]) {
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
+    { extern void pmu_start(void); pmu_start(); }
     char envp[512] = {0};
     size_t p = 0;
     if (getenv("TERM")) {

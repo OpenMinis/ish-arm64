@@ -197,7 +197,7 @@ static inline bool fits(int64_t v, int bits) { return v >= -(1LL << (bits - 1)) 
 #define NOP 0xD503201Fu
 
 static void jit_segment_installed(struct fiber_block *b, const struct jit_units *U, unsigned first,
-                                  unsigned end, const uint8_t *code, unsigned words);
+                                  unsigned end, const uint8_t *code, unsigned words, const uint8_t *roles);
 
 // ================================================================ native
 
@@ -265,6 +265,9 @@ struct em {
     uint64_t base;         // PIC: guest address the module's constants are relative to
     uint32_t buf[8192];
     unsigned n;
+    // What each word is for (ISH_JIT_MAP writes it out for profiles): ROLE_*
+    uint8_t role[8192];
+    uint8_t cur_role;
     int8_t host[33];
     uint8_t npool;
     int8_t owner[32];      // host register -> guest register (lazy pool), -1 free
@@ -300,7 +303,24 @@ struct em {
 
 static void put(struct em *e, uint32_t x) {
     if (e->n >= sizeof(e->buf) / 4) { e->fail = true; return; }
+    e->role[e->n] = e->cur_role;
     e->buf[e->n++] = x;
+}
+
+// Word roles, for attributing profile samples (see cm_segment()).
+enum {
+    ROLE_GUEST = 'g',     // the guest instructions themselves
+    ROLE_TLB = 't',       // inline TLB lookup of a load / store
+    ROLE_SBA = 's',       // shadow window check before it (kernel/sba.h)
+    ROLE_REG = 'r',       // loads and write-backs of unpinned guest registers
+    ROLE_ENTRY = 'p',     // cold-entry prologue
+    ROLE_END = 'd',       // block end: chaining, ret / br dispatch, cycle count
+    ROLE_SLOW = 'x',      // bail-out stubs back to the gadgets
+};
+static uint8_t set_role(struct em *e, uint8_t r) {
+    uint8_t old = e->cur_role;
+    e->cur_role = r;
+    return old;
 }
 
 static unsigned greg_off(int g) {
@@ -339,14 +359,18 @@ static int hreg(struct em *e, int g) {
     e->host[g] = (int8_t) h;
     e->owner[h] = (int8_t) g;
     e->locked |= 1u << h;
+    uint8_t r = set_role(e, ROLE_REG);
     put(e, 0xF9400000u | ((greg_off(g) / 8) << 10) | (1u << 5) | (uint32_t) h);  // ldr xh, [x1, #off]
+    set_role(e, r);
     return h;
 }
 
 static void writeback(struct em *e, int g) {
     if (e->pin[g] >= 0)
         return;   // pinned: stored at exits
+    uint8_t r = set_role(e, ROLE_REG);
     put(e, 0xF9000000u | ((greg_off(g) / 8) << 10) | (1u << 5) | (uint32_t) e->host[g]);  // str xh, [x1, #off]
+    set_role(e, r);
 }
 
 static void load_pinned(struct em *e) {
@@ -673,6 +697,7 @@ static uint32_t remap(struct em *e, uint32_t x, int kd, int kn, int km, int ka, 
 // the host address in T_A. Branches to the unit's stub on a miss or crossing.
 static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) {
     e->hflags = false;   // the checks below use cmp
+    uint8_t role = set_role(e, ROLE_TLB);
     put(e, 0x9240BC00u | (T_A << 5) | T_A);                    // and x9, x9, #0xffffffffffff
     put(e, 0xD34C6000u | (T_A << 5) | T_I);                    // ubfx x10, x9, #12, #13
     put(e, 0xCA400000u | (T_A << 16) | (25u << 10) | (T_I << 5) | T_I);  // eor x10, x10, x9, lsr #25
@@ -693,6 +718,7 @@ static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) 
     branch_stub(e, spos, 2);                                   // b.hi stub
     put(e, 0xF9400000u | ((offsetof(struct tlb_entry, data_minus_addr) / 8) << 10) | (T_I << 5) | T_E);  // ldr x11, [x10, #dma]
     put(e, 0x8B000000u | (T_A << 16) | (T_E << 5) | T_A);      // add x9, x11, x9
+    set_role(e, role);
 }
 
 // Load/store translation. Returns false if the form is unsupported.
@@ -1223,6 +1249,7 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
             stub_pos[ns++] = e->fix[i].spos;
         }
     }
+    e->cur_role = ROLE_SLOW;
     for (unsigned s = 0; s < ns; s++) {
         stub_at[s] = e->n;
         if (e->loop) emit_canon(e);
@@ -1976,6 +2003,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
     unsigned covered = 0, real = 0;   // real: units that emitted code
     bool ended = false;
     e->b = b;
+    e->cur_role = ROLE_ENTRY;
     // Cold entry: load pinned; hot entry = +prologue_words. PIC: x9 = &code[0]
     // from x28 (= &code[first + 1] here) first, and the cross-module entry --
     // the last prologue word -- loads x29 from the block.
@@ -1993,6 +2021,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
         emit_promote(e);
         e->loop_head = (int) e->n;
     }
+    e->cur_role = ROLE_GUEST;
     while (ui < U->n) {
         const struct jit_unit *u = &U->u[ui];
         if (u->last) {
@@ -2003,6 +2032,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
             memcpy(host0, e->host, sizeof(host0));
             memcpy(owner0, e->owner, sizeof(owner0));
             e->body_end = (int) e->n;
+            e->cur_role = ROLE_END;
             if (emit_block_end(e, b, u) && !e->fail) {
                 covered++;
                 real++;
@@ -2049,6 +2079,7 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
             real++;
         ui++;
     }
+    e->cur_role = ROLE_END;
     *ended_out = ended;
     *covered_out = covered;
     *real_out = real;
@@ -2139,7 +2170,7 @@ static void jit_native(struct fiber_block *b, const struct jit_units *U, struct 
             e->last_rec = NULL;
             uint8_t *code = e->fail ? NULL : finish_native(e, b, orig_first, U->u[first].start);
             if (code) {
-                jit_segment_installed(b, U, first, ui, code, e->n);
+                jit_segment_installed(b, U, first, ui, code, e->n, e->role);
                 if (e->ninst < sizeof(e->inst) / sizeof(e->inst[0])) {
                     e->inst[e->ninst].pos = U->u[first].start;
                     e->inst[e->ninst].code = code;
@@ -3063,7 +3094,7 @@ struct cm_module {
     uint8_t id[20], id_len;      // NT_GNU_BUILD_ID, id_len 0 if none
     uint64_t blocks, units, segments, bytes;
 };
-struct cm_segment { uint64_t code, off, pc; uint32_t words, units, insn; int mod; };
+struct cm_segment { uint64_t code, off, pc; uint32_t words, units, insn; int mod; char *roles; };
 static bool cm_on;
 static pthread_mutex_t cm_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct cm_module *cm_mods;
@@ -3405,7 +3436,12 @@ static void cm_block(struct fiber_block *b) {
 }
 
 static void cm_segment(const struct jit_units *U, unsigned first, unsigned end,
-                       const uint8_t *code, unsigned words) {
+                       const uint8_t *code, unsigned words, const uint8_t *roles) {
+    char *r = malloc(words + 1);
+    if (r) {
+        memcpy(r, roles, words);
+        r[words] = 0;
+    }
     pthread_mutex_lock(&cm_lock);
     uint64_t off;
     int mod = cm_locate(U->u[first].pc, &off, NULL);
@@ -3425,7 +3461,7 @@ static void cm_segment(const struct jit_units *U, unsigned first, unsigned end,
         cm_capsegs = cap;
     }
     cm_segs[cm_nsegs++] = (struct cm_segment) {
-        (uint64_t) (uintptr_t) code, off, U->u[first].pc, words, end - first, U->u[first].w[0], mod};
+        (uint64_t) (uintptr_t) code, off, U->u[first].pc, words, end - first, U->u[first].w[0], mod, r};
     pthread_mutex_unlock(&cm_lock);
 }
 
@@ -3442,6 +3478,9 @@ static void cm_write(const char *path) {
         fprintf(f, "S %llx %u %d %llx %llx %u %08x\n", (unsigned long long) cm_segs[i].code, cm_segs[i].words,
                 cm_segs[i].mod, (unsigned long long) cm_segs[i].off, (unsigned long long) cm_segs[i].pc,
                 cm_segs[i].units, cm_segs[i].insn);
+    for (size_t i = 0; i < cm_nsegs; i++)
+        if (cm_segs[i].roles)
+            fprintf(f, "R %llx %s\n", (unsigned long long) cm_segs[i].code, cm_segs[i].roles);
     pthread_mutex_unlock(&cm_lock);
     fclose(f);
 }
@@ -3685,10 +3724,10 @@ void jit_block(struct fiber_block *b, struct jit_units *U) {
 // code (words instructions, stubs included). This is where a recording mode
 // hooks in to capture translations.
 static void jit_segment_installed(struct fiber_block *b, const struct jit_units *U, unsigned first,
-                                  unsigned end, const uint8_t *code, unsigned words) {
+                                  unsigned end, const uint8_t *code, unsigned words, const uint8_t *roles) {
     (void) b;
     atomic_fetch_add_explicit(&st_segments, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&st_units, end - first, memory_order_relaxed);
     if (cm_on)
-        cm_segment(U, first, end, code, words);
+        cm_segment(U, first, end, code, words, roles);
 }
