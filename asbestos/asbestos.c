@@ -1250,6 +1250,18 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 }
             }
         }
+#if ISH_MAC_OPT
+        // Leave the loop, and so let go of mem->lock (task_run_current() takes
+        // it for reading around this whole loop), while a writer waits for it:
+        // mmap, munmap, mprotect, the stack of a new thread. Native code comes
+        // back here when its cycle count wraps, but leaves it at a multiple of
+        // 1024 that the increment below steps past, so a thread spinning in a
+        // native loop never left and another thread's pthread_create waited
+        // until it finished: CoreMark's 4 threads ran two at a time.
+        if (interrupt == INT_NONE &&
+                atomic_load_explicit(&container_of(tlb->mmu, struct mem, mmu)->lock.writers, memory_order_relaxed))
+            interrupt = INT_TIMER;
+#endif
         if (interrupt == INT_NONE && (++frame->cpu.cycle & ((1 << 10) - 1)) == 0) {
             interrupt = INT_TIMER;
             {
