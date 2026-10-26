@@ -321,8 +321,9 @@ struct em {
     // Shadow window accesses (tlb_lookup()): the TLB lookup each falls back
     // to, emitted after the body (finish_native()) and branching back.
     // own: the slow path does the access itself (acc, on x9) and goes back
-    // past the folded one; chk: the register the checks looked at
-    struct { unsigned at[3], back, spos; uint8_t nat, bytes; bool write, own; int8_t chk; uint32_t acc; } oop[512];
+    // past the folded one; chk: the register the checks looked at; flags:
+    // NZCV held the guest flags there, which the slow path's compare clobbers
+    struct { unsigned at[3], back, spos; uint8_t nat, bytes; bool write, own, flags; int8_t chk; uint32_t acc; } oop[512];
     unsigned noop;
 #endif
     bool fail;
@@ -823,6 +824,7 @@ static unsigned window_check(struct em *e, int ra, unsigned bytes, bool write, u
     e->oop[k].bytes = (uint8_t) bytes;
     e->oop[k].write = write;
     e->oop[k].own = false;
+    e->oop[k].flags = e->hflags;
     e->oop[k].chk = (int8_t) ra;
     set_role(e, role);
     return k;
@@ -848,6 +850,10 @@ static void emit_window_slow_paths(struct em *e) {
         if (e->oop[k].chk != T_A)
             put(e, 0xAA0003E0u | (uint32_t) e->oop[k].chk << 16 | T_A);   // mov x9, xa
         tlb_lookup_inline(e, e->oop[k].bytes, e->oop[k].write, e->oop[k].spos);
+        // The checks leave the flags alone, so the code after the access may
+        // still read them from NZCV; cpu_state has them (store_flags()).
+        if (e->oop[k].flags)
+            load_flags(e);
         if (e->oop[k].own)
             put(e, e->oop[k].acc);                                          // the access, on x9
         put(e, ENC_B(4 * ((int64_t) e->oop[k].back - (int64_t) e->n)));   // b back
@@ -2783,7 +2789,7 @@ void ish_aot_register(const struct aot_module *m) {
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
 #if ISH_MAC_OPT
-#define JIT_CODE_VERSION 12
+#define JIT_CODE_VERSION 13
 #else
 #define JIT_CODE_VERSION 10
 #endif

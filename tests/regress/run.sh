@@ -278,6 +278,25 @@ else
 fi
 rm -f "$starve_bin"
 
+# A compare, a load that takes the JIT's slow path, then a flag read: the
+# flags must come through the slow path's own compare. iSH exits 0 whatever
+# the guest does, so the verdict is read from what the test prints.
+echo
+echo "########## flags across a load's slow path ##########"
+flags_bin=$(mktemp -t regress_flags_slow_path)
+if "$CC_GUEST" -static -O1 -Wall -o "$flags_bin" tests/regress/regress_flags_slow_path.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_flags_slow_path status=none < "$flags_bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_flags_slow_path; then
+    out=$("$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_flags_slow_path)
+    echo "$out"
+    case "$out" in ok*) echo "PASS: flags survive the slow path" ;; *) echo "FAIL: flags across the slow path"; status=1 ;; esac
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_flags_slow_path
+else
+    echo "failed to build or stage regress_flags_slow_path" >&2
+    status=1
+fi
+rm -f "$flags_bin"
+
 # UDP multicast over the loopback: joining and leaving groups, IP_PKTINFO
 # and IPV6_PKTINFO, a shared port, SO_BINDTODEVICE. iSH exits 0 whatever the
 # guest does, so the verdict is read from what the test prints.
