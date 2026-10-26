@@ -320,7 +320,9 @@ struct em {
 #if ISH_MAC_OPT
     // Shadow window accesses (tlb_lookup()): the TLB lookup each falls back
     // to, emitted after the body (finish_native()) and branching back.
-    struct { unsigned at[3], back, spos; uint8_t nat, bytes; bool write; } oop[512];
+    // own: the slow path does the access itself (acc, on x9) and goes back
+    // past the folded one; chk: the register the checks looked at
+    struct { unsigned at[3], back, spos; uint8_t nat, bytes; bool write, own; int8_t chk; uint32_t acc; } oop[512];
     unsigned noop;
 #endif
     bool fail;
@@ -800,31 +802,42 @@ static void TLB_LOOKUP_INLINE(struct em *e, unsigned bytes, bool write, unsigned
 // which is all the address waits for; the map byte is at x30 - map + page and the
 // checks are predicted branches. Anything else takes the TLB lookup, out of
 // line (finish_native()), which comes back here.
+// The window checks of guest address register ra (no flags touched); returns
+// the slow path's oop entry.
+static unsigned window_check(struct em *e, int ra, unsigned bytes, bool write, unsigned spos) {
+    uint8_t role = set_role(e, ROLE_SBA);
+    unsigned k = e->noop++, nat = 0;
+    put(e, 0xD340FC0Au | (uint32_t) ra << 5 | 12u << 16);  // lsr x10, xa, #12
+    put(e, 0xD140014Au | (uint32_t) (SBA_MAP_ENTRIES >> 12) << 10);   // sub x10, x10, #entries, lsl #12 (page - map size)
+    e->oop[k].at[nat++] = e->n; put(e, 0xB6F8000Au);        // tbz x10, #63, slow (not below it: not in the window)
+    put(e, 0x386A6BCAu);                                    // ldrb w10, [x30, x10]
+    e->oop[k].at[nat++] = e->n; put(e, 0x3600000Au | (write ? 1u << 19 : 0));   // tbz w10, #(SBA_R or SBA_W), slow
+    if (bytes > 1) {
+        // the last byte in the next page: bit 12 differs (bytes <= 16)
+        put(e, 0x91000008u | (bytes - 1) << 10 | (uint32_t) ra << 5);   // add x8, xa, #(bytes - 1)
+        put(e, 0xCA000108u | (uint32_t) ra << 16);          // eor x8, x8, xa
+        e->oop[k].at[nat++] = e->n; put(e, 0x37600008u);    // tbnz x8, #12, slow (crosses into the next page)
+    }
+    e->oop[k].nat = nat;
+    e->oop[k].spos = spos;
+    e->oop[k].bytes = (uint8_t) bytes;
+    e->oop[k].write = write;
+    e->oop[k].own = false;
+    e->oop[k].chk = (int8_t) ra;
+    set_role(e, role);
+    return k;
+}
+
 static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) {
     if (!sba_jit || e->noop == sizeof(e->oop) / sizeof(e->oop[0])) {
         tlb_lookup_inline(e, bytes, write, spos);
         return;
     }
-    e->hflags = false;   // subs / cmp below
+    unsigned k = window_check(e, T_A, bytes, write, spos);
     uint8_t role = set_role(e, ROLE_SBA);
-    unsigned k = e->noop++, nat = 0;
-    put(e, 0xD34CFD2Au);                                    // lsr x10, x9, #12
-    put(e, 0xF140014Au | (uint32_t) (SBA_MAP_ENTRIES >> 12) << 10);   // subs x10, x10, #entries, lsl #12 (page - map size)
-    e->oop[k].at[nat++] = e->n; put(e, 0x54000005u);        // b.pl slow (not in the window)
-    put(e, 0x386A6BCAu);                                    // ldrb w10, [x30, x10]
-    e->oop[k].at[nat++] = e->n; put(e, 0x3600000Au | (write ? 1u << 19 : 0));   // tbz w10, #(SBA_R or SBA_W), slow
-    if (bytes > 1) {
-        put(e, 0x92402D28u);                                // and x8, x9, #0xfff
-        put(e, 0xF100011Fu | ((0x1000 - bytes) << 10));     // cmp x8, #(0x1000 - bytes)
-        e->oop[k].at[nat++] = e->n; put(e, 0x54000008u);    // b.hi slow (crosses into the next page)
-    }
-    e->oop[k].nat = nat;
     put(e, 0x8B0903C9u);                                    // add x9, x30, x9
-    e->oop[k].back = e->n;
-    e->oop[k].spos = spos;
-    e->oop[k].bytes = (uint8_t) bytes;
-    e->oop[k].write = write;
     set_role(e, role);
+    e->oop[k].back = e->n;
 }
 
 // The TLB lookups the window accesses fall back to (tlb_lookup()).
@@ -832,7 +845,11 @@ static void emit_window_slow_paths(struct em *e) {
     for (unsigned k = 0; k < e->noop && !e->fail; k++) {
         for (unsigned i = 0; i < e->oop[k].nat; i++)
             patch_here(e, e->oop[k].at[i]);
+        if (e->oop[k].chk != T_A)
+            put(e, 0xAA0003E0u | (uint32_t) e->oop[k].chk << 16 | T_A);   // mov x9, xa
         tlb_lookup_inline(e, e->oop[k].bytes, e->oop[k].write, e->oop[k].spos);
+        if (e->oop[k].own)
+            put(e, e->oop[k].acc);                                          // the access, on x9
         put(e, ENC_B(4 * ((int64_t) e->oop[k].back - (int64_t) e->n)));   // b back
     }
     e->noop = 0;
@@ -1106,7 +1123,147 @@ static bool emit_ldst_fp(struct em *e, uint32_t x, unsigned spos) {
     return true;
 }
 
+#if ISH_MAC_OPT
+// x9 = xn + imm (|imm| < 4096)
+static void add_x9(struct em *e, int hn, int64_t imm) {
+    if (imm >= 0) put(e, 0x91000000u | ((uint32_t) imm << 10) | ((uint32_t) hn << 5) | T_A);   // add x9, xn, #imm
+    else put(e, 0xD1000000u | ((uint32_t) -imm << 10) | ((uint32_t) hn << 5) | T_A);          // sub x9, xn, #-imm
+}
+
+// Shadow window loads and stores with the window base folded into the host
+// access (sba_jit): the checks look at the guest address - the base register
+// itself when nothing is added to it - while the access adds x30 in its own
+// addressing mode, [x30, xn] or [x11, xn] with x11 = x30 + offset, which does
+// not wait for the base. The address then takes no more steps to the load
+// than on the guest (it took two adds before), which is what loops chasing
+// pointers wait for. The slow path does the access on the TLB's host address
+// and comes back past it. Forms it does not take go to emit_ldst()'s own.
+static bool emit_ldst_window(struct em *e, uint32_t x, unsigned spos) {
+    if (!sba_jit || e->noop == sizeof(e->oop) / sizeof(e->oop[0]))
+        return false;
+    bool fp = x & (1u << 26);
+    if (fp && !simd_on)
+        return false;
+    if ((x & 0x3A000000u) == 0x28000000u) {                                   // pair
+        unsigned opc = x >> 30, L = (x >> 22) & 1, idx = (x >> 23) & 3;
+        int rt = x & 31, rt2 = (x >> 10) & 31, rn = (x >> 5) & 31;
+        unsigned scale;
+        if (fp) {
+            if (opc == 3 || idx == 0) return false;
+            scale = 2 + opc;
+        } else {
+            if (opc == 3 || (opc == 1 && !L) || idx == 0) return false;
+            scale = opc == 2 ? 3 : 2;
+            if ((idx == 1 || idx == 3) && ((rn == rt && rt != 31) || (rn == rt2 && rt2 != 31))) return false;
+            if (L && rt == rt2) return false;
+        }
+        int64_t imm = sext((x >> 15) & 0x7f, 7) << scale;
+        if (imm < -4095 || imm > 4095) return false;
+        int gn = rn == 31 ? G_SP : rn;
+        int hn = hreg(e, gn);
+        int ht = 0, ht2 = 0;
+        if (fp) {
+            if (!L) { vload(e, V_N, rt); vload(e, V_M, rt2); }
+            ht = V_N; ht2 = V_M;
+        } else {
+            ht = rt == 31 ? 31 : hreg(e, rt);
+            ht2 = rt2 == 31 ? 31 : hreg(e, rt2);
+        }
+        int64_t at = idx == 1 ? 0 : imm;   // post-index: the access is at xn
+        int ra = hn;
+        if (at) { add_x9(e, hn, at); ra = T_A; }
+        unsigned k = window_check(e, ra, 2u << scale, !L, spos);
+        uint32_t base = (x & 0xC0400000u) | (fp ? 0x2D000000u : 0x29000000u) | ((uint32_t) ht2 << 10) | (uint32_t) ht;
+        put(e, 0x8B0003CBu | (uint32_t) hn << 16);                                 // add x11, x30, xn
+        put(e, base | ((uint32_t) (at >> scale) & 0x7f) << 15 | (T_E << 5));       // ldp/stp t, t2, [x11, #at]
+        e->oop[k].own = true;
+        e->oop[k].acc = base | (T_A << 5);                                         // ldp/stp t, t2, [x9]
+        e->oop[k].back = e->n;
+        if (fp && L) { vstore(e, V_N, rt); vstore(e, V_M, rt2); }
+        if (!fp && L) {
+            if (rt != 31) writeback(e, rt);
+            if (rt2 != 31) writeback(e, rt2);
+        }
+        if (idx == 1 || idx == 3) ldst_wb(e, gn, hn, imm);
+        return true;
+    }
+    unsigned size = x >> 30, opc = (x >> 22) & 3;
+    int rt = x & 31, rn = (x >> 5) & 31;
+    unsigned scale;
+    if (fp) {
+        bool q = opc >= 2;
+        if (q && size) return false;
+        scale = q ? 4 : size;
+    } else {
+        if ((opc == 3 && size >= 2) || (size == 3 && opc == 2)) return false;   // prfm and the rest: emit_ldst()
+        scale = size;
+    }
+    bool load = fp ? (opc & 1) : opc != 0;
+    int64_t imm = 0;
+    int wbmode = 0;   // 0 none, 1 post, 2 pre
+    bool regoff = false;
+    if ((x & 0x3B000000u) == 0x39000000u) {                       // unsigned offset
+        imm = (int64_t) ((x >> 10) & 0xfff) << scale;
+        if (imm > 4095) return false;
+    } else if ((x & 0x3B200000u) == 0x38000000u) {                // imm9 forms
+        unsigned k = (x >> 10) & 3;
+        if (k == 2) return false;                                 // unprivileged
+        imm = sext((x >> 12) & 0x1ff, 9);
+        wbmode = k == 1 ? 1 : k == 3 ? 2 : 0;
+        if (!fp && wbmode && rn == rt && rt != 31) return false;
+    } else if ((x & 0x3B200C00u) == 0x38200800u) {                // register offset
+        if (!(((x >> 13) & 7) & 2)) return false;                 // 32-bit index with option<2 undefined
+        regoff = true;
+    } else {
+        return false;
+    }
+    int gn = rn == 31 ? G_SP : rn;
+    int hn = hreg(e, gn);
+    int ht;
+    if (fp) {
+        if (!load) vload(e, V_N, rt);
+        ht = V_N;
+    } else {
+        ht = rt == 31 ? 31 : hreg(e, rt);
+    }
+    // the access register-offset form: [base, index]
+    uint32_t sizeopc = x & 0xC0C00000u, vbit = fp ? 1u << 26 : 0;
+    int bse, idxr, ra;
+    if (regoff) {
+        int rm = (x >> 16) & 31;
+        int hm = rm == 31 ? 31 : hreg(e, rm);
+        unsigned option = (x >> 13) & 7, S = (x >> 12) & 1;
+        put(e, 0x8B200000u | ((uint32_t) hm << 16) | (option << 13) | ((S ? scale : 0) << 10) | ((uint32_t) hn << 5) | T_A);
+        ra = T_A; bse = SBA_REG; idxr = T_A;
+    } else {
+        int64_t at = wbmode == 1 ? 0 : imm;   // post-index: the access is at xn
+        ra = hn; bse = SBA_REG; idxr = hn;
+        if (at) {
+            add_x9(e, hn, at);
+            ra = T_A; bse = T_E;
+        }
+        if (bse == T_E) {
+            if (at >= 0) put(e, 0x91000000u | ((uint32_t) at << 10) | (SBA_REG << 5) | T_E);   // add x11, x30, #at
+            else put(e, 0xD1000000u | ((uint32_t) -at << 10) | (SBA_REG << 5) | T_E);         // sub x11, x30, #-at
+        }
+    }
+    unsigned k = window_check(e, ra, 1u << scale, !load, spos);
+    put(e, sizeopc | vbit | 0x38206800u | ((uint32_t) idxr << 16) | ((uint32_t) bse << 5) | (uint32_t) ht);   // ldr/str t, [base, index]
+    e->oop[k].own = true;
+    e->oop[k].acc = sizeopc | vbit | 0x39000000u | (T_A << 5) | (uint32_t) ht;          // ldr/str t, [x9]
+    e->oop[k].back = e->n;
+    if (fp && load) vstore(e, V_N, rt);   // the host load zeroed the rest of the register
+    if (!fp && load && rt != 31) writeback(e, rt);
+    if (wbmode) ldst_wb(e, gn, hn, imm);
+    return true;
+}
+#endif
+
 static bool emit_ldst(struct em *e, uint32_t x, unsigned spos) {
+#if ISH_MAC_OPT
+    if (emit_ldst_window(e, x, spos))
+        return true;
+#endif
     if (x & (1u << 26))
         return simd_on && emit_ldst_fp(e, x, spos);
     // --- load/store pair ---
@@ -2626,7 +2783,7 @@ void ish_aot_register(const struct aot_module *m) {
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
 #if ISH_MAC_OPT
-#define JIT_CODE_VERSION 11
+#define JIT_CODE_VERSION 12
 #else
 #define JIT_CODE_VERSION 10
 #endif
