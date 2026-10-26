@@ -3574,8 +3574,14 @@ static void jit_init(void) {
     simd_on = !env_off("ISH_JIT_SIMD");
     pin_on = !env_off("ISH_JIT_PIN");
     // AOT images are PIC code, so PIC is the default once one is linked in.
+    // On macOS it is the default anyway: translations are shared by every
+    // process that maps the same code, so a new process (each shell command,
+    // each python3) mostly finds its code translated already instead of
+    // translating it again -- 20 `python3 -c pass` take half the time -- and
+    // a long session no longer fills the code region with copies of the same
+    // libraries (60 starts: 11 instead of 120+ MB). ISH_JIT_PIC=0 turns it off.
     const char *pic = getenv("ISH_JIT_PIC");
-    pic_on = pic ? pic[0] == '1' : have_images;
+    pic_on = pic ? pic[0] == '1' : have_images || TARGET_OS_OSX;
     if (!have_region)
         pic_on = true;
     pin_init(pin_on);
