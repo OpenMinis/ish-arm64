@@ -2419,8 +2419,7 @@ atomic_cas_segfault:
 
     // Compute final address = adrp_target + imm12
     ubfx x10, x22, #8, #12      // imm12
-    add x8, x23, x10
-    and x8, x8, #0xffffffffffff
+    add x8, x23, x10            // full 64-bit result, like the hardware
 
     // Store to rd
     and x9, x22, #0x1f          // rd
