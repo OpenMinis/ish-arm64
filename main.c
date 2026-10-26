@@ -68,6 +68,10 @@ static_assert(CRASH_CPU_segfault_was_write == CPU_segfault_was_write, "cpu-offse
 static_assert(CRASH_LOCAL_jit_exit_sp      == LOCAL_jit_exit_sp,      "cpu-offsets drift: jit_exit_sp");
 
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
+#if defined(__aarch64__) && defined(GUEST_ARM64) && defined(ISH_JIT) && ISH_MAC_OPT
+    if ((sig == SIGSEGV || sig == SIGBUS) && jit_fastmem_fault(ctx))
+        return;
+#endif
 #if defined(__aarch64__) && defined(GUEST_ARM64)
     // If we're inside JIT code and got SIGSEGV/SIGBUS, recover by redirecting
     // execution to jit_crash_trampoline via ucontext PC manipulation.

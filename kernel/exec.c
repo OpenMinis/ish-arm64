@@ -274,6 +274,19 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
             current->mm->start_brk = current->mm->brk = BYTES_ROUND_UP(brk);
     }
 
+#if ISH_MAC_OPT
+    // Start the heap 12KB into a host page (16KB): musl's malloc puts a
+    // PROT_NONE page at the first brk, which then is the last page of its
+    // host page and the heap starts a host page of its own. fastmem
+    // (kernel/sba.h) protects host pages: a guard page sharing one with the
+    // heap's first pages sent every access to them the slow way. Linux
+    // places the heap at a random distance after the data anyway.
+    {
+        addr_t chunk = 16 * 1024;
+        current->mm->start_brk = current->mm->brk =
+            ((current->mm->start_brk + chunk - 1) & ~(chunk - 1)) + chunk - PAGE_SIZE;
+    }
+#endif
     addr_t entry = bias + header.entry_point;
     addr_t interp_base = 0;
 #ifdef GUEST_ARM64
@@ -324,8 +337,14 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
 #ifdef GUEST_ARM64
     // ARM64: stack near top of 48-bit address space
+#if ISH_MAC_OPT
+    if ((err = pt_map_nothing(current->mem, STACK_INIT_PAGE + 1 - STACK_INIT_PAGES, STACK_INIT_PAGES,
+                              P_WRITE | P_GROWSDOWN)) < 0)
+        goto beyond_hope;
+#else
     if ((err = pt_map_nothing(current->mem, STACK_INIT_PAGE, 1, P_WRITE | P_GROWSDOWN)) < 0)
         goto beyond_hope;
+#endif
     if ((err = pt_map_nothing(current->mem, STACK_TOP_PAGE, 1, P_READ)) < 0)
         goto beyond_hope;
     write_wrunlock(&current->mem->lock);

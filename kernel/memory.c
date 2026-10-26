@@ -425,6 +425,14 @@ page_t pt_find_hole(struct mem *mem, pages_t size) {
         page_t p = pt_find_hole_impl(mem, size + 15, /*prefer_high=*/false);
         return p == BAD_PAGE ? p : (p + 15) & ~(page_t) 15;
     }
+    // The rest on host page (16KB) boundaries: each mapping then starts a
+    // host page of its own, which fastmem protects as a whole -- a guard page
+    // or the vvar below one mapping and the start of the next in one host
+    // page sent every access to them the slow way.
+    if (mem->sba) {
+        page_t p = pt_find_hole_impl(mem, size + 3, /*prefer_high=*/false);
+        return p == BAD_PAGE ? p : (p + 3) & ~(page_t) 3;
+    }
 #endif
     return pt_find_hole_impl(mem, size, /*prefer_high=*/false);
 }
@@ -670,6 +678,12 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
     }
 #if ISH_SBA
     mem->sba_keep = false;
+    // Shadow memory: the caller says so too (with its reference to the
+    // region), but fastmem looks at it right now.
+    if (mem->sba && (char *) memory >= mem->sba->base && (char *) memory < mem->sba->base + SBA_SPAN) {
+        data->sba = mem->sba;
+        sba_open(mem, start, pages);
+    }
 #endif
     return 0;
 }
@@ -995,6 +1009,7 @@ static void sba_adopt(struct mem *mem, page_t start, pages_t pages) {
             page++;
         }
         pages_t n = page - run;
+        sba_resync_host(mem, mem->sba->base + ((uint64_t) run << PAGE_BITS), (size_t) n << PAGE_BITS);
         if (pt_map(mem, run, n, mem->sba->base + ((uint64_t) run << PAGE_BITS), 0, flags) < 0)
             continue;
         mem_pt(mem, run)->data->sba = mem->sba;
@@ -1008,9 +1023,17 @@ static void sba_adopt(struct mem *mem, page_t start, pages_t pages) {
 }
 #endif
 
-int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
 #if ISH_SBA
+static int pt_set_flags_(struct mem *mem, page_t start, pages_t pages, int flags);
+int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
     sba_invalidate(mem, start, pages);
+    int err = pt_set_flags_(mem, start, pages, flags);
+    sba_open(mem, start, pages);
+    return err;
+}
+static int pt_set_flags_(struct mem *mem, page_t start, pages_t pages, int flags) {
+#else
+int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
 #endif
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) == NULL) {
@@ -1129,6 +1152,11 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 #endif
 #if ISH_SBA
     struct sba_fork *sba_fork = sba_fork_begin(src, dst);
+    // dst is new (mm_copy()): nothing of its shadow to close or give back
+    // for the pt_unmap_always() of each page below -- a protect and an mmap
+    // per page of the parent, the most of what a fork took.
+    bool dying = dst->sba_dying;
+    dst->sba_dying = true;
 #endif
     for (page_t page = start; page < start + pages; mem_next_page(src, &page)) {
         struct pt_entry *entry = mem_pt(src, page);
@@ -1136,6 +1164,7 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
             continue;
         if (pt_unmap_always(dst, page, 1) < 0) {
 #if ISH_SBA
+            dst->sba_dying = dying;
             sba_fork_finish(sba_fork);
 #endif
             return -1;
@@ -1199,6 +1228,7 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
     }
 #if ISH_SBA
     sba_fork_finish(sba_fork);
+    dst->sba_dying = dying;
 #endif
     mem_changed(src);
     mem_changed(dst);
@@ -1386,6 +1416,17 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
             const pages_t max_grow = 256;   // pre-map window (1 MB)
             pages_t grow_end = p; // first already-mapped page
             pages_t grow_start = page;
+#if ISH_SBA
+            // A whole host page at a time (16KB): fastmem (kernel/sba.h)
+            // counts nothing below a stack as accessible, so a stack's
+            // lowest host page holds stack only.
+            if (mem->sba) {
+                page_t chunk = grow_start & ~(page_t) ((SBA_CHUNK >> PAGE_BITS) - 1);
+                while (grow_start > chunk && mem_pt(mem, grow_start - 1) == NULL &&
+                       mem_find_reservation(mem, grow_start - 1) == NULL)
+                    grow_start--;
+            }
+#endif
             if ((pages_t)(grow_end - grow_start) > max_grow)
                 grow_end = grow_start + max_grow; // keep fault page, cap upward
             pages_t grow_count = grow_end - grow_start;
@@ -1402,8 +1443,10 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
             // not fit we shrink to 1 page and let pt_map_nothing charge it
             // even if that nudges the cap — a 4KB overrun is noise, a
             // corrupted stack is not.
-            if (!anon_pages_reserve((long)grow_count))
+            if (!anon_pages_reserve((long)grow_count)) {
                 grow_count = 1;
+                grow_start = page;   // the fault page, not a page below it
+            }
 #endif
             // [T-ish-cluster-commit] A multi-page window is already one host
             // allocation shared by refcount, so it needs no clustering. Only

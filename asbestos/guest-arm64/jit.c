@@ -43,6 +43,7 @@ static bool pin_on;       // ISH_JIT_PIN=0: no guest registers pinned in host re
 static bool pic_on;       // ISH_JIT_PIC=1: position-independent code (see "PIC" below)
 #if ISH_MAC_OPT
 static bool sba_jit;      // ISH_SBA=0 turns off: memory accesses try the shadow window first (kernel/sba.h)
+static bool fastmem;      // ISH_FASTMEM=0 turns off: the window's alias faults instead of the byte map checks
 #endif
 static bool aot_only;     // ISH_JIT_AOT_ONLY=1: install AOT translations, translate nothing
                           // (what a build without the JIT would run)
@@ -325,6 +326,9 @@ struct em {
     // NZCV held the guest flags there, which the slow path's compare clobbers
     struct { unsigned at[3], back, spos; uint8_t nat, bytes; bool write, own, flags; int8_t chk; uint32_t acc; } oop[512];
     unsigned noop;
+    // fastmem: each access and where its slow path starts (fm_shadow)
+    struct { unsigned acc, slow; } fm[512];
+    unsigned nfm;
 #endif
     bool fail;
     bool hflags;   // host NZCV currently equals the guest flags
@@ -440,8 +444,9 @@ static void load_pinned(struct em *e) {
 #if ISH_MAC_OPT
     if (sba_jit) {
         // x30 = the shadow window (kernel/sba.h) for as long as native code runs
-        int off = (int) offsetof(struct tlb, sba_base) - (int) offsetof(struct tlb, entries);
-        put(e, 0xF8400000u | ((uint32_t) (off & 0x1ff) << 12) | (2u << 5) | SBA_REG);   // ldur x30, [x2, #sba_base]
+        int off = (int) (fastmem ? offsetof(struct tlb, sba_xbase) : offsetof(struct tlb, sba_base)) -
+                  (int) offsetof(struct tlb, entries);
+        put(e, 0xF8400000u | ((uint32_t) (off & 0x1ff) << 12) | (2u << 5) | SBA_REG);   // ldur x30, [x2, #sba_base or sba_xbase]
     }
 #endif
 }
@@ -808,6 +813,13 @@ static void TLB_LOOKUP_INLINE(struct em *e, unsigned bytes, bool write, unsigned
 static unsigned window_check(struct em *e, int ra, unsigned bytes, bool write, unsigned spos) {
     uint8_t role = set_role(e, ROLE_SBA);
     unsigned k = e->noop++, nat = 0;
+    if (fastmem) {
+        // Below SBA_SPAN, the alias's own protection does the rest: a page
+        // the guest may not access this way faults (jit_fastmem_fault()).
+        put(e, 0xD363FC0Au | (uint32_t) ra << 5);              // lsr x10, xa, #35
+        e->oop[k].at[nat++] = e->n; put(e, 0xB500000Au);       // cbnz x10, slow (not in the window)
+        goto done;
+    }
     put(e, 0xD340FC0Au | (uint32_t) ra << 5 | 12u << 16);  // lsr x10, xa, #12
     put(e, 0xD140014Au | (uint32_t) (SBA_MAP_ENTRIES >> 12) << 10);   // sub x10, x10, #entries, lsl #12 (page - map size)
     e->oop[k].at[nat++] = e->n; put(e, 0xB6F8000Au);        // tbz x10, #63, slow (not below it: not in the window)
@@ -819,6 +831,7 @@ static unsigned window_check(struct em *e, int ra, unsigned bytes, bool write, u
         put(e, 0xCA000108u | (uint32_t) ra << 16);          // eor x8, x8, xa
         e->oop[k].at[nat++] = e->n; put(e, 0x37600008u);    // tbnz x8, #12, slow (crosses into the next page)
     }
+done:
     e->oop[k].nat = nat;
     e->oop[k].spos = spos;
     e->oop[k].bytes = (uint8_t) bytes;
@@ -831,7 +844,8 @@ static unsigned window_check(struct em *e, int ra, unsigned bytes, bool write, u
 }
 
 static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) {
-    if (!sba_jit || e->noop == sizeof(e->oop) / sizeof(e->oop[0])) {
+    // fastmem: the alias only for the accesses emit_ldst_window() places
+    if (!sba_jit || fastmem || e->noop == sizeof(e->oop) / sizeof(e->oop[0])) {
         tlb_lookup_inline(e, bytes, write, spos);
         return;
     }
@@ -844,7 +858,12 @@ static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) 
 
 // The TLB lookups the window accesses fall back to (tlb_lookup()).
 static void emit_window_slow_paths(struct em *e) {
+    e->nfm = 0;
     for (unsigned k = 0; k < e->noop && !e->fail; k++) {
+        if (fastmem && e->oop[k].own) {
+            e->fm[e->nfm].acc = e->oop[k].back - 1;
+            e->fm[e->nfm++].slow = e->n;
+        }
         for (unsigned i = 0; i < e->oop[k].nat; i++)
             patch_here(e, e->oop[k].at[i]);
         if (e->oop[k].chk != T_A)
@@ -1517,6 +1536,52 @@ static struct rec_seg *record_segment(const struct em *e) {
 
 // Resolve stub branches and append stubs: x28 = &code[spos + 1]; b code[spos].
 // Returns the installed code, NULL if the segment could not be installed.
+#if ISH_MAC_OPT
+// fastmem: for each word of the code region, where the slow path of the access
+// there starts (word index + 1), 0 for anything else; the top bits count the
+// faults that went there (FM_COUNT). jit_fastmem_fault() looks the faulting
+// access up here.
+static uint32_t *fm_shadow;
+#define FM_IDX 0x1ffffffu      // 32M words: 128MB of code
+#define FM_COUNT (1u << 25)
+#define FM_PATCH 8             // faults sent to the slow path before the access goes there for good
+
+static void fm_record(struct em *e, uint8_t *dst) {
+    if (!fastmem || !fm_shadow)
+        return;
+    uintptr_t base = (uintptr_t) (dst - region) / 4;
+    for (unsigned i = 0; i < e->nfm; i++)
+        __atomic_store_n(&fm_shadow[base + e->fm[i].acc], (uint32_t) (base + e->fm[i].slow + 1), __ATOMIC_RELEASE);
+}
+
+bool jit_fastmem_fault(void *ucontext) {
+    ucontext_t *uc = ucontext;
+    uintptr_t pc = uc->uc_mcontext->__ss.__pc;
+    if (!fastmem || !fm_shadow || pc < (uintptr_t) region || pc >= (uintptr_t) region + REGION_SIZE)
+        return false;
+    uint32_t *sh = &fm_shadow[(pc - (uintptr_t) region) / 4];
+    uint32_t ent = __atomic_load_n(sh, __ATOMIC_ACQUIRE);
+    if (!(ent & FM_IDX))
+        return false;
+    // x2 = &tlb->entries in native code
+    struct tlb *tlb = (struct tlb *) (uc->uc_mcontext->__ss.__x[2] - offsetof(struct tlb, entries));
+    uintptr_t far = uc->uc_mcontext->__es.__far, xb = (uintptr_t) tlb->sba_xbase;
+    if (!xb || far < xb || far >= xb + SBA_SPAN + SBA_CHUNK)
+        return false;
+    bool write = (uc->uc_mcontext->__es.__esr & 0x40) != 0;
+    if (sba_fault(container_of(tlb->mmu, struct mem, mmu), far - xb, write))
+        return true;   // opened: run the access again
+    uintptr_t slow = (uintptr_t) region + 4 * (uintptr_t) ((ent & FM_IDX) - 1);
+    uint32_t n = ent / FM_COUNT + 1;
+    if (n < 127)
+        __atomic_store_n(sh, (ent & FM_IDX) | n * FM_COUNT, __ATOMIC_RELAXED);
+    if (n == FM_PATCH)   // keeps faulting (a host page the guest shares out): the slow path from now on
+        patch_insn((uint32_t *) pc, ENC_B((int64_t) slow - (int64_t) pc));
+    uc->uc_mcontext->__ss.__pc = slow;
+    return true;
+}
+#endif
+
 static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t orig_first, unsigned first_pos) {
 #if ISH_MAC_OPT
     set_role(e, ROLE_TLB);
@@ -1579,6 +1644,9 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
         e->buf[e->fix[i].at] = enc;
     }
     install_code(dst, e->buf, e->n);
+#if ISH_MAC_OPT
+    fm_record(e, dst);
+#endif
     if (e->loop) {
         b->native_loop = (uint32_t *) (dst + 4 * e->loop_head);
         loopmap_add((uintptr_t) b->native_loop, (uintptr_t) dst + 4 * e->body_end, e);
@@ -2754,6 +2822,8 @@ void jit_region_reset(void) {
     pthread_mutex_unlock(&loopmap_lock);
     region_used = region_start;
     region_full = false;
+    if (fm_shadow)
+        mmap(fm_shadow, REGION_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
     atomic_fetch_add(&region_flushes, 1);
     atomic_store_explicit(&flush_wanted, false, memory_order_release);
 }
@@ -2789,7 +2859,7 @@ void ish_aot_register(const struct aot_module *m) {
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
 #if ISH_MAC_OPT
-#define JIT_CODE_VERSION 13
+#define JIT_CODE_VERSION 14
 #else
 #define JIT_CODE_VERSION 10
 #endif
@@ -2803,7 +2873,7 @@ static uint32_t jit_abi(void) {
     const uint64_t v[] = {
         JIT_CODE_VERSION, (uint64_t) prologue_words, entry_off(), (uint64_t) n_pinned, CTX_BLK, CTX_SLOT, CTX_FAR,
 #if ISH_MAC_OPT
-        (uint64_t) sba_jit, offsetof(struct tlb, sba_base),
+        (uint64_t) sba_jit, offsetof(struct tlb, sba_base), (uint64_t) fastmem, offsetof(struct tlb, sba_xbase),
 #endif
         FIBER_BLOCK_code, FIBER_BLOCK_addr, offsetof(struct fiber_block, native_entry),
         offsetof(struct fiber_block, jit_ctx),
@@ -4011,6 +4081,14 @@ static void jit_init(void) {
     pin_on = !env_off("ISH_JIT_PIN");
 #if ISH_MAC_OPT
     sba_jit = sba_on() && pin_on;   // the window base lives in x30, loaded with the pinned registers
+    fastmem = sba_jit && have_region && !env_off("ISH_FASTMEM");
+    if (fastmem) {
+        void *sh = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        if (sh == MAP_FAILED)
+            fastmem = false;
+        else
+            fm_shadow = sh;
+    }
 #endif
     // AOT images are PIC code, so PIC is the default once one is linked in.
     // On macOS it is the default anyway: translations are shared by every

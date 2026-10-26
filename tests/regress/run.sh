@@ -297,6 +297,24 @@ else
 fi
 rm -f "$flags_bin"
 
+# Stores to PROT_NONE and read-only pages that share a 16KB host page with
+# writable ones fault, in hot code too (fastmem protects host pages).
+echo
+echo "########## page rights within a host page ##########"
+rights_bin=$(mktemp -t regress_fastmem_rights)
+if "$CC_GUEST" -static -O1 -Wall -o "$rights_bin" tests/regress/regress_fastmem_rights.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_fastmem_rights status=none < "$rights_bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_fastmem_rights; then
+    out=$("$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_fastmem_rights)
+    echo "$out"
+    case "$out" in ok*) echo "PASS: page rights within a host page" ;; *) echo "FAIL: page rights within a host page"; status=1 ;; esac
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_fastmem_rights
+else
+    echo "failed to build or stage regress_fastmem_rights" >&2
+    status=1
+fi
+rm -f "$rights_bin"
+
 # UDP multicast over the loopback: joining and leaving groups, IP_PKTINFO
 # and IPV6_PKTINFO, a shared port, SO_BINDTODEVICE. iSH exits 0 whatever the
 # guest does, so the verdict is read from what the test prints.

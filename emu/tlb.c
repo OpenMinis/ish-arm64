@@ -33,6 +33,7 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
 #if ISH_SBA
     tlb->sba_base = mmu->sba_base;
     tlb->sba_map = mmu->sba_map;
+    tlb->sba_xbase = mmu->sba_xbase;
 #endif
     tlb->dirty_page = TLB_PAGE_EMPTY;
     tlb->mem_changes = mmu->changes;

@@ -67,18 +67,30 @@ struct mem {
 // walks are shallow (L0[0]→L1[0]→L2→L3 — the first two levels are always
 // index 0 and stay hot in cache). The 48-bit infrastructure remains available
 // for explicit high-address mmap hints (e.g., V8 CodeRange).
+#if ISH_MAC_OPT
+// The guard page starts a host page (16KB) of its own and the stack ends one,
+// so the stack's top host page holds stack only: fastmem (kernel/sba.h)
+// protects host pages, and gives native code the stack's top at full speed
+// only if nothing less accessible shares its host page.
+#define STACK_TOP_PAGE    0xffffcULL        // guard page at 0xffffc000
+#define STACK_INIT_PAGE   0xffffbULL        // initial stack page (growsdown)
+#define STACK_INIT_PAGES  4                 // mapped from the start: one host page
+#define STACK_TOP_ADDR    0xffffc000ULL     // SP starts here
+#else
 #define STACK_TOP_PAGE    0xffffeULL        // guard page at 0xffffe000
 #define STACK_INIT_PAGE   0xffffdULL        // initial stack page (growsdown)
 #define STACK_TOP_ADDR    0xffffe000ULL     // SP starts here
+#endif
 // mmap search starts here. Not 0xefffd like x86: the software TLB is direct
 // mapped (TLB_INDEX), and with the stack at 0xffffd the top stack pages and
 // the top mmap pages -- the executable, ld.so and the first heap, all hot --
 // shared slots (0xffffc000 and 0xefff4000 both index 0x1f83), so a busybox
-// shell loop missed the TLB ~37 times per iteration. From 0xeff75 down, the
-// top 8000 mmap pages miss every index of the top 128 stack pages.
+// shell loop missed the TLB ~37 times per iteration. From 0xeff74 down, the
+// top 8000 mmap pages miss every index of the top 128 stack pages (below
+// 0xffffc; 0xeff75 for a stack below 0xffffe).
 // (iOS keeps the old start, see util/macopt.h.)
 #if ISH_MAC_OPT
-#define MMAP_HOLE_START   0xeff75ULL
+#define MMAP_HOLE_START   0xeff74ULL
 #else
 #define MMAP_HOLE_START   0xefffdULL        // mmap search starts here (same as x86)
 #endif

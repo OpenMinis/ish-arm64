@@ -37,6 +37,11 @@ struct mem;
 // which can outlive the address space for a moment (a racing munmap).
 struct sba_region {
     char *base;
+    // fastmem (ISH_FASTMEM=0 turns it off): the same memory again, for native
+    // code, protected as the guest pages allow, 16KB at a time. A host fault
+    // there opens the page (sba_fault()) or sends the access the slow way.
+    // NULL when off.
+    char *alias;
     _Atomic int refs;
 };
 
@@ -63,6 +68,17 @@ struct sba_fork *sba_fork_begin(struct mem *src, struct mem *dst);
 struct data *sba_fork_page(struct sba_fork *f, struct data *src_data, page_t page);
 void sba_fork_finish(struct sba_fork *f);
 void sba_stats(void);
+// fastmem: native code faulted at guest address addr (a store if write).
+// mem read-locked (the thread runs guest code). 1: the alias now allows the
+// access, run it again; 0: take the TLB path for it.
+int sba_fault(struct mem *mem, uint64_t addr, bool write);
+// fastmem: [start, start + pages) was just mapped or changed: let native code
+// at the host pages it now may use, before it faults on them. mem
+// write-locked.
+void sba_open(struct mem *mem, page_t start, pages_t pages);
+// fastmem: the host pages of [host, host + len) in the window were replaced
+// (a file mapped there): show the alias the new ones.
+void sba_resync_host(struct mem *mem, void *host, size_t len);
 // A hole of `pages` in the window above 4GB (BAD_PAGE if none): where large
 // reservations and NORESERVE mappings hinted at far addresses go (V8's heap
 // pages), instead of anywhere in the 48-bit space. mem write-locked.

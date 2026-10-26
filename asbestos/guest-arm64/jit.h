@@ -37,6 +37,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "asbestos/gen.h"
+#include "util/macopt.h"
 
 #define JIT_MAX_UNITS 1100
 
@@ -111,6 +112,11 @@ void jit_module_path(int mod, char *buf, size_t size);
 
 // Host fault in native code: sync pinned guest registers into cpu_state.
 bool jit_crash_sync(void *ucontext);
+#if ISH_MAC_OPT
+// fastmem (kernel/sba.h): a host fault of native code in the window's alias.
+// true: handled (the page opened, or pc moved to the access's slow path).
+bool jit_fastmem_fault(void *ucontext);
+#endif
 
 // Guest init is exiting: ISH_JIT_STATS=1 prints counters, ISH_JIT_DUMP=<file>
 // writes the code region.

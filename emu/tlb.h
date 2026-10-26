@@ -42,6 +42,7 @@ struct tlb {
     // mmu->sba_base / sba_map, for native code (kernel/sba.h)
     char *sba_base;
     uint8_t *sba_map;
+    char *sba_xbase;
 #endif
 
     struct tlb_entry entries[TLB_SIZE];

@@ -411,6 +411,8 @@ int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off
                 if (lo >= hi || mmap(memory + lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED,
                                      fd->real_fd, offset + (off_t) lo) == MAP_FAILED)
                     lo = hi = 0;
+                else
+                    sba_resync_host(mem, memory + lo, hi - lo);
             }
             for (int part = 0; part < 2; part++) {
                 uint64_t from = part == 0 ? 0 : hi, to = part == 0 ? (lo < hi ? lo : file) : file;

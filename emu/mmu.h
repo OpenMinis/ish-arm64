@@ -47,6 +47,7 @@ struct mmu {
     // address A at sba_base + A where sba_map[A >> 12] allows it.
     char *sba_base;
     uint8_t *sba_map;
+    char *sba_xbase;   // fastmem: the alias of the window (sba_region), NULL if off
     // What the last changes changed: change number `gen` (mmu->changes after
     // it) touched pages [start, start + pages) -- ~0 pages: anything. A TLB
     // catching up with a few changes drops just those pages (tlb_sync()).
