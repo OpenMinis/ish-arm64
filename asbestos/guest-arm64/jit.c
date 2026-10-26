@@ -1800,7 +1800,8 @@ static void emit_chain(struct em *e, struct fiber_block *b, unsigned long *slot,
 static void emit_ret(struct em *e, struct fiber_block *b, int rn) {
     int h = rn == 31 ? 31 : hreg(e, rn);
     put(e, 0x9240BC00u | ((uint32_t) h << 5) | 10);                              // and x10, xh, #0xffffffffffff
-    put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
+    // pc is stored on the ways out to the run loop below, not when the return
+    // continues in native code (see emit_indirect())
     unsigned miss0 = ~0u;
     if (n_pinned) {
         // ret counts a cycle: with forward edges uncounted, a loop closed by
@@ -1837,12 +1838,14 @@ static void emit_ret(struct em *e, struct fiber_block *b, int rn) {
     }
     emit_native_dispatch_ex(e, true);
     patch_here(e, unch);
+    put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
     put(e, 0xF9400188u);                                                         // ldr x8, [x12]
     put(e, 0xF9000000u | ((LOCAL_last_block / 8) << 10) | (1u << 5) | 8);        // str x8, [x1, #last_block]
     emit_exit(e, (uintptr_t) jit_fiber_ret);
     patch_here(e, miss1);
     patch_here(e, miss2);
     if (miss0 != ~0u) patch_here(e, miss0);
+    put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
     set_last_block(e, b);
     emit_exit(e, (uintptr_t) jit_fiber_ret);
 }
@@ -1872,17 +1875,13 @@ static void store_ret_cache(struct em *e, int h, uint64_t ret, int base) {
 }
 
 // x9 = the block cached for guest address x10 (tlb->block_cache, as
-// fiber_ret's lookup keeps it); the three branches go to a miss.
+// fiber_ret's lookup keeps it); the three branches go to a miss. A block
+// invalidated since it was cached is still there to look at (blocks are only
+// freed while no thread of the address space runs guest code, and the run
+// loop clears the cache before it does again), so it is enough to skip
+// jetsam blocks instead of comparing the cache's generation with the
+// address space's, which took three dependent loads.
 static void emit_block_cache_lookup(struct em *e, unsigned *miss1, unsigned *miss2, unsigned *miss3) {
-    // stale cache? tlb->block_cache_gen != mmu->asbestos->invalidate_gen
-    int mmu_off = (int) offsetof(struct tlb, mmu) - (int) offsetof(struct tlb, entries);
-    put(e, 0xF8400000u | ((uint32_t) (mmu_off & 0x1ff) << 12) | (2u << 5) | 12);  // ldur x12, [x2, #mmu]
-    put(e, 0xF9400000u | ((offsetof(struct mmu, asbestos) / 8) << 10) | (12u << 5) | 12);  // ldr x12, [x12, #asbestos]
-    put(e, 0xB9400000u | ((offsetof(struct asbestos, invalidate_gen) / 4) << 10) | (12u << 5) | 12);  // ldr w12, [x12, #gen]
-    emit_add_x2(e, 11, offsetof(struct tlb, block_cache_gen) - offsetof(struct tlb, entries));
-    put(e, 0xB9400000u | (11u << 5) | 11);                                       // ldr w11, [x11]
-    put(e, 0x6B0C017Fu);                                                         // cmp w11, w12
-    *miss1 = e->n; put(e, 0x54000001u);                                  // b.ne miss
     // x9 = block_cache[(ip ^ (ip >> 12)) & 4095]
     put(e, 0xCA4A314Bu);                                                         // eor x11, x10, x10, lsr #12
     put(e, 0x92402D6Bu);                                                         // and x11, x11, #0xfff
@@ -1892,6 +1891,8 @@ static void emit_block_cache_lookup(struct em *e, unsigned *miss1, unsigned *mis
     put(e, 0xF9400000u | ((FIBER_BLOCK_addr / 8) << 10) | (9u << 5) | 12);       // ldr x12, [x9, #addr]
     put(e, 0xEB0A019Fu);                                                         // cmp x12, x10
     *miss3 = e->n; put(e, 0x54000001u);                                  // b.ne miss
+    put(e, 0x39400000u | ((uint32_t) offsetof(struct fiber_block, is_jetsam) << 10) | (9u << 5) | 12);  // ldrb w12, [x9, #is_jetsam]
+    *miss1 = e->n; put(e, 0x3500000Cu);                                  // cbnz w12, miss
 }
 
 // PIC, at a block end's `unchained` exit with the slot in x9: a slot
@@ -1921,7 +1922,6 @@ static void emit_indirect(struct em *e, struct fiber_block *b, const struct jit_
         put(e, 0x91000000u | (LOCAL_ret_cache << 10) | (1u << 5) | 12);          // add x12, x1, #ret_cache
         store_ret_cache(e, h30, ret, 12);
     }
-    put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
     unsigned miss1, miss2, miss3;
     emit_block_cache_lookup(e, &miss1, &miss2, &miss3);
     // hit: same bookkeeping as a chained branch
@@ -1959,6 +1959,9 @@ static void emit_indirect(struct em *e, struct fiber_block *b, const struct jit_
     patch_here(e, miss1); patch_here(e, miss2); patch_here(e, miss3);
     patch_here(e, miss4);
     if (miss5 != miss4) patch_here(e, miss5);
+    // pc only for the run loop: a successor entered natively needs none
+    // (direct links store none either; every exit to the gadgets does)
+    put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 10);                 // str x10, [x1, #pc]
     set_last_block(e, b);
     emit_exit(e, (uintptr_t) jit_fiber_ret);
 }
@@ -2525,7 +2528,7 @@ void ish_aot_register(const struct aot_module *m) {
 
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
-#define JIT_CODE_VERSION 10
+#define JIT_CODE_VERSION 11
 
 // Everything the emitted code bakes in besides the gadgets it names: the
 // conventions, the struct layouts it loads from and the TLB / block cache
