@@ -194,6 +194,7 @@ struct posix_timer {
 // struct thread_group is way too long to type comfortably
 struct tgroup {
     struct list threads; // locked by pids_lock, by majority vote
+    bool diag_node; // [FEAT-261027-15] runs node (kernel/diag.c keeps the live count)
     struct task *leader; // immutable
     struct rusage_ rusage;
 

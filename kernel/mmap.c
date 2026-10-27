@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include "debug.h"
 #include "kernel/calls.h"
+#include "kernel/diag.h"
 #include "kernel/errno.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -294,6 +295,8 @@ void mm_release_from(struct mm *mm, const char *caller) {
            (unsigned long long) seq, before, caller);
     unsigned left = --mm->refcount;
     if (left == 0) {
+        ish_diag_add(DIAG_MM_DESTROYED, 1);   // [FEAT-261027-15]
+        ish_diag_event(DIAG_EV_MM_DESTROY, (int64_t) seq, 0);
         if (ish_verbose_trace_enabled)
         printk("[iSH][MM-RELEASE] pid=%d mm=%p seq=%llu refcount→0, caller=%s\n",
                current ? current->pid : -1, (void *) mm,

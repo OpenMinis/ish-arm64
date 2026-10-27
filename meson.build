@@ -1713,6 +1713,7 @@ if get_option('kernel') == 'ish'
         'kernel/user.c',
         'kernel/vdso.c', vdso,
         'kernel/task.c',
+        'kernel/diag.c',
         'kernel/group.c',
         'kernel/log.c',
 

@@ -1,4 +1,5 @@
 #include "kernel/signal.h"
+#include "kernel/diag.h"
 #include "task.h"
 #include "util/signpost.h"
 #define _GNU_SOURCE
@@ -722,6 +723,7 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     unlock(&current->general_lock);
 
     update_thread_name();
+    ish_diag_exec(strcmp(basename, "node") == 0);   // [FEAT-261027-15]
 
     // cloexec
     // consider putting this in fd.c?
@@ -1010,6 +1012,7 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
                 if (strcmp(a, "--jitless") == 0 || strcmp(a, "--no-expose-wasm") == 0)
                     jitless = true;
             }
+            ish_diag_node_mode(jitless);   // [FEAT-261027-15]
             // Conditionally inject --require for polyfill files that exist in guest fs.
             // With real WebAssembly (the default mode) only the fetch transport is used.
             static const char *optional_requires[] = {
