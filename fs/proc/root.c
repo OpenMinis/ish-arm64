@@ -4,6 +4,7 @@
 #include "kernel/calls.h"
 #include "fs/proc.h"
 #include "platform/platform.h"
+#include "util/macopt.h"
 
 static int proc_show_version(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     struct uname uts;
@@ -18,7 +19,11 @@ static int proc_show_stat(struct proc_entry *UNUSED(entry), struct proc_data *bu
 
     // calculate btime (boot time in seconds since epoch) by subtracting uptime from current time
     struct uptime_info uptime = get_uptime();
+#if ISH_MAC_OPT
+    struct timespec uptime_ts = {.tv_sec = uptime.uptime_ticks};   // whole seconds
+#else
     struct timespec uptime_ts = {.tv_sec = uptime.uptime_ticks / 100, .tv_nsec = uptime.uptime_ticks % 100};
+#endif
     struct timespec boot_time = timespec_subtract(timespec_now(CLOCK_REALTIME), uptime_ts);
     proc_printf(buf, "btime %ld\n", boot_time.tv_sec);
 
@@ -85,7 +90,14 @@ static int proc_show_meminfo(struct proc_entry *UNUSED(entry), struct proc_data 
 static int proc_show_uptime(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     struct uptime_info uptime_info = get_uptime();
     unsigned long uptime = uptime_info.uptime_ticks;
+#if ISH_MAC_OPT
+    // uptime_ticks is whole seconds (what sysinfo wants); /proc/uptime has
+    // hundredths, two digits of them: 12.05 s is "12.05", not "12.5"
+    uptime = uptime_info.uptime_centis;
+    proc_printf(buf, "%lu.%02lu %lu.%02lu\n", uptime / 100, uptime % 100, uptime / 100, uptime % 100);
+#else
     proc_printf(buf, "%lu.%lu %lu.%lu\n", uptime / 100, uptime % 100, uptime / 100, uptime % 100);
+#endif
     return 0;
 }
 

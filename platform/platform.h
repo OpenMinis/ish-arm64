@@ -1,6 +1,7 @@
 #ifndef PLATFORM_H
 #define PLATFORM_H
 #include "misc.h"
+#include "util/macopt.h"
 
 // for some reason a tick is always 10ms
 struct cpu_usage {
@@ -20,8 +21,11 @@ struct mem_usage {
 struct mem_usage get_mem_usage(void);
 
 struct uptime_info {
-    uint64_t uptime_ticks;
+    uint64_t uptime_ticks;   // whole seconds since the host booted
     uint64_t load_1m, load_5m, load_15m;
+#if ISH_MAC_OPT
+    uint64_t uptime_centis;  // the same in hundredths of a second
+#endif
 };
 struct uptime_info get_uptime(void);
 

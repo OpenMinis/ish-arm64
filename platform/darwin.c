@@ -96,6 +96,11 @@ struct uptime_info get_uptime() {
         .load_1m = vm_loadavg.ldavg[0],
         .load_5m = vm_loadavg.ldavg[1],
         .load_15m = vm_loadavg.ldavg[2],
+#if ISH_MAC_OPT
+        // kern.boottime is a struct timeval: tv_usec in the low half of [1]
+        .uptime_centis = (uint64_t) (((int64_t) now.tv_sec - (int64_t) kern_boottime[0]) * 100 +
+                                     ((int64_t) now.tv_usec - (int64_t) (uint32_t) kern_boottime[1]) / 10000),
+#endif
     };
     return uptime;
 }
