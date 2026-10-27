@@ -4081,7 +4081,7 @@ static void jit_init(void) {
     pin_on = !env_off("ISH_JIT_PIN");
 #if ISH_MAC_OPT
     sba_jit = sba_on() && pin_on;   // the window base lives in x30, loaded with the pinned registers
-    fastmem = sba_jit && have_region && !env_off("ISH_FASTMEM");
+    fastmem = sba_jit && have_region && !env_off("ISH_FASTMEM") && sba_fastmem();
     if (fastmem) {
         void *sh = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
         if (sh == MAP_FAILED)

@@ -49,6 +49,10 @@ struct sba_region {
 };
 
 bool sba_on(void);
+// fastmem: the window's alias for native code; off with ISH_FASTMEM=0 and
+// where guest code runs in a VM (kernel/hvf.h), whose threads that get no
+// vCPU run in the JIT without it.
+bool sba_fastmem(void);
 void sba_init(struct mem *mem);
 void sba_destroy(struct mem *mem);
 // Zeroed shadow memory for [start, start + pages), or NULL if the range is

@@ -3,6 +3,7 @@
 #include "kernel/errno.h"
 #include "fs/poll.h"
 #include "fs/xnet.h"
+#include "kernel/hvf.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,6 +194,16 @@ static ssize_t proc_ish_write_poll_spin(struct proc_entry *UNUSED(entry), struct
     return poll_spin_control(data->data, data->size) == 0 ? (ssize_t) data->size : _EINVAL;
 }
 
+#if ISH_HVF
+// What runs guest code (kernel/hvf.h): the VM or the JIT, and why.
+static int proc_ish_show_hvf(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char text[1024];
+    hvf_describe(text, sizeof(text));
+    proc_printf(buf, "%s", text);
+    return 0;
+}
+#endif
+
 // Transparent forwarding counters (fs/xnet.h): numbers only, never the
 // entry's port or password.
 static int proc_ish_show_xnet(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -207,6 +218,9 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
     {"defaults", S_IFDIR, .readdir = proc_ish_defaults_readdir},
     {"documents", .show = proc_ish_show_documents},
+#if ISH_HVF
+    {"hvf", .show = proc_ish_show_hvf},
+#endif
 #ifdef ISH_JIT
     {"jit", .show = proc_ish_show_jit, .pwrite = proc_ish_write_jit},
 #endif

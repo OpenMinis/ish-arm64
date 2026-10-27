@@ -37,6 +37,10 @@ struct sba_region;
 #define HVF_NO (-2)   // hvf_run(): not this thread; run it the other way
 
 bool hvf_on(void);
+// What runs guest code ("engine: vm ..." or "engine: jit (why)") and how it
+// went, NUL-terminated, as /proc/ish/hvf shows it. Callable before boot
+// (it decides then). Returns the length.
+size_t hvf_describe(char *buf, size_t size);
 // Run current's guest code until the kernel has something to do: an
 // interrupt for handle_interrupt(), or HVF_NO.
 int hvf_run(struct cpu_state *cpu);

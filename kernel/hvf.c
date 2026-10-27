@@ -74,6 +74,10 @@ static uint64_t ttbr1, mm_ids;
 
 static _Atomic uint64_t st_runs, st_sys, st_faults, st_fault_slow, st_s2, st_flush, st_kick, st_mrs, st_blocks, st_datamaps,
     st_copies, st_sync;
+// for hvf_describe()
+static hv_return_t vm_error;
+static _Atomic int64_t vcpus_live, mms_live;
+static _Atomic uint64_t vcpus_made, vcpus_refused, mms_made, mms_refused;
 
 struct hvf_mm {
     uint64_t root;           // TTBR0 table
@@ -225,6 +229,7 @@ static bool init_vm(void) {
     hv_vm_config_t cfg = HV(hv_vm_config_create)();
     HV(hv_vm_config_set_ipa_size)(cfg, ipa_bits);
     hv_return_t r = HV(hv_vm_create)(cfg);
+    vm_error = r;
     if (r != HV_SUCCESS) {
         if (getenv("ISH_HVF") != NULL)   // asked for it
             fprintf(stderr, "iSH: no Hypervisor.framework VM (%#x)%s; running guest code the other way\n", r,
@@ -285,18 +290,53 @@ bool hvf_on(void) {
     return state == 1;
 }
 
+size_t hvf_describe(char *buf, size_t size) {
+    bool on = hvf_on();
+    const char *v = getenv("ISH_HVF");
+    int n;
+    if (on)
+        n = snprintf(buf, size, "engine: vm (Hypervisor.framework), %u-bit guest physical addresses, %d-bit ASIDs\n",
+                     ipa_bits, asid16 ? 16 : 8);
+    else if (v && v[0] == '0')
+        n = snprintf(buf, size, "engine: jit (ISH_HVF=0)\n");
+    else if (vm_error == HV_DENIED)
+        n = snprintf(buf, size, "engine: jit (no VM: the com.apple.security.hypervisor entitlement is missing)\n");
+    else if (vm_error != HV_SUCCESS)
+        n = snprintf(buf, size, "engine: jit (no VM: hv_vm_create %#x)\n", vm_error);
+    else
+        n = snprintf(buf, size, "engine: jit (no usable Hypervisor.framework)\n");
+    if (!on || n < 0 || (size_t) n >= size)
+        return n < 0 ? 0 : (size_t) n;
+    n += snprintf(buf + n, size - n,
+                  "vcpus: %lld in use, %llu made, %llu refused (those threads run in the JIT)\n"
+                  "address spaces: %lld in use, %llu made, %llu refused (those run in the JIT)\n"
+                  "exits: %llu runs, %llu syscalls, %llu faults (%llu to the kernel), %llu kicks, %llu stage-2\n"
+                  "tlb: %llu flushes on entry, %llu synchronous\n"
+                  "memory: %llu 2MB window blocks mapped, %llu data objects (%llu copied)\n",
+                  (long long) vcpus_live, vcpus_made, vcpus_refused, (long long) mms_live, mms_made, mms_refused,
+                  st_runs, st_sys, st_faults, st_fault_slow, st_kick, st_s2, st_flush, st_sync, st_blocks, st_datamaps,
+                  st_copies);
+    return (size_t) n < size ? (size_t) n : size - 1;
+}
+
 static struct hvf_thread *thread_get(void) {
     if (self_t != NULL)
         return self_t;
     if (no_vcpu)
         return NULL;
     struct hvf_thread *t = calloc(1, sizeof(*t));
-    if (t == NULL || HV(hv_vcpu_create)(&t->vcpu, &t->exit, NULL) != HV_SUCCESS) {
+    hv_return_t r = t == NULL ? HV_NO_RESOURCES : HV(hv_vcpu_create)(&t->vcpu, &t->exit, NULL);
+    if (r != HV_SUCCESS) {
         // at most so many per VM: this thread runs guest code the other way
+        if (atomic_fetch_add(&vcpus_refused, 1) == 0)
+            fprintf(stderr, "iSH: no vCPU for a guest thread (%#x, %lld in use): it runs in the JIT\n", r,
+                    (long long) vcpus_live);
         free(t);
         no_vcpu = true;
         return NULL;
     }
+    vcpus_made++;
+    vcpus_live++;
     hv_vcpu_t v = t->vcpu;
     pthread_mutex_lock(&g_lock);
     if (tcr == 0) {
@@ -335,6 +375,7 @@ void hvf_thread_exit(void) {
     self_t = NULL;
     HV(hv_vcpu_destroy)(t->vcpu);
     free(t);
+    vcpus_live--;
 }
 
 void hvf_kick(struct task *task) {
@@ -363,7 +404,12 @@ static struct hvf_mm *mm_get(struct mem *mem) {
             m->id = ++mm_ids;
             pthread_mutex_init(&m->lock, NULL);
             __atomic_store_n(&mem->hvf, m, __ATOMIC_RELEASE);
+            mms_made++;
+            mms_live++;
         } else {
+            if (atomic_fetch_add(&mms_refused, 1) == 0)
+                fprintf(stderr, "iSH: no address space ID left in the VM (%lld in use): a process runs in the JIT\n",
+                        (long long) mms_live);
             if (root)
                 pt_release(root);
             if (asid)
@@ -405,6 +451,7 @@ void hvf_mm_destroy(struct mem *mem) {
     pthread_mutex_unlock(&g_lock);
     pthread_mutex_destroy(&m->lock);
     free(m);
+    mms_live--;
 }
 
 // Drop asid's entries (all, if asid < 0) from the TLBs of every core before

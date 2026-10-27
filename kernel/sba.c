@@ -32,6 +32,12 @@ bool sba_on(void) {
     return sba_state;
 }
 
+static bool fastmem_on(void);
+
+bool sba_fastmem(void) {
+    return fastmem_on();
+}
+
 static bool fastmem_on(void) {
     if (fastmem_state < 0) {
         const char *v = getenv("ISH_FASTMEM");
