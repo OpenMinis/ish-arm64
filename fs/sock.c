@@ -414,6 +414,42 @@ static struct fd *sock_getfd(fd_t sock_fd) {
     return sock;
 }
 
+// Whether fs/xnet.c looks at this socket's datagrams: an IPv4/IPv6 datagram
+// socket while the switch is on, or one that already sent through the
+// entry's relay. Otherwise one flag load and the socket's own host calls.
+static inline bool sock_xudp_send(struct fd *sock) {
+    return sock->socket.type == SOCK_DGRAM_ &&
+            (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_) &&
+            (atomic_load_explicit(&xnet_on, memory_order_relaxed) ||
+             __atomic_load_n(&sock->socket.xudp, __ATOMIC_ACQUIRE) != NULL);
+}
+
+// Receiving goes through fs/xnet.c only once the socket has used the relay.
+static ssize_t sock_host_recvmsg(struct fd *sock, struct msghdr *msg, int flags) {
+    if (__atomic_load_n(&sock->socket.xudp, __ATOMIC_ACQUIRE) != NULL) {
+        ssize_t res;
+        if (xnet_udp_recvmsg(sock, msg, flags, &res))
+            return res;
+    }
+    return recvmsg(sock->real_fd, msg, flags);
+}
+
+static ssize_t sock_host_recvfrom(struct fd *sock, void *buf, size_t len, int flags,
+        void *addr, socklen_t *addr_len) {
+    if (__atomic_load_n(&sock->socket.xudp, __ATOMIC_ACQUIRE) != NULL) {
+        struct iovec iov = {buf, len};
+        struct msghdr msg = {.msg_name = addr, .msg_namelen = addr_len != NULL ? *addr_len : 0,
+                .msg_iov = &iov, .msg_iovlen = 1};
+        ssize_t res;
+        if (xnet_udp_recvmsg(sock, &msg, flags, &res)) {
+            if (res >= 0 && addr_len != NULL)
+                *addr_len = msg.msg_namelen;
+            return res;
+        }
+    }
+    return recvfrom(sock->real_fd, buf, len, flags, addr, addr_len);
+}
+
 // Whether fs/xnet.c forwards this socket's connection (see fs/xnet.h). Only
 // then does it have a say in anything else the socket does.
 static inline bool sock_xnet(struct fd *sock) {
@@ -735,6 +771,18 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    // connect(AF_UNSPEC) dissolves a connected datagram socket. sockaddr_read
+    // refuses the family (iSH answers EINVAL, as it always has), but a peer
+    // that fs/xnet.c keeps instead of the host socket has to go.
+    if (__atomic_load_n(&sock->socket.xudp, __ATOMIC_ACQUIRE) != NULL && sockaddr_len >= 2) {
+        uint16_t family;
+        if (user_get(sockaddr_addr, family) == 0 && family == AF_UNSPEC) {
+            struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+            int err = xnet_udp_connect(sock, &unspec, sizeof(unspec));
+            if (err != XNET_PASS)
+                return err;
+        }
+    }
     struct sockaddr_max_ sockaddr;
     int err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len);
     if (err < 0)
@@ -750,6 +798,11 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (atomic_load_explicit(&xnet_on, memory_order_relaxed) && sock->socket.type == SOCK_STREAM_ &&
             (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_)) {
         err = xnet_connect(sock, (void *) &sockaddr, sockaddr_len);
+        if (err != XNET_PASS)
+            return err;
+    }
+    if (sock_xudp_send(sock)) {
+        err = xnet_udp_connect(sock, (void *) &sockaddr, sockaddr_len);
         if (err != XNET_PASS)
             return err;
     }
@@ -992,6 +1045,12 @@ int_t sys_getpeername(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_ad
         if (xres != XNET_PASS)
             return sock_xnet_write_addr(sockaddr_addr, sockaddr_len_addr, sockaddr_len, &xaddr, xlen);
     }
+    if (__atomic_load_n(&sock->socket.xudp, __ATOMIC_ACQUIRE) != NULL) {
+        struct sockaddr_storage xaddr;
+        socklen_t xlen;
+        if (xnet_udp_getpeername(sock, &xaddr, &xlen) != XNET_PASS)
+            return sock_xnet_write_addr(sockaddr_addr, sockaddr_len_addr, sockaddr_len, &xaddr, xlen);
+    }
 
     char sockaddr[sockaddr_len];
     int res = getpeername(sock->real_fd, (void *) sockaddr, &sockaddr_len);
@@ -1094,6 +1153,20 @@ int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, a
             goto error;
     }
 
+    if (sock_xudp_send(sock)) {
+        struct iovec iov = {buffer, len};
+        struct msghdr msg = {.msg_name = sockaddr_addr ? (void *) &sockaddr : NULL,
+                .msg_namelen = sockaddr_addr ? sockaddr_len : 0, .msg_iov = &iov, .msg_iovlen = 1};
+        ssize_t xres;
+        if (xnet_udp_sendmsg(sock, &msg, real_flags, &xres)) {
+            int saved = errno;
+            free(buffer);
+            errno = saved;
+            if (xres < 0)
+                return errno_map();
+            return xres;
+        }
+    }
     ssize_t res = sendto(sock->real_fd, buffer, len, real_flags,
             sockaddr_addr ? (void *) &sockaddr : NULL, sockaddr_len);
     free(buffer);
@@ -1256,7 +1329,7 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
                (unsigned)len, (unsigned)flags,
                host_flags, sock->flags);
         for (;;) {
-            res = recvfrom(sock->real_fd, buffer, len, real_flags | MSG_DONTWAIT,
+            res = sock_host_recvfrom(sock, buffer, len, real_flags | MSG_DONTWAIT,
                     sockaddr_addr != 0 ? (void *) sockaddr : NULL,
                     sockaddr_len_addr != 0 ? &sockaddr_len : NULL);
             if (res >= 0)
@@ -1276,7 +1349,7 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
             }
         }
     } else {
-        res = recvfrom(sock->real_fd, buffer, len, real_flags,
+        res = sock_host_recvfrom(sock, buffer, len, real_flags,
                 sockaddr_addr != 0 ? (void *) sockaddr : NULL,
                 sockaddr_len_addr != 0 ? &sockaddr_len : NULL);
         if (res < 0) {
@@ -1442,6 +1515,25 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     if (level == IPPROTO_IP && (option == IP_MULTICAST_IF_ ||
                 option == IP_ADD_MEMBERSHIP_ || option == IP_DROP_MEMBERSHIP_))
         return sock_set_ip_multicast(sock->real_fd, option, value, value_len);
+#if defined(__APPLE__)
+    // TCP_USER_TIMEOUT (milliseconds, 0 = the default) bounds how long sent
+    // data, or a SYN, may go unacknowledged. Darwin splits that in two, both
+    // in seconds. BIND's dig and nslookup set it on every TCP query socket
+    // and abort if it fails.
+    if (level == IPPROTO_TCP && option == TCP_USER_TIMEOUT_) {
+        if (value_len < sizeof(uint32_t))
+            return _EINVAL;
+        uint32_t ms;
+        memcpy(&ms, value, sizeof(ms));
+        if ((int32_t) ms < 0)
+            return _EINVAL;
+        int secs = (int) ((ms + 999) / 1000);
+        if (setsockopt(sock->real_fd, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &secs, sizeof(secs)) < 0 ||
+                setsockopt(sock->real_fd, IPPROTO_TCP, TCP_CONNECTIONTIMEOUT, &secs, sizeof(secs)) < 0)
+            return errno_map();
+        return 0;
+    }
+#endif
     // TCP_CONGESTION also has no equivalent on Darwin
 #if defined(__APPLE__)
     if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
@@ -1468,6 +1560,18 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         return 0;
 
     int err = setsockopt(sock->real_fd, real_level, real_opt, value, value_len);
+#if defined(__APPLE__)
+    // Darwin takes a TCP_MAXSEG only up to the current MSS, 512 before
+    // connect(); Linux takes 88..32767 at any time and clamps later. A value
+    // Linux would take is accepted and the host keeps its own MSS.
+    if (err < 0 && errno == EINVAL && level == IPPROTO_TCP && option == TCP_MAXSEG_ &&
+            value_len >= sizeof(int32_t)) {
+        int32_t mss;
+        memcpy(&mss, value, sizeof(mss));
+        if (mss >= 88 && mss <= 32767)
+            err = 0;
+    }
+#endif
     if (err < 0)
         return errno_map();
 #if defined(__APPLE__)
@@ -1530,6 +1634,18 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
                 return errno_map();
             *(dword_t *) value = real_error == 0 ? 0 : -err_map(real_error);
         }
+#if defined(__APPLE__)
+    } else if (level == IPPROTO_TCP && option == TCP_USER_TIMEOUT_) {
+        if (value_len < sizeof(uint32_t))
+            return _EINVAL;
+        int secs;
+        socklen_t secs_len = sizeof(secs);
+        if (getsockopt(sock->real_fd, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &secs, &secs_len) < 0)
+            return errno_map();
+        uint32_t ms = secs > 0 ? (uint32_t) secs * 1000 : 0;
+        memcpy(value, &ms, sizeof(ms));
+        value_len = sizeof(ms);
+#endif
     } else if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
         value_len = strlen(DEFAULT_TCP_CONGESTION);
         memcpy(value, DEFAULT_TCP_CONGESTION, value_len);
@@ -1767,6 +1883,15 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     if (real_flags < 0)
         goto out_free_scm;
 
+    ssize_t xres;
+    if (sock_xudp_send(sock) && xnet_udp_sendmsg(sock, &msg, real_flags, &xres)) {
+        if (xres < 0) {
+            err = errno_map();
+            goto out_free_scm;
+        }
+        err = (int) xres;
+        goto out_free_iov;
+    }
     err = sendmsg(sock->real_fd, &msg, real_flags);
     if (err < 0) {
         err = errno_map();
@@ -1941,7 +2066,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
                current->pid, current->comm, sock_fd, sock->real_fd,
                (unsigned)flags, host_flags_rm, sock->flags);
         for (;;) {
-            res = recvmsg(sock->real_fd, &msg, real_flags | MSG_DONTWAIT);
+            res = sock_host_recvmsg(sock, &msg, real_flags | MSG_DONTWAIT);
             if (res >= 0)
                 break;
             if (errno == EINTR)
@@ -1957,7 +2082,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
             }
         }
     } else {
-        res = recvmsg(sock->real_fd, &msg, real_flags);
+        res = sock_host_recvmsg(sock, &msg, real_flags);
         if (res < 0)
             err = errno_map();
     }
@@ -2181,7 +2306,14 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
         return err;
     int eintr_count = 0;
     for (;;) {
-        ssize_t res = read(fd->real_fd, buf, size);
+        ssize_t res;
+        if (__atomic_load_n(&fd->socket.xudp, __ATOMIC_ACQUIRE) != NULL) {
+            struct iovec iov = {buf, size};
+            struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+            res = sock_host_recvmsg(fd, &msg, 0);
+        } else {
+            res = read(fd->real_fd, buf, size);
+        }
         if (res >= 0) { err = (int)res; break; }
         if (errno != EINTR) { err = errno_map(); break; }
         eintr_count++;
@@ -2220,7 +2352,11 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
         return err;
     int eintr_count = 0;
     for (;;) {
-        ssize_t res = write(fd->real_fd, buf, size);
+        ssize_t res;
+        struct iovec iov = {(void *) buf, size};
+        struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+        if (!sock_xudp_send(fd) || !xnet_udp_sendmsg(fd, &msg, 0, &res))
+            res = write(fd->real_fd, buf, size);
         if (res >= 0) { err = (int)res; break; }
         if (errno != EINTR) { err = errno_map(); break; }
         eintr_count++;
@@ -2248,6 +2384,8 @@ static int sock_close(struct fd *fd) {
     sockrestart_end_listen(fd);
     if (fd->socket.xnet != NULL)
         xnet_release(fd);
+    if (fd->socket.xudp != NULL)
+        xnet_udp_release(fd);
     // FIXME next 3 lines should go in a function like release_unix_names
     inode_release_if_exist(fd->socket.unix_name_inode);
     if (fd->socket.unix_name_abstract != NULL)

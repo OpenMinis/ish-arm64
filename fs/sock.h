@@ -226,12 +226,14 @@ static inline int sock_flags_from_real(int real) {
 #define IP_ADD_MEMBERSHIP_ 35
 #define IP_DROP_MEMBERSHIP_ 36
 #define TCP_NODELAY_ 1
+#define TCP_MAXSEG_ 2
 #define TCP_KEEPIDLE_ 4
 #define TCP_KEEPINTVL_ 5
 #define TCP_KEEPCNT_ 6
 #define TCP_DEFER_ACCEPT_ 9
 #define TCP_INFO_ 11
 #define TCP_CONGESTION_ 13
+#define TCP_USER_TIMEOUT_ 18
 #define IPV6_UNICAST_HOPS_ 16
 #define IPV6_MULTICAST_IF_ 17
 #define IPV6_MULTICAST_HOPS_ 18
@@ -276,6 +278,7 @@ static inline int sock_opt_to_real(int fake, int level) {
         } break;
         case IPPROTO_TCP: switch (fake) {
             case TCP_NODELAY_: return TCP_NODELAY;
+            case TCP_MAXSEG_: return TCP_MAXSEG;
 #if defined(__APPLE__)
             case TCP_KEEPIDLE_: return TCP_KEEPALIVE; // macOS equivalent
 #else
@@ -287,6 +290,7 @@ static inline int sock_opt_to_real(int fake, int level) {
 #if defined(__linux__)
             case TCP_INFO_: return TCP_INFO;
             case TCP_CONGESTION_: return TCP_CONGESTION;
+            case TCP_USER_TIMEOUT_: return TCP_USER_TIMEOUT;
 #endif
         } break;
         case IPPROTO_IP: switch (fake) {

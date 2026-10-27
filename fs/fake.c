@@ -405,7 +405,11 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         if (flags & O_APPEND_) real_flags |= O_APPEND;
         if (flags & O_NONBLOCK_) real_flags |= O_NONBLOCK;
         if (flags & O_NOFOLLOW_) real_flags |= O_NOFOLLOW;
-        int fd_no = open(host_abs, real_flags, 0666);
+        /* [T-ish-hook-mode] A hook-routed file has no meta.db row to hold
+         * the guest's mode, so the host file's own bits are the mode: create
+         * it with what the guest asked for (already umasked). Static bind
+         * mounts keep 0666, their mode lives in meta.db. */
+        int fd_no = open(host_abs, real_flags, via_hook ? (mode & 07777) : 0666);
         if (fd_no < 0) {
             return ERR_PTR(errno_map());
         }
@@ -433,6 +437,7 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
      * synthesize the fake inode from the host inode so operations within a
      * single fd still behave consistently. */
     if (via_hook) {
+        fd->fake_via_hook = true;
         struct stat host_stat;
         if (fstat(fd->real_fd, &host_stat) == 0)
             fd->fake_inode = (ino_t)host_stat.st_ino;
@@ -776,9 +781,11 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         fake_stat->inode = (ino_t)host_stat.st_ino;
         fake_stat->nlink = host_stat.st_nlink;
         fake_stat->blksize = host_stat.st_blksize;
-        /* Pick a sensible mode: keep host's S_IFMT, default to 0644/0755. */
-        mode_t_ type = host_stat.st_mode & S_IFMT;
-        fake_stat->mode = type | (S_ISDIR(host_stat.st_mode) ? 0755 : 0644);
+        /* [T-ish-hook-mode] The host file's bits ARE the mode of a
+         * hook-routed path (no meta.db row). Forcing 0644 here dropped every
+         * chmod: `chmod +x` reached the host file, then exec read 0644 back
+         * and failed with EACCES. */
+        fake_stat->mode = host_stat.st_mode & (S_IFMT | 07777);
         fake_stat->uid = 0;
         fake_stat->gid = 0;
         fake_stat->size = host_stat.st_size;
@@ -855,6 +862,18 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     int err = realfs.fstat(fd, fake_stat);
     if (err < 0)
         return err;
+    // [T-ish-hook-fd-meta] fake_inode of a hook-routed fd is the host inode.
+    // Looking it up in meta.db found whatever unrelated row happened to carry
+    // that number: a file in /var/minis/workspace whose host inode matched
+    // /dev/null's row fstat'ed as a character device and read back 0 bytes.
+    // Same answer as fakefs_stat gives for the path.
+    if (fd->fake_via_hook) {
+        fake_stat->mode &= S_IFMT | 07777;
+        fake_stat->uid = 0;
+        fake_stat->gid = 0;
+        fake_stat->rdev = 0;
+        return 0;
+    }
     // [T-ish-exec-fewer-meta-txns] The row fakefs_open read a moment ago,
     // consumed once (see struct fd).
     if (fd->fake_open_stat.valid) {
@@ -880,8 +899,7 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
             char host_chk[PATH_MAX];
             bool via_hook = false;
             if (bind_mount_translate_path_ex(fd_path, host_chk, sizeof(host_chk), &via_hook) && via_hook) {
-                mode_t_ type = fake_stat->mode & S_IFMT;
-                fake_stat->mode = type | (S_ISDIR(fake_stat->mode) ? 0755 : 0644);
+                fake_stat->mode &= S_IFMT | 07777;
                 fake_stat->uid = 0;
                 fake_stat->gid = 0;
                 fake_stat->rdev = 0;
@@ -980,10 +998,15 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
     /* If this fd was opened on a hook-routed path, its fake_inode is the
      * host inode and won't be in meta.db. Detect that by probing meta.db;
      * if absent, apply attr directly to the host fd. */
-    db_begin_read(fs);
+    // [T-ish-hook-fd-meta] Never probe meta.db with a host inode number: a
+    // collision made fchmod rewrite an unrelated row's mode.
     struct ish_stat ishstat;
-    bool in_meta = inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat);
-    db_commit(fs);
+    bool in_meta = false;
+    if (!fd->fake_via_hook) {
+        db_begin_read(fs);
+        in_meta = inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat);
+        db_commit(fs);
+    }
     if (!in_meta) {
         switch (attr.type) {
             case attr_mode:
@@ -1127,6 +1150,25 @@ retry:
             goto retry;
     }
     return res;
+}
+
+/* [T-ish-hook-utime] realfs_utime resolves the guest path under the rootfs
+ * root. For a hook-routed path that walks data/var/minis/<bucket>, the app's
+ * file-browser symlink, which points at whichever session the UI showed last,
+ * not at the calling task's session: the timestamps landed on another
+ * session's file of the same name, or failed with ENOENT (shutil.copy2,
+ * `cp -p`, `touch -d`, tar extract). Go to the host path the hook chose, as
+ * open/stat/setattr already do. */
+static int fakefs_utime(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime) {
+    char host_abs[PATH_MAX];
+    bool via_hook = false;
+    if (bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook) && via_hook) {
+        struct timespec times[2] = {atime, mtime};
+        if (utimensat(AT_FDCWD, host_abs, times, 0) < 0)
+            return errno_map();
+        return 0;
+    }
+    return realfs_utime(mount, path, atime, mtime);
 }
 
 static struct fd_ops fakefs_fdops;
@@ -1473,7 +1515,7 @@ const struct fs_ops fakefs = {
     .setattr = fakefs_setattr,
     .fsetattr = fakefs_fsetattr,
     .getpath = realfs_getpath,
-    .utime = realfs_utime,
+    .utime = fakefs_utime,
 
     .mkdir = fakefs_mkdir,
     .rmdir = fakefs_rmdir,

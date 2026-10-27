@@ -15,9 +15,12 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -524,6 +527,32 @@ static void test_unlink_directory(void) {
     rmdir(d);
 }
 
+// TCP options BIND sets on every TCP query socket. iSH answered
+// ENOPROTOOPT for both, and dig +tcp / nslookup -vc aborted with
+// "netmgr/tcpdns.c:315: RUNTIME_CHECK(result == ISC_R_SUCCESS) failed".
+static void test_tcp_query_socket_options(void) {
+    section("TCP_USER_TIMEOUT / TCP_MAXSEG (dig +tcp)");
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+        check(0, "setup: socket(AF_INET, SOCK_STREAM)");
+        return;
+    }
+    unsigned ms = 2500;
+    check(setsockopt(s, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, sizeof(ms)) == 0,
+          "setsockopt(TCP_USER_TIMEOUT, 2500 ms)");
+    unsigned got = 0;
+    socklen_t len = sizeof(got);
+    // Darwin keeps whole seconds; Linux reads back 2500 exactly.
+    check(getsockopt(s, IPPROTO_TCP, TCP_USER_TIMEOUT, &got, &len) == 0 && got >= 2500 && got <= 3000,
+          "getsockopt(TCP_USER_TIMEOUT) reads back 2500..3000 ms");
+    ms = 0;
+    check(setsockopt(s, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, sizeof(ms)) == 0,
+          "setsockopt(TCP_USER_TIMEOUT, 0) restores the default");
+    int mss = 1200;
+    check(setsockopt(s, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == 0, "setsockopt(TCP_MAXSEG, 1200)");
+    close(s);
+}
+
 int main(int argc, char **argv) {
     // Optional extra path to check stat/fstat on, e.g. a fakefs mount point.
     const char *extra_path = argc > 1 ? argv[1] : NULL;
@@ -557,6 +586,7 @@ int main(int argc, char **argv) {
     test_waitid_siginfo();
     test_posix_timer_sigev_signal();
     test_unlink_directory();
+    test_tcp_query_socket_options();
 
     printf("\n================ RESULT ================\n");
     printf("  PASS: %d    FAIL: %d\n", pass, fail);

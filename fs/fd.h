@@ -79,6 +79,9 @@ struct fd {
             // A TCP connection fs/xnet.c forwards through the app's entry,
             // NULL for every other socket. See fs/xnet.h.
             struct xnet_conn *xnet;
+            // A datagram socket that sent through the entry's UDP relay (or
+            // connect()ed to a destination that does), NULL otherwise.
+            struct xnet_udp *xudp;
             cond_t unix_got_peer;
             // Queue of struct scm for sending file descriptors
             // locked by fd->lock
@@ -131,6 +134,10 @@ struct fd {
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
+    // [T-ish-hook-fd-meta] fakefs opened this fd through the path-translate
+    // hook: fake_inode is then the HOST inode number, which means nothing in
+    // meta.db and must never be looked up there.
+    bool fake_via_hook;
     // [T-ish-exec-fewer-meta-txns] fakefs_open reads the stat row inside the
     // transaction it already holds for the path lookup and parks it here; the
     // first fstat after open (generic_openat's own) consumes it instead of
