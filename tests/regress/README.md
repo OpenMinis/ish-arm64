@@ -82,3 +82,15 @@ also checks CPU time inside timed waits. `/proc/ish/poll_spin` switches the four
 guards (`regfile`, `hupedge`, `deadline`, `backoff`) off one by one, e.g.
 `echo hupedge 0 > /proc/ish/poll_spin`; with all four off the test must fail
 (5 of 7 cases hang), which proves it catches the bug.
+
+## CLI command line longer than 4 KB (2026-10-26, ish-arm64#42)
+
+| Fix | What broke before it | Covered by |
+| --- | --- | --- |
+| argv sized from the arguments, E2BIG past `ARGV_MAX` | `xX_main_Xx.h` packed the guest argv into a fixed `char argv_copy[4096]` on the stack with unchecked `strcpy`, while the kernel accepts up to `ARGV_MAX` (128 KB). A ~16 KB `sh -c` command line smashed `main`'s frame and SIGSEGVed the host. | `regress_long_cmdline.sh` |
+| crash report always exits | The report symbolized every frame with `backtrace_symbols_fd` (dladdr, not async-signal-safe); on the smashed return address `0x616161616161` dladdr spun inside dyld, so the crashed CLI never reached `_exit` and had to be killed. Frames past the first non-code address are now printed raw, and a 3 s `SIGALRM` watchdog ends the process if the report still stalls. | manual: see the commit |
+
+`tests/regress/regress_long_cmdline.sh -i <ish> -t <alpine minirootfs tarball>`
+runs 4 KB to exactly 128 KB command lines and two past it, each under a 30 s
+watchdog. Against an unfixed `ish` the 16 KB and longer cases fail with 142
+(killed by the watchdog: the hang).
