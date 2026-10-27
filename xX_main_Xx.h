@@ -144,6 +144,23 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     {
         const char *base = strrchr(argv[optind], '/');
         base = base ? base + 1 : argv[optind];
+#if ISH_HVF
+        // In the VM: node as it ships, but for Sparkplug (kernel/exec.c)
+        if (strcmp(base, "node") == 0 && !EMULATED) {
+            strcpy(&argv_copy[p], argv[optind]);
+            p += strlen(argv[optind]) + 1;
+            strcpy(&argv_copy[p], "--no-sparkplug");
+            p += strlen("--no-sparkplug") + 1;
+            exec_argc += 2;
+            for (i = optind + 1; i < argc; i++) {
+                strcpy(&argv_copy[p], argv[i]);
+                p += strlen(argv[i]) + 1;
+                exec_argc++;
+            }
+            argv_copy[p] = '\0';
+            goto do_exec;
+        }
+#endif
         if (strcmp(base, "node") == 0 && EMULATED) {
             // Copy argv[0] first
             strcpy(&argv_copy[p], argv[optind]);

@@ -210,33 +210,33 @@ static uint64_t *pte_at(uint64_t root, uint64_t va, bool create) {
     return &tbl(t)[(va >> 12) & 511];
 }
 
-static void init(void) {
-    state = 0;
+static bool init_vm(void) {
     void *fw = dlopen("/System/Library/Frameworks/Hypervisor.framework/Hypervisor", RTLD_NOW);
     if (fw == NULL)
-        return;
-#define X(f) if ((hv.f = dlsym(fw, #f)) == NULL) return;
+        return false;
+#define X(f) if ((hv.f = dlsym(fw, #f)) == NULL) return false;
     HV_FUNCS(X)
 #undef X
     uint32_t max = 0;
     HV(hv_vm_config_get_max_ipa_size)(&max);
     ipa_bits = max < 40 ? max : 40;
     if (ipa_bits < 36)
-        return;
+        return false;
     hv_vm_config_t cfg = HV(hv_vm_config_create)();
     HV(hv_vm_config_set_ipa_size)(cfg, ipa_bits);
     hv_return_t r = HV(hv_vm_create)(cfg);
     if (r != HV_SUCCESS) {
-        fprintf(stderr, "iSH: no Hypervisor.framework VM (%#x)%s; running guest code the other way\n", r,
-                r == HV_DENIED ? ", the com.apple.security.hypervisor entitlement is missing (tools/hvf-sign.sh)" : "");
-        return;
+        if (getenv("ISH_HVF") != NULL)   // asked for it
+            fprintf(stderr, "iSH: no Hypervisor.framework VM (%#x)%s; running guest code the other way\n", r,
+                    r == HV_DENIED ? ", the com.apple.security.hypervisor entitlement is missing (tools/hvf-sign.sh)" : "");
+        return false;
     }
     // EL1: every vector entry leaves to us with its index as the hvc
     // immediate; the flush stub drops an ASID from every TLB and returns.
     uint32_t *stub = mmap(NULL, K16, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     pt_host = mmap(NULL, PT_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (stub == MAP_FAILED || pt_host == MAP_FAILED)
-        return;
+        return false;
     for (unsigned i = 0; i < 16; i++)
         stub[i * 32] = 0xd4000002 | (i << 5);   // hvc #i
     static const uint32_t flush[] = {
@@ -260,29 +260,28 @@ static void init(void) {
     memcpy((char *) stub + STUB_SYNC_ALL, flush_all, sizeof(flush_all));
     if (HV(hv_vm_map)(stub, IPA_STUB, K16, HV_MEMORY_READ | HV_MEMORY_EXEC) != HV_SUCCESS ||
             HV(hv_vm_map)(pt_host, IPA_PT, PT_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE) != HV_SUCCESS)
-        return;
+        return false;
     ttbr1 = pt_alloc();
     uint64_t *e = pte_at(ttbr1, STUB_VA, true);
     if (e == NULL)
-        return;
+        return false;
     *e = IPA_STUB | D_VALID | D_AF | D_ISH | D_UXN;   // EL1 only, executable there
     nblk = ((1ull << ipa_bits) - IPA_DYN) >> BLK_BITS;
     blk_bits = calloc((nblk + 63) / 64, sizeof(uint64_t));
     asid_free = calloc(65536, sizeof(uint16_t));
     if (blk_bits == NULL || asid_free == NULL)
-        return;
-    state = 1;
+        return false;
+    return true;
+}
+static void init(void) {
+    const char *v = getenv("ISH_HVF");
+    state = !(v && v[0] == '0') && init_vm();
 }
 
+// On unless ISH_HVF=0, where there is a VM to be had.
 bool hvf_on(void) {
-    if (state < 0) {
-        const char *v = getenv("ISH_HVF");
-        if (!(v && v[0] == '1')) {
-            state = 0;
-            return false;
-        }
+    if (state < 0)
         pthread_once(&once, init);
-    }
     return state == 1;
 }
 

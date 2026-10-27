@@ -1101,6 +1101,29 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
             }
         }
 
+#if ISH_HVF
+        // In the VM node runs as it ships but for Sparkplug: the node 22.15.1
+        // of Minis' rootfs fails in Sparkplug code on any arm64 Linux (docker
+        // too: a V8 fatal error in new FileHandle(), then a hang), and doing
+        // without it costs node ~6%.
+        if (strcmp(base, "node") == 0 && native) {
+            static const char arg[] = "--no-sparkplug";
+            char *p = argv;
+            while (*p != '\0')
+                p += strlen(p) + 1;
+            size_t total_used = (p - argv) + 1;
+            bool found = false;
+            for (char *q = argv; *q != '\0'; q += strlen(q) + 1)
+                found = found || strcmp(q, arg) == 0;
+            if (!found && total_used + sizeof(arg) + 1 <= ARGV_MAX) {
+                char *after_argv0 = argv + strlen(argv) + 1;
+                memmove(after_argv0 + sizeof(arg), after_argv0, total_used - (after_argv0 - argv));
+                memcpy(after_argv0, arg, sizeof(arg));
+                argc++;
+            }
+        }
+#endif
+
         // Inject LD_PRELOAD for zero_malloc.so to zero large malloc/free.
         // V8's Zone allocator reuses freed memory without zeroing, causing
         // stale pointer dereferences. This library zeros blocks >= 4096 bytes

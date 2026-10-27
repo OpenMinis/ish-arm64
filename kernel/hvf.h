@@ -17,9 +17,10 @@
 // whatever replaces host pages in the window (resync() in kernel/sba.c)
 // maps them again.
 //
-// ISH_HVF=1 turns it on. Needs the com.apple.security.hypervisor entitlement
-// (tools/hvf-sign.sh); without it, or on too many threads, the JIT runs the
-// guest as before.
+// On by default (macOS), ISH_HVF=0 turns it off. Needs the
+// com.apple.security.hypervisor entitlement, which the meson build gives the
+// CLI (tools/hvf-sign.sh); without it, or on too many threads, the JIT runs
+// the guest as before.
 
 #include "util/macopt.h"
 #if ISH_HVF

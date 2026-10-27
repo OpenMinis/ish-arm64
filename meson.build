@@ -1812,7 +1812,14 @@ if get_option('kernel') == 'ish'
         if cli_aot.length() > 0 and not ish_jit
             error('-Dcli_aot needs -Djit=true (the images register with the JIT runtime)')
         endif
-        executable('ish', ['main.c'] + files(cli_aot), dependencies: ish)
+        ish_exe = executable('ish', ['main.c'] + files(cli_aot), dependencies: ish)
+        if guest_arch == 'arm64' and host_machine.system() == 'darwin' and host_machine.cpu_family() == 'aarch64'
+            # Hypervisor.framework runs guest code (kernel/hvf.h) only for an
+            # executable with its entitlement.
+            custom_target('ish-hvf-entitlement', input: ish_exe, output: 'ish.hvf-signed',
+                          command: [find_program('tools/hvf-sign.sh'), '-s', '@OUTPUT@', '@INPUT@'],
+                          build_by_default: true)
+        endif
     endif
 
 elif get_option('kernel') == 'linux'
