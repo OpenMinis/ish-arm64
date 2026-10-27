@@ -107,6 +107,15 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
         generic_mknodat(AT_PWD, "/dev/console", S_IFCHR|0666, dev_make(TTY_ALTERNATE_MAJOR, DEV_CONSOLE_MINOR));
         generic_mknodat(AT_PWD, "/dev/ptmx", S_IFCHR|0666, dev_make(TTY_ALTERNATE_MAJOR, DEV_PTMX_MINOR));
     }
+#if ISH_MAC_OPT
+    // POSIX shared memory (shm_open, sem_open) lives in /dev/shm: without it
+    // Python's multiprocessing has no locks, so no process pools (black runs
+    // its files one process at a time: 32 s instead of 10). A plain directory
+    // does (on Linux it is a tmpfs: what a crashed program left stays here).
+    generic_mkdirat(AT_PWD, "/dev/shm", 01777);
+    struct attr shm_mode = {.type = attr_mode, .mode = S_IFDIR | 01777};
+    generic_setattrat(AT_PWD, "/dev/shm", shm_mode, true);
+#endif
 
     char cwd[MAX_PATH + 1];
     if (root == NULL && workdir == NULL) {
