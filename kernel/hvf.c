@@ -276,6 +276,21 @@ static bool init_vm(void) {
     asid_free = calloc(65536, sizeof(uint16_t));
     if (blk_bits == NULL || asid_free == NULL)
         return false;
+    // The ASID width (8 or 16 bits), and with it TCR, read once here from a
+    // vCPU made for it, so hvf_describe() has it before any guest thread ran.
+    // No vCPU now: 8-bit ASIDs, which every CPU has.
+    hv_vcpu_t probe;
+    hv_vcpu_exit_t *probe_exit;
+    if (HV(hv_vcpu_create)(&probe, &probe_exit, NULL) == HV_SUCCESS) {
+        uint64_t mmfr0 = 0;
+        HV(hv_vcpu_get_sys_reg)(probe, HV_SYS_REG_ID_AA64MMFR0_EL1, &mmfr0);
+        HV(hv_vcpu_destroy)(probe);
+        asid16 = ((mmfr0 >> 4) & 0xf) == 2;
+    }
+    uint64_t ips = ipa_bits >= 44 ? 4 : ipa_bits >= 42 ? 3 : ipa_bits >= 40 ? 2 : 1;
+    // 48-bit VA on both halves, 4KB granule, write-back inner shareable walks
+    tcr = 16 | (1ull << 8) | (1ull << 10) | (3ull << 12) | (16ull << 16) | (1ull << 24) | (1ull << 26) |
+          (3ull << 28) | (2ull << 30) | (ips << 32) | ((uint64_t) asid16 << 36);
     return true;
 }
 static void init(void) {
@@ -338,17 +353,6 @@ static struct hvf_thread *thread_get(void) {
     vcpus_made++;
     vcpus_live++;
     hv_vcpu_t v = t->vcpu;
-    pthread_mutex_lock(&g_lock);
-    if (tcr == 0) {
-        uint64_t mmfr0 = 0;
-        HV(hv_vcpu_get_sys_reg)(v, HV_SYS_REG_ID_AA64MMFR0_EL1, &mmfr0);
-        asid16 = ((mmfr0 >> 4) & 0xf) == 2;
-        uint64_t ips = ipa_bits >= 44 ? 4 : ipa_bits >= 42 ? 3 : ipa_bits >= 40 ? 2 : 1;
-        // 48-bit VA on both halves, 4KB granule, write-back inner shareable walks
-        tcr = 16 | (1ull << 8) | (1ull << 10) | (3ull << 12) | (16ull << 16) | (1ull << 24) | (1ull << 26) |
-              (3ull << 28) | (2ull << 30) | (ips << 32) | ((uint64_t) asid16 << 36);
-    }
-    pthread_mutex_unlock(&g_lock);
     HV(hv_vcpu_set_sys_reg)(v, HV_SYS_REG_MAIR_EL1, 0xff);   // attribute 0: normal, write-back
     HV(hv_vcpu_set_sys_reg)(v, HV_SYS_REG_TCR_EL1, tcr);
     HV(hv_vcpu_set_sys_reg)(v, HV_SYS_REG_TTBR1_EL1, ttbr1);
