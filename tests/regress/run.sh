@@ -315,6 +315,25 @@ else
 fi
 rm -f "$rights_bin"
 
+# What Go's asynchronous preemption does: a signal handler that pushes a
+# call at whatever instruction it interrupted, as fast as another thread can
+# send it; registers, flags and the interrupted system calls must survive.
+echo
+echo "########## a call pushed by a signal handler ##########"
+push_bin=$(mktemp -t regress_signal_pushcall)
+if "$CC_GUEST" -static -O1 -Wall -pthread -o "$push_bin" tests/regress/regress_signal_pushcall.c &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/dd of=/tmp/regress_signal_pushcall status=none < "$push_bin" &&
+        "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/chmod 755 /tmp/regress_signal_pushcall; then
+    out=$(timeout 60 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_signal_pushcall 3)
+    echo "$out"
+    case "$out" in ok*) echo "PASS: pushed calls" ;; *) echo "FAIL: pushed calls"; status=1 ;; esac
+    "$ISH" "$MOUNT_FLAG" "$ROOTFS" /bin/rm -f /tmp/regress_signal_pushcall
+else
+    echo "failed to build or stage regress_signal_pushcall" >&2
+    status=1
+fi
+rm -f "$push_bin"
+
 # UDP multicast over the loopback: joining and leaving groups, IP_PKTINFO
 # and IPV6_PKTINFO, a shared port, SO_BINDTODEVICE. iSH exits 0 whatever the
 # guest does, so the verdict is read from what the test prints.

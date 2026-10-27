@@ -10,6 +10,7 @@
 #include "kernel/task.h"
 #include "kernel/memory.h"
 #include "emu/tlb.h"
+#include "kernel/hvf.h"
 
 __thread struct task *current;
 
@@ -89,6 +90,9 @@ struct task *task_create_(struct task *parent) {
     // permanent one-interrupt-per-block storm in the child.
     task->cpu.poked_ptr = &task->cpu._poked;
     task->cpu._poked = false;
+#if ISH_MAC_OPT
+    task->hvf_vcpu = 0;
+#endif
 
     // Initialize blocking state for deadlock detection.
     task->blocking = false;
@@ -170,6 +174,9 @@ static void task_run_tlb_cleanup(void *arg) {
 #ifdef GUEST_ARM64
     tlb_detach((struct tlb *) arg);   // exited while running guest code
 #endif
+#if ISH_HVF
+    hvf_thread_exit();
+#endif
     tlb_free((struct tlb *)arg);
     // [T-ish-mm-leak-refcount-handoff] If the do_exit_group safety valve
     // orphaned this thread (stuck in an uninterruptible host syscall) it
@@ -227,6 +234,16 @@ void task_run_current() {
         if (self->mem == NULL) {
             pthread_exit(NULL);
         }
+#if ISH_HVF
+        // natively, in the VM, when there is one for this thread
+        if (hvf_on()) {
+            int interrupt = hvf_run(cpu);
+            if (interrupt != HVF_NO) {
+                handle_interrupt(interrupt);
+                continue;
+            }
+        }
+#endif
         read_wrlock_behind_writer(&self->mem->lock);
 #ifdef GUEST_ARM64
         tlb_attach(tlb, &self->mem->mmu);

@@ -43,6 +43,9 @@ struct sba_region {
     // NULL when off.
     char *alias;
     _Atomic int refs;
+    // Where the Hypervisor.framework VM sees each 2MB of the window
+    // (kernel/hvf.c): its block of guest physical addresses, 0 if none.
+    uint32_t *hvf_blk;
 };
 
 bool sba_on(void);

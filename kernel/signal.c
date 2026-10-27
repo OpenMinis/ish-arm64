@@ -9,6 +9,7 @@
 #include "kernel/native_offload.h"
 #include "kernel/vdso.h"
 #include "emu/interrupt.h"
+#include "kernel/hvf.h"
 
 #if is_gcc(9)
 #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
@@ -131,6 +132,9 @@ void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
     deliver_signal_unlocked(task, sig, info);
     unlock(&task->sighand->lock);
     cpu_poke(&task->cpu);
+#if ISH_HVF
+    hvf_kick(task);
+#endif
 }
 
 void send_signal(struct task *task, int sig, struct siginfo_ info) {
@@ -163,6 +167,9 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
         // boundary instead of waiting for INT_TIMER (up to 1024 cycles).
         // This reduces signal delivery latency from ~1024 to ~1 gadget.
         cpu_poke(&task->cpu);
+#if ISH_HVF
+        hvf_kick(task);
+#endif
     }
     unlock(&sighand->lock);
 

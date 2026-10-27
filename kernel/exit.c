@@ -12,6 +12,7 @@
 #include "kernel/mm.h"
 #include "kernel/futex.h"
 #include "kernel/ptrace.h"
+#include "kernel/hvf.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
 #ifdef ISH_JIT
@@ -385,6 +386,9 @@ noreturn void do_exit_group(int status) {
                     if (task != current && !task->exiting) {
                         still_alive++;
                         cpu_poke(&task->cpu);
+#if ISH_HVF
+                        hvf_kick(task);
+#endif
                         if (task->thread)
                             pthread_kill(task->thread, SIGUSR1);
                     }

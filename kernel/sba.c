@@ -11,6 +11,7 @@
 #include "kernel/sba.h"
 #include "fs/fd.h"
 #include "kernel/memory.h"
+#include "kernel/hvf.h"
 
 
 static int sba_state = -1, fastmem_state = -1;
@@ -34,7 +35,9 @@ bool sba_on(void) {
 static bool fastmem_on(void) {
     if (fastmem_state < 0) {
         const char *v = getenv("ISH_FASTMEM");
-        fastmem_state = !(v && v[0] == '0');
+        // Not for guest code run in a VM (kernel/hvf.h): there the alias
+        // would only be kept up to date for nothing.
+        fastmem_state = !(v && v[0] == '0') && !hvf_on();
     }
     return fastmem_state;
 }
@@ -42,6 +45,7 @@ static bool fastmem_on(void) {
 // Show the alias the window's host pages of [a, b) (shadow offsets, rounded
 // out to host pages) again, closed: what it showed may have been replaced.
 static void resync(struct sba_region *r, uint64_t a, uint64_t b) {
+    hvf_region_remap(r, a, b);
     if (r->alias == NULL || b <= a)
         return;
     a &= ~(SBA_CHUNK - 1);
@@ -59,6 +63,7 @@ static void resync(struct sba_region *r, uint64_t a, uint64_t b) {
 // shadow memory stays resident while anything maps it); whatever maps them
 // again resyncs them.
 static void unsync(struct sba_region *r, uint64_t a, uint64_t b) {
+    hvf_region_remap(r, a, b);
     if (r->alias == NULL || b <= a)
         return;
     mmap(r->alias + a, b - a, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
@@ -112,6 +117,7 @@ void sba_init(struct mem *mem) {
     r->base = p + SBA_MAP_ENTRIES;
     r->alias = NULL;
     r->refs = 1;
+    r->hvf_blk = NULL;
     if (fastmem_on()) {
         // Closed address space to begin with: whatever puts memory in the
         // window shows it to the alias (resync()), closed, and pt_map()
@@ -128,6 +134,7 @@ void sba_init(struct mem *mem) {
 }
 
 static void region_free(struct sba_region *r) {
+    hvf_region_free(r);
     munmap(r->base - SBA_MAP_ENTRIES, SBA_MAP_ENTRIES + SBA_SPAN + SBA_CHUNK);
     if (r->alias)
         munmap(r->alias, SBA_SPAN + SBA_CHUNK);
@@ -252,6 +259,7 @@ void sba_invalidate(struct mem *mem, page_t start, pages_t pages) {
     uint8_t *map = mem->mmu.sba_map;
     if (map == NULL || mem->sba_dying)
         return;
+    hvf_invalidate(mem, start, pages);
     uint64_t a = (uint64_t) start << PAGE_BITS;
     if (a >= SBA_SPAN)
         return;
@@ -357,6 +365,8 @@ struct data *sba_fork_page(struct sba_fork *f, struct data *sd, page_t page) {
         dd->data = f->dst->sba->base + ((char *) sd->data - f->src->sba->base);
         dd->refcount = 0;
         dd->sba = f->dst->sba;
+        dd->hvf_ipa = 0;
+        dd->hvf_copy = NULL;
         atomic_fetch_add(&dd->sba->refs, 1);
         if (dd->fd != NULL)
             dd->fd = fd_retain(dd->fd);

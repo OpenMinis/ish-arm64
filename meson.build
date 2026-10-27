@@ -1711,6 +1711,7 @@ if get_option('kernel') == 'ish'
         'kernel/calls.c',] + arch_kernel_src + [
         'kernel/memory.c',
         'kernel/sba.c',
+        'kernel/hvf.c',
         'kernel/pmu.c',
         'kernel/user.c',
         'kernel/vdso.c', vdso,

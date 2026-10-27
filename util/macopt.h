@@ -20,5 +20,7 @@
 #else
 #define ISH_SBA 0
 #endif
+// guest code run in a Hypervisor.framework VM (kernel/hvf.h), on the window
+#define ISH_HVF ISH_SBA
 
 #endif

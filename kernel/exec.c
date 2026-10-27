@@ -19,6 +19,7 @@
 #include "kernel/vdso.h"
 #include "kernel/mm.h"
 #include "kernel/native_offload.h"
+#include "kernel/hvf.h"
 #include "tools/ptraceomatic-config.h"
 
 #define ARGV_MAX 32 * PAGE_SIZE
@@ -901,6 +902,18 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     }
 
 #if defined(GUEST_ARM64)
+#if ISH_HVF
+    // Natively, in a VM (kernel/hvf.h), guest code needs none of what is
+    // injected below to work around emulating it: allocator, thread counts,
+    // V8 without its compilers. What changes behavior (NO_COLOR and the
+    // like) stays, and so does GODEBUG=asyncpreemptoff=1: Go's preemption
+    // signals break Go programs in the JIT too (esbuild: 2 runs in 12).
+    // (A thread that gets no vCPU runs it emulated anyway.)
+    bool native = hvf_on();
+#define EMULATED (!native)
+#else
+#define EMULATED 1
+#endif
     // Force-inject environment variables into every execve'd process.
     // mode=0: inject only if not present, mode=1: replace existing value
     static const struct { const char *kv; size_t prefix_len; int mode; } inject_envs[] = {
@@ -925,6 +938,12 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         { "UV_THREADPOOL_SIZE=1", 19, 0 },
     };
     for (size_t vi = 0; vi < sizeof(inject_envs)/sizeof(inject_envs[0]); vi++) {
+#if ISH_HVF
+        if (native && (strncmp(inject_envs[vi].kv, "PYTHONMALLOC=", 13) == 0 ||
+                       strncmp(inject_envs[vi].kv, "GOMAXPROCS=", 11) == 0 ||
+                       strncmp(inject_envs[vi].kv, "UV_THREADPOOL_SIZE=", 19) == 0))
+            continue;
+#endif
         char *e = envp;
         char *found_at = NULL;
         while (*e != '\0') {
@@ -966,7 +985,7 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     {
         const char *base = strrchr(filename, '/');
         base = base ? base + 1 : filename;
-        if (strcmp(base, "node") == 0) {
+        if (strcmp(base, "node") == 0 && EMULATED) {
             // Fallback (jitless) mode, see the mode choice below.
             static const char *inject_args_jitless[] = {
                 "--jitless",
@@ -1086,7 +1105,7 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         // V8's Zone allocator reuses freed memory without zeroing, causing
         // stale pointer dereferences. This library zeros blocks >= 4096 bytes
         // on both malloc and free (Zone segments are >= 8KB).
-        if (strcmp(base, "node") == 0) {
+        if (strcmp(base, "node") == 0 && EMULATED) {
             static const char *ld_preload = "LD_PRELOAD=/lib/zero_free.so";
             size_t env_len = strlen(ld_preload) + 1;
 
@@ -1109,6 +1128,7 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
             }
         }
     }
+#undef EMULATED
 #endif
 
     // Native offload: check if this binary should run natively on the host.

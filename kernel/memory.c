@@ -20,6 +20,7 @@
 #include "kernel/resource.h"
 #include "fs/fd.h"
 #include "kernel/sba.h"
+#include "kernel/hvf.h"
 
 // increment the change count
 static void mem_changed(struct mem *mem);
@@ -53,6 +54,9 @@ void mem_init(struct mem *mem) {
     lock_init(&mem->cow_lock);
 #if ISH_SBA
     sba_init(mem);
+#endif
+#if ISH_HVF
+    mem->hvf = NULL;
 #endif
 }
 
@@ -108,6 +112,9 @@ void mem_destroy(struct mem *mem) {
     mem->mmu.asbestos = NULL;
     pt_node_free(mem->pgdir, 0);
     mem->pgdir = NULL;
+#if ISH_HVF
+    hvf_mm_destroy(mem);
+#endif
 #if ISH_SBA
     sba_destroy(mem);
 #endif
@@ -735,6 +742,9 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
 #endif
         mem_pt_del(mem, page);
         if (--data->refcount == 0) {
+#if ISH_HVF
+            hvf_data_free(data);
+#endif
             // vdso wasn't allocated with mmap, it's just in our data segment
 #if ISH_SBA
             if (data->sba) {
@@ -1188,6 +1198,10 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
             entry->flags |= P_COW;
             if (entry->data->sba)
                 sba_invalidate(src, page, 1);   // a store must copy it now
+#if ISH_HVF
+            else
+                hvf_invalidate(src, page, 1);
+#endif
         }
 #else
         if (!(entry->flags & P_SHARED))

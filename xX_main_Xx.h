@@ -11,6 +11,7 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "kernel/native_offload.h"
+#include "kernel/hvf.h"
 #ifdef __APPLE__
 #include <sys/resource.h>
 #define IOPOL_TYPE_VFS_HFS_CASE_SENSITIVITY 1
@@ -127,6 +128,13 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     if (argv[optind] == NULL)
 	    return _ENOENT;
 #ifdef GUEST_ARM64
+#if ISH_HVF
+    // In a VM (kernel/hvf.h) none of the emulation workarounds below, as in
+    // sys_execve (kernel/exec.c).
+#define EMULATED (!hvf_on())
+#else
+#define EMULATED 1
+#endif
     // Inject V8 flags for node to work around scope corruption in emulation.
     // --jitless: disable JIT (avoids V8 code gen incompatible with our JIT)
     // --predictable: disable concurrent GC/compilation (avoids race conditions)
@@ -136,7 +144,7 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     {
         const char *base = strrchr(argv[optind], '/');
         base = base ? base + 1 : argv[optind];
-        if (strcmp(base, "node") == 0) {
+        if (strcmp(base, "node") == 0 && EMULATED) {
             // Copy argv[0] first
             strcpy(&argv_copy[p], argv[optind]);
             p += strlen(argv[optind]) + 1;
@@ -216,6 +224,12 @@ do_exec:
             "UV_THREADPOOL_SIZE=1",
         };
         for (size_t vi = 0; vi < sizeof(inject_vars)/sizeof(inject_vars[0]); vi++) {
+#if ISH_HVF
+            if (!EMULATED && (strncmp(inject_vars[vi], "GOMAXPROCS=", 11) == 0 ||
+                              strncmp(inject_vars[vi], "PYTHONMALLOC=", 13) == 0 ||
+                              strncmp(inject_vars[vi], "UV_THREADPOOL_SIZE=", 19) == 0))
+                continue;
+#endif
             // Check if already present (search by prefix up to '=')
             const char *eq = strchr(inject_vars[vi], '=');
             size_t prefix_len = eq ? (size_t)(eq - inject_vars[vi] + 1) : strlen(inject_vars[vi]);
@@ -240,7 +254,7 @@ do_exec:
         // Node-specific: LD_PRELOAD for zero_free.so
         const char *base2 = strrchr(argv[optind], '/');
         base2 = base2 ? base2 + 1 : argv[optind];
-        if (strcmp(base2, "node") == 0) {
+        if (strcmp(base2, "node") == 0 && EMULATED) {
             static const char *ld_preload = "LD_PRELOAD=/lib/zero_free.so";
             size_t plen = strlen(ld_preload) + 1;
             if (ep + plen < sizeof(envp_buf) - 2) {
@@ -251,6 +265,7 @@ do_exec:
         envp_buf[ep] = '\0';
         err = do_execve(argv[optind], exec_argc, argv_copy, envp_buf);
     }
+#undef EMULATED
 #else
     err = do_execve(argv[optind], exec_argc, argv_copy, envp == NULL ? "\0" : envp);
 #endif

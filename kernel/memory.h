@@ -58,6 +58,7 @@ struct mem {
     struct sba_region *sba;   // kernel/sba.h, NULL when off
     bool sba_dying;           // mem_destroy(): the shadow goes as a whole
     bool sba_keep;            // pt_map() replacing pages: the shadow holds the new ones
+    struct hvf_mm *hvf;       // kernel/hvf.c, NULL until guest code runs in the VM
 #endif
 };
 
@@ -152,6 +153,10 @@ struct data {
 #if ISH_MAC_OPT
     // The shadow region data lives in (kernel/sba.h), NULL for host memory.
     struct sba_region *sba;
+    // Where the Hypervisor.framework VM sees data (kernel/hvf.c), 0 if not,
+    // and the copy it sees when it cannot have the memory itself.
+    uint64_t hvf_ipa;
+    void *hvf_copy;
 #endif
 #if LEAK_DEBUG
     int pid;

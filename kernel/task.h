@@ -16,6 +16,10 @@
 // locking, unless otherwise specified
 struct task {
     struct cpu_state cpu;
+#if ISH_MAC_OPT
+    // + 1: the Hypervisor.framework vCPU running this task (kernel/hvf.c), 0 if none
+    _Atomic uint64_t hvf_vcpu;
+#endif
     struct mm *mm; // locked by general_lock
     struct mem *mem; // pointer to mm.mem, for convenience
     pthread_t thread;
