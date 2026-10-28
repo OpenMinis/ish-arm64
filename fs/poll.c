@@ -160,6 +160,13 @@ static _Atomic uint64_t poll_stat_regfile_skips; // host registrations skipped f
 // file`, or a log another process keeps appending to. Pipes, sockets and
 // character devices keep their registration.
 static bool poll_fd_wants_host(struct fd *fd) {
+#if HAVE_PX_POLL
+    // The Windows poll() reports a file or directory ready at once and never
+    // wakes for one, so there is nothing to guard against, and the fstat
+    // costs more than the poll itself.
+    (void) fd;
+    return true;
+#endif
     if (!poll_guard_regfile)
         return true;
     struct stat st;
@@ -461,8 +468,12 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
     // host wait that returned NO events as a timeout, so a host that keeps
     // reporting something the guest check then rejects never let a finite
     // wait end - with timeout 0 not even after the first pass.
+    // A zero timeout needs no clock: it is over at the first spurious
+    // wakeup. Reading the clock is not free everywhere (QueryPerformanceCounter
+    // traps to the hypervisor in some VMs: ~3.5 us, more than the poll).
+    bool zero_timeout = timeout != NULL && timeout->tv_sec == 0 && timeout->tv_nsec == 0;
     uint64_t deadline_ns = 0;
-    if (timeout != NULL) {
+    if (timeout != NULL && !zero_timeout) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         deadline_ns = (uint64_t) now.tv_sec * 1000000000ULL + now.tv_nsec
@@ -537,6 +548,10 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 poll_stat_spins++;
             if (spurious == POLL_SPIN_LOG_AT)
                 poll_spin_report(poll_, spurious, last_events, last_n);
+            if (zero_timeout && poll_guard_deadline) {
+                poll_stat_deadline++;
+                break; // res is 0: timed out
+            }
             if (timeout != NULL && poll_guard_deadline) {
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
