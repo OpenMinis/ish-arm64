@@ -15,9 +15,9 @@ command = shlex.split(command['command'])[:-9] + ['-MD', '-MQ', '$output', '-MF'
 print(shlex.join(command))
 END
 )
-eval "$flags" '"$input"' -include "$(dirname $0)/staticdefine.h" -S -o - | \
+eval "$flags" '"$input"' -include '"$(dirname "$0")/staticdefine.h"' -S -o - | \
 sed -ne 's:^[[:space:]]*\.ascii[[:space:]]*"\(.*\)".*:\1:;
          /^->/{s:->#\(.*\):/* \1 */:;
          s:^->\([^ ]*\) [\$$#]*\([^ ]*\) \(.*\):#define \1 \2 /* \3 */:;
-         s:->::; p;}' > $output
+         s:->::; p;}' > "$output"
 # sed magic was copied from the linux kernel build system

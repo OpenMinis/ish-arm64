@@ -25,6 +25,9 @@
 #include "fs/fd.h"
 #include "fs/path.h"
 #include "ish_commit.h"
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+#endif
 
 bool ish_serve_mode;
 const char *ish_serve_rootfs;
@@ -1378,10 +1381,14 @@ static void handle_request(struct jv *req) {
     }
 }
 
-static const char *engine(void) {
+const char *ish_engine(void) {
 #ifdef GUEST_X86_64
     if (vm_wanted())
         return "vm";
+#endif
+#ifdef ISH_JIT
+    if (jit_enabled())
+        return "jit";
 #endif
 #ifdef ISH_XJIT
     if (xjit_enabled())
@@ -1406,7 +1413,8 @@ noreturn void serve_main(void) {
     struct jb b = {0};
     jb_printf(&b, "{\"ev\":\"ready\",\"proto\":1,\"pid\":%lu,\"version\":", px_host_pid());
     jb_str(&b, ISH_COMMIT);
-    jb_printf(&b, ",\"engine\":\"%s\",\"exec_binds\":true,\"rootfs\":", engine());
+    jb_printf(&b, ",\"engine\":\"%s\",\"guest_arch\":\"%s\",\"host_arch\":\"%s\",\"exec_binds\":true,\"rootfs\":",
+              ish_engine(), ish_guest_arch(), ish_host_arch());
     jb_str(&b, rootfs);
     jb_send(&b);
 

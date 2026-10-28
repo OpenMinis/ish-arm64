@@ -34,8 +34,12 @@
 
 #if __APPLE__
 #define NAME(x) _##x
+#define PAGE(x) x@PAGE
+#define PAGEOFF(x) x@PAGEOFF
 #else
 #define NAME(x) x
+#define PAGE(x) x
+#define PAGEOFF(x) :lo12:x
 #endif
 .macro .global.name name
     .global NAME(\name)

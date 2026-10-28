@@ -1,6 +1,7 @@
 #include "fs/proc.h"
 #include "fs/proc/ish.h"
 #include "kernel/errno.h"
+#include "fs/poll.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,6 +181,17 @@ static ssize_t proc_ish_write_jit(struct proc_entry *UNUSED(entry), struct proc_
 }
 #endif
 
+// [T-ish-poll-spin-guard] Poll wakeup counters and guard switches (fs/poll.c).
+static int proc_ish_show_poll_spin(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char text[512];
+    poll_spin_describe(text, sizeof(text));
+    proc_printf(buf, "%s", text);
+    return 0;
+}
+static ssize_t proc_ish_write_poll_spin(struct proc_entry *UNUSED(entry), struct proc_data *data, off_t UNUSED(off)) {
+    return poll_spin_control(data->data, data->size) == 0 ? (ssize_t) data->size : _EINVAL;
+}
+
 struct proc_children proc_ish_children = PROC_CHILDREN({
     {"colors", .show = proc_ish_show_colors},
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
@@ -188,5 +200,6 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
 #ifdef ISH_JIT
     {"jit", .show = proc_ish_show_jit, .pwrite = proc_ish_write_jit},
 #endif
+    {"poll_spin", .show = proc_ish_show_poll_spin, .pwrite = proc_ish_write_poll_spin},
     {"version", .show = proc_ish_show_version},
 });

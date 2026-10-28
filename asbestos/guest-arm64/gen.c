@@ -881,7 +881,7 @@ extern void gadget_fused_subs_reg_bcond_lt(void);
 extern void gadget_fused_subs_reg_bcond_gt(void);
 extern void gadget_fused_subs_reg_bcond_le(void);
 
-static void gen(struct gen_state *state, unsigned long thing) {
+static void gen(struct gen_state *state, uintptr_t thing) {
     assert(state->size <= state->capacity);
     // Once the buffer has failed to grow, stop writing. The remaining gadgets
     // for this instruction are dropped, but the block is discarded wholesale by
@@ -891,7 +891,7 @@ static void gen(struct gen_state *state, unsigned long thing) {
     if (state->size >= state->capacity) {
         unsigned new_capacity = state->capacity * 2;
         struct fiber_block *new_block = realloc(state->block,
-                sizeof(*new_block) + new_capacity * sizeof(unsigned long));
+                sizeof(*new_block) + new_capacity * sizeof(uintptr_t));
         if (new_block == NULL) {
             // Aborting here killed the entire app -- every guest thread, plus
             // the Swift UI side -- because one guest process asked for more
@@ -911,9 +911,9 @@ static void gen(struct gen_state *state, unsigned long thing) {
 // Generate interrupt and end the block
 static void gen_interrupt(struct gen_state *state, int interrupt_type) {
     // Set guest PC to the faulting instruction so signal handlers see the correct address
-    gen(state, (unsigned long) gadget_set_pc);
+    gen(state, (uintptr_t) gadget_set_pc);
     gen(state, state->orig_ip);
-    gen(state, (unsigned long) gadget_interrupt);
+    gen(state, (uintptr_t) gadget_interrupt);
     gen(state, interrupt_type);
 }
 
@@ -930,7 +930,7 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     }
     state->block_patch_ip = 0;
 
-    struct fiber_block *block = malloc(sizeof(struct fiber_block) + state->capacity * sizeof(unsigned long));
+    struct fiber_block *block = malloc(sizeof(struct fiber_block) + state->capacity * sizeof(uintptr_t));
     if (block == NULL)
         return false;
     state->block = block;
@@ -955,7 +955,7 @@ void gen_end(struct gen_state *state) {
         list_init(&block->jumps_from_links[i]);
     }
     if (state->block_patch_ip != 0) {
-        block->code[state->block_patch_ip] = (unsigned long) block;
+        block->code[state->block_patch_ip] = (uintptr_t) block;
     }
     if (block->addr != state->ip)
         block->end_addr = state->ip - 1;
@@ -969,7 +969,7 @@ void gen_end(struct gen_state *state) {
 }
 
 void gen_exit(struct gen_state *state) {
-    gen(state, (unsigned long) gadget_exit);
+    gen(state, (uintptr_t) gadget_exit);
     gen(state, state->ip);
 }
 
@@ -977,8 +977,8 @@ void gen_exit(struct gen_state *state) {
 // the native spec_fn, then resumes at guest LR (emulating the function's ret).
 // Layout matches gadget_prebuilt_entry in control.S: [&gadget_prebuilt_entry][spec_fn].
 void gen_prebuilt_block(struct gen_state *state, void *spec_fn) {
-    gen(state, (unsigned long) gadget_prebuilt_entry);
-    gen(state, (unsigned long) spec_fn);
+    gen(state, (uintptr_t) gadget_prebuilt_entry);
+    gen(state, (uintptr_t) spec_fn);
 }
 
 // Forward declarations
@@ -991,7 +991,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn);
 extern volatile bool g_trace_highbits;
 
 static void gen_trace_highbits(struct gen_state *state) {
-    gen(state, (unsigned long)gadget_check_highbits);
+    gen(state, (uintptr_t)gadget_check_highbits);
     gen(state, (uint64_t)state->orig_ip);  // guest PC for this instruction
 }
 
@@ -1040,10 +1040,10 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
                 addr_t skip = state->ip + tbnz_off;   // tbnz PC = state->ip (post-LDR)
                 addr_t dealloc = p5;                  // insn after cbnz (fallthrough)
                 extern void gadget_decref(void);
-                gen(state, (unsigned long) gadget_decref);
+                gen(state, (uintptr_t) gadget_decref);
                 gen(state, obj);
-                gen(state, (unsigned long)(skip | (1ULL << 63)));
-                gen(state, (unsigned long)(dealloc | (1ULL << 63)));
+                gen(state, (uintptr_t)(skip | (1ULL << 63)));
+                gen(state, (uintptr_t)(dealloc | (1ULL << 63)));
                 state->ip = p6;                       // consumed ldr+tbnz+sub+str+cbnz
                 return 1;
             }
@@ -1084,7 +1084,7 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
             addr_t after_str = q5;   // instruction after the str (fall-through)
             if (adds_ok && beq_ok && str_ok && beq_target == after_str) {
                 extern void gadget_incref(void);
-                gen(state, (unsigned long) gadget_incref);
+                gen(state, (uintptr_t) gadget_incref);
                 gen(state, obj);
                 state->ip = q5;      // consumed ldr+adds+b.eq+str
                 return 1;
@@ -1099,7 +1099,7 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rm = (insn >> 16) & 0x1f;
-        gen(state, (unsigned long) gadget_sve_eor_d);
+        gen(state, (uintptr_t) gadget_sve_eor_d);
         gen(state, rd | (rn << 8) | (rm << 16));
         return 1;
     }
@@ -1113,7 +1113,7 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
             imm_low = 32;
         }
         uint32_t imm = imm_low + (((insn >> 22) & 1) ? 0 : 32);
-        gen(state, (unsigned long) gadget_sve_xar_d);
+        gen(state, (uintptr_t) gadget_sve_xar_d);
         gen(state, rd | (zm << 8) | (imm << 16));
         return 1;
     }
@@ -1380,16 +1380,16 @@ static int try_fuse_subs_bcond(struct gen_state *state, uint32_t sf, uint32_t rd
 
     int64_t offset = arm64_branch_imm19(next_insn);
     addr_t target = (state->ip - 4) + offset;
-    unsigned long fake_target = (unsigned long)target | (1UL << 63);
-    unsigned long fake_fallthrough = (unsigned long)state->ip | (1UL << 63);
+    uintptr_t fake_target = (uintptr_t)target | (1ULL << 63);
+    uintptr_t fake_fallthrough = (uintptr_t)state->ip | (1ULL << 63);
 
     if (rd == 31) {
         // CMP: no result register, only flags
-        gen(state, (unsigned long)(sf ? fused_cmp_bcond_gadgets[cond] : fused_cmp32_bcond_gadgets[cond]));
+        gen(state, (uintptr_t)(sf ? fused_cmp_bcond_gadgets[cond] : fused_cmp32_bcond_gadgets[cond]));
         gen(state, rn | ((uint64_t)imm12 << 8));
     } else {
         // SUBS: result register + flags
-        gen(state, (unsigned long)(sf ? fused_subs_bcond_gadgets[cond] : fused_subs32_bcond_gadgets[cond]));
+        gen(state, (uintptr_t)(sf ? fused_subs_bcond_gadgets[cond] : fused_subs32_bcond_gadgets[cond]));
         gen(state, rd | (rn << 8) | ((uint64_t)imm12 << 16));
     }
     gen(state, fake_target);
@@ -1420,16 +1420,16 @@ static int try_fuse_subs_reg_bcond(struct gen_state *state, uint32_t rd, uint32_
 
     int64_t offset = arm64_branch_imm19(next_insn);
     addr_t target = (state->ip - 4) + offset;
-    unsigned long fake_target = (unsigned long)target | (1UL << 63);
-    unsigned long fake_fallthrough = (unsigned long)state->ip | (1UL << 63);
+    uintptr_t fake_target = (uintptr_t)target | (1ULL << 63);
+    uintptr_t fake_fallthrough = (uintptr_t)state->ip | (1ULL << 63);
 
     if (rd == 31) {
         // CMP reg: no result, only flags
-        gen(state, (unsigned long)fused_cmp_reg_bcond_gadgets[cond]);
+        gen(state, (uintptr_t)fused_cmp_reg_bcond_gadgets[cond]);
         gen(state, rn | (rm << 8));
     } else {
         // SUBS reg: result + flags
-        gen(state, (unsigned long)fused_subs_reg_bcond_gadgets[cond]);
+        gen(state, (uintptr_t)fused_subs_reg_bcond_gadgets[cond]);
         gen(state, rd | (rn << 8) | (rm << 16));
     }
     gen(state, fake_target);
@@ -1473,7 +1473,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                         // Param 1: ldr_rt[0:4] | rd[5:9] | ldr_offset[16:31]
                         // Param 2: adrp_target (32-bit, zero-extended)
                         state->ip += 4;
-                        gen(state, (unsigned long) gadget_fused_adrp_ldr64);
+                        gen(state, (uintptr_t) gadget_fused_adrp_ldr64);
                         gen(state, ldr_rt | ((uint64_t)rd << 5) | ((uint64_t)ldr_offset << 16));
                         gen(state, target & 0xffffffffffffULL);
                         return 1;
@@ -1487,7 +1487,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                     uint32_t add_imm12 = (next >> 10) & 0xfff;
                     if (add_rn == rd && add_rd == rd) {
                         state->ip += 4;
-                        gen(state, (unsigned long) gadget_fused_adrp_add);
+                        gen(state, (uintptr_t) gadget_fused_adrp_add);
                         gen(state, rd | ((uint64_t)add_imm12 << 8));
                         gen(state, target & 0xffffffffffffULL);
                         return 1;
@@ -1498,7 +1498,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
 
         // Generate: store immediate to register
         // Pack rd(0:4) | target(8:55) in single code-stream word
-        gen(state, (unsigned long) gadget_adr);
+        gen(state, (uintptr_t) gadget_adr);
         gen(state, rd | ((uint64_t)(target & 0xffffffffffffULL) << 8));
         return 1;
     }
@@ -1528,25 +1528,25 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         bool can_specialize_imm_sh = sf && sh && rn != 31;
         if (can_specialize_imm && S) {
             // ADDS/SUBS imm 64-bit (rd=31 allowed for CMP/CMN)
-            gen(state, (unsigned long)(op ? gadget_subs_imm_64 : gadget_adds_imm_64));
+            gen(state, (uintptr_t)(op ? gadget_subs_imm_64 : gadget_adds_imm_64));
             gen(state, rd | (rn << 8) | ((uint64_t)imm12 << 16));
             return 1;
         }
         if (can_specialize_imm_sh && S) {
             // ADDS/SUBS imm 64-bit with LSL#12 (rd=31 allowed for CMP/CMN)
-            gen(state, (unsigned long)(op ? gadget_subs_imm_64_sh : gadget_adds_imm_64_sh));
+            gen(state, (uintptr_t)(op ? gadget_subs_imm_64_sh : gadget_adds_imm_64_sh));
             gen(state, rd | (rn << 8) | ((uint64_t)imm12 << 16));
             return 1;
         }
         if (can_specialize_imm && !S && rd != 31) {
             // ADD/SUB imm 64-bit, no flags, no SP
-            gen(state, (unsigned long)(op ? gadget_sub_imm_64 : gadget_add_imm_64));
+            gen(state, (uintptr_t)(op ? gadget_sub_imm_64 : gadget_add_imm_64));
             gen(state, rd | (rn << 8) | ((uint64_t)imm12 << 16));
             return 1;
         }
         if (can_specialize_imm_sh && !S && rd != 31) {
             // ADD/SUB imm 64-bit with LSL#12, no flags, no SP
-            gen(state, (unsigned long)(op ? gadget_sub_imm_64_sh : gadget_add_imm_64_sh));
+            gen(state, (uintptr_t)(op ? gadget_sub_imm_64_sh : gadget_add_imm_64_sh));
             gen(state, rd | (rn << 8) | ((uint64_t)imm12 << 16));
             return 1;
         }
@@ -1555,29 +1555,29 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         bool can_specialize_32 = !sf && !sh && rn != 31;
         if (can_specialize_32 && S) {
             // ADDS/SUBS imm 32-bit (rd=31 allowed for CMP/CMN)
-            gen(state, (unsigned long)(op ? gadget_subs_imm_32 : gadget_adds_imm_32));
+            gen(state, (uintptr_t)(op ? gadget_subs_imm_32 : gadget_adds_imm_32));
             gen(state, rd | (rn << 8) | ((uint64_t)imm12 << 16));
             return 1;
         }
         if (can_specialize_32 && !S && rd != 31) {
             // ADD/SUB imm 32-bit, no flags, no SP
-            gen(state, (unsigned long)(op ? gadget_sub_imm_32 : gadget_add_imm_32));
+            gen(state, (uintptr_t)(op ? gadget_sub_imm_32 : gadget_add_imm_32));
             gen(state, rd | (rn << 8) | ((uint64_t)imm12 << 16));
             return 1;
         }
 
         // SP-source specialization: ADD/SUB Xd, SP, #imm (sf=1, S=0, sh=0, rn==31, rd!=31)
         if (sf && !sh && rn == 31 && !S && rd != 31) {
-            gen(state, (unsigned long)(op ? gadget_sub_imm_sp_src_64 : gadget_add_imm_sp_src_64));
+            gen(state, (uintptr_t)(op ? gadget_sub_imm_sp_src_64 : gadget_add_imm_sp_src_64));
             gen(state, rd | ((uint64_t)imm12 << 16));
             return 1;
         }
 
         // Generic path: handles remaining SP cases, LSL#12 with 32-bit, etc.
         if (op == 0) {
-            gen(state, (unsigned long) gadget_add_imm);
+            gen(state, (uintptr_t) gadget_add_imm);
         } else {
-            gen(state, (unsigned long) gadget_sub_imm);
+            gen(state, (uintptr_t) gadget_sub_imm);
         }
         // Pack parameters: rd, rn, imm12, sf, S, sh
         // Layout: [0:4]=rd, [8:12]=rn, [16:27]=imm12, [28]=sf, [29]=S, [30]=sh
@@ -1595,7 +1595,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
 
-        gen(state, (unsigned long) gadget_extr);
+        gen(state, (uintptr_t) gadget_extr);
         gen(state, rd | (rn << 8) | (rm << 16) | ((uint64_t)imm << 24) | ((uint64_t)sf << 30));
         return 1;
     }
@@ -1643,10 +1643,10 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                                 int64_t br_off = arm64_branch_imm19(br_insn);
                                 addr_t target = br_ip + br_off;
                                 addr_t ft_addr = state->ip + 8;
-                                unsigned long fake_target      = (unsigned long)target | (1UL << 63);
-                                unsigned long fake_fallthrough = (unsigned long)ft_addr | (1UL << 63);
+                                uintptr_t fake_target      = (uintptr_t)target | (1ULL << 63);
+                                uintptr_t fake_fallthrough = (uintptr_t)ft_addr | (1ULL << 63);
                                 state->ip += 8;  // consume CMP + B.cond
-                                gen(state, (unsigned long) g);
+                                gen(state, (uintptr_t) g);
                                 gen(state, (uint64_t)rd | ((uint64_t)rn << 5) | ((uint64_t)cmp_imm << 10));
                                 gen(state, imm & 0xffffffffULL);  // 32-bit AND mask
                                 gen(state, fake_target);
@@ -1664,7 +1664,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         // Fast path: AND immediate, no flag setting (opc=0), rn != 31, rd != 31.
         // Hot for PyObject tag/flag bit masking. ~30 → ~10 inline insns.
         if (opc == 0 && rn != 31 && rd != 31) {
-            gen(state, (unsigned long)(sf ? gadget_and_imm_64_simple : gadget_and_imm_32_simple));
+            gen(state, (uintptr_t)(sf ? gadget_and_imm_64_simple : gadget_and_imm_32_simple));
             gen(state, rd | ((uint64_t)rn << 8));
             gen(state, imm);
             return 1;
@@ -1674,7 +1674,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         // rd=31 (TST instruction) is allowed and handled inside the gadget.
         // Common in CPython tag-bit tests: `if (Py_TYPE(o)->tp_flags & Py_TPFLAGS_X)`.
         if (opc == 3 && rn != 31) {
-            gen(state, (unsigned long)(sf ? gadget_ands_imm_64 : gadget_ands_imm_32));
+            gen(state, (uintptr_t)(sf ? gadget_ands_imm_64 : gadget_ands_imm_32));
             gen(state, rd | ((uint64_t)rn << 8));
             gen(state, imm);
             return 1;
@@ -1691,8 +1691,8 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                 return 0;
         }
 
-        gen(state, (unsigned long) gadget);
-        gen(state, rd | (rn << 8) | ((uint64_t)sf << 16) | ((opc == 3) ? (1UL << 17) : 0));
+        gen(state, (uintptr_t) gadget);
+        gen(state, rd | (rn << 8) | ((uint64_t)sf << 16) | ((opc == 3) ? (1ULL << 17) : 0));
         gen(state, imm);
         return 1;
     }
@@ -1722,7 +1722,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                 return 0;
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (hw << 8) | ((uint64_t)imm16 << 16) | ((uint64_t)sf << 32));
         return 1;
     }
@@ -1755,12 +1755,12 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
             // LSR / ASR: imms == size-1
             if (imms == size - 1) {
                 if (opc == 2) {  // UBFM → LSR
-                    gen(state, (unsigned long)(sf ? gadget_lsr_imm_64 : gadget_lsr_imm_32));
+                    gen(state, (uintptr_t)(sf ? gadget_lsr_imm_64 : gadget_lsr_imm_32));
                     gen(state, shift_pkt | ((uint64_t)immr << 16));
                     return 1;
                 }
                 if (opc == 0) {  // SBFM → ASR
-                    gen(state, (unsigned long)(sf ? gadget_asr_imm_64 : gadget_asr_imm_32));
+                    gen(state, (uintptr_t)(sf ? gadget_asr_imm_64 : gadget_asr_imm_32));
                     gen(state, shift_pkt | ((uint64_t)immr << 16));
                     return 1;
                 }
@@ -1769,7 +1769,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
             // Excludes shift==0 (which would have immr=0,imms=-1 — never encoded).
             if (opc == 2 && immr == imms + 1 && immr <= size - 1) {
                 uint32_t shift = size - immr;
-                gen(state, (unsigned long)(sf ? gadget_lsl_imm_64 : gadget_lsl_imm_32));
+                gen(state, (uintptr_t)(sf ? gadget_lsl_imm_64 : gadget_lsl_imm_32));
                 gen(state, shift_pkt | ((uint64_t)shift << 16));
                 return 1;
             }
@@ -1778,50 +1778,50 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         // Handle SBFM (opc=0) and UBFM (opc=2) with fused fast path
         if (opc == 0) {
             if (can_fuse) {
-                gen(state, (unsigned long) gadget_sbfm_fused);
+                gen(state, (uintptr_t) gadget_sbfm_fused);
                 gen(state, fused_param);
                 return 1;
             }
             // Fallback: load_reg + alias/generic + store_reg
-            gen(state, (unsigned long) gadget_load_reg);
+            gen(state, (uintptr_t) gadget_load_reg);
             gen(state, rn);
             if (immr == 0 && imms == 31 && sf == 1)
-                gen(state, (unsigned long) gadget_sxtw);
+                gen(state, (uintptr_t) gadget_sxtw);
             else if (immr == 0 && imms == 15) {
-                gen(state, (unsigned long) gadget_sxth);
+                gen(state, (uintptr_t) gadget_sxth);
                 gen(state, sf);
             } else if (immr == 0 && imms == 7) {
-                gen(state, (unsigned long) gadget_sxtb);
+                gen(state, (uintptr_t) gadget_sxtb);
                 gen(state, sf);
             } else {
-                gen(state, (unsigned long) gadget_sbfm);
+                gen(state, (uintptr_t) gadget_sbfm);
                 gen(state, immr | (imms << 8) | ((uint64_t)sf << 16));
             }
         } else if (opc == 2) {
             if (can_fuse) {
-                gen(state, (unsigned long) gadget_ubfm_fused);
+                gen(state, (uintptr_t) gadget_ubfm_fused);
                 gen(state, fused_param);
                 return 1;
             }
-            gen(state, (unsigned long) gadget_load_reg);
+            gen(state, (uintptr_t) gadget_load_reg);
             gen(state, rn);
             if (immr == 0 && imms == 31 && sf == 1)
-                gen(state, (unsigned long) gadget_uxtw);
+                gen(state, (uintptr_t) gadget_uxtw);
             else if (immr == 0 && imms == 15) {
-                gen(state, (unsigned long) gadget_uxth);
+                gen(state, (uintptr_t) gadget_uxth);
                 gen(state, sf);
             } else if (immr == 0 && imms == 7) {
-                gen(state, (unsigned long) gadget_uxtb);
+                gen(state, (uintptr_t) gadget_uxtb);
                 gen(state, sf);
             } else {
-                gen(state, (unsigned long) gadget_ubfm);
+                gen(state, (uintptr_t) gadget_ubfm);
                 gen(state, immr | (imms << 8) | ((uint64_t)sf << 16));
             }
         } else if (opc == 1) {
             // BFM needs both source and destination — not fused
-            gen(state, (unsigned long) gadget_load_reg);
+            gen(state, (uintptr_t) gadget_load_reg);
             gen(state, rn);
-            gen(state, (unsigned long) gadget_bfm);
+            gen(state, (uintptr_t) gadget_bfm);
             gen(state, immr | (imms << 8) | ((uint64_t)sf << 16) | ((uint64_t)rd << 24));
         } else {
             gen_interrupt(state, INT_UNDEFINED);
@@ -1829,7 +1829,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         }
 
         // Store result for non-fused paths
-        gen(state, (unsigned long) gadget_store_reg);
+        gen(state, (uintptr_t) gadget_store_reg);
         gen(state, rd);
         return 1;
     }
@@ -1844,7 +1844,7 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
 static int gen_branch(struct gen_state *state, uint32_t insn) {
     // SVC (system call)
     if ((insn & 0xffe0001f) == 0xd4000001) {
-        gen(state, (unsigned long) gadget_svc);
+        gen(state, (uintptr_t) gadget_svc);
         gen(state, state->ip);  // Next instruction address for resuming after syscall
         gen_interrupt(state, INT_SYSCALL);
         return 0;
@@ -1864,13 +1864,13 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         int64_t offset = arm64_branch_imm26(insn);
         addr_t target = state->orig_ip + offset;
         // Use fake_ip (with bit 63 set) so fiber_ret_chain can detect unchained blocks
-        unsigned long fake_target = (unsigned long)target | (1UL << 63);
+        uintptr_t fake_target = (uintptr_t)target | (1ULL << 63);
 
         if (is_bl) {
             // BL: save return address to X30
             // Code stream: [gadget][block_self_ptr][return_addr][fake_return_cont][fake_target]
-            unsigned long fake_return = (unsigned long)state->ip | (1UL << 63);
-            gen(state, (unsigned long) gadget_branch_link);
+            uintptr_t fake_return = (uintptr_t)state->ip | (1ULL << 63);
+            gen(state, (uintptr_t) gadget_branch_link);
             gen(state, 0);                  // block self-pointer (patched by gen_end)
             gen(state, state->ip);          // return address (next instruction)
             gen(state, fake_return);        // return continuation (patched to return-site block)
@@ -1889,7 +1889,7 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
                 state->b_follow_depth++;
                 return 1;  // continue compiling from target
             }
-            gen(state, (unsigned long) gadget_branch);
+            gen(state, (uintptr_t) gadget_branch);
             gen(state, fake_target);
             state->jump_ip[0] = state->size - 1;
         }
@@ -1902,8 +1902,8 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         uint32_t cond = insn & 0xf;
         int64_t offset = arm64_branch_imm19(insn);
         addr_t target = state->orig_ip + offset;
-        unsigned long fake_target = (unsigned long)target | (1UL << 63);
-        unsigned long fake_fallthrough = (unsigned long)state->ip | (1UL << 63);
+        uintptr_t fake_target = (uintptr_t)target | (1ULL << 63);
+        uintptr_t fake_fallthrough = (uintptr_t)state->ip | (1ULL << 63);
 
         // Per-condition gadgets eliminate indirect branch through jump table
         static void *bcond_gadgets[16] = {
@@ -1933,12 +1933,12 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
 
         if (cond >= 14) {
             // AL/NV: always taken — emit unconditional branch
-            gen(state, (unsigned long) gadget_branch);
+            gen(state, (uintptr_t) gadget_branch);
             gen(state, fake_target);
             state->jump_ip[0] = state->size - 1;
         } else {
             // Per-condition gadget: code stream is [gadget][target][fallthrough]
-            gen(state, (unsigned long) bcond_gadgets[cond]);
+            gen(state, (uintptr_t) bcond_gadgets[cond]);
             gen(state, fake_target);
             gen(state, fake_fallthrough);
             state->jump_ip[0] = state->size - 2;  // target
@@ -1955,8 +1955,8 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         int64_t offset = arm64_branch_imm19(insn);
         addr_t target = state->orig_ip + offset;
         // Use fake_ip for both target and fallthrough
-        unsigned long fake_target = (unsigned long)target | (1UL << 63);
-        unsigned long fake_fallthrough = (unsigned long)state->ip | (1UL << 63);
+        uintptr_t fake_target = (uintptr_t)target | (1ULL << 63);
+        uintptr_t fake_fallthrough = (uintptr_t)state->ip | (1ULL << 63);
 
         if (rt != 31) {
             // Fast path: specialized gadgets skip XZR check and sf check
@@ -1965,11 +1965,11 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
                 gadget = sf ? gadget_cbnz_64 : gadget_cbnz_32;
             else
                 gadget = sf ? gadget_cbz_64 : gadget_cbz_32;
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, (uint64_t)rt);
         } else {
             // Fallback: generic gadget handles XZR (rt==31)
-            gen(state, (unsigned long)(is_cbnz ? gadget_cbnz : gadget_cbz));
+            gen(state, (uintptr_t)(is_cbnz ? gadget_cbnz : gadget_cbz));
             gen(state, rt | ((uint64_t)sf << 8));
         }
         gen(state, fake_target);
@@ -1994,13 +1994,13 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         int64_t offset = imm14 * 4;
         addr_t target = state->orig_ip + offset;
 
-        unsigned long fake_target = (unsigned long)target | (1UL << 63);
-        unsigned long fake_fallthrough = (unsigned long)state->ip | (1UL << 63);
+        uintptr_t fake_target = (uintptr_t)target | (1ULL << 63);
+        uintptr_t fake_fallthrough = (uintptr_t)state->ip | (1ULL << 63);
 
         if (is_tbnz) {
-            gen(state, (unsigned long) gadget_tbnz);
+            gen(state, (uintptr_t) gadget_tbnz);
         } else {
-            gen(state, (unsigned long) gadget_tbz);
+            gen(state, (uintptr_t) gadget_tbz);
         }
         gen(state, rt | (bit_pos << 8));
         gen(state, fake_target);
@@ -2018,7 +2018,7 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
 
         switch (opc) {
             case 0:  // BR
-                gen(state, (unsigned long) gadget_branch_reg);
+                gen(state, (uintptr_t) gadget_branch_reg);
                 gen(state, rn);
                 break;
             case 1:  // BLR
@@ -2026,21 +2026,21 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
                 // [gadget][block_self_ptr][return_addr][return_cont][rn]: the
                 // first words match BL so an indirect call fills ret_cache too
                 // and its RET (gadget or native) stays out of the run loop.
-                gen(state, (unsigned long) gadget_branch_link_reg);
+                gen(state, (uintptr_t) gadget_branch_link_reg);
                 gen(state, 0);                                        // block self-pointer (gen_end)
                 gen(state, state->ip);                                // return address
-                gen(state, (unsigned long) state->ip | (1UL << 63));  // return continuation (chained)
+                gen(state, (uintptr_t) state->ip | (1ULL << 63));  // return continuation (chained)
                 gen(state, rn);
                 state->block_patch_ip = state->size - 4;
                 state->jump_ip[0] = state->size - 2;
 #else
-                gen(state, (unsigned long) gadget_branch_link_reg);
+                gen(state, (uintptr_t) gadget_branch_link_reg);
                 gen(state, rn);
                 gen(state, state->ip);  // return address
 #endif
                 break;
             case 2:  // RET
-                gen(state, (unsigned long) gadget_ret);
+                gen(state, (uintptr_t) gadget_ret);
                 gen(state, rn);  // usually X30
                 break;
             default:
@@ -2069,7 +2069,7 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
             (insn & 0xfffff0ff) == 0xd50330df) {  // ISB
             // Guest threads run as real host threads sharing host memory,
             // so guest barriers must issue real host barriers for correctness.
-            gen(state, (unsigned long) gadget_dmb);
+            gen(state, (uintptr_t) gadget_dmb);
             return 1;
         }
 
@@ -2093,7 +2093,7 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         // caches returning stale property values).
         if ((insn & 0xffffffe0) == 0xd50b7520) {  // IC IVAU
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_ic_ivau);
+            gen(state, (uintptr_t) gadget_ic_ivau);
             gen(state, rt);
             return 1;
         }
@@ -2116,14 +2116,14 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         if ((insn & 0xffffffe0) == 0xd53b4200) {
             // MRS Xt, NZCV - read condition flags
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_mrs_nzcv);
+            gen(state, (uintptr_t) gadget_mrs_nzcv);
             gen(state, rt);
             return 1;
         }
         if ((insn & 0xffffffe0) == 0xd51b4200) {
             // MSR NZCV, Xt - write condition flags
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_msr_nzcv);
+            gen(state, (uintptr_t) gadget_msr_nzcv);
             gen(state, rt);
             return 1;
         }
@@ -2131,14 +2131,14 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         // MSR FPCR, Xt: d51b4400 (op0=3, op1=3, CRn=4, CRm=4, op2=0)
         if ((insn & 0xffffffe0) == 0xd51b4400) {
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_msr_fpcr);
+            gen(state, (uintptr_t) gadget_msr_fpcr);
             gen(state, rt);
             return 1;
         }
         // MSR FPSR, Xt: d51b4420 (op0=3, op1=3, CRn=4, CRm=4, op2=1)
         if ((insn & 0xffffffe0) == 0xd51b4420) {
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_msr_fpsr);
+            gen(state, (uintptr_t) gadget_msr_fpsr);
             gen(state, rt);
             return 1;
         }
@@ -2146,7 +2146,7 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         // Go runtime uses this for async preemption control. NOP in emulation.
         if ((insn & 0xffffffe0) == 0xd51b4220) {
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_msr_daif);
+            gen(state, (uintptr_t) gadget_msr_daif);
             gen(state, rt);
             return 1;
         }
@@ -2159,14 +2159,14 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
         if ((insn & 0xffffffe0) == 0xd51bd040) {
             // MSR TPIDR_EL0, Xt - write TLS pointer
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_msr_tpidr);
+            gen(state, (uintptr_t) gadget_msr_tpidr);
             gen(state, rt);
             return 1;
         }
         if ((insn & 0xffffffe0) == 0xd53bd040) {
             // MRS Xt, TPIDR_EL0 - read TLS pointer
             uint32_t rt = insn & 0x1f;
-            gen(state, (unsigned long) gadget_mrs_tpidr);
+            gen(state, (uintptr_t) gadget_mrs_tpidr);
             gen(state, rt);
             return 1;
         }
@@ -2239,7 +2239,7 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
             }
 
             if (sysreg_id >= 0) {
-                gen(state, (unsigned long) gadget_mrs_sysreg);
+                gen(state, (uintptr_t) gadget_mrs_sysreg);
                 gen(state, rt);
                 gen(state, sysreg_id);
                 return 1;
@@ -2280,17 +2280,17 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         }
 
         // Generate address from Rn
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (0ULL << 8));  // offset = 0
 
-        if (R) gen(state, (unsigned long) gadget_dmb);  // release barrier before
+        if (R) gen(state, (uintptr_t) gadget_dmb);  // release barrier before
         // Perform atomic RMW (returns old value in _tmp)
-        gen(state, (unsigned long) gadget_atomic_rmw);
+        gen(state, (uintptr_t) gadget_atomic_rmw);
         gen(state, rs | ((uint64_t)size << 8) | ((uint64_t)op << 16));
-        if (A) gen(state, (unsigned long) gadget_dmb);  // acquire barrier after
+        if (A) gen(state, (uintptr_t) gadget_dmb);  // acquire barrier after
 
         // Store old value to Rt
-        gen(state, (unsigned long) gadget_store_reg);
+        gen(state, (uintptr_t) gadget_store_reg);
         gen(state, rt);
         return 1;
     }
@@ -2311,13 +2311,13 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         uint32_t rt = insn & 0x1f;          // desired pair (Rt, Rt+1)
 
         // Generate address from Rn
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (0ULL << 8));  // offset = 0
 
-        if (R) gen(state, (unsigned long) gadget_dmb);  // release barrier before
-        gen(state, (unsigned long) gadget_atomic_casp);
+        if (R) gen(state, (uintptr_t) gadget_dmb);  // release barrier before
+        gen(state, (uintptr_t) gadget_atomic_casp);
         gen(state, rs | ((uint64_t)rt << 8));
-        if (A) gen(state, (unsigned long) gadget_dmb);  // acquire barrier after
+        if (A) gen(state, (uintptr_t) gadget_dmb);  // acquire barrier after
         return 1;
     }
 
@@ -2333,16 +2333,16 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rt = insn & 0x1f;
 
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (0ULL << 8));
 
-        if (R) gen(state, (unsigned long) gadget_dmb);
+        if (R) gen(state, (uintptr_t) gadget_dmb);
         // 32-bit pair CAS packs the register pair into one 64-bit word; the
         // dedicated gadget assembles {Ws:W(s+1)} / {Wt:W(t+1)} and does an
         // 8-byte atomic compare-and-swap.
-        gen(state, (unsigned long) gadget_atomic_casp32);
+        gen(state, (uintptr_t) gadget_atomic_casp32);
         gen(state, rs | ((uint64_t)rt << 8));
-        if (A) gen(state, (unsigned long) gadget_dmb);
+        if (A) gen(state, (uintptr_t) gadget_dmb);
         return 1;
     }
 
@@ -2364,17 +2364,17 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         uint32_t rt = insn & 0x1f;          // new value
 
         // Generate address from Rn
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (0ULL << 8));  // offset = 0
 
-        if (R) gen(state, (unsigned long) gadget_dmb);  // release barrier before
+        if (R) gen(state, (uintptr_t) gadget_dmb);  // release barrier before
         // Perform CAS (returns old value in _tmp)
-        gen(state, (unsigned long) gadget_atomic_cas);
+        gen(state, (uintptr_t) gadget_atomic_cas);
         gen(state, rs | ((uint64_t)rt << 8) | ((uint64_t)size << 16));
-        if (A) gen(state, (unsigned long) gadget_dmb);  // acquire barrier after
+        if (A) gen(state, (uintptr_t) gadget_dmb);  // acquire barrier after
 
         // Store old value back to Rs (CAS writes old value to expected register)
-        gen(state, (unsigned long) gadget_store_reg);
+        gen(state, (uintptr_t) gadget_store_reg);
         gen(state, rs);
         return 1;
     }
@@ -2402,8 +2402,8 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             // opc=00: LDR St (32-bit float)
             // opc=01: LDR Dt (64-bit float)
             // opc=10: LDR Qt (128-bit)
-            gen(state, (unsigned long) gadget_calc_addr_pc_rel);
-            gen(state, (unsigned long) target);  // 32-bit guest address
+            gen(state, (uintptr_t) gadget_calc_addr_pc_rel);
+            gen(state, (uintptr_t) target);  // 32-bit guest address
 
             void *gadget;
             switch (opc) {
@@ -2414,13 +2414,13 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     gen_interrupt(state, INT_UNDEFINED);
                     return 0;
             }
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rt);
             return 1;
         } else {
             // GPR literal load
-            gen(state, (unsigned long) gadget_calc_addr_pc_rel);
-            gen(state, (unsigned long) target);  // 32-bit guest address
+            gen(state, (uintptr_t) gadget_calc_addr_pc_rel);
+            gen(state, (uintptr_t) target);  // 32-bit guest address
 
             void *gadget;
             switch (opc) {
@@ -2431,8 +2431,8 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     gen_interrupt(state, INT_UNDEFINED);
                     return 0;
             }
-            gen(state, (unsigned long) gadget);
-            gen(state, (unsigned long) gadget_store_reg);
+            gen(state, (uintptr_t) gadget);
+            gen(state, (uintptr_t) gadget_store_reg);
             gen(state, rt);
             return 1;
         }
@@ -2461,7 +2461,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             uint64_t offset = imm12 << scale;
 
             // Generate address calculation
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (offset << 8));
 
             bool is_load = (opc & 1) == 1;
@@ -2480,7 +2480,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                         default: gen_interrupt(state, INT_UNDEFINED); return 0;
                     }
                 }
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
                 gen(state, rt);
             } else {
                 // STR Bt/Ht/St/Dt/Qt
@@ -2496,7 +2496,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                         default: gen_interrupt(state, INT_UNDEFINED); return 0;
                     }
                 }
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
                 gen(state, rt);
             }
             return 1;
@@ -2536,7 +2536,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                                      (sp_fast ? gadget_load64_sp_imm : gadget_load64_imm); break;
                     default: gen_interrupt(state, INT_UNDEFINED); return 0;
                 }
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
                 gen(state, fused_param);
             } else {
                 void *gadget;
@@ -2549,12 +2549,12 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                                      (sp_fast ? gadget_store64_sp_imm : gadget_store64_imm); break;
                     default: gen_interrupt(state, INT_UNDEFINED); return 0;
                 }
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
                 gen(state, fused_param);
             }
         } else {
             // Fallback 3-gadget path for sign-extending 8/16-bit loads
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             uint64_t param = rn | ((uint64_t)offset << 8);
             gen(state, param);
 
@@ -2571,8 +2571,8 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     gen_interrupt(state, INT_UNDEFINED);
                     return 0;
             }
-            gen(state, (unsigned long) gadget);
-            gen(state, (unsigned long) gadget_store_reg);
+            gen(state, (uintptr_t) gadget);
+            gen(state, (uintptr_t) gadget_store_reg);
             gen(state, rt);
         }
         return 1;
@@ -2598,7 +2598,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             uint32_t shift = S ? (is_128bit ? 4 : size) : 0;
 
             // Generate address calculation with register offset
-            gen(state, (unsigned long) gadget_calc_addr_reg);
+            gen(state, (uintptr_t) gadget_calc_addr_reg);
             gen(state, rn | (rm << 8) | (option << 16) | (shift << 24));
 
             void *gadget;
@@ -2626,7 +2626,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                 }
             }
 
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rt);  // SIMD register number
             return 1;
         }
@@ -2654,12 +2654,12 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             // Saves ~6 inline branches by skipping XZR/SP checks.
             bool fast_load = is_load && !sign_extend && rn != 31 && rm != 31 && rt != 31;
             if (fast_load && size == 3) {
-                gen(state, (unsigned long) gadget_load64_reg_fast);
+                gen(state, (uintptr_t) gadget_load64_reg_fast);
                 gen(state, fused_param);
                 return 1;
             }
             if (fast_load && size == 2) {
-                gen(state, (unsigned long) gadget_load32_reg_fast);
+                gen(state, (uintptr_t) gadget_load32_reg_fast);
                 gen(state, fused_param);
                 return 1;
             }
@@ -2673,7 +2673,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     case 3: gadget = gadget_load64_reg; break;
                     default: gen_interrupt(state, INT_UNDEFINED); return 0;
                 }
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
                 gen(state, fused_param);
             } else {
                 void *gadget;
@@ -2684,13 +2684,13 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     case 3: gadget = gadget_store64_reg; break;
                     default: gen_interrupt(state, INT_UNDEFINED); return 0;
                 }
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
                 gen(state, fused_param);
             }
         } else {
             // Fallback 3-gadget path for extend types other than UXTX,
             // and for sign-extending 8/16-bit loads
-            gen(state, (unsigned long) gadget_calc_addr_reg);
+            gen(state, (uintptr_t) gadget_calc_addr_reg);
             gen(state, rn | (rm << 8) | (option << 16) | (shift << 24));
 
             if (is_load) {
@@ -2712,11 +2712,11 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                         gen_interrupt(state, INT_UNDEFINED);
                         return 0;
                 }
-                gen(state, (unsigned long) gadget);
-                gen(state, (unsigned long) gadget_store_reg);
+                gen(state, (uintptr_t) gadget);
+                gen(state, (uintptr_t) gadget_store_reg);
                 gen(state, rt);
             } else {
-                gen(state, (unsigned long) gadget_load_reg);
+                gen(state, (uintptr_t) gadget_load_reg);
                 gen(state, rt);
 
                 void *gadget;
@@ -2729,7 +2729,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                         gen_interrupt(state, INT_UNDEFINED);
                         return 0;
                 }
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
             }
         }
         return 1;
@@ -2771,10 +2771,10 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
 
             // Calculate address
             if (is_post) {
-                gen(state, (unsigned long) gadget_calc_addr_base);
+                gen(state, (uintptr_t) gadget_calc_addr_base);
                 gen(state, rn);
             } else {
-                gen(state, (unsigned long) gadget_calc_addr_imm);
+                gen(state, (uintptr_t) gadget_calc_addr_imm);
                 gen(state, rn | ((uint64_t)simd_offset << 8));
             }
 
@@ -2795,16 +2795,16 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     default: gen_interrupt(state, INT_UNDEFINED); return 0;
                 }
             }
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rt | (rt2 << 8));
 
             // Writeback for pre/post-indexed
             if (is_pre || is_post) {
                 if (is_post) {
-                    gen(state, (unsigned long) gadget_update_base);
+                    gen(state, (uintptr_t) gadget_update_base);
                     gen(state, rn | ((uint64_t)simd_offset << 8));
                 } else {
-                    gen(state, (unsigned long) gadget_writeback_addr);
+                    gen(state, (uintptr_t) gadget_writeback_addr);
                     gen(state, rn);
                 }
             }
@@ -2843,7 +2843,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             else
                 gadget = fast_pair ? (is64 ? gadget_stp64_imm_fast : gadget_stp32_imm_fast)
                                    : (is64 ? gadget_stp64_imm : gadget_stp32_imm);
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, param);
             return 1;
         }
@@ -2862,7 +2862,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             void *gadget;
             if (L) gadget = is_pre ? gadget_ldp64_imm_preidx_sp : gadget_ldp64_imm_postidx_sp;
             else   gadget = is_pre ? gadget_stp64_imm_preidx_sp : gadget_stp64_imm_postidx_sp;
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, param);
             return 1;
         }
@@ -2882,7 +2882,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             void *gadget;
             if (L) gadget = is_pre ? gadget_ldp64_imm_preidx_fast : gadget_ldp64_imm_postidx_fast;
             else   gadget = is_pre ? gadget_stp64_imm_preidx_fast : gadget_stp64_imm_postidx_fast;
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, param);
             return 1;
         }
@@ -2892,29 +2892,29 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         // Step 1: Calculate address
         if (is_post) {
             // Post-indexed: use base register directly
-            gen(state, (unsigned long) gadget_calc_addr_base);
+            gen(state, (uintptr_t) gadget_calc_addr_base);
             gen(state, rn);
         } else {
             // Pre-indexed: add offset to base
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | ((uint64_t)offset << 8));
         }
 
         // Step 2: Perform the load/store pair
         if (L) {
-            gen(state, (unsigned long) (is64 ? gadget_ldp64 : gadget_ldp32));
+            gen(state, (uintptr_t) (is64 ? gadget_ldp64 : gadget_ldp32));
         } else {
-            gen(state, (unsigned long) (is64 ? gadget_stp64 : gadget_stp32));
+            gen(state, (uintptr_t) (is64 ? gadget_stp64 : gadget_stp32));
         }
         gen(state, rt | (rt2 << 8));
 
         // Step 3: Writeback for pre/post-indexed
         if (is_post) {
-            gen(state, (unsigned long) gadget_update_base);
+            gen(state, (uintptr_t) gadget_update_base);
             gen(state, rn | ((uint64_t)offset << 8));
         } else {
             // Pre-indexed: writeback calculated address
-            gen(state, (unsigned long) gadget_writeback_addr);
+            gen(state, (uintptr_t) gadget_writeback_addr);
             gen(state, rn);
         }
 
@@ -2954,11 +2954,11 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             bool is_pre = (mode == 3);
 
             if (is_pre || is_unscaled) {
-                gen(state, (unsigned long) gadget_calc_addr_imm);
+                gen(state, (uintptr_t) gadget_calc_addr_imm);
                 gen(state, rn | ((int64_t)(int32_t)imm9 << 8));
             } else if (mode == 1) {
                 // Post-indexed
-                gen(state, (unsigned long) gadget_calc_addr_base);
+                gen(state, (uintptr_t) gadget_calc_addr_base);
                 gen(state, rn);
             } else {
                 gen_interrupt(state, INT_UNDEFINED);
@@ -2990,13 +2990,13 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                 }
             }
 
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rt);  // SIMD register number
 
             // Handle writeback for pre/post-indexed modes
             // Use update_base to preserve full 64-bit register semantics
             if (mode == 1 || mode == 3) {
-                gen(state, (unsigned long) gadget_update_base);
+                gen(state, (uintptr_t) gadget_update_base);
                 gen(state, rn | ((int64_t)(int32_t)imm9 << 8));
             }
 
@@ -3046,7 +3046,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                 }
             }
             if (g != NULL) {
-                gen(state, (unsigned long) g);
+                gen(state, (uintptr_t) g);
                 gen(state, param);
                 return 1;
             }
@@ -3083,7 +3083,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                 }
             }
             if (g != NULL) {
-                gen(state, (unsigned long) g);
+                gen(state, (uintptr_t) g);
                 gen(state, param);
                 return 1;
             }
@@ -3095,11 +3095,11 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         // - mode=3 (pre-indexed): address = base + offset (same for writeback)
         if (is_pre_indexed || is_unscaled) {
             // Pre-indexed or unscaled: address = base + offset
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | ((int64_t)(int32_t)imm9 << 8));
         } else {
             // Post-indexed: address = base only
-            gen(state, (unsigned long) gadget_calc_addr_base);
+            gen(state, (uintptr_t) gadget_calc_addr_base);
             gen(state, rn);
         }
 
@@ -3125,12 +3125,12 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     gen_interrupt(state, INT_UNDEFINED);
                     return 0;
             }
-            gen(state, (unsigned long) gadget);
-            gen(state, (unsigned long) gadget_store_reg);
+            gen(state, (uintptr_t) gadget);
+            gen(state, (uintptr_t) gadget_store_reg);
             gen(state, rt);
         } else {
             // Store
-            gen(state, (unsigned long) gadget_load_reg);
+            gen(state, (uintptr_t) gadget_load_reg);
             gen(state, rt);
 
             void *gadget;
@@ -3143,18 +3143,18 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     gen_interrupt(state, INT_UNDEFINED);
                     return 0;
             }
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
         }
 
         // Writeback to base register (only for pre/post-indexed, not unscaled)
         if (!is_unscaled) {
             if (is_pre_indexed) {
                 // Pre-indexed: base = address (which is base + offset)
-                gen(state, (unsigned long) gadget_writeback_addr);
+                gen(state, (uintptr_t) gadget_writeback_addr);
                 gen(state, rn);
             } else {
                 // Post-indexed: base = base + offset
-                gen(state, (unsigned long) gadget_update_base);
+                gen(state, (uintptr_t) gadget_update_base);
                 gen(state, rn | ((int64_t)(int32_t)imm9 << 8));
             }
         }
@@ -3186,7 +3186,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         // Handle pair exclusives (LDXP/STXP/LDAXP/STLXP): o2=0, o1=1
         if (o2 == 0 && o1 == 1) {
             // Generate address from Rn
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (0ULL << 8));  // offset = 0
 
             if (L) {
@@ -3195,9 +3195,9 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     gen_interrupt(state, INT_UNDEFINED);
                     return 0;
                 }
-                gen(state, (unsigned long) gadget_ldxp_c);
+                gen(state, (uintptr_t) gadget_ldxp_c);
                 gen(state, rt | ((uint64_t)rt2 << 8) | ((uint64_t)size << 16));
-                if (o0) gen(state, (unsigned long) gadget_dmb);  // LDAXP: acquire
+                if (o0) gen(state, (uintptr_t) gadget_dmb);  // LDAXP: acquire
             } else {
                 // STXP/STLXP — must be a TRUE atomic pair CAS against the
                 // values loaded by LDXP. Emulating it as a plain store pair
@@ -3207,9 +3207,9 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                     gen_interrupt(state, INT_UNDEFINED);
                     return 0;
                 }
-                if (o0) gen(state, (unsigned long) gadget_dmb);  // STLXP: release
+                if (o0) gen(state, (uintptr_t) gadget_dmb);  // STLXP: release
                 extern void gadget_stxp_c(void);
-                gen(state, (unsigned long) gadget_stxp_c);
+                gen(state, (uintptr_t) gadget_stxp_c);
                 gen(state, rt | ((uint64_t)rt2 << 8) | ((uint64_t)rs << 16) |
                         ((uint64_t)size << 24));
             }
@@ -3226,7 +3226,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             // Guest threads share host memory, so real barriers are required.
             if (L) {
                 // LDAR (load-acquire): load + DMB after
-                gen(state, (unsigned long) gadget_calc_addr_imm);
+                gen(state, (uintptr_t) gadget_calc_addr_imm);
                 gen(state, rn | (0ULL << 8));
                 void (*load_gadget)(void) = NULL;
                 switch (size) {
@@ -3235,17 +3235,17 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                 case 2: load_gadget = gadget_load32; break;
                 case 3: load_gadget = gadget_load64; break;
                 }
-                gen(state, (unsigned long) load_gadget);
-                gen(state, (unsigned long) gadget_dmb);
-                gen(state, (unsigned long) gadget_store_reg);
+                gen(state, (uintptr_t) load_gadget);
+                gen(state, (uintptr_t) gadget_dmb);
+                gen(state, (uintptr_t) gadget_store_reg);
                 gen(state, rt);
             } else {
                 // STLR (store-release): DMB before + store
-                gen(state, (unsigned long) gadget_load_reg);
+                gen(state, (uintptr_t) gadget_load_reg);
                 gen(state, rt);
-                gen(state, (unsigned long) gadget_calc_addr_imm);
+                gen(state, (uintptr_t) gadget_calc_addr_imm);
                 gen(state, rn | (0ULL << 8));
-                gen(state, (unsigned long) gadget_dmb);
+                gen(state, (uintptr_t) gadget_dmb);
                 void (*store_gadget)(void) = NULL;
                 switch (size) {
                 case 0: store_gadget = gadget_store8; break;
@@ -3253,22 +3253,22 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                 case 2: store_gadget = gadget_store32; break;
                 case 3: store_gadget = gadget_store64; break;
                 }
-                gen(state, (unsigned long) store_gadget);
+                gen(state, (uintptr_t) store_gadget);
                 // No Rs writeback for STLR/STLLR (non-exclusive)
             }
         } else if (L) {
             // LDXR/LDAXR - Load exclusive
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (0ULL << 8));  // offset = 0
-            gen(state, (unsigned long) gadget_ldxr);
+            gen(state, (uintptr_t) gadget_ldxr);
             gen(state, rt | ((uint64_t)size << 8));
-            if (o0) gen(state, (unsigned long) gadget_dmb);  // LDAXR: acquire
+            if (o0) gen(state, (uintptr_t) gadget_dmb);  // LDAXR: acquire
         } else {
             // STXR/STLXR - Store exclusive
-            if (o0) gen(state, (unsigned long) gadget_dmb);  // STLXR: release
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            if (o0) gen(state, (uintptr_t) gadget_dmb);  // STLXR: release
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (0ULL << 8));  // offset = 0
-            gen(state, (unsigned long) gadget_stxr);
+            gen(state, (uintptr_t) gadget_stxr);
             gen(state, rt | ((uint64_t)rs << 8) | ((uint64_t)size << 16));
         }
         return 1;
@@ -3294,19 +3294,19 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
 
         if (num_regs > 0) {
             int bytes_per_reg = Q ? 16 : 8;
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (0ULL << 8));
             for (int i = 0; i < num_regs; i++) {
                 uint32_t vt = (rt + i) & 0x1f;
                 if (L) {
-                    gen(state, (unsigned long) (Q ? gadget_ldr_simd_q : gadget_ldr_simd_d));
+                    gen(state, (uintptr_t) (Q ? gadget_ldr_simd_q : gadget_ldr_simd_d));
                     gen(state, vt);
                 } else {
-                    gen(state, (unsigned long) (Q ? gadget_str_simd_q : gadget_str_simd_d));
+                    gen(state, (uintptr_t) (Q ? gadget_str_simd_q : gadget_str_simd_d));
                     gen(state, vt);
                 }
                 if (i < num_regs - 1) {
-                    gen(state, (unsigned long) gadget_advance_addr);
+                    gen(state, (uintptr_t) gadget_advance_addr);
                     gen(state, bytes_per_reg);
                 }
             }
@@ -3320,14 +3320,14 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         else if (opcode == 0x0) interleave_regs = 4;
 
         if (interleave_regs > 0) {
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (0ULL << 8));
             uint64_t param = rt | ((uint64_t)interleave_regs << 8) |
                              ((uint64_t)size << 16) | ((uint64_t)Q << 24);
             if (L) {
-                gen(state, (unsigned long) gadget_simd_load_interleaved);
+                gen(state, (uintptr_t) gadget_simd_load_interleaved);
             } else {
-                gen(state, (unsigned long) gadget_simd_store_interleaved);
+                gen(state, (uintptr_t) gadget_simd_store_interleaved);
             }
             gen(state, param);
             return 1;
@@ -3369,7 +3369,7 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         int bytes_per_reg = Q ? 16 : 8;
         int total_bytes = bytes_per_reg * effective_regs;
 
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (0ULL << 8));
 
         if (num_regs > 0) {
@@ -3377,14 +3377,14 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             for (int i = 0; i < num_regs; i++) {
                 uint32_t vt = (rt + i) & 0x1f;
                 if (L) {
-                    gen(state, (unsigned long) (Q ? gadget_ldr_simd_q : gadget_ldr_simd_d));
+                    gen(state, (uintptr_t) (Q ? gadget_ldr_simd_q : gadget_ldr_simd_d));
                     gen(state, vt);
                 } else {
-                    gen(state, (unsigned long) (Q ? gadget_str_simd_q : gadget_str_simd_d));
+                    gen(state, (uintptr_t) (Q ? gadget_str_simd_q : gadget_str_simd_d));
                     gen(state, vt);
                 }
                 if (i < num_regs - 1) {
-                    gen(state, (unsigned long) gadget_advance_addr);
+                    gen(state, (uintptr_t) gadget_advance_addr);
                     gen(state, bytes_per_reg);
                 }
             }
@@ -3393,19 +3393,19 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             uint64_t param = rt | ((uint64_t)interleave_regs << 8) |
                              ((uint64_t)size << 16) | ((uint64_t)Q << 24);
             if (L) {
-                gen(state, (unsigned long) gadget_simd_load_interleaved);
+                gen(state, (uintptr_t) gadget_simd_load_interleaved);
             } else {
-                gen(state, (unsigned long) gadget_simd_store_interleaved);
+                gen(state, (uintptr_t) gadget_simd_store_interleaved);
             }
             gen(state, param);
         }
 
         // Post-index writeback
         if (rm == 31) {
-            gen(state, (unsigned long) gadget_update_base);
+            gen(state, (uintptr_t) gadget_update_base);
             gen(state, rn | ((uint64_t)total_bytes << 8));
         } else {
-            gen(state, (unsigned long) gadget_update_base_reg);
+            gen(state, (uintptr_t) gadget_update_base_reg);
             gen(state, rn | (rm << 8));
         }
         return 1;
@@ -3436,9 +3436,9 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             else if (opcode == 7 && R == 0) { gadget = gadget_ld3r_vec; }
             else { gadget = gadget_ld4r_vec; }
 
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (0ULL << 8));
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rt | (size << 8) | (Q << 16));
             return 1;
         }
@@ -3479,33 +3479,33 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
 
         int lane_offset = lane * elem_size;
 
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (0ULL << 8));
 
         for (int i = 0; i < num_regs; i++) {
             if (i > 0) {
-                gen(state, (unsigned long) gadget_addr_add_imm);
+                gen(state, (uintptr_t) gadget_addr_add_imm);
                 gen(state, (uint64_t)elem_size);
             }
             uint32_t vr = (rt + i) % 32;
             if (L) {
                 if (elem_size == 1)
-                    gen(state, (unsigned long) gadget_ld1_single_b);
+                    gen(state, (uintptr_t) gadget_ld1_single_b);
                 else if (elem_size == 2)
-                    gen(state, (unsigned long) gadget_ld1_single_h);
+                    gen(state, (uintptr_t) gadget_ld1_single_h);
                 else if (elem_size == 4)
-                    gen(state, (unsigned long) gadget_ld1_single_s);
+                    gen(state, (uintptr_t) gadget_ld1_single_s);
                 else
-                    gen(state, (unsigned long) gadget_ld1_single_d);
+                    gen(state, (uintptr_t) gadget_ld1_single_d);
             } else {
                 if (elem_size == 1)
-                    gen(state, (unsigned long) gadget_st1_single_b);
+                    gen(state, (uintptr_t) gadget_st1_single_b);
                 else if (elem_size == 2)
-                    gen(state, (unsigned long) gadget_st1_single_h);
+                    gen(state, (uintptr_t) gadget_st1_single_h);
                 else if (elem_size == 4)
-                    gen(state, (unsigned long) gadget_st1_single_s);
+                    gen(state, (uintptr_t) gadget_st1_single_s);
                 else
-                    gen(state, (unsigned long) gadget_st1_single_d);
+                    gen(state, (uintptr_t) gadget_st1_single_d);
             }
             gen(state, vr | (lane_offset << 8));
         }
@@ -3538,17 +3538,17 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             int ldnr_elem_size = 1 << size;
             int total_bytes = ldnr_elem_size * num_regs;
 
-            gen(state, (unsigned long) gadget_calc_addr_imm);
+            gen(state, (uintptr_t) gadget_calc_addr_imm);
             gen(state, rn | (0ULL << 8));
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rt | (size << 8) | (Q << 16));
 
             // Post-index writeback
             if (rm == 31) {
-                gen(state, (unsigned long) gadget_update_base);
+                gen(state, (uintptr_t) gadget_update_base);
                 gen(state, rn | ((uint64_t)total_bytes << 8));
             } else {
-                gen(state, (unsigned long) gadget_update_base_reg);
+                gen(state, (uintptr_t) gadget_update_base_reg);
                 gen(state, rn | (rm << 8));
             }
             return 1;
@@ -3587,33 +3587,33 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         int lane_offset = lane * elem_size;
         int total_bytes = elem_size * num_regs;
 
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (0ULL << 8));
 
         for (int i = 0; i < num_regs; i++) {
             if (i > 0) {
-                gen(state, (unsigned long) gadget_addr_add_imm);
+                gen(state, (uintptr_t) gadget_addr_add_imm);
                 gen(state, (uint64_t)elem_size);
             }
             uint32_t vr = (rt + i) % 32;
             if (L) {
                 if (elem_size == 1)
-                    gen(state, (unsigned long) gadget_ld1_single_b);
+                    gen(state, (uintptr_t) gadget_ld1_single_b);
                 else if (elem_size == 2)
-                    gen(state, (unsigned long) gadget_ld1_single_h);
+                    gen(state, (uintptr_t) gadget_ld1_single_h);
                 else if (elem_size == 4)
-                    gen(state, (unsigned long) gadget_ld1_single_s);
+                    gen(state, (uintptr_t) gadget_ld1_single_s);
                 else
-                    gen(state, (unsigned long) gadget_ld1_single_d);
+                    gen(state, (uintptr_t) gadget_ld1_single_d);
             } else {
                 if (elem_size == 1)
-                    gen(state, (unsigned long) gadget_st1_single_b);
+                    gen(state, (uintptr_t) gadget_st1_single_b);
                 else if (elem_size == 2)
-                    gen(state, (unsigned long) gadget_st1_single_h);
+                    gen(state, (uintptr_t) gadget_st1_single_h);
                 else if (elem_size == 4)
-                    gen(state, (unsigned long) gadget_st1_single_s);
+                    gen(state, (uintptr_t) gadget_st1_single_s);
                 else
-                    gen(state, (unsigned long) gadget_st1_single_d);
+                    gen(state, (uintptr_t) gadget_st1_single_d);
             }
             gen(state, vr | (lane_offset << 8));
         }
@@ -3621,11 +3621,11 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         // Post-index writeback
         if (rm == 31) {
             // Immediate: increment by total bytes (num_regs * elem_size)
-            gen(state, (unsigned long) gadget_update_base);
+            gen(state, (uintptr_t) gadget_update_base);
             gen(state, rn | ((uint64_t)total_bytes << 8));
         } else {
             // Register: increment by Xm
-            gen(state, (unsigned long) gadget_update_base_reg);
+            gen(state, (uintptr_t) gadget_update_base_reg);
             gen(state, rn | (rm << 8));
         }
         return 1;
@@ -3673,10 +3673,10 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
                     return 0;
             }
 
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             // Pack: rd(0-4), rn(8-12), rm(16-20), sf(24), S(25), N(26), shift_type(27-28)
             uint64_t param = rd | (rn << 8) | (rm << 16) | ((uint64_t)sf << 24)
-                | ((opc == 3) ? (1UL << 25) : 0) | ((uint64_t)N << 26) | ((uint64_t)shift << 27);
+                | ((opc == 3) ? (1ULL << 25) : 0) | ((uint64_t)N << 26) | ((uint64_t)shift << 27);
             gen(state, param);
             gen(state, imm6);  // shift amount as second parameter
             return 1;
@@ -3684,7 +3684,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
 
         // Fast path: MOV Xd, Xm is ORR Xd, XZR, Xm (opc=1, N=0, rn=31)
         if (opc == 1 && N == 0 && rn == 31 && rd != 31 && rm != 31) {
-            gen(state, (unsigned long)(sf ? gadget_mov_reg : gadget_mov_reg32));
+            gen(state, (uintptr_t)(sf ? gadget_mov_reg : gadget_mov_reg32));
             gen(state, rd | (rm << 16));
             return 1;
         }
@@ -3696,13 +3696,13 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         if (rn == rm && N == 0 && opc != 3) {
             if (opc == 2 && rd != 31) {
                 // EOR Xd, Xn, Xn → Xd = 0
-                gen(state, (unsigned long) gadget_movz);
+                gen(state, (uintptr_t) gadget_movz);
                 gen(state, rd | (0 << 8) | (0ULL << 16) | ((uint64_t)sf << 32));
                 return 1;
             }
             if ((opc == 0 || opc == 1) && rd != 31 && rn != 31) {
                 // AND/ORR Xd, Xn, Xn → Xd = Xn (MOV)
-                gen(state, (unsigned long)(sf ? gadget_mov_reg : gadget_mov_reg32));
+                gen(state, (uintptr_t)(sf ? gadget_mov_reg : gadget_mov_reg32));
                 gen(state, rd | (rn << 16));
                 return 1;
             }
@@ -3725,7 +3725,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
                     case 2: fast = gadget_eor_reg_32_nshift; break;
                 }
             }
-            gen(state, (unsigned long) fast);
+            gen(state, (uintptr_t) fast);
             gen(state, rd | ((uint64_t)rn << 8) | ((uint64_t)rm << 16));
             return 1;
         }
@@ -3741,9 +3741,9 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
                 return 0;
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd(0-4), rn(8-12), rm(16-20), sf(24), S(25), N(26)
-        uint64_t param = rd | (rn << 8) | (rm << 16) | ((uint64_t)sf << 24) | ((opc == 3) ? (1UL << 25) : 0) | ((uint64_t)N << 26);
+        uint64_t param = rd | (rn << 8) | (rm << 16) | ((uint64_t)sf << 24) | ((opc == 3) ? (1ULL << 25) : 0) | ((uint64_t)N << 26);
         gen(state, param);
         return 1;
     }
@@ -3779,12 +3779,12 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
             if (fused == 0) return 0;
         }
         if (can_spec_reg && S) {
-            gen(state, (unsigned long)(op ? gadget_subs_reg_64_nshift : gadget_adds_reg_64_nshift));
+            gen(state, (uintptr_t)(op ? gadget_subs_reg_64_nshift : gadget_adds_reg_64_nshift));
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }
         if (can_spec_reg && !S && rd != 31) {
-            gen(state, (unsigned long)(op ? gadget_sub_reg_64_nshift : gadget_add_reg_64_nshift));
+            gen(state, (uintptr_t)(op ? gadget_sub_reg_64_nshift : gadget_add_reg_64_nshift));
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }
@@ -3792,7 +3792,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         // 32-bit ADD/SUB reg fast path (no shift, no flags, no XZR/SP).
         // Hot in CRC inner loops, byte-pointer arithmetic, hash mixing.
         if (!sf && imm6 == 0 && shift == 0 && !S && rn != 31 && rm != 31 && rd != 31) {
-            gen(state, (unsigned long)(op ? gadget_sub_reg_32_nshift : gadget_add_reg_32_nshift));
+            gen(state, (uintptr_t)(op ? gadget_sub_reg_32_nshift : gadget_add_reg_32_nshift));
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }
@@ -3801,7 +3801,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         // Hot in Python comparisons, CPython refcount post-decrement.
         // rd=31 (CMP/CMN) allowed — gadget handles XZR via cmp.
         if (!sf && imm6 == 0 && shift == 0 && S && rn != 31 && rm != 31) {
-            gen(state, (unsigned long)(op ? gadget_subs_reg_32_nshift : gadget_adds_reg_32_nshift));
+            gen(state, (uintptr_t)(op ? gadget_subs_reg_32_nshift : gadget_adds_reg_32_nshift));
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }
@@ -3814,7 +3814,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         } else {
             gadget = op ? gadget_sub_reg : gadget_add_reg;
         }
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | rm<<16 | sf<<24 | S<<25 | shift_type<<26 | imm6<<32
         gen(state, rd | (rn << 8) | (rm << 16) | ((uint64_t)sf << 24) | ((uint64_t)S << 25) | ((uint64_t)shift << 26) | ((uint64_t)imm6 << 32));
         return 1;
@@ -3840,7 +3840,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         } else {
             gadget = op ? gadget_sub_ext : gadget_add_ext;
         }
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | rm<<16 | option<<24 | imm3<<27 | sf<<30
         gen(state, rd | (rn << 8) | (rm << 16) | ((uint64_t)option << 24) | ((uint64_t)imm3 << 27) | ((uint64_t)sf << 30));
         return 1;
@@ -3858,7 +3858,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         uint32_t rd = insn & 0x1f;
 
         void *gadget = op ? gadget_sbc_reg : gadget_adc_reg;
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | rm<<16 | sf<<24 | S<<25
         gen(state, rd | (rn << 8) | (rm << 16) | ((uint64_t)sf << 24) | ((uint64_t)S << 25));
         return 1;
@@ -3883,7 +3883,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         } else {
             gadget = op ? gadget_ccmp_reg : gadget_ccmn_reg;
         }
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rn | (rm/imm5)<<8 | cond<<16 | nzcv<<20 | sf<<24
         gen(state, rn | (rm_or_imm5 << 8) | (cond << 16) | (nzcv << 20) | ((uint64_t)sf << 24));
         return 1;
@@ -3917,7 +3917,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
             case 3: gadget = gadget_csneg; break;  // op=1, op2=1: CSNEG
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (rm << 16) | (cond << 24) | ((uint64_t)sf << 28));
         return 1;
     }
@@ -3948,7 +3948,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
                 case 0x0a: fast = gadget_asrv_64; break;
             }
             if (fast) {
-                gen(state, (unsigned long) fast);
+                gen(state, (uintptr_t) fast);
                 gen(state, rd | (rn << 8) | (rm << 16));
                 return 1;
             }
@@ -3976,7 +3976,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
                 return 0;
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | rm<<16 | sf<<24
         gen(state, rd | (rn << 8) | (rm << 16) | ((uint64_t)sf << 24));
         return 1;
@@ -4034,7 +4034,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | sf<<24
         gen(state, rd | (rn << 8) | ((uint64_t)sf << 24));
         return 1;
@@ -4083,7 +4083,7 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | rm<<16 | ra<<24 | sf<<29
         gen(state, rd | (rn << 8) | (rm << 16) | ((uint64_t)ra << 24) | ((uint64_t)sf << 29));
         return 1;
@@ -4116,7 +4116,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint64_t bits = arm64_fpimm_to_bits(is_double, imm8);
         uint64_t lo = is_double ? bits : (uint64_t)(uint32_t)bits;
 
-        gen(state, (unsigned long) gadget_set_vec_imm);
+        gen(state, (uintptr_t) gadget_set_vec_imm);
         gen(state, rd);
         gen(state, lo);
         gen(state, 0);
@@ -4130,7 +4130,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         bool is_double = (insn & 0x00400000) != 0;  // type bit: 1=double, 0=single
-        gen(state, (unsigned long) gadget_fmov_fp_to_fp);
+        gen(state, (uintptr_t) gadget_fmov_fp_to_fp);
         gen(state, rd | (rn << 8) | ((uint64_t)is_double << 16));
         return 1;
     }
@@ -4144,7 +4144,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t idx = (insn >> 20) & 0x1;  // D element index (0 or 1)
-        gen(state, (unsigned long) gadget_ins_gpr_to_vec_d);
+        gen(state, (uintptr_t) gadget_ins_gpr_to_vec_d);
         gen(state, rd | (rn << 8) | (idx << 16));
         return 1;
     }
@@ -4156,7 +4156,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t idx = (insn >> 19) & 0x3;  // S element index
-        gen(state, (unsigned long) gadget_ins_gpr_to_vec_s);
+        gen(state, (uintptr_t) gadget_ins_gpr_to_vec_s);
         gen(state, rd | (rn << 8) | (idx << 16));
         return 1;
     }
@@ -4169,7 +4169,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t imm5 = (insn >> 16) & 0x1f;
         uint32_t idx = (imm5 >> 2) & 0x7;  // H element index (0..7)
-        gen(state, (unsigned long) gadget_ins_gpr_to_vec_h);
+        gen(state, (uintptr_t) gadget_ins_gpr_to_vec_h);
         gen(state, rd | (rn << 8) | (idx << 16));
         return 1;
     }
@@ -4181,7 +4181,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t imm5 = (insn >> 16) & 0x1f;
         uint32_t idx = (imm5 >> 1) & 0xf;  // B element index (0..15)
-        gen(state, (unsigned long) gadget_ins_gpr_to_vec_b);
+        gen(state, (uintptr_t) gadget_ins_gpr_to_vec_b);
         gen(state, rd | (rn << 8) | (idx << 16));
         return 1;
     }
@@ -4219,7 +4219,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 shift = ((immh << 3) | immb) - 8;
             }
 
-            gen(state, (unsigned long) gadget_shl_imm_vec);
+            gen(state, (uintptr_t) gadget_shl_imm_vec);
             // Pack: rd | rn<<8 | shift<<16 | esize<<24 | Q<<28
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
@@ -4255,7 +4255,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 shift = 16 - ((immh << 3) | immb);
             }
 
-            gen(state, (unsigned long) gadget_ushr_imm_vec);
+            gen(state, (uintptr_t) gadget_ushr_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4290,7 +4290,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 shift = 16 - ((immh << 3) | immb);
             }
 
-            gen(state, (unsigned long) gadget_sshr_imm_vec);
+            gen(state, (uintptr_t) gadget_sshr_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4324,7 +4324,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 shift = 16 - ((immh << 3) | immb);
             }
 
-            gen(state, (unsigned long) gadget_usra_imm_vec);
+            gen(state, (uintptr_t) gadget_usra_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4358,7 +4358,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 shift = 16 - ((immh << 3) | immb);
             }
 
-            gen(state, (unsigned long) gadget_ssra_imm_vec);
+            gen(state, (uintptr_t) gadget_ssra_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4379,7 +4379,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             else if (immh & 0x4) { esize = 2; shift = 64 - ((immh << 3) | immb); }
             else if (immh & 0x2) { esize = 1; shift = 32 - ((immh << 3) | immb); }
             else { esize = 0; shift = 16 - ((immh << 3) | immb); }
-            gen(state, (unsigned long) gadget_srshr_imm_vec);
+            gen(state, (uintptr_t) gadget_srshr_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4400,7 +4400,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             else if (immh & 0x4) { esize = 2; shift = 64 - ((immh << 3) | immb); }
             else if (immh & 0x2) { esize = 1; shift = 32 - ((immh << 3) | immb); }
             else { esize = 0; shift = 16 - ((immh << 3) | immb); }
-            gen(state, (unsigned long) gadget_urshr_imm_vec);
+            gen(state, (uintptr_t) gadget_urshr_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4421,7 +4421,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             else if (immh & 0x4) { esize = 2; shift = 64 - ((immh << 3) | immb); }
             else if (immh & 0x2) { esize = 1; shift = 32 - ((immh << 3) | immb); }
             else { esize = 0; shift = 16 - ((immh << 3) | immb); }
-            gen(state, (unsigned long) gadget_srsra_imm_vec);
+            gen(state, (uintptr_t) gadget_srsra_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4442,7 +4442,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             else if (immh & 0x4) { esize = 2; shift = 64 - ((immh << 3) | immb); }
             else if (immh & 0x2) { esize = 1; shift = 32 - ((immh << 3) | immb); }
             else { esize = 0; shift = 16 - ((immh << 3) | immb); }
-            gen(state, (unsigned long) gadget_ursra_imm_vec);
+            gen(state, (uintptr_t) gadget_ursra_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4462,7 +4462,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             if (immh & 0x4) { esize = 2; shift = 64 - ((immh << 3) | immb); }
             else if (immh & 0x2) { esize = 1; shift = 32 - ((immh << 3) | immb); }
             else { esize = 0; shift = 16 - ((immh << 3) | immb); }
-            gen(state, (unsigned long) gadget_shrn_vec);
+            gen(state, (uintptr_t) gadget_shrn_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4482,7 +4482,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             if (immh & 0x4) { esize = 2; shift = 64 - ((immh << 3) | immb); }
             else if (immh & 0x2) { esize = 1; shift = 32 - ((immh << 3) | immb); }
             else { esize = 0; shift = 16 - ((immh << 3) | immb); }
-            gen(state, (unsigned long) gadget_rshrn_vec);
+            gen(state, (uintptr_t) gadget_rshrn_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4513,7 +4513,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 if (immh & 0x4) { esize = 2; shift = 64 - ((immh << 3) | immb); }
                 else if (immh & 0x2) { esize = 1; shift = 32 - ((immh << 3) | immb); }
                 else { esize = 0; shift = 16 - ((immh << 3) | immb); }
-                gen(state, (unsigned long) sat_gadget);
+                gen(state, (uintptr_t) sat_gadget);
                 gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
                 return 1;
             }
@@ -4546,7 +4546,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 shift = 16 - ((immh << 3) | immb);
             }
 
-            gen(state, (unsigned long) gadget_sri_imm_vec);
+            gen(state, (uintptr_t) gadget_sri_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4578,7 +4578,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 shift = ((immh << 3) | immb) - 8;
             }
 
-            gen(state, (unsigned long) gadget_sli_imm_vec);
+            gen(state, (uintptr_t) gadget_sli_imm_vec);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24) | (Q << 28));
             return 1;
         }
@@ -4625,7 +4625,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8) | (shift << 16));
             return 1;
         }
@@ -4666,7 +4666,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
-        gen(state, (unsigned long) gadget_dup_elem_vec);
+        gen(state, (uintptr_t) gadget_dup_elem_vec);
         // Pack: rd | rn<<8 | elem_size<<16 | index<<20 | Q<<24
         gen(state, rd | (rn << 8) | (elem_size << 16) | (index << 20) | (Q << 24));
         return 1;
@@ -4702,7 +4702,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
-        gen(state, (unsigned long) gadget_dup_elem_scalar);
+        gen(state, (uintptr_t) gadget_dup_elem_scalar);
         // Pack: rd | rn<<8 | elem_size<<16 | index<<20
         gen(state, rd | (rn << 8) | (elem_size << 16) | (index << 20));
         return 1;
@@ -4745,7 +4745,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
-        gen(state, (unsigned long) gadget_ins_elem_vec);
+        gen(state, (uintptr_t) gadget_ins_elem_vec);
         // Pack: rd | rn<<8 | elem_size<<16 | dst_idx<<20 | src_idx<<24
         gen(state, rd | (rn << 8) | (elem_size << 16) | (dst_idx << 20) | (src_idx << 24));
         return 1;
@@ -4777,7 +4777,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         }
 
         // Generate a general DUP gadget that takes element size as parameter
-        gen(state, (unsigned long) gadget_dup_gpr_to_vec);
+        gen(state, (uintptr_t) gadget_dup_gpr_to_vec);
         gen(state, rd | (rn << 8) | (elem_size << 16) | (Q << 24));
         return 1;
     }
@@ -4789,7 +4789,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
     if ((insn & 0xffe0fc00) == 0x4e083c00) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
-        gen(state, (unsigned long) gadget_mov_v_to_gpr);
+        gen(state, (uintptr_t) gadget_mov_v_to_gpr);
         gen(state, rd | (rn << 8));
         return 1;
     }
@@ -4819,7 +4819,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
-        gen(state, (unsigned long) gadget_umov_vec_to_gpr);
+        gen(state, (uintptr_t) gadget_umov_vec_to_gpr);
         // Pack: rd | rn<<8 | elem_size<<16 | index<<20
         gen(state, rd | (rn << 8) | (elem_size << 16) | (index << 20));
         return 1;
@@ -4834,9 +4834,9 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint32_t imm12 = (insn >> 10) & 0xfff;
         // Offset is imm12 * 16 for Q register
         int64_t offset = (int64_t)imm12 * 16;
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (offset << 8));
-        gen(state, (unsigned long) gadget_str_q);
+        gen(state, (uintptr_t) gadget_str_q);
         gen(state, rt);
         return 1;
     }
@@ -4847,9 +4847,9 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         uint32_t rt = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         int32_t imm9 = ((int32_t)(insn >> 12) << 23) >> 23;  // Sign-extend
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | ((int64_t)imm9 << 8));
-        gen(state, (unsigned long) gadget_str_q);
+        gen(state, (uintptr_t) gadget_str_q);
         gen(state, rt);
         return 1;
     }
@@ -4864,9 +4864,9 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         int32_t imm7 = ((int32_t)(insn >> 15) << 25) >> 25;  // Sign-extend
         // Offset is imm7 * 16 for Q registers
         int64_t offset = (int64_t)imm7 * 16;
-        gen(state, (unsigned long) gadget_calc_addr_imm);
+        gen(state, (uintptr_t) gadget_calc_addr_imm);
         gen(state, rn | (offset << 8));
-        gen(state, (unsigned long) gadget_stp_q);
+        gen(state, (uintptr_t) gadget_stp_q);
         gen(state, rt | (rt2 << 8));
         return 1;
     }
@@ -4906,7 +4906,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                     elem64 |= (0xFFULL << (i * 8));
                 }
             }
-            gen(state, (unsigned long) gadget_set_vec_imm);
+            gen(state, (uintptr_t) gadget_set_vec_imm);
             gen(state, rd);
             gen(state, elem64);           // lo = expanded 64-bit value
             gen(state, Q ? elem64 : 0);   // hi = same if Q=1, else 0
@@ -4926,7 +4926,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 uint32_t frac = (cdefgh & 0xf) << 19;
                 uint32_t fp32 = (a << 31) | (exp << 23) | frac;
                 uint64_t elem64 = ((uint64_t)fp32 << 32) | fp32;
-                gen(state, (unsigned long) gadget_set_vec_imm);
+                gen(state, (uintptr_t) gadget_set_vec_imm);
                 gen(state, rd);
                 gen(state, elem64);
                 gen(state, Q ? elem64 : 0);
@@ -4944,7 +4944,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 uint64_t exp = ((1 - b) << 10) | ((b * 0xff) << 2) | ((cdefgh >> 4) & 3);
                 uint64_t frac = (cdefgh & 0xfULL) << 48;
                 uint64_t fp64 = (a << 63) | (exp << 52) | frac;
-                gen(state, (unsigned long) gadget_set_vec_imm);
+                gen(state, (uintptr_t) gadget_set_vec_imm);
                 gen(state, rd);
                 gen(state, fp64);
                 gen(state, fp64);
@@ -4986,12 +4986,12 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
                 lo = ~lo;
                 if (Q) hi = ~hi;
             }
-            gen(state, (unsigned long) gadget_set_vec_imm);
+            gen(state, (uintptr_t) gadget_set_vec_imm);
             gen(state, rd);
             gen(state, lo);
             gen(state, hi);
         } else {
-            gen(state, (unsigned long) (op ? gadget_bic_imm_vec : gadget_orr_imm_vec));
+            gen(state, (uintptr_t) (op ? gadget_bic_imm_vec : gadget_orr_imm_vec));
             gen(state, rd | (Q << 8));
             gen(state, lo);
             gen(state, hi);
@@ -5193,7 +5193,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             // Pack: rd | rn<<8 | rm<<16 | size<<24 | Q<<26
             gen(state, rd | (rn << 8) | (rm << 16) | (size << 24) | (Q << 26));
             return 1;
@@ -5240,7 +5240,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
             }
 
             if (fp_gadget) {
-                gen(state, (unsigned long) fp_gadget);
+                gen(state, (uintptr_t) fp_gadget);
                 // Pack: rd | rn<<8 | rm<<16 | sz<<24 | Q<<26
                 gen(state, rd | (rn << 8) | (rm << 16) | (sz << 24) | (Q << 26));
                 return 1;
@@ -5309,7 +5309,7 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             // Pack: rd | rn<<8 | rm<<16 | size<<24 | Q<<26
             gen(state, rd | (rn << 8) | (rm << 16) | (size << 24) | (Q << 26));
             return 1;
@@ -5332,7 +5332,7 @@ skip_three_different:
             gen_interrupt(state, INT_UNDEFINED);
             return 0;
         }
-        gen(state, (unsigned long) gadget_xtn_vec);
+        gen(state, (uintptr_t) gadget_xtn_vec);
         // Pack: rd | rn<<8 | size<<16 | hi<<18 (hi=Q for XTN2)
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 18));
         return 1;
@@ -5367,7 +5367,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             // Pack: rd | rn<<8 | rm<<16 | size<<24 | Q<<26
             gen(state, rd | (rn << 8) | (rm << 16) | (size << 24) | (Q << 26));
             return 1;
@@ -5401,7 +5401,7 @@ skip_three_different:
         else if (U == 0 && opcode == 0x06) gadget = gadget_sadalp_vec;
         else if (U == 1 && opcode == 0x06) gadget = gadget_uadalp_vec;
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5432,7 +5432,7 @@ skip_three_different:
         else if (U == 0 && opcode == 0x14) gadget = gadget_sqxtn_vec;
         else if (U == 1 && opcode == 0x14) gadget = gadget_uqxtn_vec;
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5444,7 +5444,7 @@ skip_three_different:
         uint32_t size = (insn >> 22) & 0x3;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
-        gen(state, (unsigned long) gadget_cmeq_zero_vec);
+        gen(state, (uintptr_t) gadget_cmeq_zero_vec);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5477,7 +5477,7 @@ skip_three_different:
         else if (U == 1 && opcode == 0x08) gadget = gadget_cmge_zero_vec;
         else if (U == 1 && opcode == 0x09) gadget = gadget_cmle_zero_vec;
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5499,7 +5499,7 @@ skip_three_different:
         }
 
         void *gadget = (U == 0) ? gadget_abs_vec : gadget_neg_vec;
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5522,7 +5522,7 @@ skip_three_different:
         }
 
         void *gadget = (U == 0) ? gadget_cls_vec : gadget_clz_vec;
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5534,7 +5534,7 @@ skip_three_different:
         uint32_t Q = (insn >> 30) & 1;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
-        gen(state, (unsigned long) gadget_not_vec);
+        gen(state, (uintptr_t) gadget_not_vec);
         gen(state, rd | (rn << 8) | (Q << 16));
         return 1;
     }
@@ -5542,7 +5542,7 @@ skip_three_different:
         uint32_t Q = (insn >> 30) & 1;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
-        gen(state, (unsigned long) gadget_rbit_vec);
+        gen(state, (uintptr_t) gadget_rbit_vec);
         gen(state, rd | (rn << 8) | (Q << 16));
         return 1;
     }
@@ -5577,7 +5577,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8) | (sz << 16) | (Q << 24));
             return 1;
         }
@@ -5640,7 +5640,7 @@ skip_three_different:
                 gen_interrupt(state, INT_UNDEFINED);
                 return 0;
             }
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8) | (sz << 16) | (Q << 24));
             return 1;
         }
@@ -5653,7 +5653,7 @@ skip_three_different:
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
         if (size == 3 && Q == 0) { gen_interrupt(state, INT_UNDEFINED); return 0; }
-        gen(state, (unsigned long) gadget_cmeq_zero_vec);
+        gen(state, (uintptr_t) gadget_cmeq_zero_vec);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5683,7 +5683,7 @@ skip_three_different:
             gadget = Q ? gadget_shll2_vec_b_to_h : gadget_shll_vec_b_to_h;
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8));
         return 1;
     }
@@ -5696,7 +5696,7 @@ skip_three_different:
         uint32_t Q = (insn >> 30) & 1;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
-        gen(state, (unsigned long) gadget_rev16_vec);
+        gen(state, (uintptr_t) gadget_rev16_vec);
         gen(state, rd | (rn << 8) | (Q << 24));
         return 1;
     }
@@ -5733,7 +5733,7 @@ skip_three_different:
             }
             gadget = gadget_rev32_vec;
         }
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5747,7 +5747,7 @@ skip_three_different:
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
 
-        gen(state, (unsigned long) gadget_rbit_vec);
+        gen(state, (uintptr_t) gadget_rbit_vec);
         gen(state, rd | (rn << 8) | (Q << 16));
         return 1;
     }
@@ -5767,7 +5767,7 @@ skip_three_different:
             return 0;
         }
 
-        gen(state, (unsigned long) gadget_addv_vec);
+        gen(state, (uintptr_t) gadget_addv_vec);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5789,7 +5789,7 @@ skip_three_different:
             return 0;
         }
 
-        gen(state, (unsigned long) (U ? gadget_uaddlv_vec : gadget_saddlv_vec));
+        gen(state, (uintptr_t) (U ? gadget_uaddlv_vec : gadget_saddlv_vec));
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5822,7 +5822,7 @@ skip_three_different:
         else if (U == 1 && opcode == 0x0a) gadget = gadget_umaxv_vec;
         else if (U == 1 && opcode == 0x1a) gadget = gadget_uminv_vec;
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (size << 16) | (Q << 24));
         return 1;
     }
@@ -5846,7 +5846,7 @@ skip_three_different:
         else if (base_val == 0x6eb0f800) gadget = gadget_fminv_vec;
         else if (base_val == 0x6e30c800) gadget = gadget_fmaxnmv_vec;
         else gadget = gadget_fminnmv_vec;
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8));
         return 1;
     }
@@ -5860,7 +5860,7 @@ skip_three_different:
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rd = insn & 0x1f;
 
-        gen(state, (unsigned long) gadget_cnt_vec);
+        gen(state, (uintptr_t) gadget_cnt_vec);
         gen(state, rd | (rn << 8) | (Q << 16));
         return 1;
     }
@@ -5931,7 +5931,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             // Pack: rd | rn<<8 | type<<16 | sf<<18
             gen(state, rd | (rn << 8) | (type << 16) | (sf << 18));
             return 1;
@@ -5968,7 +5968,7 @@ skip_three_different:
             }
 
             if (gadget) {
-                gen(state, (unsigned long) gadget);
+                gen(state, (uintptr_t) gadget);
                 // Pack: rd | rn<<8 | type<<16 | sf<<18 | fbits<<20
                 gen(state, rd | (rn << 8) | (type << 16) | (sf << 18) | (fbits << 20));
                 return 1;
@@ -5994,10 +5994,10 @@ skip_three_different:
         uint32_t imm8 = imm8_raw ^ 0x40;
         uint64_t fpbits = arm64_fpimm_to_bits(is_double, imm8);
 
-        gen(state, (unsigned long) gadget_fmov_fp_imm);
+        gen(state, (uintptr_t) gadget_fmov_fp_imm);
         gen(state, rd | (ftype << 8));
-        // Emit the 64-bit FP value as a single unsigned long
-        gen(state, (unsigned long) fpbits);
+        // Emit the 64-bit FP value as a single uintptr_t
+        gen(state, (uintptr_t) fpbits);
         return 1;
     }
 
@@ -6015,13 +6015,13 @@ skip_three_different:
         }
         if (insn & 0x08) {
             // Bit 3 set: FCMP/FCMPE with zero
-            gen(state, (unsigned long) gadget_fcmp_zero_scalar);
+            gen(state, (uintptr_t) gadget_fcmp_zero_scalar);
             // Pack: rn | type<<16
             gen(state, rn | (type << 16));
         } else {
             // Bit 3 clear: FCMP/FCMPE with register
             uint32_t rm = (insn >> 16) & 0x1f;
-            gen(state, (unsigned long) gadget_fcmp_scalar);
+            gen(state, (uintptr_t) gadget_fcmp_scalar);
             // Pack: rn | rm<<8 | type<<16
             gen(state, rn | (rm << 8) | (type << 16));
         }
@@ -6041,7 +6041,7 @@ skip_three_different:
             gen_interrupt(state, INT_UNDEFINED);
             return 0;
         }
-        gen(state, (unsigned long) gadget_fccmp_scalar);
+        gen(state, (uintptr_t) gadget_fccmp_scalar);
         // Pack: rn | rm<<8 | ftype<<16 | cond<<20 | nzcv<<24
         gen(state, rn | (rm << 8) | (ftype << 16) | (cond << 20) | (nzcv << 24));
         return 1;
@@ -6060,7 +6060,7 @@ skip_three_different:
             gen_interrupt(state, INT_UNDEFINED);
             return 0;
         }
-        gen(state, (unsigned long) gadget_fcsel_scalar);
+        gen(state, (uintptr_t) gadget_fcsel_scalar);
         // Pack two words: [rd | rn<<8 | rm<<16 | ftype<<24] [cond]
         gen(state, rd | (rn << 8) | (rm << 16) | (ftype << 24));
         gen(state, cond);
@@ -6080,7 +6080,7 @@ skip_three_different:
         // We handle all common dp1 ops via a generic gadget that re-executes
         // the instruction natively on the host (with emulated FP reg operands)
         if (ftype <= 1 && opcode <= 15) {
-            gen(state, (unsigned long) gadget_fp_dp1);
+            gen(state, (uintptr_t) gadget_fp_dp1);
             // Pack: rd | rn<<8 | ftype<<16 | opcode<<20
             gen(state, rd | (rn << 8) | (ftype << 16) | (opcode << 20));
             return 1;
@@ -6116,7 +6116,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             // Pack: rd | rn<<8 | rm<<16 | type<<24
             gen(state, rd | (rn << 8) | (rm << 16) | (type << 24));
             return 1;
@@ -6162,7 +6162,7 @@ skip_three_different:
             case 3: gadget = gadget_fnmsub_scalar; break;
         }
 
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | rm<<16 | ra<<24
         gen(state, rd | (rn << 8) | (rm << 16) | (ra << 24));
         // ftype as second word
@@ -6184,7 +6184,7 @@ skip_three_different:
         uint32_t Q = (insn >> 30) & 0x1;   // 0=64-bit, 1=128-bit
 
         void *gadget = op ? gadget_tbx : gadget_tbl;
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         // Pack: rd | rn<<8 | rm<<16 | len<<24 | Q<<28
         gen(state, rd | (rn << 8) | (rm << 16) | (len << 24) | (Q << 28));
         return 1;
@@ -6200,7 +6200,7 @@ skip_three_different:
         uint32_t rm = (insn >> 16) & 0x1f;
         uint32_t Q = (insn >> 30) & 0x1;     // 0=8B, 1=16B
 
-        gen(state, (unsigned long) gadget_ext_vec);
+        gen(state, (uintptr_t) gadget_ext_vec);
         // Pack: rd | rn<<8 | rm<<16 | imm4<<24 | Q<<28
         gen(state, rd | (rn << 8) | (rm << 16) | (imm4 << 24) | (Q << 28));
         return 1;
@@ -6226,7 +6226,7 @@ skip_three_different:
             case 7: gadget = gadget_aesimc; break; // 0111 -> AESIMC
         }
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8));
             return 1;
         }
@@ -6249,7 +6249,7 @@ skip_three_different:
             case 2: gadget = gadget_sha256su0; break;  // SHA256SU0
         }
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8));
             return 1;
         }
@@ -6276,7 +6276,7 @@ skip_three_different:
             case 3: gadget = gadget_sha1su0; break;
         }
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }
@@ -6301,7 +6301,7 @@ skip_three_different:
             case 2: gadget = gadget_sha256su1; break;
         }
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }
@@ -6312,7 +6312,7 @@ skip_three_different:
     if ((insn & 0xfffffc00) == 0xcec08000) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
-        gen(state, (unsigned long) gadget_sha512su0);
+        gen(state, (uintptr_t) gadget_sha512su0);
         gen(state, rd | (rn << 8));
         return 1;
     }
@@ -6323,7 +6323,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rm = (insn >> 16) & 0x1f;
-        gen(state, (unsigned long) gadget_sha512h);
+        gen(state, (uintptr_t) gadget_sha512h);
         gen(state, rd | (rn << 8) | (rm << 16));
         return 1;
     }
@@ -6334,7 +6334,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rm = (insn >> 16) & 0x1f;
-        gen(state, (unsigned long) gadget_sha512h2);
+        gen(state, (uintptr_t) gadget_sha512h2);
         gen(state, rd | (rn << 8) | (rm << 16));
         return 1;
     }
@@ -6345,7 +6345,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rm = (insn >> 16) & 0x1f;
-        gen(state, (unsigned long) gadget_sha512su1);
+        gen(state, (uintptr_t) gadget_sha512su1);
         gen(state, rd | (rn << 8) | (rm << 16));
         return 1;
     }
@@ -6355,7 +6355,7 @@ skip_three_different:
     if ((insn & 0xfffffc00) == 0xcec08400) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
-        gen(state, (unsigned long) gadget_sm4e);
+        gen(state, (uintptr_t) gadget_sm4e);
         gen(state, rd | (rn << 8));
         return 1;
     }
@@ -6366,7 +6366,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t rm = (insn >> 16) & 0x1f;
-        gen(state, (unsigned long) gadget_sm3partw1);
+        gen(state, (uintptr_t) gadget_sm3partw1);
         gen(state, rd | (rn << 8) | (rm << 16));
         return 1;
     }
@@ -6378,7 +6378,7 @@ skip_three_different:
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t ra = (insn >> 10) & 0x1f;
         uint32_t rm = (insn >> 16) & 0x1f;
-        gen(state, (unsigned long) gadget_eor3);
+        gen(state, (uintptr_t) gadget_eor3);
         gen(state, rd | (rn << 8) | (rm << 16) | (ra << 24));
         return 1;
     }
@@ -6397,7 +6397,7 @@ skip_three_different:
         uint32_t size = (insn >> 22) & 0x3;
 
 
-        gen(state, (unsigned long) gadget_pmull);
+        gen(state, (uintptr_t) gadget_pmull);
         gen(state, rd | (rn << 8) | (rm << 16) | (Q << 24) | (size << 26));
         return 1;
     }
@@ -6444,7 +6444,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, packed);
             return 1;
         }
@@ -6550,7 +6550,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, packed);
             return 1;
         }
@@ -6600,7 +6600,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, Rd | (Rn << 8) | (Rm << 16));
             return 1;
         }
@@ -6610,7 +6610,7 @@ skip_three_different:
         // bit22 = 0: single, bit22 = 1: double
         if (U == 1 && (sz & 2) && opcode == 0x1a) {
             uint32_t type = sz & 1; // bit 22: 0=single, 1=double
-            gen(state, (unsigned long) gadget_fabd_scalar);
+            gen(state, (uintptr_t) gadget_fabd_scalar);
             gen(state, Rd | (Rn << 8) | (Rm << 16) | (type << 24));
             return 1;
         }
@@ -6624,7 +6624,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t sz = (insn >> 22) & 1;
-        gen(state, (unsigned long) gadget_faddp_scalar);
+        gen(state, (uintptr_t) gadget_faddp_scalar);
         gen(state, rd | (rn << 8) | (sz << 16));
         return 1;
     }
@@ -6637,7 +6637,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t sz = (insn >> 22) & 1;
-        gen(state, (unsigned long) gadget_fmaxp_scalar);
+        gen(state, (uintptr_t) gadget_fmaxp_scalar);
         gen(state, rd | (rn << 8) | (sz << 16));
         return 1;
     }
@@ -6645,7 +6645,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t sz = (insn >> 22) & 1;
-        gen(state, (unsigned long) gadget_fminp_scalar);
+        gen(state, (uintptr_t) gadget_fminp_scalar);
         gen(state, rd | (rn << 8) | (sz << 16));
         return 1;
     }
@@ -6657,7 +6657,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t sz = (insn >> 22) & 1;
-        gen(state, (unsigned long) gadget_fmaxnmp_scalar);
+        gen(state, (uintptr_t) gadget_fmaxnmp_scalar);
         gen(state, rd | (rn << 8) | (sz << 16));
         return 1;
     }
@@ -6665,7 +6665,7 @@ skip_three_different:
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
         uint32_t sz = (insn >> 22) & 1;
-        gen(state, (unsigned long) gadget_fminnmp_scalar);
+        gen(state, (uintptr_t) gadget_fminnmp_scalar);
         gen(state, rd | (rn << 8) | (sz << 16));
         return 1;
     }
@@ -6676,7 +6676,7 @@ skip_three_different:
     if ((insn & 0xfffffc00) == 0x5ef1b800) {
         uint32_t rd = insn & 0x1f;
         uint32_t rn = (insn >> 5) & 0x1f;
-        gen(state, (unsigned long) gadget_addp_scalar);
+        gen(state, (uintptr_t) gadget_addp_scalar);
         gen(state, rd | (rn << 8));
         return 1;
     }
@@ -6707,7 +6707,7 @@ skip_three_different:
         else if (opcode == 0x0b && U == 1) gadget = gadget_neg_scalar;
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8));
             return 1;
         }
@@ -6737,7 +6737,7 @@ skip_three_different:
         else if (opcode == 0x0e && U == 0) gadget = gadget_fcmlt_scalar_zero;
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8) | (sz << 16));
             return 1;
         }
@@ -6757,7 +6757,7 @@ skip_three_different:
         uint32_t U = (insn >> 29) & 1;
 
         void *gadget = U ? gadget_fcvtzu_simd_scalar : gadget_fcvtzs_simd_scalar;
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (sz << 16));
         return 1;
     }
@@ -6776,7 +6776,7 @@ skip_three_different:
         uint32_t U = (insn >> 29) & 1;
 
         void *gadget = U ? gadget_ucvtf_simd_scalar : gadget_scvtf_simd_scalar;
-        gen(state, (unsigned long) gadget);
+        gen(state, (uintptr_t) gadget);
         gen(state, rd | (rn << 8) | (sz << 16));
         return 1;
     }
@@ -6884,7 +6884,7 @@ skip_three_different:
         }
 
         if (gadget) {
-            gen(state, (unsigned long) gadget);
+            gen(state, (uintptr_t) gadget);
             gen(state, rd | (rn << 8) | (shift << 16) | (esize << 24));
             return 1;
         }

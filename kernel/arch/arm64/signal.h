@@ -27,7 +27,7 @@ struct sigcontext_arm64 {
 
 // ARM64 ucontext structure
 struct ucontext_arm64 {
-    unsigned long uc_flags;
+    uint64_t uc_flags;   // guest LP64 unsigned long
     struct ucontext_arm64 *uc_link;
     struct stack_t_ uc_stack;
     struct sigset_t_ uc_sigmask;

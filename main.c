@@ -69,8 +69,32 @@ static_assert(CRASH_CPU_segfault_was_write == CPU_segfault_was_write, "cpu-offse
 static_assert(CRASH_LOCAL_jit_exit_sp      == LOCAL_jit_exit_sp,      "cpu-offsets drift: jit_exit_sp");
 #endif
 
+#if defined(_WIN32) && defined(__aarch64__) && defined(GUEST_ARM64)
+// A host access violation while running guest code (stale TLB after CoW and
+// the like): what crash_handler() does on Apple, from a vectored handler --
+// the block runs again from its start, or the guest gets SIGSEGV.
+static bool guest_code_fault(struct px_fault *f) {
+    if (!in_jit)
+        return false;
+#ifdef ISH_JIT
+    jit_crash_sync_regs(f->pc, f->x);
+#endif
+    uint64_t cpu_ptr = f->x[1];   // _cpu
+    jit_last_host_fault = f->addr;
+    jit_last_x7 = f->x[7];
+    jit_last_x10 = f->x[10];
+    jit_crash_count++;
+    *(addr_t *) (cpu_ptr + CRASH_CPU_segfault_addr) = (f->x[7] - f->x[10]) & 0xffffffffffffULL;
+    *(bool *) (cpu_ptr + CRASH_CPU_segfault_was_write) = f->is_write;
+    *(uint64_t *) (cpu_ptr + CRASH_CPU_pc) = (uint64_t) jit_saved_pc;
+    f->sp = *(uint64_t *) (cpu_ptr + CRASH_LOCAL_jit_exit_sp);
+    f->pc = (uint64_t) jit_crash_trampoline;
+    return true;
+}
+#endif
+
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
-#if defined(__aarch64__) && defined(GUEST_ARM64)
+#if defined(__aarch64__) && defined(GUEST_ARM64) && defined(__APPLE__)
     // If we're inside JIT code and got SIGSEGV/SIGBUS, recover by redirecting
     // execution to jit_crash_trampoline via ucontext PC manipulation.
     // This avoids the overhead of _setjmp on every block entry.
@@ -417,6 +441,11 @@ int main(int argc, char *const argv[]) {
             printf("serve-proto=1\n");
             return 0;
         }
+        // --arch: what this ish.exe runs, without booting a kernel
+        if (strcmp(argv[i], "--arch") == 0) {
+            printf("guest_arch=%s host_arch=%s engine=%s\n", ish_guest_arch(), ish_host_arch(), ish_engine());
+            return 0;
+        }
         if (strcmp(argv[i], "--serve") == 0)
             ish_serve_mode = true;
         else
@@ -518,6 +547,9 @@ int main(int argc, char *const argv[]) {
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
+#if defined(_WIN32) && defined(__aarch64__) && defined(GUEST_ARM64)
+    px_fault_hook(guest_code_fault);
+#endif
 #ifndef _WIN32
     // Guest job control is emulated. A guest program that sets the terminal
     // mode with SIGTTOU blocked (node restoring stdin at exit) must not get

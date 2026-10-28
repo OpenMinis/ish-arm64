@@ -1,15 +1,39 @@
 // Native JIT for the ARM64 guest -- see jit.h. Built only with -Djit=true.
 
-#if !defined(__APPLE__) || !defined(__aarch64__)
-#error "the ARM64 JIT needs an Apple arm64 host (MAP_JIT)"
+#if !defined(__aarch64__) || !(defined(__APPLE__) || defined(_WIN32))
+#error "the ARM64 JIT needs an arm64 host: Apple (MAP_JIT / dual mapping) or Windows (dual mapping)"
 #endif
 
+#ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <dlfcn.h>
 #include <fnmatch.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <sys/ucontext.h>
+#else
+// Windows: one pagefile section mapped twice (px_jit_map_dual), like iOS.
+#define TARGET_OS_OSX 0
+#define sys_icache_invalidate px_icache_flush
+// '*' and '?' only: what AOT family patterns use
+static int fnmatch(const char *p, const char *s, int flags) {
+    (void) flags;
+    for (; *p; p++, s++) {
+        if (*p == '*') {
+            for (const char *t = s;; t++) {
+                if (fnmatch(p + 1, t, 0) == 0)
+                    return 0;
+                if (!*t)
+                    return 1;
+            }
+        }
+        if (!*s || (*p != '?' && *p != *s))
+            return 1;
+    }
+    return *s ? 1 : 0;
+}
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -17,7 +41,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/ucontext.h>
 #include "asbestos/guest-arm64/jit.h"
 #include "asbestos/guest-arm64/aot.h"
 #include "asbestos/asbestos.h"
@@ -39,6 +62,14 @@ static bool loop_off;     // ISH_JIT_LOOP=0: no register promotion in self-loops
 static bool simd_on;      // ISH_JIT_SIMD=0: leave SIMD/FP instructions to the gadgets
 static bool pin_on;       // ISH_JIT_PIN=0: no guest registers pinned in host registers
 static bool pic_on;       // ISH_JIT_PIC=1: position-independent code (see "PIC" below)
+// ISH_JIT_HOT=<n>: translate a block when it runs the n-th time (1: at once).
+// Windows waits: start-up code that runs a few times costs more to translate
+// there (code faulted in through two views, a system call per icache flush).
+#ifdef _WIN32
+static unsigned hot_after = 16;
+#else
+static unsigned hot_after = 1;
+#endif
 static bool aot_only;     // ISH_JIT_AOT_ONLY=1: install AOT translations, translate nothing
                           // (what a build without the JIT would run)
 
@@ -67,6 +98,7 @@ static double jit_ticks_ms(uint64_t ticks) {
 static _Atomic uint64_t st_unsupported_insns, st_fail_regs;
 static _Atomic uint64_t st_block_ends, st_block_end_fail, st_links, st_loops;
 static _Atomic uint64_t st_shared, st_aot, st_aot_moved, st_aot_busy, st_aot_fixed;
+static _Atomic uint64_t st_deferred;   // blocks whose translation waited to get hot (jit_block_heat)
 static _Atomic uint64_t st_find_ticks;   // jit_ticks() spent in aot_lookup()
 
 // ---------------------------------------------------------------- code region
@@ -89,6 +121,16 @@ static _Atomic bool region_full;   // an allocation failed: what came after runs
 
 #ifndef ISH_JIT_NO_EMIT   // AOT-only builds never map executable memory
 static bool map_dual(void) {
+#ifdef _WIN32
+    void *rw;
+    void *rx = px_jit_map_dual(REGION_SIZE, &rw);
+    if (rx == NULL)
+        return false;
+    region = rx;
+    rw_delta = (intptr_t) rw - (intptr_t) rx;
+    dual_map = true;
+    return true;
+#else
     void *rw = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (rw == MAP_FAILED)
         return false;
@@ -109,6 +151,7 @@ static bool map_dual(void) {
     rw_delta = (intptr_t) rw - (intptr_t) rx;
     dual_map = true;
     return true;
+#endif
 }
 
 static bool map_jit(void) {
@@ -126,12 +169,39 @@ static bool map_jit(void) {
 }
 #endif
 
+#ifdef _WIN32
+// The section is only reserved: commit it 1 MB at a time ahead of region_used.
+#define REGION_COMMIT_STEP (1u << 20)
+static size_t region_committed;
+static pthread_mutex_t region_commit_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool region_commit(size_t end) {
+    if (__atomic_load_n(&region_committed, __ATOMIC_ACQUIRE) >= end)
+        return true;
+    pthread_mutex_lock(&region_commit_lock);
+    bool ok = true;
+    while (ok && region_committed < end) {
+        size_t step = REGION_SIZE - region_committed < REGION_COMMIT_STEP ? REGION_SIZE - region_committed : REGION_COMMIT_STEP;
+        ok = px_jit_commit_dual(region + region_committed, region + region_committed + rw_delta, step);
+        if (ok)
+            __atomic_store_n(&region_committed, region_committed + step, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&region_commit_lock);
+    return ok;
+}
+#endif
+
 static uint8_t *region_alloc(size_t bytes) {
     size_t off = atomic_fetch_add(&region_used, (bytes + 15) & ~(size_t) 15);
     if (off + bytes > REGION_SIZE) {
         region_full = true;
         return NULL;
     }
+#ifdef _WIN32
+    if (!region_commit(off + bytes)) {
+        region_full = true;   // out of commit (a job's memory limit): what comes after runs as gadgets
+        return NULL;
+    }
+#endif
     return region + off;
 }
 
@@ -216,7 +286,19 @@ static const uint8_t lazy_pool[] = {16, 17, 0};
 static const uint8_t pool_nopin[] = {0, 3, 4, 5, 6, 7, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27};
 static int n_pinned;               // 0 when pinning is off
 static int prologue_words;          // cold-entry prologue length (hot entry offset)
-static uintptr_t exit_stub;         // shared: store pinned registers; br x8
+// Shared stubs in the code region, reached with a plain `b` (an AOT image has
+// its own copies, from the recording's header): what every block end would
+// otherwise carry inline although it rarely runs (make_stubs()).
+enum {
+    STUB_EXIT,      // store the pinned registers; br x8
+    STUB_GENERIC,   // x9 = &code[0] of a chained successor not linked to: enter it
+    STUB_POKE,      // x9 = the same, the cycle count wrapped: through the run loop
+    STUB_UNCH,      // x9 = an unchained slot, w10 = idx << 2 | jump_ip slot (2: none)
+    NSTUBS
+};
+static uintptr_t stubs[NSTUBS];
+static struct rec_seg *stub_rec[NSTUBS];
+#define exit_stub stubs[STUB_EXIT]
 static unsigned exit_stub_words;
 static int8_t pin_of[33];          // guest -> host register, -1 if not pinned
 
@@ -259,7 +341,7 @@ struct em {
     uint32_t locked;       // host registers used by the instruction being emitted
     uint8_t victim;        // round-robin eviction cursor
     // bailout / exit sites: branch at buf[at] must go to the stub for stream position spos
-    struct { unsigned at; unsigned spos; uint8_t kind; uintptr_t abs; } fix[1024];
+    struct { unsigned at; unsigned spos; uint8_t kind, stub; uintptr_t abs; } fix[1024];
     unsigned nfix;
     bool fail;
     bool hflags;   // host NZCV currently equals the guest flags
@@ -566,11 +648,16 @@ static void make_exit_stub(void) {
 
 // Leave native code for `target` (gadget, fiber_ret, ...): x8 = target, then
 // the shared exit stub stores the pinned registers and branches to x8.
-static void emit_exit_x8(struct em *e) {
+static void emit_to_stub(struct em *e, int id) {
     if (e->nfix == 1024) { e->fail = true; return; }
-    e->fix[e->nfix].at = e->n; e->fix[e->nfix].spos = 0; e->fix[e->nfix].kind = 4; e->fix[e->nfix].abs = exit_stub;
+    e->fix[e->nfix].at = e->n; e->fix[e->nfix].spos = 0; e->fix[e->nfix].kind = 4;
+    e->fix[e->nfix].stub = (uint8_t) id; e->fix[e->nfix].abs = stubs[id];
     e->nfix++;
-    put(e, 0x14000000u);                                           // b exit_stub (patched)
+    put(e, 0x14000000u);                                           // b stub (patched)
+}
+
+static void emit_exit_x8(struct em *e) {
+    emit_to_stub(e, STUB_EXIT);
 }
 
 static void set_last_block(struct em *e, struct fiber_block *b) {
@@ -1130,14 +1217,14 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
     if (!dst)
         return NULL;
     for (unsigned i = 0; i < e->nfix; i++) {
-        if (e->fix[i].kind == 4) {   // absolute target (shared exit stub)
+        if (e->fix[i].kind == 4) {   // absolute target (a shared stub)
             int64_t d = (int64_t) e->fix[i].abs - (int64_t) ((uintptr_t) dst + 4 * e->fix[i].at);
             if (!fits(d >> 2, 26)) return NULL;
             e->buf[e->fix[i].at] = ENC_B(d);
             if (e->record) {
                 unsigned n = e->n;
                 e->n = e->fix[i].at;
-                add_rel(e, REL_EXIT, 0);
+                add_rel(e, REL_EXIT, e->fix[i].stub);
                 e->n = n;
                 if (e->fail) return NULL;
             }
@@ -1167,7 +1254,7 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
         }
     if (e->record)
         e->last_rec = record_segment(e);
-    b->code[first_pos] = (unsigned long) dst;
+    b->code[first_pos] = (uintptr_t) dst;
     if (first_pos == 0 && n_pinned)
         __atomic_store_n(&b->native_entry, (uintptr_t) dst + entry_off(), __ATOMIC_RELEASE);
     return dst;
@@ -1240,7 +1327,7 @@ bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to) 
         __atomic_load_n(&ctx->slot[from->jit_idx].blk, __ATOMIC_ACQUIRE) != from)
         return false;
     __atomic_store_n(&ctx_far(ctx, from->jit_idx)->alt[i], (uintptr_t) to->code, __ATOMIC_RELEASE);
-    __atomic_store_n(from->jump_ip[i], *from->jump_ip[i] | 1UL << 62, __ATOMIC_RELEASE);
+    __atomic_store_n(from->jump_ip[i], *from->jump_ip[i] | 1ULL << 62, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -1348,7 +1435,127 @@ static void emit_native_dispatch_ex(struct em *e, bool block_start) {
 // swaps them back first.
 static void emit_refused_edge(struct em *e, unsigned generic, int link);
 
-static void emit_chain_ex(struct em *e, struct fiber_block *b, unsigned long *slot, int link, bool self_loop) {
+// Install the stub in e as stubs[id] (its branches to other stubs resolved)
+// and keep its words and relocations for the recording's header.
+static void install_stub(struct em *e, int id) {
+    uint8_t *dst = e->fail ? NULL : region_alloc(e->n * 4);
+    if (!dst)
+        return;
+    for (unsigned i = 0; i < e->nfix; i++) {
+        int64_t d = (int64_t) e->fix[i].abs - (int64_t) ((uintptr_t) dst + 4 * e->fix[i].at);
+        if (e->fix[i].kind != 4 || !e->fix[i].abs || !fits(d >> 2, 26))
+            return;
+        e->buf[e->fix[i].at] = ENC_B(d);
+        unsigned n = e->n;
+        e->n = e->fix[i].at;
+        add_rel(e, REL_EXIT, e->fix[i].stub);
+        e->n = n;
+    }
+    if (e->fail)
+        return;
+    install_code(dst, e->buf, e->n);
+    stub_rec[id] = record_segment(e);
+    stubs[id] = (uintptr_t) dst;
+}
+
+// PIC with pinned registers: the slow paths of a block end (see
+// emit_chain_outlined()), as emit_chain_ex() has them inline.
+static void make_stubs(void) {
+    struct em *e = calloc(1, sizeof(*e));
+    if (!e)
+        return;
+    int ne = (int) offsetof(struct fiber_block, native_entry) - FIBER_BLOCK_code;
+    int boff = FIBER_BLOCK_addr - FIBER_BLOCK_code;
+    for (int id = STUB_GENERIC; id < NSTUBS; id++) {
+        memset(e, 0, sizeof(*e));
+        e->link_at[0] = e->link_at[1] = -1;
+        if (id == STUB_GENERIC) {
+            put(e, 0xF8400000u | ((uint32_t) (ne & 0x1ff) << 12) | (9u << 5) | 8);       // ldur x8, [x9, #native_entry-code]
+            unsigned slow = e->n; put(e, 0xB4000008u);                                   // cbz x8, slow
+            enter_native(e);
+            patch_here(e, slow);
+            put(e, 0xF8400000u | ((uint32_t) (boff & 0x1ff) << 12) | (9u << 5) | 11);    // ldur x11, [x9, #addr-code]
+            put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 11);                 // str x11, [x1, #pc]
+            put(e, 0xAA0903FCu);                                                         // mov x28, x9
+            emit_native_dispatch_ex(e, true);
+        } else if (id == STUB_POKE) {
+            put(e, 0xF8400000u | ((uint32_t) (boff & 0x1ff) << 12) | (9u << 5) | 11);    // ldur x11, [x9, #addr-code]
+            put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 11);                 // str x11, [x1, #pc]
+            put(e, 0xD1000000u | (FIBER_BLOCK_code << 10) | (9u << 5) | 8);              // sub x8, x9, #code
+            put(e, 0xF9000000u | ((LOCAL_last_block / 8) << 10) | (1u << 5) | 8);        // str x8, [x1, #last_block]
+            put(e, 0xAA0903FCu);                                                         // mov x28, x9
+            emit_exit(e, (uintptr_t) jit_fiber_ret);
+        } else {
+            // refused (emit_refused_edge()): x9 = far[idx].alt[link] if set, enter it
+            put(e, 0x1200054Bu);                                                         // and w11, w10, #3
+            put(e, 0x7100097Fu);                                                         // cmp w11, #2
+            unsigned plain1 = e->n; put(e, 0x54000000u);                                 // b.eq plain
+            unsigned plain2 = e->n; put(e, 0xB6F00009u);                                 // tbz x9, #62, plain
+            put(e, 0x53027D4Cu);                                                         // lsr w12, w10, #2
+            put(e, 0x8B0C058Cu);                                                         // add x12, x12, x12, lsl #1
+            put(e, 0xCB0C0FACu);                                                         // sub x12, x29, x12, lsl #3
+            put(e, 0x8B0B0D8Cu);                                                         // add x12, x12, x11, lsl #3
+            put(e, 0xF8400000u | ((uint32_t) ((int) offsetof(struct jit_far, alt) - CTX_FAR) & 0x1ff) << 12
+                   | (12u << 5) | 12);                                                   // ldur x12, [x12, #alt-CTX_FAR]
+            unsigned plain3 = e->n; put(e, 0xB400000Cu);                                 // cbz x12, plain
+            put(e, 0xAA0C03E9u);                                                         // mov x9, x12
+            emit_to_stub(e, STUB_GENERIC);
+            patch_here(e, plain1); patch_here(e, plain2); patch_here(e, plain3);
+            // the run loop chains the slot on its way back (set_last_block())
+            put(e, 0x53027D4Cu);                                                         // lsr w12, w10, #2
+            put(e, 0x8B0C13ACu);                                                         // add x12, x29, x12, lsl #4
+            put(e, 0xF9400000u | ((CTX_BLK / 8) << 10) | (12u << 5) | 8);                // ldr x8, [x12, #CTX_BLK]
+            put(e, 0xF9000000u | ((LOCAL_last_block / 8) << 10) | (1u << 5) | 8);        // str x8, [x1, #last_block]
+            put(e, 0x9240BC00u | (9u << 5) | 11);                                        // and x11, x9, #0xffffffffffff
+            put(e, 0xF9000000u | ((CPU_pc / 8) << 10) | (1u << 5) | 11);                 // str x11, [x1, #pc]
+            put(e, 0xAA0903FCu);                                                         // mov x28, x9
+            emit_exit(e, (uintptr_t) jit_fiber_ret_chain);
+        }
+        install_stub(e, id);
+        if (!stubs[id])
+            break;   // block ends stay inline (emit_chain_ex() checks stubs[STUB_UNCH])
+    }
+    free(e);
+}
+
+// PIC block end, outlined (stubs made): only what the common case runs stays
+// inline. Chained slot -> count the cycle -> the direct link, or, not linked
+// yet, STUB_GENERIC; the cycle count wrapping and an unchained slot go to
+// their stubs. The slot is loaded before the count, so the stubs all start
+// from it in x9.
+static void emit_chain_outlined(struct em *e, struct fiber_block *b, uintptr_t *slot, int link) {
+    ldr_block(e, 9, (unsigned) ((char *) slot - (char *) b));
+    unsigned to_unch = e->n; put(e, 0xB7F80009u);                     // tbnz x9, #63, unchained
+    unsigned to_poke = ~0u;
+    if (!e->chain_fwd) {   // forward edges do not count (see emit_chain_ex)
+        put(e, 0x110005EFu);                                           // add w15, w15, #1
+        put(e, 0x720025FFu);                                           // tst w15, #0x3ff
+        to_poke = e->n; put(e, 0x54000000u);                           // b.eq poke
+    }
+    if (!(e->n & 1))
+        put(e, NOP);   // keep the literal 8-byte aligned (segments start 16-aligned)
+    unsigned site = e->n; put(e, 0x14000000u);                         // b <link entry> (patched)
+    if (link >= 0 && link < 2) e->link_at[link] = (int) site;
+    put(e, LINK_UNSET); put(e, 0);                                     // literal: target - branch
+    patch_here(e, site);
+    emit_to_stub(e, STUB_GENERIC);
+    if (to_poke != ~0u) {
+        patch_here(e, to_poke);
+        emit_to_stub(e, STUB_POKE);
+    }
+    patch_here(e, to_unch);
+    uint32_t p = e->idx << 2 | (link >= 0 && link < 2 ? (uint32_t) link : 2u);
+    put(e, 0x5280000Au | (p & 0xffff) << 5);                          // movz w10, #p
+    if (p >> 16)
+        put(e, 0x72A0000Au | (p >> 16) << 5);                          // movk w10, #p >> 16, lsl #16
+    emit_to_stub(e, STUB_UNCH);
+}
+
+static void emit_chain_ex(struct em *e, struct fiber_block *b, uintptr_t *slot, int link, bool self_loop) {
+    if (pic_on && n_pinned && !self_loop && stubs[STUB_UNCH]) {
+        emit_chain_outlined(e, b, slot, link);
+        return;
+    }
     bool reg_cycle = n_pinned > 0;
     unsigned generic = 0;   // PIC: chained successor in x9, entered natively or through its gadgets
     unsigned slot_off = (unsigned) ((char *) slot - (char *) b);
@@ -1458,7 +1665,7 @@ static void emit_chain_ex(struct em *e, struct fiber_block *b, unsigned long *sl
     emit_exit(e, (uintptr_t) jit_fiber_ret_chain);
 }
 
-static void emit_chain(struct em *e, struct fiber_block *b, unsigned long *slot, int link) {
+static void emit_chain(struct em *e, struct fiber_block *b, uintptr_t *slot, int link) {
     emit_chain_ex(e, b, slot, link, false);
 }
 
@@ -2015,8 +2222,13 @@ static struct jit_ctx *ctx_get(struct asbestos *a, int mod, uint64_t base, const
         // An image knows how many it uses.
         size_t nidx = owner ? owner->nidx : CTX_MAX;
         size_t far = CTX_FAR * nidx, bytes = far + CTX_BLK + CTX_SLOT * nidx;
+#ifdef _WIN32
+        void *p = px_reserve_lazy(bytes);   // Windows commits an anonymous mmap at once
+        if (p == NULL) {
+#else
         void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (p == MAP_FAILED) {
+#endif
             free(n);
             n = NULL;
         } else {
@@ -2042,7 +2254,11 @@ void jit_asbestos_free(struct asbestos *a) {
     pthread_mutex_unlock(&ctx_lock);
     while (n) {
         struct ctx_node *next = n->next;
+#ifdef _WIN32
+        px_reserve_lazy_free(n->map);
+#else
         munmap(n->map, n->bytes);
+#endif
         free(n);
         n = next;
     }
@@ -2070,6 +2286,8 @@ static bool one_mapping(const struct jit_units *U, int mod, uint64_t base) {
 }
 
 void jit_block_free(struct fiber_block *b) {
+    free(b->jit_pending);
+    b->jit_pending = NULL;
     struct jit_ctx *ctx = b->jit_ctx;
     if (!ctx || !pic_on)
         return;
@@ -2109,7 +2327,7 @@ static void reg_install(struct fiber_block *b, struct jit_ctx *ctx, const struct
     b->native_link[0] = r->link[0];
     b->native_link[1] = r->link[1];
     for (unsigned i = 0; i < r->nseg; i++) {
-        b->code[r->seg[i].pos] = (unsigned long) r->seg[i].code;
+        b->code[r->seg[i].pos] = (uintptr_t) r->seg[i].code;
         if (r->seg[i].pos == 0 && n_pinned)
             __atomic_store_n(&b->native_entry, (uintptr_t) r->seg[i].code + entry_off(), __ATOMIC_RELEASE);
     }
@@ -2160,7 +2378,7 @@ void ish_aot_register(const struct aot_module *m) {
 
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
-#define JIT_CODE_VERSION 9
+#define JIT_CODE_VERSION 10
 
 // Everything the emitted code bakes in besides the gadgets it names: the
 // conventions, the struct layouts it loads from and the TLB / block cache
@@ -2571,7 +2789,7 @@ static bool aot_install(struct fiber_block *b, struct jit_ctx *ctx, const struct
     const struct aot_seg *seg = aot_rel(&t->seg);
     for (unsigned i = 0; i < t->nseg; i++) {
         uintptr_t code = (uintptr_t) aot_rel(&seg[i].code);
-        b->code[seg[i].pos] = (unsigned long) code;
+        b->code[seg[i].pos] = (uintptr_t) code;
         if (seg[i].pos == 0 && n_pinned)
             __atomic_store_n(&b->native_entry, code + (uintptr_t) entry, __ATOMIC_RELEASE);
     }
@@ -2774,16 +2992,14 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
 // Host fault inside native code: the pinned guest registers only live in host
 // registers, so copy them from the signal context into cpu_state before the
 // crash-recovery path re-runs the block.
-bool jit_crash_sync(void *ucontext) {
+bool jit_crash_sync_regs(uintptr_t pc, const uint64_t *x) {
     if (!region || n_pinned <= 0)
         return false;
-    ucontext_t *uc = ucontext;
-    uintptr_t pc = uc->uc_mcontext->__ss.__pc;
     const struct aot_module *img = NULL;
     bool in_region = pc >= (uintptr_t) region && pc < (uintptr_t) region + REGION_SIZE;
     if (!in_region && !in_aot_text(pc, &img))
         return false;
-    char *cpu = (char *) uc->uc_mcontext->__ss.__x[1];
+    char *cpu = (char *) x[1];
     // Faults only happen at guest accesses, which in a loop block are all in
     // the promoted body. (Blocking lock: this runs in a signal handler, but
     // only for faults inside native code, never from within loopmap_add.)
@@ -2807,12 +3023,24 @@ bool jit_crash_sync(void *ucontext) {
         bool donor = false;
         for (unsigned k = 0; k < lm.n; k++) donor |= lm.d[k] == pin_guest[i];
         if (!donor)
-            *(uint64_t *) (cpu + greg_off(pin_guest[i])) = uc->uc_mcontext->__ss.__x[pin_host[i]];
+            *(uint64_t *) (cpu + greg_off(pin_guest[i])) = x[pin_host[i]];
     }
     for (unsigned k = 0; k < lm.n; k++)
-        *(uint64_t *) (cpu + greg_off(lm.g[k])) = uc->uc_mcontext->__ss.__x[lm.h[k]];
+        *(uint64_t *) (cpu + greg_off(lm.g[k])) = x[lm.h[k]];
     return true;
 }
+
+#ifdef __APPLE__
+bool jit_crash_sync(void *ucontext) {
+    ucontext_t *uc = ucontext;
+    uint64_t x[31];
+    for (int i = 0; i < 29; i++)
+        x[i] = uc->uc_mcontext->__ss.__x[i];
+    x[29] = uc->uc_mcontext->__ss.__fp;
+    x[30] = uc->uc_mcontext->__ss.__lr;
+    return jit_crash_sync_regs(uc->uc_mcontext->__ss.__pc, x);
+}
+#endif
 
 
 // ================================================================ code map
@@ -3004,22 +3232,52 @@ static bool module_path_has(int mod, const char *sub) {
 // ---- ISH_JIT_RECORD: one JSON object per translation
 //   {"mod", "off", "idx", "key": [...], "keysym": {"i": "sym"}, "segs": [
 //     {"pos", "code" (host address), "words": [...],
-//      "rel": [[at, "sym", name] | [at, "exit"]],
+//      "rel": [[at, "sym", name] | [at, "exit"] | [at, "stub", id]],
 //      "links": [[slot, at, target translation | -1, target segment, target word]],
 //      "loop": [head, end, [promoted], [donors], [host regs]] | null}]}
 // Host addresses become symbol names (gadgets, fiber_ret, ...; "@region" for
 // the code region); a direct link resolves to the translation it went to.
+// The header has the shared stubs: "exit_stub" (words) and "stubs" (id 1...:
+// {"words", "rel"}), which an image carries copies of.
 
 static void rec_sym(FILE *f, uintptr_t p) {
+#ifndef __APPLE__
+    // No dladdr: "=<rva>" for an address in ish.exe, named afterwards from its
+    // symbol table (tools/jit_aot on Windows), "?<address>" for anything else.
+    extern char __ImageBase;
+    uintptr_t base = (uintptr_t) &__ImageBase;
+    if (p == (uintptr_t) region)
+        fputs("\"@region\"", f);
+    else if (p >= base && p - base < (256u << 20))
+        fprintf(f, "\"=%llx\"", (unsigned long long) (p - base));
+    else
+        fprintf(f, "\"?%llx\"", (unsigned long long) p);
+#else
     Dl_info info;
     if (p == (uintptr_t) region) {
         fputs("\"@region\"", f);
     } else if (dladdr((void *) p, &info) && info.dli_sname && (uintptr_t) info.dli_saddr == p) {
         fprintf(f, "\"%s\"", info.dli_sname);
     } else if (dladdr((void *) p, &info) && info.dli_sname) {
-        fprintf(f, "\"%s+%lu\"", info.dli_sname, (unsigned long) (p - (uintptr_t) info.dli_saddr));
+        fprintf(f, "\"%s+%lu\"", info.dli_sname, (uintptr_t) (p - (uintptr_t) info.dli_saddr));
     } else {
-        fprintf(f, "\"?%lx\"", (unsigned long) p);
+        fprintf(f, "\"?%lx\"", (uintptr_t) p);
+    }
+#endif
+}
+
+static void rec_rels(FILE *f, const struct rec_seg *rs) {
+    for (unsigned j = 0; j < rs->nrel; j++) {
+        fprintf(f, "%s[%u, ", j ? ", " : "", rs->rel[j].at);
+        if (rs->rel[j].kind == REL_EXIT && rs->rel[j].val == STUB_EXIT) {
+            fprintf(f, "\"exit\"]");
+        } else if (rs->rel[j].kind == REL_EXIT) {
+            fprintf(f, "\"stub\", %lu]", (uintptr_t) rs->rel[j].val);
+        } else {
+            fprintf(f, "\"sym\", ");
+            rec_sym(f, rs->rel[j].val);
+            fprintf(f, "]");
+        }
     }
 }
 
@@ -3058,10 +3316,19 @@ static void rec_write(const char *path) {
     // region_full: the code region filled up, so the recording misses what ran after that.
     fprintf(f, "{\"header\": {\"abi\": %u, \"prologue_words\": %d, \"entry_off\": %lu, \"n_pinned\": %d, "
             "\"region_full\": %s, \"region_used\": %zu, \"exit_stub\": [",
-            jit_abi(), prologue_words, (unsigned long) entry_off(), n_pinned, region_full ? "true" : "false",
+            jit_abi(), prologue_words, (uintptr_t) entry_off(), n_pinned, region_full ? "true" : "false",
             region_full ? (size_t) REGION_SIZE : (size_t) region_used);
     for (unsigned i = 0; i < exit_stub_words; i++)
         fprintf(f, "%s%u", i ? ", " : "", ((uint32_t *) exit_stub)[i]);
+    fprintf(f, "], \"stubs\": [");
+    for (int id = STUB_GENERIC; id < NSTUBS && stub_rec[id]; id++) {
+        fprintf(f, "%s{\"words\": [", id > STUB_GENERIC ? ", " : "");
+        for (unsigned j = 0; j < stub_rec[id]->nwords; j++)
+            fprintf(f, "%s%u", j ? ", " : "", stub_rec[id]->words[j]);
+        fprintf(f, "], \"rel\": [");
+        rec_rels(f, stub_rec[id]);
+        fprintf(f, "]}");
+    }
     fprintf(f, "]}}\n");
     // Pass 2: write them.
     for (size_t k = 0; t && w && k < n; k++) {
@@ -3088,20 +3355,11 @@ static void rec_write(const char *path) {
             const struct rec_seg *rs = r->seg[i].rec;
             if (!rs) continue;
             fprintf(f, "%s{\"pos\": %u, \"code\": %lu, \"words\": [", i ? ", " : "", r->seg[i].pos,
-                    (unsigned long) r->seg[i].code);
+                    (uintptr_t) r->seg[i].code);
             for (unsigned j = 0; j < rs->nwords; j++)
                 fprintf(f, "%s%u", j ? ", " : "", rs->words[j]);
             fprintf(f, "], \"rel\": [");
-            for (unsigned j = 0; j < rs->nrel; j++) {
-                fprintf(f, "%s[%u, ", j ? ", " : "", rs->rel[j].at);
-                if (rs->rel[j].kind == REL_EXIT) {
-                    fprintf(f, "\"exit\"]");
-                } else {
-                    fprintf(f, "\"sym\", ");
-                    rec_sym(f, rs->rel[j].val);
-                    fprintf(f, "]");
-                }
-            }
+            rec_rels(f, rs);
             fprintf(f, "], \"links\": [");
             for (int slot = 0, first = 1; slot < 2; slot++) {
                 if (rs->link_at[slot] < 0) continue;
@@ -3297,9 +3555,11 @@ void jit_report(void) {
     fprintf(stderr,
             "🛠  JIT(%s): blocks %llu, segments %llu, units %llu, code %llu KB, compile %.1f ms | "
             "block ends %llu (not translated %llu), direct links %llu, loop blocks %llu | "
-            "unsupported insns %llu, out of regs %llu | shared %llu, AOT %llu (%u images)\n",
+            "unsupported insns %llu, out of regs %llu | shared %llu, AOT %llu (%u images) | "
+            "waited to get hot %llu (ISH_JIT_HOT=%u)\n",
             dual_map ? (pic_on ? "dual-map, PIC" : "dual-map") : (pic_on ? "MAP_JIT, PIC" : "MAP_JIT"), st_blocks, st_segments, st_units, st_bytes / 1024, jit_ticks_ms(st_ticks),
-            st_block_ends, st_block_end_fail, st_links, st_loops, st_unsupported_insns, st_fail_regs, st_shared, st_aot, aot_nimages);
+            st_block_ends, st_block_end_fail, st_links, st_loops, st_unsupported_insns, st_fail_regs, st_shared, st_aot, aot_nimages,
+            st_deferred, hot_after);
 }
 
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
@@ -3322,11 +3582,22 @@ static void jit_init(void) {
     }
     link_off = env_off("ISH_JIT_LINK");
     loop_off = env_off("ISH_JIT_LOOP");
+    const char *hot = getenv("ISH_JIT_HOT");
+    if (hot && atoi(hot) >= 1)
+        hot_after = atoi(hot) < 65535 ? (unsigned) atoi(hot) : 65535;   // jit_heat is 16 bits
     simd_on = !env_off("ISH_JIT_SIMD");
     pin_on = !env_off("ISH_JIT_PIN");
     // AOT images are PIC code, so PIC is the default once one is linked in.
     const char *pic = getenv("ISH_JIT_PIC");
+#ifdef _WIN32
+    // Windows: PIC by default even without images. Its registry hands a
+    // translation to every process of the kernel that runs the same code, so
+    // the second python of a resident ish.exe starts like it had AOT images,
+    // and the code region does not fill up with copies of the same blocks.
+    pic_on = pic ? pic[0] == '1' : true;
+#else
     pic_on = pic ? pic[0] == '1' : have_images;
+#endif
     if (!have_region)
         pic_on = true;
     pin_init(pin_on);
@@ -3335,6 +3606,8 @@ static void jit_init(void) {
     rec_mod = getenv("ISH_JIT_RECORD_MOD") ? getenv("ISH_JIT_RECORD_MOD") : "ld-musl";
     if (have_region) {
         make_exit_stub();
+        if (pic_on && n_pinned && !env_off("ISH_JIT_STUBS"))
+            make_stubs();
         jit_exec_ready();
     }
     if (pic_on)
@@ -3370,6 +3643,11 @@ static struct jit_scratch *get_scratch(void) {
     if (scratch)
         pthread_setspecific(scratch_key, scratch);
     return scratch;
+}
+
+bool jit_enabled(void) {
+    pthread_once(&init_once, jit_init);
+    return jit_on;
 }
 
 struct jit_units *jit_units_begin(void) {
@@ -3411,11 +3689,51 @@ void jit_block_init(struct fiber_block *b) {
     b->native_entry = 0;
     b->jit_ctx = NULL;
     b->jit_idx = 0;
+    b->jit_pending = NULL;
+    b->jit_heat = 0;
 }
+
+static void jit_block_now(struct fiber_block *b, struct jit_units *U);
 
 void jit_block(struct fiber_block *b, struct jit_units *U) {
     if (!U || U->n > JIT_MAX_UNITS)
         return;
+    // Most blocks run a few times (start-up code): translating them costs more
+    // than it saves, so a block waits until it has run hot_after times. AOT
+    // images and recordings translate (look up) every block at once.
+    if (hot_after > 1 && !aot_nimages && !rec_file) {
+        size_t size = offsetof(struct jit_units, u) + U->n * sizeof(U->u[0]);
+        struct jit_units *keep = malloc(size);
+        if (keep) {
+            memcpy(keep, U, size);
+            b->jit_pending = keep;
+            atomic_fetch_add_explicit(&st_deferred, 1, memory_order_relaxed);
+            return;
+        }
+    }
+    jit_block_now(b, U);
+}
+
+bool jit_block_heat_due(struct fiber_block *b) {
+    uint16_t heat = __atomic_load_n(&b->jit_heat, __ATOMIC_RELAXED);
+    if (heat < 65535)
+        __atomic_store_n(&b->jit_heat, ++heat, __ATOMIC_RELAXED);   // a lost count only delays it
+    return heat >= hot_after;
+}
+
+void jit_block_heat(struct fiber_block *b, struct tlb *tlb) {
+    struct jit_units *U = b->jit_pending;
+    b->jit_pending = NULL;
+    if (!U || !get_scratch())
+        return;
+    struct tlb *saved = cm_tlb;
+    cm_tlb = tlb;
+    jit_block_now(b, U);
+    cm_tlb = saved;
+    free(U);
+}
+
+static void jit_block_now(struct fiber_block *b, struct jit_units *U) {
     uint64_t t0 = jit_ticks();
     if (cm_on)
         cm_block(b);

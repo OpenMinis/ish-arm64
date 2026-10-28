@@ -4,7 +4,7 @@
 usage: hotblocks.py <recording.jsonl> <profile.txt>... [--coverage 0.999] [--max N] [--keep out.txt]
 
 profile.txt: the block profiler's "<module> <offset hex> <insns> <count>" lines (ISH_BLOCK_PROF_FILE, run with
-ISH_JIT=0 ISH_NO_CHAIN=1 ISH_NO_RETCACHE=1). A translation is worth what it saves, the guest instructions it runs
+ISH_JIT=0 ISH_NO_CHAIN=1: about 3x the time the workload takes as gadgets). A translation is worth what it saves, the guest instructions it runs
 natively instead of as gadgets (count * insns of its block), and costs its native code: translations are taken by
 worth per byte until they cover the given share of the module's executed instructions. With several profiles
 (workloads), each is scaled to the same total first, so a short workload counts as much as a long one.
@@ -13,9 +13,7 @@ With --max the image keeps that many translations: those for the coverage first,
 order the recording first translated them. Code that runs early (start-up, the runtime's core) serves
 workloads the profile never saw better than code that is merely rare in it: for node, 128000
 translations picked this way ran the node cases 0.9% faster than the first 123464 the recording made,
-and 5.9% faster than the 128000 worth most. --max is also the cap for an image that has to link: ld
-fails on an object with too many references from its tables to its code ("too many large addends",
-ld-27037: between 339384 and 349699 references, about 136000 translations of node).
+and 5.9% faster than the 128000 worth most; all 155894 ran them 0.2% faster than those 128000.
 """
 import argparse
 import json

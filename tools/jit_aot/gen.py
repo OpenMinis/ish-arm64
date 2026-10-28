@@ -6,8 +6,9 @@ one module, with every host address the code depends on named. This script
 lays them out as assembly that links into ish:
 
 - code in __TEXT,__ish_aot: each host symbol (movz + 3 movk in the recording)
-  becomes adrp/add + 2 nops, each branch to the JIT's exit stub a branch to
-  the image's own stub, and each direct link the JIT had made a static branch
+  becomes adrp/add + 2 nops, each branch to one of the JIT's shared stubs (the
+  exit stub, the block-end slow paths) a branch to the image's own copy of it,
+  and each direct link the JIT had made a static branch
   whose literal holds the assemble-time offset target - branch;
 - tables in __DATA,__const, described by `struct aot_module` (asbestos/guest-
   arm64/aot.h): module identity (path, size, sha256), translations sorted by
@@ -86,13 +87,16 @@ def seg_label(t, s):
     return f'Lt{t}s{s}'
 
 
-def emit_segment(out, syms, t, s, seg, stats):
+def emit_segment(out, syms, t, s, seg, stats, label=None):
     words = seg['words']
     special = {}
     for rel in seg['rel']:
         at, kind = rel[0], rel[1]
         if kind == 'exit':
-            special[at] = ('exit',)
+            special[at] = ('stub', 'Laot_exit_stub')
+            continue
+        if kind == 'stub':
+            special[at] = ('stub', f'Laot_stub_{rel[2]}')
             continue
         target = link_name(syms, rel[2])
         if target is None:
@@ -102,7 +106,7 @@ def emit_segment(out, syms, t, s, seg, stats):
         special[at] = ('link', slot, tt, ts, tw)
 
     out.append('    .p2align 4')
-    out.append(f'{seg_label(t, s)}:')
+    out.append(f'{label or seg_label(t, s)}:')
     i = 0
     while i < len(words):
         sp = special.get(i)
@@ -110,8 +114,8 @@ def emit_segment(out, syms, t, s, seg, stats):
             out.append(f'    .inst 0x{words[i]:08x}')
             i += 1
             continue
-        if sp[0] == 'exit':
-            out.append('    b Laot_exit_stub')
+        if sp[0] == 'stub':
+            out.append(f'    b {sp[1]}')
             stats['exit'] += 1
             i += 1
             continue
@@ -218,6 +222,14 @@ def sha256_of(path):
     return h.digest()
 
 
+# A linker-private symbol (l...) every ANCHOR_EVERY translations, in the code and in the tables: a
+# table's 32-bit pointer into the code (target - field) is relocated against the nearest ones before the
+# target and the field, with small addends, not against the two sections with offsets into them. ld
+# (ld-27037) fails on an object with too many large addends ("too many large addends", about 136000
+# translations of node without the anchors).
+ANCHOR_EVERY = 32
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('recording')
@@ -284,6 +296,8 @@ def main():
         if not ok:
             stats['dropped'] += 1
             continue
+        if ti % ANCHOR_EVERY == 0:
+            code.append(f'l_ish_aot_{args.name}_{ti}:')
         code += body
         keep.append(ti)
     # A dropped translation's code is gone: branches into it would dangle.
@@ -303,6 +317,8 @@ def main():
             name = t['keysym'].get(str(g))
             key[g] = key[g + 1] = 0
             gadgets.append(link_name(syms, name) if name else None)
+        if ti % ANCHOR_EVERY == 0:
+            data.append(f'l_ish_aot_{args.name}_k{ti}:')
         data.append('    .p2align 3')
         data.append(f'Lk{ti}:')
         for i in range(0, len(key), 8):
@@ -334,6 +350,9 @@ def main():
              'Laot_text_start:',
              'Laot_exit_stub:']
     lines += [f'    .inst 0x{w:08x}' for w in exit_stub]
+    for i, stub in enumerate(header.get('stubs', []), 1):
+        if not emit_segment(lines, syms, 0, 0, dict(stub, links=[]), stats, f'Laot_stub_{i}'):
+            sys.exit(f"❌ stub {i} of the recording references an unnamed host address")
     lines += code
     lines += ['    .p2align 2', 'Laot_text_end:', '', '    .section __DATA,__const']
     lines += data
@@ -345,6 +364,8 @@ def main():
             site = next((f'{seg_label(ti, si)}_l{slot}' for si, seg in enumerate(t['segs'])
                          for l in seg['links'] if l[0] == slot), None)
             links.append(site or '0')
+        if ti % ANCHOR_EVERY == 0:
+            lines.append(f'l_ish_aot_{args.name}_t{ti}:')
         lines.append(f'    .quad {t["off"]}')
         lines.append(f'    .long {t["idx"]}, {len(t["key"])}')
         lines.append(f'    .quad Lk{ti}, Lg{ti}, Ls{ti}')

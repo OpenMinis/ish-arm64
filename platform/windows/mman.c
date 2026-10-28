@@ -519,6 +519,7 @@ bool px_fm_committed_until(void *addr, char **end) {
     return mbi.State == MEM_COMMIT;
 }
 
+#if defined(__x86_64__)
 static uintptr_t (*fault_redirect)(uintptr_t pc, uintptr_t r11);
 static LONG CALLBACK fault_redirect_veh(PEXCEPTION_POINTERS ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || fault_redirect == NULL)
@@ -535,6 +536,7 @@ void px_fault_redirect(uintptr_t (*fn)(uintptr_t pc, uintptr_t r11)) {
         AddVectoredExceptionHandler(1, fault_redirect_veh);
     fault_redirect = fn;
 }
+#endif
 
 // ---- the translation cache's file (asbestos/guest-x86_64/xlat.c)
 static wchar_t *px_utf8_to_w(const char *s) {
@@ -618,3 +620,134 @@ const char *px_local_appdata(void) {
     }
     return path;
 }
+
+#if !defined(__x86_64__)
+// No WHP backend here (whp.c is x86_64-only): nothing can have the window mapped.
+void px_vm_forget(void *window) { (void) window; }
+void px_vm_populate(void *addr, size_t len, bool write) { (void) addr; (void) len; (void) write; }
+#endif
+
+void *px_jit_map_dual(size_t size, void **rw) {
+    // reserved only: px_jit_commit() commits what the JIT gets to, so a
+    // process (and the job Minis caps its memory with) is charged for the
+    // code there is, not the whole region
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
+                                        (DWORD) ((uint64_t) size >> 32), (DWORD) size, NULL);
+    if (section == NULL)
+        return NULL;
+    void *w = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, size);
+    void *x = w != NULL ? MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, size) : NULL;
+    CloseHandle(section);   // the views keep it
+    if (x == NULL) {
+        if (w != NULL)
+            UnmapViewOfFile(w);
+        return NULL;
+    }
+    *rw = w;
+    return x;
+}
+
+bool px_jit_commit_dual(void *rx, void *rw, size_t len) {
+    return VirtualAlloc(rw, len, MEM_COMMIT, PAGE_READWRITE) != NULL &&
+        VirtualAlloc(rx, len, MEM_COMMIT, PAGE_EXECUTE_READ) != NULL;
+}
+
+void px_icache_flush(void *addr, size_t len) {
+    FlushInstructionCache(GetCurrentProcess(), addr, len);
+}
+
+// Address space committed on first touch, like an anonymous POSIX mapping
+// that is never written in full (asbestos/guest-arm64/jit.c's per-module
+// contexts reserve 20 MB each and touch a few pages): committing all of it
+// would count against the job Minis caps ish.exe's memory with.
+#define LAZY_MAX 256
+static struct { char *base; size_t len; } lazy[LAZY_MAX];
+static SRWLOCK lazy_lock = SRWLOCK_INIT;
+static LONG CALLBACK lazy_veh(PEXCEPTION_POINTERS ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    char *a = (char *) er->ExceptionInformation[1];
+    LONG r = EXCEPTION_CONTINUE_SEARCH;
+    AcquireSRWLockShared(&lazy_lock);
+    for (int i = 0; i < LAZY_MAX; i++) {
+        if (lazy[i].base == NULL || a < lazy[i].base || a >= lazy[i].base + lazy[i].len)
+            continue;
+        // 64 KB around it, within the range
+        char *lo = lazy[i].base + (((size_t) (a - lazy[i].base)) & ~(size_t) 0xffff);
+        size_t n = lazy[i].base + lazy[i].len - lo < 0x10000 ? (size_t) (lazy[i].base + lazy[i].len - lo) : 0x10000;
+        if (VirtualAlloc(lo, n, MEM_COMMIT, PAGE_READWRITE) != NULL)
+            r = EXCEPTION_CONTINUE_EXECUTION;
+        break;
+    }
+    ReleaseSRWLockShared(&lazy_lock);
+    return r;
+}
+
+void *px_reserve_lazy(size_t len) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending) {
+        AddVectoredExceptionHandler(1, lazy_veh);
+        InitOnceComplete(&once, 0, NULL);
+    }
+    void *p = VirtualAlloc(NULL, len, MEM_RESERVE, PAGE_READWRITE);
+    if (p == NULL)
+        return NULL;
+    AcquireSRWLockExclusive(&lazy_lock);
+    int i;
+    for (i = 0; i < LAZY_MAX && lazy[i].base != NULL; i++) {}
+    if (i < LAZY_MAX) {
+        lazy[i].base = p;
+        lazy[i].len = len;
+    }
+    ReleaseSRWLockExclusive(&lazy_lock);
+    if (i == LAZY_MAX) {   // no slot to commit it from: commit it all, as before
+        if (!VirtualAlloc(p, len, MEM_COMMIT, PAGE_READWRITE)) {
+            VirtualFree(p, 0, MEM_RELEASE);
+            return NULL;
+        }
+    }
+    return p;
+}
+
+void px_reserve_lazy_free(void *p) {
+    AcquireSRWLockExclusive(&lazy_lock);
+    for (int i = 0; i < LAZY_MAX; i++)
+        if (lazy[i].base == p)
+            lazy[i].base = NULL;
+    ReleaseSRWLockExclusive(&lazy_lock);
+    VirtualFree(p, 0, MEM_RELEASE);
+}
+
+#if defined(__aarch64__)
+// Host faults in guest code (asbestos/guest-arm64): the arm64 build's
+// SIGSEGV handler on Apple, as a vectored handler. Lazy memory (above) is
+// committed first: a fault there is not the guest's.
+static bool (*a64_fault_fn)(struct px_fault *f);
+static LONG CALLBACK a64_fault_veh(PEXCEPTION_POINTERS ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (lazy_veh(ep) == EXCEPTION_CONTINUE_EXECUTION)
+        return EXCEPTION_CONTINUE_EXECUTION;
+    CONTEXT *c = ep->ContextRecord;
+    struct px_fault f;
+    memcpy(f.x, c->X, sizeof(f.x));
+    f.sp = c->Sp;
+    f.pc = c->Pc;
+    f.addr = er->ExceptionInformation[1];
+    f.is_write = er->ExceptionInformation[0] == 1;
+    if (!a64_fault_fn(&f))
+        return EXCEPTION_CONTINUE_SEARCH;
+    c->Sp = f.sp;
+    c->Pc = f.pc;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void px_fault_hook(bool (*fn)(struct px_fault *f)) {
+    if (a64_fault_fn == NULL)
+        AddVectoredExceptionHandler(1, a64_fault_veh);
+    a64_fault_fn = fn;
+}
+#endif

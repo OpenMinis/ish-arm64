@@ -161,9 +161,11 @@ void dump_pc_hist(void) {
     fflush(stderr);
 }
 // --- Block execution profile (ISH_BLOCK_PROF_FILE=/path) ---
-// Records exact per-block dispatch counts + insn length for trace-AOT
-// feasibility study. Build with -DDISABLE_BLOCK_CHAINING for exact counts
-// (otherwise chained transitions bypass the dispatch loop and are missed).
+// Records exact per-block dispatch counts + insn length (tools/jit_aot/hotblocks.py
+// picks an AOT image's translations by them). For exact counts run with
+// ISH_JIT=0 ISH_NO_CHAIN=1: chained transitions bypass the dispatch loop, and
+// unchained, a return-cache hit goes through it too (ISH_NO_RETCACHE=1, which
+// clears the 32 KB cache at every dispatch, is not needed and 10x slower).
 // Open-addressing hash, fixed size; dump at pid-1 exit.
 #define BLK_PROF_SZ (1 << 21)   // 2M entries * 16B = 32MB
 static struct { _Atomic uint64_t addr; _Atomic uint64_t cnt_len; } *blk_prof; // cnt_len = count<<8 | insns
@@ -1128,9 +1130,23 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         }
         if (no_retcache)
             memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
+#ifdef ISH_JIT
+        // Not translated yet: count this entry (jit_block_heat). A block keeps
+        // coming back here until it is translated: neither it nor a block
+        // leading into it is chained meanwhile.
+        if (block != NULL && block->jit_pending != NULL && jit_block_heat_due(block)) {
+            lock(&asbestos->lock);
+            if (block->jit_pending != NULL && !block->is_jetsam)
+                jit_block_heat(block, tlb);
+            unlock(&asbestos->lock);
+        }
+#endif
         struct fiber_block *last_block = no_chain ? NULL : frame->last_block;
         if (block != NULL && last_block != NULL &&
                 !last_block->is_jetsam && !block->is_jetsam &&
+#ifdef ISH_JIT
+                last_block->jit_pending == NULL && block->jit_pending == NULL &&
+#endif
                 (last_block->jump_ip[0] != NULL ||
                  last_block->jump_ip[1] != NULL)) {
             {
@@ -1285,7 +1301,24 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
                 }
             }
         }
-        if (interrupt == INT_NONE && (++frame->cpu.cycle & ((1 << 10) - 1)) == 0) {
+        // A tick every 1024 cycles counted here. JIT code chains blocks
+        // natively and counts its back edges in the same field, coming back
+        // here rarely and with the count at a multiple of 1024: that is a
+        // tick too, or the count here alone would take ~1M of its exits per
+        // tick. (Not for gadgets: their chained exits come back that way every
+        // 1024 blocks, and a tick there costs ~12% of an import httpx.) The
+        // count moves on either way, so the next pass does not tick again.
+        bool tick_due = false;
+        if (interrupt == INT_NONE) {
+#ifdef ISH_JIT
+            static int jit_ticks = -1;
+            if (jit_ticks < 0)
+                jit_ticks = jit_enabled();
+            tick_due = jit_ticks && (frame->cpu.cycle & ((1 << 10) - 1)) == 0;
+#endif
+            tick_due |= (++frame->cpu.cycle & ((1 << 10) - 1)) == 0;
+        }
+        if (tick_due) {
             interrupt = INT_TIMER;
 #if defined(ISH_XJIT) && defined(GUEST_X86_64)
             xjit_tick(asbestos);
