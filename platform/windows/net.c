@@ -1143,6 +1143,11 @@ int px_poll(struct px_pollfd *fds, unsigned long nfds, int timeout) {
         res = pipes_wait(fds, nfds, descs, wfds, n, timeout, &sock_res);
         if (res >= 0)
             res = sock_res < 0 ? sock_res : 0;
+    } else if (pipes && n == 0 && ready == 0) {
+        // timeout 0: a look, not a wait. Not px_wsapoll(NULL, 0, 0), whose
+        // sleep_ns parks a hypervisor VM's processor (px_blocking) even for
+        // no time, 10x the cost of the look (FIX-261028-13).
+        res = px_interrupted() ? px_fail(EINTR) : 0;
     } else if (n == 0 && ready == 0) {
         res = px_wsapoll(NULL, 0, timeout);
     } else {
