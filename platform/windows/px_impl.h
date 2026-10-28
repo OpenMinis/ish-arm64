@@ -51,9 +51,12 @@
 
 enum px_kind {
     PX_FILE = 1,    // a file or directory handle
-    PX_SOCK,        // a socket: real ones, and the pipes and stdin bridged onto them
+    PX_SOCK,        // a socket (pipes are not: see PX_PIPE)
     PX_CONSOLE_OUT, // an inherited stdout/stderr handle (console, pipe or file)
     PX_NUL,         // NUL: reads EOF, writes vanish
+    PX_PIPE,        // one end of an in-process pipe (fd.c): pipe(), stdin and
+                    // the inputs of ish.exe --serve's commands. No loopback
+                    // socket, so blocked or broken Winsock cannot empty them.
 };
 
 // An open file description, shared by dup()s.
@@ -68,6 +71,7 @@ struct px_desc {
     bool is_pipe;       // a pipe() end: EPIPE rather than ECONNRESET
     bool is_stdin;      // the stdin bridge: reading or polling it asks the pump for more
     bool own_h;         // PX_CONSOLE_OUT: h was given to us (px_fd_from_handle), closed with it
+    struct px_pipe *pipe; // PX_PIPE: the pipe; flags say which end (PX_O_WRONLY: the write end)
     int domain, type, protocol; // sockets, Linux values
     // An emulated ICMP datagram ("ping") socket: s reads the replies that
     // the IcmpSendEcho2 workers write into icmp_tx (see net.c).
@@ -163,6 +167,22 @@ int px_sock_ioctl_fionread(struct px_desc *d, int *out);
 // Blocks in WSAPoll on fds plus this thread's wake socket. Returns the
 // WSAPoll result, or -1 with errno EINTR when interrupted.
 int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms);
+// The same, but a poke (px_waiter_poke with sock) also ends the wait, with 0
+// when no socket is ready.
+int px_wsapoll_poked(WSAPOLLFD *fds, ULONG n, int timeout_ms);
+// A thread waiting on in-process pipes (fd.c) hangs one of these on each
+// pipe; the pipe pokes it when its state changes. sock: the thread waits in
+// px_wsapoll_poked (the poke goes to its wake socket), else in px_poke_wait.
+struct px_thread;
+struct px_waiter {
+    struct px_thread *t;
+    bool sock;
+    struct px_waiter *prev, *next;
+};
+void px_waiter_init(struct px_waiter *w, bool sock);
+void px_waiter_poke(struct px_waiter *w);
+// Waits for a poke: 1 poked, 0 timed out, -1 with errno EINTR interrupted.
+int px_poke_wait(int timeout_ms);
 // The thread was interrupted (consumes it).
 bool px_interrupted(void);
 
@@ -173,6 +193,10 @@ bool px_interrupted(void);
 void px_stdin_demand(void);
 // The real stdin handle behind the bridge (for a child to inherit).
 HANDLE px_stdin_handle(void);
+// In-process pipes (PX_PIPE). The poll side: what of events (PX_POLL*) the
+// end is ready for, and hanging a waiter on (on) or off its pipe.
+short px_pipe_revents(struct px_desc *d, short events);
+void px_pipe_watch(struct px_desc *d, struct px_waiter *w, bool on);
 int px_console_tcgetattr(struct px_termios *t);
 int px_console_tcsetattr(const struct px_termios *t);
 int px_console_winsize(struct px_winsize *ws);

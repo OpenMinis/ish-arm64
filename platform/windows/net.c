@@ -1009,6 +1009,84 @@ int px_inet_pton(int af, const char *src, void *dst) {
 
 // ---- poll
 
+// Readiness of the in-process pipes (PX_PIPE) among fds; how many are ready.
+static int pipes_check(struct px_pollfd *fds, unsigned long nfds, struct px_desc **descs) {
+    int ready = 0;
+    for (unsigned long i = 0; i < nfds; i++) {
+        if (descs[i] == NULL || descs[i]->kind != PX_PIPE)
+            continue;
+        fds[i].revents = px_pipe_revents(descs[i], fds[i].events);
+        if (fds[i].revents)
+            ready++;
+    }
+    return ready;
+}
+
+// Nothing was ready and some fds are pipes: wait for a pipe to change (a
+// poke), a socket to be ready, the timeout or an interrupt. Returns how many
+// pipes are ready (their revents set), with *sock_res the last wait on the
+// sockets (wfds[].revents filled) or 0; -1 with errno EINTR if interrupted.
+static int pipes_wait(struct px_pollfd *fds, unsigned long nfds, struct px_desc **descs,
+        WSAPOLLFD *wfds, ULONG n, int timeout, int *sock_res) {
+    *sock_res = 0;
+    struct px_waiter *ws = calloc(nfds, sizeof(*ws));
+    if (ws == NULL)
+        return px_fail(ENOMEM);
+    for (unsigned long i = 0; i < nfds; i++) {
+        if (descs[i] == NULL || descs[i]->kind != PX_PIPE)
+            continue;
+        px_waiter_init(&ws[i], n > 0);
+        px_pipe_watch(descs[i], &ws[i], true);
+    }
+    // with sockets, a poke reaches the wait through the thread's wake
+    // socket; a thread without one looks at its pipes every few ms
+    bool sliced = false;
+    for (unsigned long i = 0; i < nfds && n > 0; i++)
+        if (descs[i] != NULL && descs[i]->kind == PX_PIPE) {
+            sliced = !ws[i].sock;
+            break;
+        }
+    ULONGLONG deadline = timeout > 0 ? GetTickCount64() + (ULONGLONG) timeout : 0;
+    int res;
+    for (;;) {
+        res = pipes_check(fds, nfds, descs);
+        if (res > 0)
+            break;
+        int left = timeout;
+        if (timeout > 0) {
+            ULONGLONG now = GetTickCount64();
+            left = now >= deadline ? 0 : (int) (deadline - now);
+        }
+        if (left == 0)
+            break;
+        if (n > 0) {
+            int w = px_wsapoll_poked(wfds, n, sliced && (left < 0 || left > 10) ? 10 : left);
+            if (w < 0) {
+                res = -1;
+                break;
+            }
+            *sock_res = w;
+            if (w > 0) {
+                res = pipes_check(fds, nfds, descs);
+                break;
+            }
+        } else if (px_poke_wait(left) < 0) {
+            res = -1;
+            break;
+        }
+    }
+    int err = errno;
+    for (unsigned long i = 0; i < nfds; i++)
+        if (descs[i] != NULL && descs[i]->kind == PX_PIPE)
+            px_pipe_watch(descs[i], &ws[i], false);
+    free(ws);
+    errno = err;
+    // a pipe woke it: the sockets as they are now
+    if (res > 0 && n > 0 && *sock_res == 0)
+        *sock_res = px_wsapoll(wfds, n, 0);
+    return res;
+}
+
 int px_poll(struct px_pollfd *fds, unsigned long nfds, int timeout) {
     px_init();
     WSAPOLLFD *wfds = calloc(nfds + 1, sizeof(*wfds));
@@ -1016,6 +1094,7 @@ int px_poll(struct px_pollfd *fds, unsigned long nfds, int timeout) {
     struct px_desc **descs = calloc(nfds + 1, sizeof(*descs));
     ULONG n = 0;
     int ready = 0;
+    bool pipes = false;
     for (unsigned long i = 0; i < nfds; i++) {
         fds[i].revents = 0;
         if (fds[i].fd < 0)
@@ -1045,6 +1124,12 @@ int px_poll(struct px_pollfd *fds, unsigned long nfds, int timeout) {
             case PX_CONSOLE_OUT:
                 fds[i].revents = ev & PX_POLLOUT;
                 break;
+            case PX_PIPE:
+                if ((ev & PX_POLLIN) && d->is_stdin)
+                    px_stdin_demand();
+                fds[i].revents = px_pipe_revents(d, ev);
+                pipes = true;
+                break;
             default:
                 fds[i].revents = ev & (PX_POLLIN | PX_POLLOUT);
                 break;
@@ -1053,12 +1138,21 @@ int px_poll(struct px_pollfd *fds, unsigned long nfds, int timeout) {
             ready++;
     }
     int res;
-    if (n == 0 && ready == 0) {
+    if (pipes && ready == 0 && timeout != 0) {
+        int sock_res;
+        res = pipes_wait(fds, nfds, descs, wfds, n, timeout, &sock_res);
+        if (res >= 0)
+            res = sock_res < 0 ? sock_res : 0;
+    } else if (n == 0 && ready == 0) {
         res = px_wsapoll(NULL, 0, timeout);
     } else {
         res = n == 0 ? 0 : px_wsapoll(wfds, n, ready ? 0 : timeout);
     }
     if (res >= 0) {
+        ready = 0;
+        for (unsigned long i = 0; i < nfds; i++)
+            if (fds[i].revents && (descs[i] == NULL || descs[i]->kind != PX_SOCK))
+                ready++;
         for (ULONG j = 0; j < n; j++) {
             short re = wfds[j].revents, out = 0;
             if (re & (POLLRDNORM | POLLRDBAND)) out |= PX_POLLIN;

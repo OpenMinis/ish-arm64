@@ -16,6 +16,9 @@ struct px_thread {
     struct sockaddr_in wake_addr;
     HANDLE event;
     HANDLE timer;
+    // Set by px_waiter_poke: an in-process pipe (fd.c) this thread waits on
+    // changed. Auto-reset; a stale poke only costs a recheck.
+    HANDLE poke;
     struct px_thread *next;
 };
 
@@ -38,6 +41,7 @@ static void thread_free(void *param) {
     if (t->wake != INVALID_SOCKET)
         closesocket(t->wake);
     CloseHandle(t->event);
+    CloseHandle(t->poke);
     if (t->timer)
         CloseHandle(t->timer);
     free(t);
@@ -63,6 +67,7 @@ static struct px_thread *thread_find(pthread_t id, bool create) {
         t->id = id;
         t->wake = INVALID_SOCKET;
         t->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        t->poke = CreateEventW(NULL, FALSE, FALSE, NULL);
         t->next = threads;
         threads = t;
     }
@@ -130,7 +135,11 @@ int px_pthread_kill(pthread_t thread, int sig) {
 
 static int sleep_ns(int64_t ns, struct timespec *rem);
 
-int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms) {
+// The wake socket also carries pokes (px_waiter_poke), which are not
+// interrupts. With poked_returns a poke ends the wait (0 if no socket is
+// ready: the caller looks at its pipes); otherwise one is drained and the
+// wait goes on for what is left of timeout_ms.
+static int wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms, bool poked_returns) {
     struct px_thread *t = self();
     if (n == 0 || t->wake == INVALID_SOCKET) {
         if (n == 0)
@@ -146,20 +155,89 @@ int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms) {
     if (n)
         memcpy(all, fds, n * sizeof(*all));
     all[n] = (WSAPOLLFD) {.fd = t->wake, .events = POLLRDNORM};
-    int res = WSAPoll(all, t->wake != INVALID_SOCKET ? n + 1 : n, timeout_ms);
-    if (res == SOCKET_ERROR) {
-        res = px_fail_wsa();
-    } else {
+    ULONGLONG deadline = timeout_ms > 0 ? GetTickCount64() + (ULONGLONG) timeout_ms : 0;
+    int wait_ms = timeout_ms;
+    int res;
+    for (;;) {
+        all[n].revents = 0;
+        res = WSAPoll(all, t->wake != INVALID_SOCKET ? n + 1 : n, wait_ms);
+        if (res == SOCKET_ERROR) {
+            res = px_fail_wsa();
+            break;
+        }
+        bool woke = all[n].revents != 0;
         if (n)
             memcpy(fds, all, n * sizeof(*all));
-        if (all[n].revents)
+        if (woke)
             res--;
-        if (px_interrupted())
+        if (px_interrupted()) {
             res = px_fail(EINTR);
+            break;
+        }
+        if (!woke)
+            break;
+        // a poke: its byte goes, and an interrupt whose byte went with it
+        // is still marked
+        drain(t);
+        if (px_interrupted()) {
+            res = px_fail(EINTR);
+            break;
+        }
+        if (res > 0 || poked_returns || timeout_ms == 0)
+            break;
+        if (timeout_ms > 0) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline)
+                break;
+            wait_ms = (int) (deadline - now);
+        }
     }
     if (all != stack)
         free(all);
     return res;
+}
+
+int px_wsapoll(WSAPOLLFD *fds, ULONG n, int timeout_ms) {
+    return wsapoll(fds, n, timeout_ms, false);
+}
+
+int px_wsapoll_poked(WSAPOLLFD *fds, ULONG n, int timeout_ms) {
+    return wsapoll(fds, n, timeout_ms, true);
+}
+
+// ---- waiting on in-process pipes (fd.c)
+
+void px_waiter_init(struct px_waiter *w, bool sock) {
+    w->t = self();
+    w->sock = sock && w->t->wake != INVALID_SOCKET && poker != INVALID_SOCKET;
+    w->prev = w->next = NULL;
+}
+
+void px_waiter_poke(struct px_waiter *w) {
+    struct px_thread *t = w->t;
+    if (w->sock)
+        sendto(poker, "!", 1, 0, (struct sockaddr *) &t->wake_addr, sizeof(t->wake_addr));
+    else
+        SetEvent(t->poke);
+}
+
+int px_poke_wait(int timeout_ms) {
+    px_blocking();
+    struct px_thread *t = self();
+    if (px_interrupted())
+        return px_fail(EINTR);
+    HANDLE hs[2] = {t->poke, t->event};
+    DWORD res = WaitForMultipleObjects(2, hs, FALSE, timeout_ms < 0 ? INFINITE : (DWORD) timeout_ms);
+    if (res == WAIT_OBJECT_0 + 1 || px_interrupted()) {
+        atomic_store(&t->pending, false);
+        drain(t);
+        return px_fail(EINTR);
+    }
+    if (res == WAIT_TIMEOUT)
+        return 0;
+    if (res == WAIT_OBJECT_0)
+        return 1;
+    return px_fail_win();
 }
 
 void (*px_about_to_block)(void);

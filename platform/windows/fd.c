@@ -88,6 +88,10 @@ void px_init(void) {
     InitOnceExecuteOnce(&init_guard, init_cb, NULL, NULL);
 }
 
+static void pipe_end_close(struct px_desc *d);
+static ssize_t pipe_read(struct px_desc *d, void *buf, size_t n);
+static ssize_t pipe_write(struct px_desc *d, const void *buf, size_t n);
+
 struct px_desc *px_desc_new(enum px_kind kind) {
     struct px_desc *d = calloc(1, sizeof(*d));
     if (d == NULL)
@@ -117,6 +121,9 @@ static void desc_free(struct px_desc *d) {
                 CloseHandle(d->h);
             break;
         case PX_NUL:
+            break;
+        case PX_PIPE:
+            pipe_end_close(d);
             break;
     }
     free(d->path);
@@ -282,6 +289,11 @@ ssize_t px_read(int fd, void *buf, size_t n) {
                 px_stdin_demand();
             res = px_sock_read(d, buf, n);
             break;
+        case PX_PIPE:
+            if (d->is_stdin)
+                px_stdin_demand();
+            res = pipe_read(d, buf, n);
+            break;
         case PX_NUL:
             res = 0;
             break;
@@ -316,6 +328,9 @@ ssize_t px_write(int fd, const void *buf, size_t n) {
         }
         case PX_SOCK:
             res = px_sock_write(d, buf, n);
+            break;
+        case PX_PIPE:
+            res = pipe_write(d, buf, n);
             break;
         case PX_CONSOLE_OUT: {
             DWORD put;
@@ -536,6 +551,266 @@ out:
     return res;
 }
 
+// ---- in-process pipes. pipe(), stdin and the inputs of ish.exe --serve's
+// commands are a buffer here, both ends in this process, instead of a pair of
+// 127.0.0.1 TCP sockets: those need Winsock and a loopback connection that
+// security software, VPNs and broken LSPs can block, and when they could not
+// be made stdin silently read as empty and pipe() failed. A thread that
+// waits on a pipe (a blocking read or write, or a poll) hangs a px_waiter on
+// it and is poked when the pipe changes.
+
+#define PIPE_CAP 65536
+#define PIPE_ATOMIC 4096 // PIPE_BUF: writes up to this never interleave
+
+struct px_pipe {
+    SRWLOCK lock;
+    atomic_int refs; // the two ends
+    int readers, writers;
+    char *buf;       // PIPE_CAP bytes once something is written
+    size_t head, len;
+    struct px_waiter *waiters;
+    int id;          // for px_describe: the ends report 2*id and 2*id+1
+};
+
+static atomic_int pipe_ids;
+
+static struct px_pipe *pipe_new(void) {
+    struct px_pipe *p = calloc(1, sizeof(*p));
+    if (p == NULL)
+        return NULL;
+    InitializeSRWLock(&p->lock);
+    atomic_init(&p->refs, 2);
+    p->readers = p->writers = 1;
+    p->id = atomic_fetch_add(&pipe_ids, 1) % 0x3fffffff + 1;
+    return p;
+}
+
+static bool pipe_is_writer(struct px_desc *d) {
+    return (d->flags & PX_O_ACCMODE) == PX_O_WRONLY;
+}
+
+// lock held
+static void pipe_poke(struct px_pipe *p) {
+    for (struct px_waiter *w = p->waiters; w != NULL; w = w->next)
+        px_waiter_poke(w);
+}
+
+// lock held
+static void pipe_hang(struct px_pipe *p, struct px_waiter *w) {
+    w->prev = NULL;
+    w->next = p->waiters;
+    if (p->waiters != NULL)
+        p->waiters->prev = w;
+    p->waiters = w;
+}
+
+// lock held
+static void pipe_unhang(struct px_pipe *p, struct px_waiter *w) {
+    if (w->prev != NULL)
+        w->prev->next = w->next;
+    else if (p->waiters == w)
+        p->waiters = w->next;
+    if (w->next != NULL)
+        w->next->prev = w->prev;
+    w->prev = w->next = NULL;
+}
+
+static void pipe_end_close(struct px_desc *d) {
+    struct px_pipe *p = d->pipe;
+    if (p == NULL)
+        return;
+    AcquireSRWLockExclusive(&p->lock);
+    if (pipe_is_writer(d))
+        p->writers--;
+    else
+        p->readers--;
+    pipe_poke(p);
+    ReleaseSRWLockExclusive(&p->lock);
+    if (atomic_fetch_sub(&p->refs, 1) == 1) {
+        free(p->buf);
+        free(p);
+    }
+}
+
+// Waits for the pipe to change; lock held on entry and on return. 1 when it
+// may have, -1 (errno EINTR) when interrupted.
+static int pipe_wait(struct px_pipe *p) {
+    struct px_waiter w;
+    px_waiter_init(&w, false);
+    pipe_hang(p, &w);
+    ReleaseSRWLockExclusive(&p->lock);
+    int res = px_poke_wait(-1);
+    AcquireSRWLockExclusive(&p->lock);
+    pipe_unhang(p, &w);
+    return res < 0 ? -1 : 1;
+}
+
+static ssize_t pipe_read(struct px_desc *d, void *buf, size_t n) {
+    struct px_pipe *p = d->pipe;
+    if (pipe_is_writer(d))
+        return px_fail(EBADF);
+    if (n == 0)
+        return 0;
+    AcquireSRWLockExclusive(&p->lock);
+    ssize_t res;
+    for (;;) {
+        if (p->len > 0) {
+            size_t take = n < p->len ? n : p->len;
+            size_t first = PIPE_CAP - p->head < take ? PIPE_CAP - p->head : take;
+            memcpy(buf, p->buf + p->head, first);
+            memcpy((char *) buf + first, p->buf, take - first);
+            p->head = (p->head + take) % PIPE_CAP;
+            p->len -= take;
+            if (p->len == 0)
+                p->head = 0;
+            pipe_poke(p);
+            res = (ssize_t) take;
+            break;
+        }
+        if (p->writers == 0) {
+            res = 0;
+            break;
+        }
+        if (d->flags & PX_O_NONBLOCK) {
+            res = px_fail(EAGAIN);
+            break;
+        }
+        if (pipe_wait(p) < 0) {
+            res = -1;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&p->lock);
+    return res;
+}
+
+// As Linux: a blocking write puts all of buf (a write of up to PIPE_ATOMIC
+// bytes in one piece) unless interrupted, then it says how much went; a
+// non-blocking one puts what fits, all or nothing up to PIPE_ATOMIC. No
+// reader: EPIPE.
+static ssize_t pipe_write(struct px_desc *d, const void *buf, size_t n) {
+    struct px_pipe *p = d->pipe;
+    if (!pipe_is_writer(d))
+        return px_fail(EBADF);
+    if (n == 0)
+        return 0;
+    AcquireSRWLockExclusive(&p->lock);
+    size_t put = 0;
+    ssize_t res;
+    for (;;) {
+        if (p->readers == 0) {
+            res = put > 0 ? (ssize_t) put : px_fail(EPIPE);
+            break;
+        }
+        if (p->buf == NULL && (p->buf = malloc(PIPE_CAP)) == NULL) {
+            res = put > 0 ? (ssize_t) put : px_fail(ENOMEM);
+            break;
+        }
+        size_t room = PIPE_CAP - p->len, want = n - put;
+        if (room > 0 && (want > PIPE_ATOMIC || room >= want)) {
+            size_t give = want < room ? want : room;
+            size_t tail = (p->head + p->len) % PIPE_CAP;
+            size_t first = PIPE_CAP - tail < give ? PIPE_CAP - tail : give;
+            memcpy(p->buf + tail, (const char *) buf + put, first);
+            memcpy(p->buf, (const char *) buf + put + first, give - first);
+            p->len += give;
+            put += give;
+            pipe_poke(p);
+            if (put == n) {
+                res = (ssize_t) put;
+                break;
+            }
+            continue;
+        }
+        if (d->flags & PX_O_NONBLOCK) {
+            res = put > 0 ? (ssize_t) put : px_fail(EAGAIN);
+            break;
+        }
+        if (pipe_wait(p) < 0) {
+            res = put > 0 ? (ssize_t) put : -1;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&p->lock);
+    return res;
+}
+
+static size_t pipe_buffered(struct px_desc *d) {
+    AcquireSRWLockShared(&d->pipe->lock);
+    size_t len = d->pipe->len;
+    ReleaseSRWLockShared(&d->pipe->lock);
+    return len;
+}
+
+// lock held
+static short pipe_revents_locked(struct px_desc *d, short events) {
+    struct px_pipe *p = d->pipe;
+    short re = 0;
+    if (pipe_is_writer(d)) {
+        if (p->readers == 0)
+            re |= PX_POLLERR | (events & PX_POLLOUT);
+        else if (p->len < PIPE_CAP)
+            re |= events & PX_POLLOUT;
+    } else {
+        if (p->len > 0)
+            re |= events & PX_POLLIN;
+        // as the socket pairs did: a closed writer is POLLHUP, and readable
+        if (p->writers == 0)
+            re |= PX_POLLHUP | (events & PX_POLLIN);
+    }
+    return re;
+}
+
+short px_pipe_revents(struct px_desc *d, short events) {
+    AcquireSRWLockShared(&d->pipe->lock);
+    short re = pipe_revents_locked(d, events);
+    ReleaseSRWLockShared(&d->pipe->lock);
+    return re;
+}
+
+void px_pipe_watch(struct px_desc *d, struct px_waiter *w, bool on) {
+    AcquireSRWLockExclusive(&d->pipe->lock);
+    if (on)
+        pipe_hang(d->pipe, w);
+    else
+        pipe_unhang(d->pipe, w);
+    ReleaseSRWLockExclusive(&d->pipe->lock);
+}
+
+// Two descriptions on a new pipe: *r its read end, *w its write end.
+static int pipe_pair(struct px_desc **r, struct px_desc **w) {
+    struct px_pipe *p = pipe_new();
+    *r = px_desc_new(PX_PIPE);
+    *w = px_desc_new(PX_PIPE);
+    if (p == NULL || *r == NULL || *w == NULL) {
+        free(p);
+        free(*r);
+        free(*w);
+        return px_fail(ENOMEM);
+    }
+    (*r)->pipe = (*w)->pipe = p;
+    (*r)->is_pipe = (*w)->is_pipe = true;
+    (*r)->flags = 0;
+    (*w)->flags = PX_O_WRONLY;
+    return 0;
+}
+
+// For the pumps (host threads, never interrupted): all of buf, or false
+// once nobody reads the pipe.
+static bool pipe_put_all(struct px_desc *w, const char *buf, size_t n) {
+    while (n > 0) {
+        ssize_t put = pipe_write(w, buf, n);
+        if (put < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        buf += put;
+        n -= (size_t) put;
+    }
+    return true;
+}
+
 static int px_port_of(const struct sockaddr_storage *a) {
     if (a->ss_family == AF_INET)
         return ntohs(((const struct sockaddr_in *) a)->sin_port);
@@ -593,6 +868,23 @@ int px_describe(int fd, char *buf, size_t size, int *local_port, int *peer_port)
         case PX_NUL:
             len = snprintf(buf, size, "NUL");
             break;
+        case PX_PIPE: {
+            AcquireSRWLockShared(&d->pipe->lock);
+            size_t avail = d->pipe->len;
+            bool wr = pipe_is_writer(d);
+            bool eof = d->pipe->writers == 0, gone = wr ? d->pipe->readers == 0 : d->pipe->writers == 0;
+            int id = d->pipe->id;
+            ReleaseSRWLockShared(&d->pipe->lock);
+            // kernel/state_dump.c pairs the two ends by these
+            *local_port = wr ? 2 * id + 1 : 2 * id;
+            *peer_port = wr ? 2 * id : 2 * id + 1;
+            if (d->is_stdin)
+                len = snprintf(buf, size, "stdin bridge buffered=%zu%s", avail, eof && avail == 0 ? " eof" : "");
+            else
+                len = snprintf(buf, size, "pipe %s end, buffered=%zu%s%s", wr ? "write" : "read", avail,
+                               !wr && eof ? ", writer closed (EOF)" : "", gone ? ", peer gone" : "");
+            break;
+        }
     }
     if (len >= 0 && (size_t) len < size)
         len += snprintf(buf + len, size - len, " refs=%d", atomic_load(&d->refs));
@@ -602,19 +894,19 @@ int px_describe(int fd, char *buf, size_t size, int *local_port, int *peer_port)
 
 int px_pipe(int fds[2]) {
     px_init();
-    SOCKET s[2];
-    if (px_sock_pair(1 /* SOCK_STREAM */, s) < 0)
+    struct px_desc *r, *w;
+    if (pipe_pair(&r, &w) < 0)
         return -1;
-    struct px_desc *r = px_desc_new(PX_SOCK), *w = px_desc_new(PX_SOCK);
-    r->s = s[0];
-    w->s = s[1];
-    r->is_pipe = w->is_pipe = true;
-    r->domain = w->domain = 1; // AF_UNIX
-    r->type = w->type = 1;
-    r->flags = 0;
-    w->flags = PX_O_WRONLY;
     fds[0] = px_install(r, 0, false);
+    if (fds[0] < 0) {
+        px_put(w);
+        return -1;
+    }
     fds[1] = px_install(w, 0, false);
+    if (fds[1] < 0) {
+        px_close(fds[0]);
+        return -1;
+    }
     return 0;
 }
 
@@ -680,6 +972,10 @@ int px_ioctl(int fd, unsigned long req, ...) {
                 if (d->is_stdin)
                     px_stdin_demand();
                 res = px_sock_ioctl_fionread(d, &avail);
+            } else if (d->kind == PX_PIPE) {
+                if (d->is_stdin)
+                    px_stdin_demand();
+                avail = (int) pipe_buffered(d);
             } else if (d->kind == PX_FILE && !d->is_dir) {
                 LARGE_INTEGER size;
                 if (d->fc != NULL)
@@ -724,7 +1020,8 @@ int px_isatty(int fd) {
 }
 
 // ---- stdio. stdout and stderr write straight to the inherited handles; stdin
-// is pumped by a thread into a socket so it can be polled like anything else.
+// is pumped by a thread into an in-process pipe so it can be polled like
+// anything else.
 
 static HANDLE con_in = INVALID_HANDLE_VALUE;
 static HANDLE stdin_want; // manual-reset: set while someone waits for stdin data
@@ -741,23 +1038,8 @@ static DWORD con_in_mode_saved, con_out_mode_saved;
 static bool con_in_saved, con_out_saved;
 static HANDLE con_out = INVALID_HANDLE_VALUE;
 
-static bool send_all(SOCKET s, const char *buf, int n) {
-    while (n > 0) {
-        int put = send(s, buf, n, 0);
-        if (put == SOCKET_ERROR) {
-            if (WSAGetLastError() != WSAEWOULDBLOCK)
-                return false;
-            px_sock_wait(s, POLLWRNORM, 100);
-            continue;
-        }
-        buf += put;
-        n -= put;
-    }
-    return true;
-}
-
 static DWORD WINAPI stdin_pump(void *param) {
-    SOCKET out = (SOCKET) param;
+    struct px_desc *out = param;
     HANDLE in = con_in;
     DWORD mode;
     bool console = GetConsoleMode(in, &mode);
@@ -783,20 +1065,19 @@ static DWORD WINAPI stdin_pump(void *param) {
         } else if (!ReadFile(in, buf, sizeof(buf), &got, NULL) || got == 0) {
             break;
         }
-        if (!send_all(out, buf, (int) got))
+        if (!pipe_put_all(out, buf, got))
             break;
     }
-    shutdown(out, SD_SEND);
-    closesocket(out);
+    px_put(out); // the write end: the guest reads EOF
     return 0;
 }
 
 // A handle another process gave us (ish.exe --serve's commands get their
-// stdio so): the reading end of an input is pumped into a socket as stdin
+// stdio so): the reading end of an input is pumped into a pipe as stdin
 // is, eagerly, until it ends or the guest closes its end.
 struct handle_pump {
     HANDLE in;
-    SOCKET out;
+    struct px_desc *out;
 };
 
 static DWORD WINAPI handle_pump(void *param) {
@@ -806,11 +1087,10 @@ static DWORD WINAPI handle_pump(void *param) {
         DWORD got = 0;
         if (!ReadFile(p->in, buf, sizeof(buf), &got, NULL) || got == 0)
             break;
-        if (!send_all(p->out, buf, (int) got))
+        if (!pipe_put_all(p->out, buf, got))
             break;
     }
-    shutdown(p->out, SD_SEND);
-    closesocket(p->out);
+    px_put(p->out);
     CloseHandle(p->in);
     free(p);
     return 0;
@@ -836,29 +1116,25 @@ int px_fd_from_handle(void *handle, bool input) {
         d->flags = PX_O_WRONLY;
         return px_install(d, 0, true);
     }
-    SOCKET s[2];
+    struct px_desc *r, *w;
     struct handle_pump *p = malloc(sizeof(*p));
-    if (p == NULL || px_sock_pair(1, s) < 0) {
+    if (p == NULL || pipe_pair(&r, &w) < 0) {
         free(p);
         CloseHandle(h);
         return -1;
     }
     p->in = h;
-    p->out = s[1];
+    p->out = w;
     HANDLE thread = CreateThread(NULL, 64 << 10, handle_pump, p, 0, NULL);
     if (thread == NULL) {
-        closesocket(s[0]);
-        closesocket(s[1]);
+        px_put(r);
+        px_put(w);
         CloseHandle(h);
         free(p);
         return px_fail(EAGAIN);
     }
     CloseHandle(thread);
-    struct px_desc *d = px_desc_new(PX_SOCK);
-    d->s = s[0];
-    d->is_pipe = true;
-    d->domain = d->type = 1;
-    return px_install(d, 0, true);
+    return px_install(r, 0, true);
 }
 
 static struct px_desc *stdio_desc(DWORD which) {
@@ -887,19 +1163,21 @@ static struct px_desc *stdio_desc(DWORD which) {
         con_in_mode_saved = mode;
         con_in_saved = true;
     }
-    SOCKET s[2];
-    if (px_sock_pair(1, s) < 0)
+    struct px_desc *d, *w;
+    if (pipe_pair(&d, &w) < 0) {
+        fprintf(stderr, "ish: stdin: no memory for its pipe; stdin is empty\n");
         return px_desc_new(PX_NUL);
-    struct px_desc *d = px_desc_new(PX_SOCK);
-    d->s = s[0];
-    d->is_pipe = true;
+    }
     d->is_stdin = true;
     d->is_tty = console;
     stdin_want = CreateEventW(NULL, TRUE, FALSE, NULL);
-    d->domain = d->type = 1;
-    HANDLE thread = CreateThread(NULL, 0, stdin_pump, (void *) s[1], 0, NULL);
-    if (thread != NULL)
+    HANDLE thread = CreateThread(NULL, 0, stdin_pump, w, 0, NULL);
+    if (thread != NULL) {
         CloseHandle(thread);
+    } else {
+        fprintf(stderr, "ish: stdin: cannot start its pump (error %lu); stdin is empty\n", GetLastError());
+        px_put(w);
+    }
     return d;
 }
 

@@ -292,6 +292,11 @@ int px_fstat(int fd, struct px_stat *st) {
             st->st_mode = PX_S_IFCHR | 0666;
             st->st_rdev = (1 << 8) | 3;
             break;
+        case PX_PIPE:
+            st->st_mode = d->is_tty ? PX_S_IFCHR | 0620 : PX_S_IFIFO | 0600;
+            st->st_ino = (uint64_t) (uintptr_t) d->pipe;
+            st->st_blksize = 4096;
+            break;
     }
     px_put(d);
     return res;
