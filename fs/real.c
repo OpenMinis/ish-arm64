@@ -655,18 +655,53 @@ int realfs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
 // per open file description: host flock() semantics between descriptions,
 // processes, fork and close stay exactly the same.
 static char flock_dir[PATH_MAX];
+// Set when no directory for the proxy files could be made usable. flock() then
+// locks the real file for the whole process (see realfs_flock).
+static _Atomic int flock_proxy_dir_broken;
+
+// Try `base` as the directory holding the proxy files. Returns 1 and records it
+// in flock_dir when it exists or was created and is really a directory.
+static int flock_proxy_dir_use(const char *base) {
+    if (base == NULL || *base == '\0')
+        return 0;
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s/ish-flock", base) >= (int) sizeof(buf))
+        return 0;
+    if (mkdir(buf, 0700) < 0 && errno != EEXIST)
+        return 0;   // ENOENT (missing parent), EACCES, EROFS, ENOSPC, ...
+    struct stat st;
+    if (stat(buf, &st) < 0 || !S_ISDIR(st.st_mode))
+        return 0;
+    memcpy(flock_dir, buf, sizeof(flock_dir));
+    return 1;
+}
 
 static void flock_proxy_dir_init(void) {
-    const char *tmp = getenv("TMPDIR");
-    char buf[PATH_MAX];
+    // Every candidate is verified: TMPDIR may be unset (a process started from a
+    // background context gets no environment at all) or may name a directory the
+    // sandbox does not let us write, and blindly falling back to /tmp puts
+    // ish-flock somewhere iOS refuses to create it. That left every flock()
+    // failing with ENOENT, which apk reports as
+    // "Unable to lock database: No such file or directory".
+    if (flock_proxy_dir_use(getenv("TMPDIR")))
+        return;
 #if defined(__APPLE__)
-    if (tmp == NULL && confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf)) > 0)
-        tmp = buf;
+    char buf[PATH_MAX];
+    if (confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf)) > 0
+            && flock_proxy_dir_use(buf))
+        return;
 #endif
-    if (tmp == NULL)
-        tmp = "/tmp";
-    snprintf(flock_dir, sizeof(flock_dir), "%s/ish-flock", tmp);
-    mkdir(flock_dir, 0700);
+    if (flock_proxy_dir_use("/tmp"))
+        return;
+    flock_dir[0] = '\0';
+}
+
+// iOS purges an app's temporary directory while the app is running, taking
+// ish-flock with it. pthread_once would keep handing out a path that no longer
+// exists, so put the directory back when a proxy file cannot be opened.
+static void flock_proxy_dir_recreate(void) {
+    if (flock_dir[0] != '\0')
+        mkdir(flock_dir, 0700);
 }
 
 static const char *flock_proxy_dir(void) {
@@ -682,10 +717,22 @@ static int flock_proxy_fd(struct fd *fd) {
     struct stat st;
     if (fstat(fd->real_fd, &st) < 0)
         return -1;
+    const char *dir = flock_proxy_dir();
+    if (dir[0] == '\0') {
+        atomic_store(&flock_proxy_dir_broken, 1);
+        errno = ENOENT;
+        return -1;
+    }
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%llx-%llx", flock_proxy_dir(),
+    snprintf(path, sizeof(path), "%s/%llx-%llx", dir,
              (unsigned long long) st.st_dev, (unsigned long long) st.st_ino);
     int pfd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (pfd < 0 && errno == ENOENT) {
+        flock_proxy_dir_recreate();
+        pfd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (pfd < 0 && errno == ENOENT)
+            atomic_store(&flock_proxy_dir_broken, 1);
+    }
     if (pfd < 0)
         return -1;
     int expected = 0;
@@ -703,6 +750,13 @@ int realfs_flock(struct fd *fd, int operation) {
     if (operation & LOCK_UN_) real_op |= LOCK_UN;
     if (operation & LOCK_NB_) real_op |= LOCK_NB;
     int pfd = flock_proxy_fd(fd);
+    if (pfd < 0 && atomic_load(&flock_proxy_dir_broken)) {
+        // No usable directory for the proxies. Locking the real file risks the
+        // 0xdead10cc kill this proxy exists to avoid, but a process where every
+        // flock() fails breaks apk and anything else that locks, so fall back to
+        // upstream behaviour (consistently, for the whole process).
+        pfd = fd->real_fd;
+    }
     if (pfd < 0)
         return errno_map();
     // A blocking LOCK_EX/LOCK_SH waits in the host: the SIGUSR1 that
