@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <time.h>
 #include "asbestos/asbestos.h"
+#include "kernel/diag.h"
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
 #ifdef ISH_JIT
@@ -444,6 +445,7 @@ void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t e
                     fiber_block_disconnect(absestos, block);
                     block->is_jetsam = true;
                     list_add(&absestos->jetsam, &block->jetsam);
+                    ish_diag_add(DIAG_JETSAM_ADDED, 1);   // [FEAT-261027-15]
                     did_invalidate = true;
                 }
             }
@@ -466,6 +468,7 @@ void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t e
                 fiber_block_disconnect(absestos, block);
                 block->is_jetsam = true;
                 list_add(&absestos->jetsam, &block->jetsam);
+                ish_diag_add(DIAG_JETSAM_ADDED, 1);   // [FEAT-261027-15]
                 did_invalidate = true;
             }
         }
@@ -508,6 +511,7 @@ void asbestos_invalidate_all(struct asbestos *asbestos) {
                 fiber_block_disconnect(asbestos, block);
                 block->is_jetsam = true;
                 list_add(&asbestos->jetsam, &block->jetsam);
+                ish_diag_add(DIAG_JETSAM_ADDED, 1);   // [FEAT-261027-15]
                 did_invalidate = true;
             }
         }
@@ -782,13 +786,16 @@ static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *bloc
 
 static void fiber_free_jetsam(struct asbestos *asbestos) {
     struct fiber_block *block, *tmp;
+    uint64_t freed = 0;
     list_for_each_entry_safe(&asbestos->jetsam, block, tmp, jetsam) {
         list_remove(&block->jetsam);
 #ifdef ISH_JIT
         jit_block_free(block);
 #endif
         free(block);
+        freed++;
     }
+    ish_diag_add(DIAG_JETSAM_FREED, freed);   // [FEAT-261027-15]
 }
 
 int fiber_enter(struct fiber_block *block, struct fiber_frame *frame, struct tlb *tlb);

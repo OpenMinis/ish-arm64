@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include "debug.h"
 #include "kernel/task.h"
+#include "kernel/diag.h"
 #include "fs/fd.h"
 #include "kernel/calls.h"
 #include "fs/tty.h"
@@ -168,7 +169,9 @@ static void fork_rate_wait(struct task *task) {
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
     *group = *old_group;
-    atomic_fetch_add_explicit(&ish_live_guest_procs, 1, memory_order_relaxed);   // [T-ish-freeze-watch]
+    int64_t live = atomic_fetch_add_explicit(&ish_live_guest_procs, 1, memory_order_relaxed) + 1;   // [T-ish-freeze-watch]
+    ish_diag_note_procs(live);          // [FEAT-261027-15]
+    ish_diag_group_forked(group);
     list_init(&group->threads);
     list_add(&old_group->pgroup, &group->pgroup);
     list_add(&old_group->session, &group->session);

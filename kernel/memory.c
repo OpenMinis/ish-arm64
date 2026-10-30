@@ -11,6 +11,7 @@
 #define DEFAULT_CHANNEL memory
 #include "debug.h"
 #include "kernel/errno.h"
+#include "kernel/diag.h"
 #include "kernel/signal.h"
 #include "kernel/memory.h"
 #include "util/verbosetrace.h"
@@ -625,6 +626,14 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
 
     mem_remove_reservations(mem, start, pages);
 
+    // [FEAT-261027-15] Whether another task shares this address space while
+    // its host memory goes back (a thread, or a vfork parent).
+    unsigned sharers = mem == NULL ? 0 : atomic_load(&MM_OF_MEM(mem)->refcount);
+    ish_diag_add(DIAG_UNMAP_CALLS, 1);
+    if (sharers > 1)
+        ish_diag_add(DIAG_UNMAP_SHARED_MM, 1);
+    uint64_t unmapped = 0, host_frees = 0;
+
     for (page_t page = start; page < start + pages; mem_next_page(mem, &page)) {
         struct pt_entry *pt = mem_pt(mem, page);
         if (pt == NULL)
@@ -646,10 +655,12 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
             atomic_fetch_sub(&anon_page_count, 1);
 #endif
         mem_pt_del(mem, page);
+        unmapped++;
         if (--data->refcount == 0) {
             // vdso wasn't allocated with mmap, it's just in our data segment
             if (data->data != vdso_data) {
                 munmap(data->data, data->size);
+                host_frees++;
             }
             if (data->fd != NULL) {
                 fd_close(data->fd);
@@ -657,6 +668,10 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
             free(data);
         }
     }
+    ish_diag_add(DIAG_UNMAP_PAGES, unmapped);
+    ish_diag_add(DIAG_UNMAP_HOST_FREES, host_frees);
+    if (unmapped >= 256)   // 1 MB and more
+        ish_diag_event(DIAG_EV_BIG_MUNMAP, (int64_t) unmapped, sharers);
     mem_changed(mem);
     return 0;
 }
@@ -1026,6 +1041,7 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 
 static void mem_changed(struct mem *mem) {
     __atomic_add_fetch(&mem->mmu.changes, 1, __ATOMIC_SEQ_CST);
+    ish_diag_add(DIAG_MEM_CHANGED, 1);   // [FEAT-261027-15]
 #ifdef GUEST_ARM64
     mmu_tlbs_stale(&mem->mmu);
 #endif
@@ -1330,6 +1346,7 @@ have_entry:
         if (__atomic_load_n(&entry->flags, __ATOMIC_RELAXED) & P_CODE) {
             __atomic_fetch_and(&entry->flags, ~P_CODE, __ATOMIC_ACQ_REL);
             atomic_fetch_add_explicit(&st_wx_clears, 1, memory_order_relaxed);
+            ish_diag_add(DIAG_WX_CLEARS, 1);   // [FEAT-261027-15] under the mem read lock
             mem_changed(mem);
             // Order the bump before the caller's store: a compiling thread
             // that observes the (torn) store bytes must also observe the

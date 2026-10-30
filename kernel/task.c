@@ -7,6 +7,7 @@
 #include <time.h>
 #include "kernel/calls.h"
 #include "kernel/task.h"
+#include "kernel/diag.h"
 #include "kernel/memory.h"
 #include "emu/tlb.h"
 
@@ -193,6 +194,8 @@ static void task_run_tlb_cleanup(void *arg) {
         // finds — a value other than 1 here means a second holder.
         printk("[iSH][DEFERRED-RELEASE] pid=%d mm_release from cleanup handler, mm=%p refcount_before=%u\n",
                self->pid, (void *) mm, (unsigned) mm->refcount);
+        ish_diag_add(DIAG_DEFERRED_RELEASED, 1);   // [FEAT-261027-15]
+        ish_diag_event(DIAG_EV_DEFERRED_RELEASE, (int64_t) mm->refcount, 0);
         mm_release_from(mm, "cleanup_handler");
     }
 }
@@ -258,6 +261,7 @@ static void *task_thread(void *vtask) {
     sigemptyset(&wake);
     sigaddset(&wake, SIGUSR1);
     pthread_sigmask(SIG_UNBLOCK, &wake, NULL);
+    ish_diag_thread_own(current->pid);   // [FEAT-261027-15]
     update_thread_name();
     task_run_current();
     die("task_thread returned"); // above function call should never return
@@ -298,5 +302,8 @@ void update_thread_name() {
 #else
     pthread_setname_np(pthread_self(), name);
 #endif
+    // [FEAT-261027-15] On an app thread (exec from a GCD worker) the name
+    // stays after the kernel gives the thread back.
+    ish_diag_thread_renamed(current->pid);
 }
 

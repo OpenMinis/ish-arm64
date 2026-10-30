@@ -1,6 +1,7 @@
 #include "fs/proc.h"
 #include "fs/proc/ish.h"
 #include "kernel/errno.h"
+#include "kernel/diag.h"
 #include "fs/poll.h"
 #include "fs/xnet.h"
 #include <stdbool.h>
@@ -202,10 +203,19 @@ static int proc_ish_show_xnet(struct proc_entry *UNUSED(entry), struct proc_data
     return 0;
 }
 
+// [FEAT-261027-15] Diagnostic counters (kernel/diag.h): numbers only.
+static int proc_ish_show_diag(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char text[2048];
+    ish_diag_describe(text, sizeof(text));
+    proc_printf(buf, "%s", text);
+    return 0;
+}
+
 struct proc_children proc_ish_children = PROC_CHILDREN({
     {"colors", .show = proc_ish_show_colors},
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
     {"defaults", S_IFDIR, .readdir = proc_ish_defaults_readdir},
+    {"diag", .show = proc_ish_show_diag},
     {"documents", .show = proc_ish_show_documents},
 #ifdef ISH_JIT
     {"jit", .show = proc_ish_show_jit, .pwrite = proc_ish_write_jit},

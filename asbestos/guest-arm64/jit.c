@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
+#include "kernel/diag.h"
 #include "asbestos/guest-arm64/jit.h"
 #include "asbestos/guest-arm64/aot.h"
 #include "asbestos/asbestos.h"
@@ -2433,6 +2434,8 @@ static void aot_init(void) {
                     "(abi %08x, this ish %08x), not used\n", m->path, m->abi, abi);
             if (aot_nrejected < 64)
                 aot_rejected[aot_nrejected++] = m;
+            ish_diag_add(DIAG_AOT_REJECTED_IMAGES, 1);   // [FEAT-261027-15]
+            ish_diag_event(DIAG_EV_AOT_REJECT, m->abi, abi);
             continue;
         }
         aot_images[aot_nimages++] = m;
@@ -2670,6 +2673,26 @@ static bool aot_slot_usable(struct aot_place *p, const struct aot_module *m, con
     return !owner || owner == b;
 }
 
+// [FEAT-261027-15] An installed moved translation whose words differ from the
+// block's only in pc-relative immediates: count which classes differed.
+static void diag_count_fixed(const struct aot_trans *t, const uint32_t *k, unsigned nkey) {
+    for (unsigned i = 4; i < nkey; i++) {
+        if (key_is_gadget(i) || !key_is_insn(i))
+            continue;
+        uint32_t w = aot_key_word(t, i);
+        if (w == k[i])
+            continue;
+        enum ish_diag_counter c =
+            (w & 0x7C000000u) == 0x14000000u ? DIAG_AOT_FIX_B :
+            (w & 0xFF000010u) == 0x54000000u ? DIAG_AOT_FIX_BCOND :
+            (w & 0x7E000000u) == 0x34000000u ? DIAG_AOT_FIX_CBZ :
+            (w & 0x7E000000u) == 0x36000000u ? DIAG_AOT_FIX_TBZ :
+            (w & 0x9F000000u) == 0x10000000u ? DIAG_AOT_FIX_ADR :
+            (w & 0x9F000000u) == 0x90000000u ? DIAG_AOT_FIX_ADRP : DIAG_AOT_FIX_OTHER;
+        ish_diag_add(c, 1);
+    }
+}
+
 // Would recorded translation t (key tk) run block b (key k, at file offset
 // off) right, and with what dbase? Every word must be the same except the
 // immediates insn_norm() leaves out; where adr / adrp targets moved, all of
@@ -2684,10 +2707,21 @@ static bool aot_fits_moved(const struct aot_trans *t, const uint32_t *k, unsigne
             continue;
         uint32_t w = aot_key_word(t, i);
         if (!key_is_insn(i) || loop) {
-            if (w != k[i]) return false;
+            if (w != k[i]) {
+                ish_diag_add(key_is_insn(i) ? DIAG_AOT_GIVEUP_LOOP : DIAG_AOT_GIVEUP_DATA, 1);   // [FEAT-261027-15]
+                return false;
+            }
             continue;
         }
-        if (insn_norm(w) != insn_norm(k[i])) return false;
+        if (insn_norm(w) != insn_norm(k[i])) {
+            // [FEAT-261027-15] An ldr (literal) whose offset alone moved is
+            // the one pc-relative class insn_norm() does not leave out.
+            bool ldrlit = (w & 0x3B000000u) == 0x18000000u && (w & ~0x00FFFFE0u) == (k[i] & ~0x00FFFFE0u);
+            ish_diag_add(DIAG_AOT_GIVEUP_INSN, 1);
+            if (ldrlit)
+                ish_diag_add(DIAG_AOT_GIVEUP_LDRLIT, 1);
+            return false;
+        }
         fixed |= w != k[i];
     }
     for (unsigned u = 0; u < k[4]; u++) {
@@ -2698,8 +2732,10 @@ static bool aot_fits_moved(const struct aot_trans *t, const uint32_t *k, unsigne
                 continue;
             int64_t d = (int64_t) (adr_target(ku[5 + j], off + dpc + 4 * j) -
                                    adr_target(aot_key_word(t, 7 + 9 * u + 5 + j), t->off + dpc + 4 * j));
-            if (have && d != shift)
+            if (have && d != shift) {
+                ish_diag_add(DIAG_AOT_GIVEUP_ADRSHIFT, 1);   // [FEAT-261027-15]
                 return false;
+            }
             have = true;
             shift = d;
         }
@@ -2833,6 +2869,19 @@ struct aot_memo {
 static struct aot_memo *aot_memo;   // reg_lock
 static _Atomic uint64_t st_memo_hits, st_search_n, st_search_ticks;
 
+// [FEAT-261027-15] For kernel/diag.c (crash dump and snapshots): atomic loads only.
+static void jit_diag_counts(uint64_t out[6]) {
+    out[0] = __atomic_load_n(&aot_nimages, __ATOMIC_RELAXED);
+    out[1] = __atomic_load_n(&aot_nrejected, __ATOMIC_RELAXED);
+    out[2] = atomic_load_explicit(&st_aot, memory_order_relaxed);
+    out[3] = atomic_load_explicit(&st_aot_moved, memory_order_relaxed);
+    out[4] = atomic_load_explicit(&st_aot_fixed, memory_order_relaxed);
+    out[5] = atomic_load_explicit(&st_aot_busy, memory_order_relaxed);
+}
+__attribute__((constructor)) static void jit_diag_register(void) {
+    ish_diag_jit_counts = jit_diag_counts;
+}
+
 // Look b up in the images of its module (reg_lock held): those recorded from
 // this very file first, so that with several images of one family linked in,
 // the one made from this build wins wherever it has the block; then other
@@ -2930,8 +2979,10 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
         atomic_fetch_add_explicit(&st_aot, 1, memory_order_relaxed);
         if (moved)
             atomic_fetch_add_explicit(&st_aot_moved, 1, memory_order_relaxed);
-        if (fixed)
+        if (fixed) {
             atomic_fetch_add_explicit(&st_aot_fixed, 1, memory_order_relaxed);
+            diag_count_fixed(at, key, nkey);
+        }
         pthread_mutex_lock(&reg_lock);
         if ((unsigned) mod < mod_next_cap) {
             mod_hits[mod]++;

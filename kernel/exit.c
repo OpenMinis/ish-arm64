@@ -8,6 +8,7 @@
 #include <malloc/malloc.h>
 #endif
 #include "kernel/calls.h"
+#include "kernel/diag.h"
 #include "kernel/mm.h"
 #include "kernel/futex.h"
 #include "kernel/ptrace.h"
@@ -290,6 +291,8 @@ noreturn void do_exit_group(int status) {
         notify(&task->group->stopped_cond);
     }
     (void)is_group_leader;
+    ish_diag_add(DIAG_EXIT_GROUPS, 1);   // [FEAT-261027-15]
+    ish_diag_event(DIAG_EV_EXIT_GROUP, thread_count, 0);
 
     // Only the first thread (group leader) waits for others to exit
     // Other threads exit immediately to avoid deadlock
@@ -448,9 +451,12 @@ noreturn void do_exit_group(int status) {
             unlock(&pids_lock);
             // [T-ish-mm-diag] Unconditional: do_exit_group runs once per
             // process, so this is at most one line per exiting process.
-            if (leaked > 0)
+            if (leaked > 0) {
                 printk("[iSH][SAFETY-VALVE] pid=%d leaked %d stuck threads, mm_release deferred\n",
                        current->pid, leaked);
+                ish_diag_add(DIAG_VALVE_LEAKED, (uint64_t) leaked);   // [FEAT-261027-15]
+                ish_diag_event(DIAG_EV_VALVE_LEAK, leaked, 0);
+            }
         } else {
 
             // Give extra time for pthread cleanup on host system
@@ -610,6 +616,7 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
     cond_destroy(&task->group->child_exit);
     task_leave_session(task);
     list_remove(&task->group->pgroup);
+    ish_diag_group_gone(task->group);   // [FEAT-261027-15]
     free(task->group);
     atomic_fetch_sub_explicit(&ish_live_guest_procs, 1, memory_order_relaxed);   // [T-ish-freeze-watch]
 
