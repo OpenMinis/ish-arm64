@@ -11,6 +11,7 @@
 #include "kernel/errno.h"
 #include "kernel/resource.h"
 #include "kernel/time.h"
+#include "kernel/diag.h"
 #include "fs/poll.h"
 
 #define TIMER_ABSTIME_ (1 << 0)
@@ -390,6 +391,9 @@ dword_t sys_settimeofday(addr_t UNUSED(tv), addr_t UNUSED(tz)) {
 }
 
 static void posix_timer_callback(struct posix_timer *timer) {
+    // [FIX-261031-04] Record the fire (and a fire on a slot whose timer is
+    // gone) before anything else reads the slot. Observation only.
+    ish_diag_timer_fire(timer);
     if (timer->tgroup == NULL)
         return;
     struct siginfo_ info = {
@@ -430,11 +434,23 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
     }
     if (sigev.method != SIGEV_SIGNAL_ && sigev.method != SIGEV_NONE_ && sigev.method != SIGEV_THREAD_ID_)
         return _EINVAL;
+    // [FIX-261031-04] A timer that sends a signal must name one iSH has
+    // (Linux: EINVAL unless 1..SIGRTMAX; iSH's table stops at NUM_SIGS - 1).
+    // The stored number is what posix_timer_callback hands to send_signal.
+    // SIGEV_NONE sends nothing, so its number is not looked at.
+    if (sigev.method != SIGEV_NONE_ && (sigev.signo < 1 || sigev.signo >= NUM_SIGS)) {
+        ish_diag_add(DIAG_TIMER_SIGNO_REJECTED, 1);
+        return _EINVAL;
+    }
 
     if (sigev.method == SIGEV_THREAD_ID_) {
         lock(&pids_lock);
-        if (pid_get_task(sigev.tid) == NULL)
+        if (pid_get_task(sigev.tid) == NULL) {
+            // [FIX-261031-04] Used to return with pids_lock held, after which
+            // every fork, kill and wait waited for it forever.
+            unlock(&pids_lock);
             return _EINVAL;
+        }
         unlock(&pids_lock);
     }
 
@@ -459,6 +475,8 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
     timer->timer = timer_new(real_clockid, (timer_callback_t) posix_timer_callback, timer);
     timer->signal = sigev.signo;
     timer->sig_value = sigev.value;
+    timer->seq = ish_diag_timer_seq_next();
+    __atomic_store_n(&timer->magic, DIAG_TIMER_MAGIC, __ATOMIC_RELAXED);
     timer->tgroup = NULL;
     if (sigev.method == SIGEV_SIGNAL_) {
         timer->tgroup = group;
@@ -474,7 +492,14 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
         timer->thread_pid = group->leader->pid;
     }
     unlock(&group->lock);
+    ish_diag_add(DIAG_TIMER_CREATE, 1);
     return 0;
+}
+
+// [FIX-261031-04] The id a timer syscall was given is outside the table, or
+// (empty) names a slot with no timer: recorded, and the caller says EINVAL.
+static void timer_id_refused(dword_t timer_id, enum ish_diag_timer_call call, bool empty) {
+    ish_diag_event(DIAG_EV_TIMER_OOB, (int32_t) timer_id, call + (empty ? DIAG_TIMER_SLOT_EMPTY : 0));
 }
 
 int_t sys_timer_settime(dword_t timer_id, int_t flags, addr_t new_value_addr, addr_t old_value_addr) {
@@ -482,11 +507,21 @@ int_t sys_timer_settime(dword_t timer_id, int_t flags, addr_t new_value_addr, ad
     struct itimerspec_ value;
     if (user_get(new_value_addr, value))
         return _EFAULT;
-    if (timer_id > TIMERS_MAX)
+    // [FIX-261031-04] Was `> TIMERS_MAX`: id TIMERS_MAX read one past the
+    // table. And a slot with no timer was dereferenced as if it had one.
+    if (timer_id >= TIMERS_MAX) {
+        ish_diag_add(DIAG_TIMER_SETTIME_OOB, 1);
+        timer_id_refused(timer_id, DIAG_TIMER_CALL_SETTIME, false);
         return _EINVAL;
+    }
 
     lock(&current->group->lock);
     struct posix_timer *timer = &current->group->posix_timers[timer_id];
+    if (timer->timer == NULL) {
+        unlock(&current->group->lock);
+        timer_id_refused(timer_id, DIAG_TIMER_CALL_SETTIME, true);
+        return _EINVAL;
+    }
     struct timer_spec spec = timer_spec_to_real(value);
     struct timer_spec old_spec;
     if (flags & TIMER_ABSTIME_) {
@@ -508,8 +543,10 @@ int_t sys_timer_settime(dword_t timer_id, int_t flags, addr_t new_value_addr, ad
 
 int_t sys_timer_gettime(dword_t timer_id, addr_t curr_value_addr) {
     STRACE("timer_gettime(%d, %#x)", timer_id, curr_value_addr);
-    if (timer_id >= TIMERS_MAX)
+    if (timer_id >= TIMERS_MAX) {
+        timer_id_refused(timer_id, DIAG_TIMER_CALL_GETTIME, false);
         return _EINVAL;
+    }
 
     lock(&current->group->lock);
     struct posix_timer *pt = &current->group->posix_timers[timer_id];
@@ -539,8 +576,10 @@ int_t sys_timer_gettime(dword_t timer_id, addr_t curr_value_addr) {
 
 int_t sys_timer_getoverrun(dword_t timer_id) {
     STRACE("timer_getoverrun(%d)", timer_id);
-    if (timer_id >= TIMERS_MAX)
+    if (timer_id >= TIMERS_MAX) {
+        timer_id_refused(timer_id, DIAG_TIMER_CALL_GETOVERRUN, false);
         return _EINVAL;
+    }
 
     lock(&current->group->lock);
     struct posix_timer *pt = &current->group->posix_timers[timer_id];
@@ -554,15 +593,26 @@ int_t sys_timer_getoverrun(dword_t timer_id) {
 
 int_t sys_timer_delete(dword_t timer_id) {
     STRACE("timer_delete(%d)\n", timer_id);
+    // [FIX-261031-04] The id indexed posix_timers[] with no bound at all: a
+    // guest could read, then free and NULL out, a word of any host memory
+    // past the group.
+    if (timer_id >= TIMERS_MAX) {
+        ish_diag_add(DIAG_TIMER_DELETE_OOB, 1);
+        timer_id_refused(timer_id, DIAG_TIMER_CALL_DELETE, false);
+        return _EINVAL;
+    }
     lock(&current->group->lock);
     struct posix_timer *timer = &current->group->posix_timers[timer_id];
     if (timer->timer == NULL) {
         unlock(&current->group->lock);
+        timer_id_refused(timer_id, DIAG_TIMER_CALL_DELETE, true);
         return _EINVAL;
     }
+    __atomic_store_n(&timer->magic, 0, __ATOMIC_RELAXED);
     timer_free(timer->timer);
     timer->timer = NULL;
     unlock(&current->group->lock);
+    ish_diag_add(DIAG_TIMER_DELETE, 1);
     return 0;
 }
 

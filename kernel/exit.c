@@ -8,6 +8,7 @@
 #include <malloc/malloc.h>
 #endif
 #include "kernel/calls.h"
+#include "kernel/diag.h"
 #include "kernel/pmu.h"
 #include "kernel/mm.h"
 #include "kernel/futex.h"
@@ -36,6 +37,10 @@ static bool exit_tgroup(struct task *task) {
         // - locking pids_lock first, which do_exit did
         if (group->itimer)
             timer_free(group->itimer);
+        // [FIX-261031-04] POSIX timers are not freed here (their threads keep
+        // firing into this group after it is freed - left for a later fix);
+        // count them, and mark their slots gone so such a fire is recorded.
+        ish_diag_timer_leak(group);
 
         // The group will be removed from its group and session by reap_if_zombie,
         // because fish tries to set the pgid to that of an exited but not reaped
