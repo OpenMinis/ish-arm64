@@ -189,6 +189,11 @@ struct posix_timer {
     pid_t_ thread_pid;
     int_t signal;
     union sigval_ sig_value;
+    // [FIX-261031-04] Diagnostics only (kernel/diag.h): DIAG_TIMER_MAGIC from
+    // timer_create until timer_delete or the group's death, and the order of
+    // creation, so a fire on a timer that is gone can be told apart.
+    uint32_t magic;
+    uint32_t seq;
 };
 
 // struct thread_group is way too long to type comfortably

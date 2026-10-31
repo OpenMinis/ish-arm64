@@ -49,6 +49,14 @@ static const char *const counter_names[DIAG_COUNTER_COUNT] = {
     [DIAG_AOT_GIVEUP_LDRLIT] = "aot_giveup_ldrlit",
     [DIAG_AOT_GIVEUP_ADRSHIFT] = "aot_giveup_adrshift",
     [DIAG_AOT_REJECTED_IMAGES] = "aot_rejected_images",
+    [DIAG_TIMER_CREATE] = "timer_create",
+    [DIAG_TIMER_DELETE] = "timer_delete",
+    [DIAG_TIMER_DELETE_OOB] = "timer_delete_oob",
+    [DIAG_TIMER_SETTIME_OOB] = "timer_settime_oob",
+    [DIAG_TIMER_SIGNO_REJECTED] = "timer_signo_rejected",
+    [DIAG_SEND_SIGNAL_OOB] = "send_signal_oob",
+    [DIAG_TIMER_LEAKED_AT_EXIT] = "timer_leaked_at_exit",
+    [DIAG_TIMER_THREADS_LIVE] = "timer_threads_live",
 };
 
 static const char *const event_names[] = {
@@ -61,6 +69,11 @@ static const char *const event_names[] = {
     [DIAG_EV_AOT_REJECT] = "aot_reject",
     [DIAG_EV_BORROW_RENAME] = "borrow_rename",
     [DIAG_EV_BORROW_BEGIN] = "borrow_begin",
+    [DIAG_EV_SEND_SIGNAL_OOB] = "send_signal_oob",
+    [DIAG_EV_TIMER_OOB] = "timer_oob",
+    [DIAG_EV_TIMER_LEAK_EXIT] = "timer_leak_exit",
+    [DIAG_EV_TIMER_STALE] = "timer_stale",
+    [DIAG_EV_TIMER_FIRE] = "timer_fire",
 };
 
 // Milliseconds since the process started (monotonic; clock_gettime is
@@ -114,6 +127,65 @@ void ish_diag_event(enum ish_diag_event type, int64_t a, int64_t b) {
     if (pthread_getname_np(pthread_self(), e->thread, sizeof(e->thread)) != 0)
         e->thread[0] = '\0';
     atomic_store_explicit(&e->seq, idx + 1, memory_order_release);
+}
+
+// MARK: - POSIX timers [FIX-261031-04]
+
+static _Atomic uint32_t timer_seq;
+uint32_t ish_diag_timer_seq_next(void) {
+    return atomic_fetch_add_explicit(&timer_seq, 1, memory_order_relaxed) + 1;
+}
+
+// The last 16 fires, apart from the main ring: a timer firing every few
+// milliseconds must not push the rare events out of it.
+#define FIRE_RING 16
+struct diag_fire {
+    _Atomic uint64_t seq;   // index + 1 once written; 0 while being written
+    uint64_t ms;
+    int32_t timer_id, signal, thread_pid;
+    uint32_t tgroup_lo, timer_seq, magic;
+    uint8_t tgroup_null;
+};
+static struct diag_fire fire_ring[FIRE_RING];
+static _Atomic uint64_t fire_head;
+
+void ish_diag_timer_fire(const struct posix_timer *timer) {
+    // Plain reads of a slot the kernel may be freeing (that is what is being
+    // looked for); nothing here is acted on.
+    uint32_t magic = __atomic_load_n(&timer->magic, __ATOMIC_RELAXED);
+    uint64_t idx = atomic_fetch_add_explicit(&fire_head, 1, memory_order_relaxed);
+    struct diag_fire *f = &fire_ring[idx % FIRE_RING];
+    atomic_store_explicit(&f->seq, 0, memory_order_relaxed);
+    f->ms = now_ms();
+    f->timer_id = (int32_t) timer->timer_id;
+    f->signal = (int32_t) timer->signal;
+    f->thread_pid = (int32_t) timer->thread_pid;
+    f->tgroup_lo = (uint32_t) (uintptr_t) timer->tgroup;
+    f->tgroup_null = timer->tgroup == NULL;
+    f->timer_seq = timer->seq;
+    f->magic = magic;
+    atomic_store_explicit(&f->seq, idx + 1, memory_order_release);
+    if (magic != DIAG_TIMER_MAGIC)
+        ish_diag_event(DIAG_EV_TIMER_STALE, timer->signal, magic);
+}
+
+void ish_diag_timer_leak(struct tgroup *group) {
+    int64_t left = 0, inherited = 0;
+    for (int i = 0; i < TIMERS_MAX; i++) {
+        struct posix_timer *t = &group->posix_timers[i];
+        if (t->timer == NULL)
+            continue;
+        left++;
+        // A copy made by fork still names the parent's group.
+        if (t->tgroup != NULL && t->tgroup != group)
+            inherited++;
+        // Gone from here on: a later fire through this slot reads as stale.
+        __atomic_store_n(&t->magic, 0, __ATOMIC_RELAXED);
+    }
+    if (left == 0)
+        return;
+    ish_diag_add(DIAG_TIMER_LEAKED_AT_EXIT, (uint64_t) left);
+    ish_diag_event(DIAG_EV_TIMER_LEAK_EXIT, left, inherited);
 }
 
 // MARK: - Thread ownership
@@ -348,6 +420,29 @@ void ish_diag_write_crash(int fd) {
         c_str(" thread=\""); c_strn(e->thread, sizeof(e->thread)); c_str("\"");
         c_str(" a="); c_i64(e->a);
         c_str(" b="); c_i64(e->b);
+        c_str("\n");
+        if (crash_len > sizeof(crash_buf) - 256)
+            c_flush(fd);
+    }
+    c_flush(fd);
+    // [FIX-261031-04] The last timer fires, oldest first, in the same shape
+    // (pid = the target thread pid; a = signal, b = timer id) plus the fields
+    // a fire carries.
+    uint64_t fhead = atomic_load_explicit(&fire_head, memory_order_acquire);
+    uint64_t ffirst = fhead > FIRE_RING ? fhead - FIRE_RING : 0;
+    for (uint64_t idx = ffirst; idx < fhead; idx++) {
+        struct diag_fire *f = &fire_ring[idx % FIRE_RING];
+        if (atomic_load_explicit(&f->seq, memory_order_acquire) != idx + 1)
+            continue;
+        c_str("[ish-diag] ev "); c_u64(f->ms); c_str("ms timer_fire");
+        c_str(" pid="); c_i64(f->thread_pid);
+        c_str(" thread=\"timer\"");
+        c_str(" a="); c_i64(f->signal);
+        c_str(" b="); c_i64(f->timer_id);
+        c_str(" seq="); c_u64(f->timer_seq);
+        c_str(" tgroup_lo="); c_u64(f->tgroup_lo);
+        c_str(" tgroup_null="); c_u64(f->tgroup_null);
+        c_str(" magic_ok="); c_u64(f->magic == DIAG_TIMER_MAGIC);
         c_str("\n");
         if (crash_len > sizeof(crash_buf) - 256)
             c_flush(fd);

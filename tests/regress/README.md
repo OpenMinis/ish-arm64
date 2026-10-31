@@ -94,3 +94,20 @@ guards (`regfile`, `hupedge`, `deadline`, `backoff`) off one by one, e.g.
 runs 4 KB to exactly 128 KB command lines and two past it, each under a 30 s
 watchdog. Against an unfixed `ish` the 16 KB and longer cases fail with 142
 (killed by the watchdog: the hang).
+
+## POSIX timer ids and signal numbers (2026-10-31, FIX-261031-04)
+
+| Fix | What broke before it | Covered by |
+| --- | --- | --- |
+| timer syscall bounds | `timer_delete` indexed `posix_timers[]` with the guest's id and no upper bound (an out-of-range read, `timer_free` and NULL store into host memory: `timer_delete(16)` crashed iSH in `timer_free`); `timer_settime` checked `> TIMERS_MAX` instead of `>=` and used an empty slot's NULL timer (`timer_settime(16)` crashed in `timer_set`). | `regress_posix_timer_bounds.c` (`ids`, `diag`) |
+| timer signal numbers | `timer_create` stored any signal number for `posix_timer_callback` to send; `send_signal` then indexed `sighand->action[sig]` (a 10-31 SIGBUS had sig=0x40814800). Now EINVAL outside 1..NUM_SIGS-1 for SIGEV_SIGNAL / SIGEV_THREAD_ID, and `send_signal` drops and records such a number. | `regress_posix_timer_bounds.c` (`signo`), `host_timer_diag.c` |
+| SIGEV_THREAD_ID, no such thread | `timer_create` returned EINVAL with `pids_lock` still held: the next fork / kill / wait hung forever. | `regress_posix_timer_bounds.c` (`thread_id`) |
+| probes | Counters (`timer_create`, `timer_delete`, `timer_delete_oob`, `timer_settime_oob`, `timer_signo_rejected`, `send_signal_oob`, `timer_leaked_at_exit`, `timer_threads_live`), events (`send_signal_oob`, `timer_oob`, `timer_leak_exit`, `timer_stale`) and a 16-slot ring of the last `timer_fire`s in the crash dump. Observation only. | `regress_posix_timer_bounds.c` (`diag`, `leak`), `host_timer_diag.c` |
+
+`tests/regress/run_posix_timer.sh [-i build-native/ish]` runs each guest case in its
+own iSH under a 20 s host timeout (a crash or a hang fails only that case) and
+builds `host_timer_diag.c` against the `libish.a` next to the binary. The guest
+binary is static, so without `-r` a throwaway rootfs with only `/tmp` is used.
+The `normal` case pins the unchanged paths: SIGEV_SIGNAL SIGALRM with its
+siginfo, `timer_create(clock, NULL, &id)` (coreutils `timeout`), SIGEV_THREAD_ID
+to the caller, all 16 slots then ENOMEM, `setitimer` and `alarm`.

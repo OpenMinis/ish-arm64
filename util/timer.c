@@ -3,6 +3,7 @@
 #include <time.h>
 #include "util/timer.h"
 #include "misc.h"
+#include "kernel/diag.h"
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data) {
 //    assert(clockid == CLOCK_MONOTONIC || clockid == CLOCK_REALTIME);
@@ -57,6 +58,7 @@ static void *timer_thread(void *param) {
         }
     }
     timer->thread_running = false;
+    ish_diag_add(DIAG_TIMER_THREADS_LIVE, (uint64_t) -1);   // [FIX-261031-04]
     if (timer->dead)
         free(timer);
     else
@@ -80,6 +82,7 @@ int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *ol
         pthread_kill(timer->thread, SIGUSR1);
     } else if (timer->active) {
         timer->thread_running = true;
+        ish_diag_add(DIAG_TIMER_THREADS_LIVE, 1);   // [FIX-261031-04] ended in timer_thread
         pthread_create(&timer->thread, NULL, timer_thread, timer);
         pthread_detach(timer->thread);
     }

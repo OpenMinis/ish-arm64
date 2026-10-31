@@ -47,6 +47,15 @@ enum ish_diag_counter {
     DIAG_AOT_GIVEUP_LDRLIT,     // ...of which: an ldr (literal) whose offset moved
     DIAG_AOT_GIVEUP_ADRSHIFT,   // ...adr / adrp targets moved by different distances
     DIAG_AOT_REJECTED_IMAGES,
+    // [FIX-261031-04] POSIX timers and signal numbers (kernel/time.c, signal.c)
+    DIAG_TIMER_CREATE,          // timer_create calls that made a timer
+    DIAG_TIMER_DELETE,          // timer_delete calls that freed one
+    DIAG_TIMER_DELETE_OOB,      // timer_delete refused: id out of range
+    DIAG_TIMER_SETTIME_OOB,     // timer_settime refused: id out of range
+    DIAG_TIMER_SIGNO_REJECTED,  // timer_create refused: signal number out of range
+    DIAG_SEND_SIGNAL_OOB,       // send_signal refused a signal number out of range
+    DIAG_TIMER_LEAKED_AT_EXIT,  // posix timers still allocated when their group died
+    DIAG_TIMER_THREADS_LIVE,    // timer threads running now (started minus ended)
     DIAG_COUNTER_COUNT
 };
 
@@ -70,6 +79,12 @@ enum ish_diag_event {
     DIAG_EV_AOT_REJECT,         // a: image abi, b: this ish's abi
     DIAG_EV_BORROW_RENAME,      // a: pid the app thread was renamed for
     DIAG_EV_BORROW_BEGIN,       // a: borrow depth after
+    // [FIX-261031-04]
+    DIAG_EV_SEND_SIGNAL_OOB,    // a: the signal number, b: target pid
+    DIAG_EV_TIMER_OOB,          // a: timer id, b: enum ish_diag_timer_call (+ DIAG_TIMER_SLOT_EMPTY)
+    DIAG_EV_TIMER_LEAK_EXIT,    // a: timers left, b: of which inherited through fork
+    DIAG_EV_TIMER_STALE,        // a: signal, b: magic seen (a fire on a timer not created or already gone)
+    DIAG_EV_TIMER_FIRE,         // own ring, see ish_diag_timer_fire
 };
 // One event: time, thread, pid, two numbers. 64 slots, the oldest overwritten.
 void ish_diag_event(enum ish_diag_event type, int64_t a, int64_t b);
@@ -94,6 +109,29 @@ void ish_diag_group_forked(struct tgroup *group);
 
 // Set by the JIT engine (asbestos/guest-arm64/jit.c) when it is built in.
 extern void (*ish_diag_jit_counts)(uint64_t out[6]);
+
+// [FIX-261031-04] POSIX timers. Observation only.
+// The syscall a DIAG_EV_TIMER_OOB came from; DIAG_TIMER_SLOT_EMPTY is added
+// when the id was in range but its slot held no timer.
+enum ish_diag_timer_call {
+    DIAG_TIMER_CALL_DELETE = 1,
+    DIAG_TIMER_CALL_SETTIME = 2,
+    DIAG_TIMER_CALL_GETTIME = 3,
+    DIAG_TIMER_CALL_GETOVERRUN = 4,
+};
+#define DIAG_TIMER_SLOT_EMPTY 16
+// Set in a posix_timer by timer_create, cleared by timer_delete and when its
+// group dies; a fire that does not find it is recorded as stale.
+#define DIAG_TIMER_MAGIC 0x54494d52u    // "TIMR"
+uint32_t ish_diag_timer_seq_next(void);
+// Called by posix_timer_callback on every fire, before it sends the signal:
+// one record in a 16-slot ring of its own (so frequent timers cannot push
+// the rarer events out of the main ring); no lock, no allocation, no output.
+// A missing magic is also recorded in the main ring (DIAG_EV_TIMER_STALE).
+struct posix_timer;
+void ish_diag_timer_fire(const struct posix_timer *timer);
+// A process's group died with posix timers still allocated (counted, not freed).
+void ish_diag_timer_leak(struct tgroup *group);
 
 // Text for /proc/ish/diag and the app's snapshots: one "key=value" list.
 size_t ish_diag_describe(char *buf, size_t size);

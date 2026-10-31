@@ -8,6 +8,7 @@
 #include "kernel/task.h"
 #include "kernel/native_offload.h"
 #include "kernel/vdso.h"
+#include "kernel/diag.h"
 #include "emu/interrupt.h"
 
 #if is_gcc(9)
@@ -33,6 +34,12 @@ static int signal_is_blockable(int sig) {
 #define SIGNAL_STOP 3
 
 static int signal_action(struct sighand *sighand, int sig) {
+    // [FIX-261031-04] action[] has NUM_SIGS entries: a number outside it would
+    // index past the array (the 10-31 SIGBUS read action[0x40814800]).
+    // send_signal refuses such numbers first; this keeps any other caller
+    // from reading out of bounds.
+    if (sig < 1 || sig >= NUM_SIGS)
+        return SIGNAL_IGNORE;
     if (signal_is_blockable(sig)) {
         struct sigaction_ *action = &sighand->action[sig];
         if (action->handler == SIG_IGN_)
@@ -137,6 +144,13 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
     // signal zero is for testing whether a process exists
     if (sig == 0)
         return;
+    // [FIX-261031-04] Not a signal number iSH has: dropped like signal zero,
+    // and recorded (a POSIX timer's stored signal was the 10-31 source).
+    if (sig < 0 || sig >= NUM_SIGS) {
+        ish_diag_add(DIAG_SEND_SIGNAL_OOB, 1);
+        ish_diag_event(DIAG_EV_SEND_SIGNAL_OOB, sig, task ? (int64_t) task->pid : -1);
+        return;
+    }
     if (task->zombie || task->exiting)
         return;
 #ifdef GUEST_ARM64
