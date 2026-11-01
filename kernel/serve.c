@@ -4,6 +4,11 @@
 // no guest code. It starts each command as its child, in a session of its
 // own, reaps every process that ends up its child, and reports.
 //
+// A command's tree is every process descended from it, kept by a mark fork
+// copies (tgroup.serve_tree), so setsid and double forks stay in it. Only a
+// signal `to: tree` (Stop, a timeout) uses it: what a command leaves running
+// after a normal exit is left alone.
+//
 // Threads: the reader (requests; answers ping and state itself, taking no
 // guest lock), pid 1 (everything else; it never touches a guest pipe), and
 // each command's own task thread, which sets up its stdio and cwd, runs the
@@ -441,12 +446,24 @@ struct cmd {
     pid_t_ pid;             // its process, and its session
     int state;
     uint64_t done_cpu_ms;   // its session's processes that have ended
+    uint64_t tree;          // its processes' tgroup.serve_tree
+    // A signal went to the tree: the entry stays until the tree is empty, so
+    // that a SIGKILL can still reach what outlived the command.
+    bool tree_signalled;
+    bool gone_sent;
+    // px_uptime_ms() from which the tree gets SIGKILL until it is empty, 0 for
+    // never. Set and read on pid 1 only.
+    uint64_t tree_kill_at_ms;
 };
 
 // Taken with pids_lock held, never the other way round; nothing blocks under
 // it (events are written after it is let go).
 static pthread_mutex_t cmds_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct cmd *cmds;
+// On pid 1 only.
+static uint64_t last_tree;
+// A command has a tree_kill_at_ms: pid 1 wakes often enough to keep to it.
+static _Atomic bool tree_kill_pending;
 
 static struct cmd *cmd_find(const char *id) {
     for (struct cmd *c = cmds; c != NULL; c = c->next)
@@ -919,11 +936,15 @@ static void op_exec(struct jv *req, const char *id) {
         return;
     }
     task->group->fs_context = (uint64_t) ctx;
+    // Not the pid: a pid comes back, and a daemon of an old command would then
+    // be in the tree of a new one.
+    task->group->serve_tree = ++last_tree;
 
     struct cmd *cmd = calloc(1, sizeof(*cmd));
     cmd->id = strdup(id);
     cmd->pid = task->pid;
     cmd->state = CMD_STARTING;
+    cmd->tree = task->group->serve_tree;
     pthread_mutex_lock(&cmds_lock);
     cmd->next = cmds;
     cmds = cmd;
@@ -1000,6 +1021,17 @@ static struct usage session_usage(pid_t_ sid, bool mapped) {
     return u;
 }
 
+// With pids_lock: is a process of this tree still running?
+static bool tree_alive(uint64_t tree) {
+    for (dword_t p = 2; p <= MAX_PID; p++) {
+        struct task *t = pid_get_task(p);
+        if (t != NULL && t == t->group->leader && t->group->serve_tree == tree &&
+                !list_empty(&t->group->threads))
+            return true;
+    }
+    return false;
+}
+
 // For the snapshot: which command a task's session is.
 static void state_tag(struct task *t, char *buf, size_t size) {
     if (t->group == NULL)
@@ -1050,10 +1082,13 @@ static void report_ended(struct ended *e) {
                 jb_printf(&b, ",\"code\":%d,\"signal\":null,\"core\":false,\"rc\":%d", code, code);
             jb_printf(&b, ",\"left\":%d,\"cpu_ms\":%llu", u.procs,
                       (unsigned long long) (cmd->done_cpu_ms + u.cpu_ms));
-            if (u.procs == 0)
+            if (u.procs == 0 && !(cmd->tree_signalled && tree_alive(cmd->tree))) {
                 cmd_remove(cmd);
-            else
+            } else {
                 cmd->state = CMD_EXITED;
+                // exit said left=0: nobody waits for a gone
+                cmd->gone_sent = u.procs == 0;
+            }
         }
     }
     pthread_mutex_unlock(&cmds_lock);
@@ -1061,18 +1096,24 @@ static void report_ended(struct ended *e) {
     jb_send(&b);
 }
 
-// Commands whose last background process has now gone.
+// Commands whose last background process has now gone; an entry kept for its
+// tree goes with the tree.
 static void report_gone(void) {
     for (;;) {
         char *id = NULL;
         lock(&pids_lock);
         pthread_mutex_lock(&cmds_lock);
-        for (struct cmd *c = cmds; c != NULL && id == NULL; c = c->next) {
-            if (c->state == CMD_EXITED && session_usage(c->pid, false).procs == 0) {
-                id = c->id;
-                c->id = NULL;
-                cmd_remove(c);
+        struct cmd *next;
+        for (struct cmd *c = cmds; c != NULL && id == NULL; c = next) {
+            next = c->next;
+            if (c->state != CMD_EXITED || session_usage(c->pid, false).procs != 0)
+                continue;
+            if (!c->gone_sent) {
+                c->gone_sent = true;
+                id = strdup(c->id);
             }
+            if (!(c->tree_signalled && tree_alive(c->tree)))
+                cmd_remove(c);
         }
         pthread_mutex_unlock(&cmds_lock);
         unlock(&pids_lock);
@@ -1119,7 +1160,53 @@ static void out_of_memory(void) {
     free(id);
 }
 
+// Trees past their tree_kill_at_ms get SIGKILL again each pass: a process that
+// was forking when the last one went out is only seen now.
+static void sweep_trees(void) {
+    if (!atomic_load(&tree_kill_pending))
+        return;
+    uint64_t now = px_uptime_ms();
+    bool pending = false;
+    for (struct cmd *c = cmds; c != NULL; c = c->next) {
+        if (c->tree_kill_at_ms == 0)
+            continue;
+        pending = true;
+        if (now >= c->tree_kill_at_ms)
+            send_tree_signal(c->tree, SIGKILL_, (struct siginfo_) {.code = SI_KERNEL_});
+    }
+    atomic_store(&tree_kill_pending, pending);
+    report_gone();
+}
+
 // --- other requests ---
+
+// {"to":"tree"}: every process of the command, and with kill_after_ms SIGKILL
+// to whatever of them is still there after that long, the command itself
+// having ended or not.
+static void op_signal_tree(struct jv *req, const char *id, int sig, struct siginfo_ info) {
+    struct jv *after = jget(req, "kill_after_ms");
+    if (after != NULL && (after->type != J_NUM || after->num < 0)) {
+        ev_error(id, 22, "kill_after_ms: expected a number");
+        return;
+    }
+    pthread_mutex_lock(&cmds_lock);
+    struct cmd *cmd = id != NULL ? cmd_find(id) : NULL;
+    bool found = cmd != NULL && cmd->state != CMD_FAILED;
+    pthread_mutex_unlock(&cmds_lock);
+    if (!found) {
+        ev_error(id, -_ESRCH, "%s: nothing left to signal", id ? id : "");
+        return;
+    }
+    cmd->tree_signalled = true;
+    if (sig == SIGKILL_ || after != NULL) {
+        cmd->tree_kill_at_ms = px_uptime_ms() + (sig == SIGKILL_ ? 0 : (uint64_t) after->num);
+        atomic_store(&tree_kill_pending, true);
+    }
+    if (send_tree_signal(cmd->tree, sig, info) == 0)
+        ev_error(id, -_ESRCH, "%s: nothing left to signal", id);
+    else
+        ev_ok(id);
+}
 
 static void op_signal(struct jv *req, const char *id) {
     struct jv *sigv = jget(req, "sig");
@@ -1132,6 +1219,10 @@ static void op_signal(struct jv *req, const char *id) {
     }
     int sig = (int) sigv->num;
     struct siginfo_ info = {.code = SI_USER_};
+    if (strcmp(to, "tree") == 0) {
+        op_signal_tree(req, id, sig, info);
+        return;
+    }
     if (strcmp(to, "all") == 0) {
         int err = send_all_signal(sig, info);
         if (err < 0)
@@ -1158,7 +1249,7 @@ static void op_signal(struct jv *req, const char *id) {
                 send_signal(task, sig, info);
             unlock(&pids_lock);
         } else {
-            ev_error(id, 22, "to: expected process, group, session or all");
+            ev_error(id, 22, "to: expected process, group, session, tree or all");
             return;
         }
     }
@@ -1413,7 +1504,8 @@ noreturn void serve_main(void) {
     struct jb b = {0};
     jb_printf(&b, "{\"ev\":\"ready\",\"proto\":1,\"pid\":%lu,\"version\":", px_host_pid());
     jb_str(&b, ISH_COMMIT);
-    jb_printf(&b, ",\"engine\":\"%s\",\"guest_arch\":\"%s\",\"host_arch\":\"%s\",\"exec_binds\":true,\"rootfs\":",
+    jb_printf(&b, ",\"engine\":\"%s\",\"guest_arch\":\"%s\",\"host_arch\":\"%s\",\"exec_binds\":true,"
+                  "\"tree_signal\":true,\"rootfs\":",
               ish_engine(), ish_guest_arch(), ish_host_arch());
     jb_str(&b, rootfs);
     jb_send(&b);
@@ -1428,7 +1520,15 @@ noreturn void serve_main(void) {
         while (reqs == NULL && endeds == NULL && !q_eof && !atomic_load(&braked)) {
             struct timespec until;
             clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_sec += 1;
+            if (atomic_load(&tree_kill_pending)) {
+                until.tv_nsec += 100 * 1000 * 1000;
+                if (until.tv_nsec >= 1000 * 1000 * 1000) {
+                    until.tv_nsec -= 1000 * 1000 * 1000;
+                    until.tv_sec += 1;
+                }
+            } else {
+                until.tv_sec += 1;
+            }
             if (pthread_cond_timedwait(&q_cond, &q_lock, &until) != 0)
                 break;
         }
@@ -1439,6 +1539,7 @@ noreturn void serve_main(void) {
         pthread_mutex_unlock(&q_lock);
 
         handle_ended();
+        sweep_trees();
         if (atomic_exchange(&braked, false))
             out_of_memory();
         while (r != NULL) {

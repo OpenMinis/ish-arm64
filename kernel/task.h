@@ -208,6 +208,12 @@ struct tgroup {
     pid_t_ sid, pgid;
     struct list session;
     struct list pgroup;
+#ifdef _WIN32
+    // ish.exe --serve: the command this process descends from, 0 for none.
+    // Set on a command's first process and copied by fork; setsid and being
+    // reparented to init leave it alone, unlike sid and ppid.
+    uint64_t serve_tree;
+#endif
 
     bool stopped;
     cond_t stopped_cond;

@@ -190,6 +190,25 @@ int send_session_signal(dword_t sid, int sig, struct siginfo_ info) {
     return sent > 0 ? 0 : _ESRCH;
 }
 
+#ifdef _WIN32
+// every process descended from one command of ish.exe --serve, wherever it
+// went (setsid, a double fork); how many got it
+int send_tree_signal(uint64_t tree, int sig, struct siginfo_ info) {
+    int sent = 0;
+    lock(&pids_lock);
+    for (dword_t p = 2; p <= MAX_PID; p++) {
+        struct task *t = pid_get_task(p);
+        if (t == NULL || t != t->group->leader || t->group->serve_tree != tree ||
+                list_empty(&t->group->threads))
+            continue;
+        send_signal(process_signal_target(t, sig), sig, info);
+        sent++;
+    }
+    unlock(&pids_lock);
+    return sent;
+}
+#endif
+
 // every process but init
 int send_all_signal(int sig, struct siginfo_ info) {
     lock(&pids_lock);
