@@ -28,8 +28,8 @@ def check(what, ok):
 
 class Serve:
     def __init__(self, exe, rootfs):
-        self.p = subprocess.Popen([exe, "--serve", "-f", rootfs], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.p = subprocess.Popen([exe, "-f", rootfs, "--serve"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
         self.events = queue.Queue()
         threading.Thread(target=self._read, daemon=True).start()
         self.ready = self.wait(lambda e: e.get("ev") == "ready", 30)
@@ -130,6 +130,16 @@ def main():
     check("ish's own SIGKILL takes it after the grace", s.gone_within(6031, 5))
     time.sleep(0.5)
     check("the command's entry went with its tree", c not in s.tracked())
+
+    print("a child in the session that ignores SIGTERM: gone still comes (the client stops tracking, idle-out can run)")
+    c = s.start("sh -c 'trap \"\" TERM; exec sleep 6036' & sleep 6037")
+    time.sleep(1)
+    s.send(op="signal", id=c, sig=15, to="tree", kill_after_ms=1000)
+    e = s.exit_of(c)
+    check("exit counts it as left", e is not None and e.get("left", 0) >= 1)
+    check("gone follows the SIGKILL", s.wait(lambda v: v.get("id") == c and v.get("ev") == "gone", 5) is not None)
+    time.sleep(0.5)
+    check("the entry went too", c not in s.tracked())
 
     print("a command that ignores SIGTERM, then SIGKILL (a client's escalation)")
     c = s.start("trap '' TERM; setsid sleep 6041 & sleep 6042")
