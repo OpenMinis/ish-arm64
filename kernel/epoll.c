@@ -40,17 +40,32 @@ __attribute__((packed))
 #define EPOLLET_ (1 << 31)
 #define EPOLLONESHOT_ (1 << 30)
 
+static int epoll_ctl_held(struct fd *epoll, int_t op, struct fd *fd, fd_t f, addr_t event_addr);
+
 int_t sys_epoll_ctl(fd_t epoll_f, int_t op, fd_t f, addr_t event_addr) {
     STRACE("epoll_ctl(%d, %d, %d, %#x)", epoll_f, op, f, event_addr);
-    struct fd *epoll = f_get(epoll_f);
+    // [T-ish-poll-member-race] Both fds are held for the whole call: a
+    // concurrent close() of either number used to free the epoll set (or the
+    // member) while this call was adding to it.
+    struct fd *epoll = f_get_retained(epoll_f);
     if (epoll == NULL)
         return _EBADF;
-    if (epoll->ops != &epoll_ops)
+    if (epoll->ops != &epoll_ops) {
+        fd_close(epoll);
         return _EINVAL;
-    struct fd *fd = f_get(f);
-    if (fd == NULL)
+    }
+    struct fd *fd = f_get_retained(f);
+    if (fd == NULL) {
+        fd_close(epoll);
         return _EBADF;
+    }
+    int err = epoll_ctl_held(epoll, op, fd, f, event_addr);
+    fd_close(fd);
+    fd_close(epoll);
+    return err;
+}
 
+static int epoll_ctl_held(struct fd *epoll, int_t op, struct fd *fd, fd_t f, addr_t event_addr) {
     // Regular files (and directories) are not pollable: they are always
     // "ready", so Linux rejects adding them to an epoll set with EPERM. iSH
     // used to accept them, which makes bun's fs.WriteStream take its polling
@@ -90,14 +105,24 @@ static int epoll_callback(void *context, int types, union poll_fd_info info) {
     return 1;
 }
 
+static int epoll_wait_held(struct fd *epoll, addr_t events_addr, int_t max_events, int_t timeout);
+
 int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t timeout) {
     STRACE("epoll_wait(%d, %#x, %d, %d)", epoll_f, events_addr, max_events, timeout);
-    struct fd *epoll = f_get(epoll_f);
+    // [T-ish-poll-member-race] Held across the wait: poll_wait() drops
+    // poll->lock while it sleeps, and a close(epfd) from another thread then
+    // freed the set under the sleeper, which woke up writing into it.
+    struct fd *epoll = f_get_retained(epoll_f);
     if (epoll == NULL)
         return _EBADF;
-    if (epoll->ops != &epoll_ops)
-        return _EINVAL;
+    int res = epoll->ops == &epoll_ops
+        ? epoll_wait_held(epoll, events_addr, max_events, timeout)
+        : _EINVAL;
+    fd_close(epoll);
+    return res;
+}
 
+static int epoll_wait_held(struct fd *epoll, addr_t events_addr, int_t max_events, int_t timeout) {
     struct timespec timeout_ts;
     if (timeout >= 0) {
         timeout_ts.tv_sec = timeout / 1000;
