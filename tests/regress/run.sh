@@ -172,6 +172,22 @@ else
         status=1
     fi
 
+    # poll() / select() racing close() of the same fds must not crash the
+    # emulator (FIX-261109-13: the fd reference used to be taken after
+    # files->lock was dropped).
+    echo
+    echo "########## poll / select vs close ##########"
+    if "$CC_GUEST" -static -O0 -Wall -pthread -o "$GUEST_ROOT/tmp/regress_poll_close_race" \
+            tests/regress/regress_poll_close_race.c; then
+        out=$(timeout 120 "$ISH" "$MOUNT_FLAG" "$ROOTFS" /tmp/regress_poll_close_race 5 4 2>/dev/null | tail -1)
+        echo "$out"
+        echo "$out" | grep -q '^PASS' || status=1
+        rm -f "$GUEST_ROOT/tmp/regress_poll_close_race"
+    else
+        echo "failed to build regress_poll_close_race" >&2
+        status=1
+    fi
+
 fi
 
 # Signals against blocking calls: the output must equal the expected file,
