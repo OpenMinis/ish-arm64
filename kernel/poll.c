@@ -68,12 +68,18 @@ static dword_t select_common(fd_t nfds, addr_t readfds_addr, addr_t writefds_add
                     bit_test(i, readfds) ? "r" : "",
                     bit_test(i, writefds) ? "w" : "",
                     bit_test(i, exceptfds) ? "x" : "");
-            struct fd *fd = f_get(i);
+            // [FIX-261109-06] Taken with the reference inside files->lock:
+            // a close() of i from another thread between f_get() and
+            // poll_add_fd() freed the fd poll_add_fd() then linked into the
+            // set. Once linked, a later close is unlinked by
+            // poll_cleanup_fd(), so the reference is only held for the add.
+            struct fd *fd = f_get_retained(i);
             if (fd == NULL) {
                 poll_destroy(poll);
                 return _EBADF;
             }
             poll_add_fd(poll, fd, i, events, (union poll_fd_info) i);
+            fd_close(fd);
         }
     }
     STRACE("...\n");
@@ -156,10 +162,12 @@ static dword_t poll_common(addr_t fds, dword_t nfds, struct timespec *timeout) {
 
     struct fd *files[nfds];
     for (unsigned i = 0; i < nfds; i++) {
-        files[i] = f_get(polls[i].fd);
-        if (files[i] != NULL)
-            // FIXME it might have been closed by now by another thread
-            fd_retain(files[i]);
+        // [FIX-261109-06] The reference is taken inside files->lock. It was
+        // taken after f_get() returned (the old FIXME): a close() of the
+        // number in between freed the fd, and this poll went on with it -
+        // on Windows realfs_poll() then asserted on POLLNVAL for the closed
+        // host fd and the whole ish.exe aborted.
+        files[i] = f_get_retained(polls[i].fd);
         // clear revents, which is reused to mark whether a pollfd has been added or not
         polls[i].revents = 0;
     }
