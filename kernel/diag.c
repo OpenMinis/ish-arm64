@@ -387,13 +387,33 @@ size_t ish_diag_describe(char *buf, size_t size) {
             (unsigned long long) j[0], (unsigned long long) j[1], (unsigned long long) j[2],
             (unsigned long long) j[3], (unsigned long long) j[4], (unsigned long long) j[5]);
     }
-    for (int i = 0; i < DIAG_COUNTER_COUNT; i++)
-        PUT(" %s=%llu", counter_names[i], (unsigned long long) atomic_load_explicit(&ish_diag_counters[i], memory_order_relaxed));
+    for (int i = 0; i < DIAG_COUNTER_COUNT; i++) {
+        uint64_t v = atomic_load_explicit(&ish_diag_counters[i], memory_order_relaxed);
+        // [INV-261109-03] A gauge that is decremented: signed, so a negative
+        // value (a thread end without a counted start) still parses.
+        if (i == DIAG_TIMER_THREADS_LIVE)
+            PUT(" %s=%lld", counter_names[i], (long long) v);
+        else
+            PUT(" %s=%llu", counter_names[i], (unsigned long long) v);
+    }
     PUT("\n");
 #undef PUT
     if (n >= size && size > 0)
         n = size - 1;
     return n;
+}
+
+// [INV-261109-03] Counters the crash line always carries, zero or not.
+static bool counter_always_shown(int i) {
+    switch (i) {
+    case DIAG_VALVE_LEAKED: case DIAG_DEFERRED_RELEASED: case DIAG_EXIT_GROUPS:
+    case DIAG_TIMER_CREATE: case DIAG_TIMER_DELETE: case DIAG_TIMER_LEAKED_AT_EXIT:
+    case DIAG_TIMER_THREADS_LIVE: case DIAG_TIMER_STALE_SKIPPED: case DIAG_TIMER_STRUCT_BAD:
+    case DIAG_TIMER_INHERITED_OPS:
+        return true;
+    default:
+        return false;
+    }
 }
 
 // MARK: - Crash time (async-signal-safe)
@@ -484,9 +504,13 @@ void ish_diag_write_crash(int fd) {
     }
     for (int i = 0; i < DIAG_COUNTER_COUNT; i++) {
         uint64_t v = atomic_load_explicit(&ish_diag_counters[i], memory_order_relaxed);
-        if (v == 0)
+        // [INV-261109-03] Zero counters are left out, except these: their
+        // absence read as "this build has no such counter" (valve_leaked in
+        // the 11-09 crash), when it meant 0.
+        if (v == 0 && !counter_always_shown(i))
             continue;
-        c_str(" "); c_str(counter_names[i]); c_str("="); c_u64(v);
+        c_str(" "); c_str(counter_names[i]); c_str("=");
+        if (i == DIAG_TIMER_THREADS_LIVE) c_i64((int64_t) v); else c_u64(v);
     }
     c_str("\n");
     c_flush(fd);

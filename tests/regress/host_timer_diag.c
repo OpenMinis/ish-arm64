@@ -105,6 +105,10 @@ int main(void) {
     fputs(dump, stdout);
     check(strstr(dump, " send_signal_oob=3") != NULL, "counter line: send_signal_oob=3");
     check(strstr(dump, " timer_leaked_at_exit=3") != NULL, "counter line: timer_leaked_at_exit=3");
+    // [INV-261109-03] Shown even at zero, so a missing key means an older build.
+    check(strstr(dump, " valve_leaked=0") && strstr(dump, " deferred_released=0") && strstr(dump, " timer_struct_bad=0"),
+          "counter line: valve_leaked, deferred_released, timer_struct_bad shown at 0");
+    check(strstr(dump, " unmap_calls=") == NULL, "counter line: other zero counters still left out");
     check(strstr(dump, "send_signal_oob pid=-1 thread=") && strstr(dump, " a=1082214400 b=4242"),
           "event: send_signal_oob a=sig b=target pid");
     check(strstr(dump, "timer_leak_exit") && strstr(dump, " a=3 b=1\n"), "event: timer_leak_exit a=3 b=1 (one inherited)");
