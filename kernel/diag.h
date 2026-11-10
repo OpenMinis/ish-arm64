@@ -56,6 +56,10 @@ enum ish_diag_counter {
     DIAG_SEND_SIGNAL_OOB,       // send_signal refused a signal number out of range
     DIAG_TIMER_LEAKED_AT_EXIT,  // posix timers still allocated when their group died
     DIAG_TIMER_THREADS_LIVE,    // timer threads running now (started minus ended)
+    // [INV-261109-03] (appended: earlier keys keep their order)
+    DIAG_TIMER_STALE_SKIPPED,   // fires dropped: the slot is no longer this timer's (its group died)
+    DIAG_TIMER_STRUCT_BAD,      // timer_free / timer_set on a freed or reused struct timer, skipped
+    DIAG_TIMER_INHERITED_OPS,   // timer syscalls on a slot copied by fork (the timer is the parent's)
     DIAG_COUNTER_COUNT
 };
 
@@ -124,6 +128,26 @@ enum ish_diag_timer_call {
 // group dies; a fire that does not find it is recorded as stale.
 #define DIAG_TIMER_MAGIC 0x54494d52u    // "TIMR"
 uint32_t ish_diag_timer_seq_next(void);
+// [INV-261109-03] The timers' lifecycle, for finding who frees a timer or its
+// group while the timer thread still uses it: the last 32 creates, deletes,
+// deaths and refusals, each with the slot, struct timer and group addresses
+// and a short backtrace, written by the crash handler. No lock, no allocation.
+enum ish_diag_timer_life {
+    DIAG_TL_CREATE = 1,     // timer_create made a timer in this slot
+    DIAG_TL_DELETE,         // timer_delete freed it
+    DIAG_TL_GROUP_DEAD,     // its group died with it still allocated (x: 1 if inherited)
+    DIAG_TL_GROUP_FREE,     // reap freed a group that had such slots (x: how many)
+    DIAG_TL_INHERITED_OP,   // a syscall on a slot fork copied (x: enum ish_diag_timer_call)
+    DIAG_TL_STALE_SKIP,     // a fire dropped: x = magic seen, timer = the firing timer
+    DIAG_TL_STRUCT_BAD,     // timer_free / timer_set on a dead struct timer (id: call, x: magic)
+};
+struct posix_timer;
+struct timer;
+void ish_diag_timer_life(enum ish_diag_timer_life kind, const void *slot, const struct timer *timer,
+                         const struct tgroup *group, int id, int64_t x);
+void ish_diag_timer_struct_bad(const struct timer *timer, enum ish_diag_timer_call call, uint32_t magic);
+// The fire is going to be dropped (the slot is not the firing timer's).
+void ish_diag_timer_stale_skip(const struct posix_timer *slot, const struct timer *firing);
 // Called by posix_timer_callback on every fire, before it sends the signal:
 // one record in a 16-slot ring of its own (so frequent timers cannot push
 // the rarer events out of the main ring); no lock, no allocation, no output.

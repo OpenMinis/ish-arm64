@@ -1,4 +1,7 @@
 // [FEAT-261027-15] See diag.h.
+#if __APPLE__
+#include <execinfo.h>
+#endif
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -8,6 +11,7 @@
 #include <unistd.h>
 #include "kernel/diag.h"
 #include "kernel/task.h"
+#include "util/timer.h"
 
 _Atomic uint64_t ish_diag_counters[DIAG_COUNTER_COUNT];
 _Atomic int64_t ish_diag_live_node, ish_diag_peak_procs, ish_diag_peak_node;
@@ -57,6 +61,9 @@ static const char *const counter_names[DIAG_COUNTER_COUNT] = {
     [DIAG_SEND_SIGNAL_OOB] = "send_signal_oob",
     [DIAG_TIMER_LEAKED_AT_EXIT] = "timer_leaked_at_exit",
     [DIAG_TIMER_THREADS_LIVE] = "timer_threads_live",
+    [DIAG_TIMER_STALE_SKIPPED] = "timer_stale_skipped",
+    [DIAG_TIMER_STRUCT_BAD] = "timer_struct_bad",
+    [DIAG_TIMER_INHERITED_OPS] = "timer_inherited_ops",
 };
 
 static const char *const event_names[] = {
@@ -145,6 +152,9 @@ struct diag_fire {
     int32_t timer_id, signal, thread_pid;
     uint32_t tgroup_lo, timer_seq, magic;
     uint8_t tgroup_null;
+    // [INV-261109-03] Where the fire went: the slot (inside its group), and
+    // the struct timer that fired, whose slot it should be.
+    uint64_t slot, firing, slot_timer;
 };
 static struct diag_fire fire_ring[FIRE_RING];
 static _Atomic uint64_t fire_head;
@@ -164,6 +174,9 @@ void ish_diag_timer_fire(const struct posix_timer *timer) {
     f->tgroup_null = timer->tgroup == NULL;
     f->timer_seq = timer->seq;
     f->magic = magic;
+    f->slot = (uint64_t) (uintptr_t) timer;
+    f->firing = (uint64_t) (uintptr_t) timer_firing();
+    f->slot_timer = (uint64_t) (uintptr_t) timer->timer;
     atomic_store_explicit(&f->seq, idx + 1, memory_order_release);
     if (magic != DIAG_TIMER_MAGIC)
         ish_diag_event(DIAG_EV_TIMER_STALE, timer->signal, magic);
@@ -181,11 +194,64 @@ void ish_diag_timer_leak(struct tgroup *group) {
             inherited++;
         // Gone from here on: a later fire through this slot reads as stale.
         __atomic_store_n(&t->magic, 0, __ATOMIC_RELAXED);
+        ish_diag_timer_life(DIAG_TL_GROUP_DEAD, t, t->timer, group, i,
+                            t->tgroup != NULL && t->tgroup != group);
     }
     if (left == 0)
         return;
     ish_diag_add(DIAG_TIMER_LEAKED_AT_EXIT, (uint64_t) left);
     ish_diag_event(DIAG_EV_TIMER_LEAK_EXIT, left, inherited);
+}
+
+// [INV-261109-03] The timer lifecycle ring (diag.h).
+#define LIFE_RING 32
+#define LIFE_BT 6
+struct diag_life {
+    _Atomic uint64_t seq;   // index + 1 once written; 0 while being written
+    uint64_t ms;
+    uint64_t slot, timer, group;
+    int64_t x;
+    int32_t pid, id;
+    uint16_t kind;
+    uint16_t frames;
+    uint64_t bt[LIFE_BT];
+};
+static struct diag_life life_ring[LIFE_RING];
+static _Atomic uint64_t life_head;
+
+void ish_diag_timer_life(enum ish_diag_timer_life kind, const void *slot, const struct timer *timer,
+                         const struct tgroup *group, int id, int64_t x) {
+    uint64_t idx = atomic_fetch_add_explicit(&life_head, 1, memory_order_relaxed);
+    struct diag_life *l = &life_ring[idx % LIFE_RING];
+    atomic_store_explicit(&l->seq, 0, memory_order_relaxed);
+    l->ms = now_ms();
+    l->slot = (uint64_t) (uintptr_t) slot;
+    l->timer = (uint64_t) (uintptr_t) timer;
+    l->group = (uint64_t) (uintptr_t) group;
+    l->x = x;
+    l->pid = current ? (int32_t) current->pid : -1;
+    l->id = id;
+    l->kind = (uint16_t) kind;
+    l->frames = 0;
+#if __APPLE__
+    // Darwin's backtrace() walks frame pointers; it does not allocate.
+    void *frames[LIFE_BT + 1];
+    int n = backtrace(frames, LIFE_BT + 1);
+    for (int i = 1; i < n; i++)   // drop this function's own frame
+        l->bt[l->frames++] = (uint64_t) (uintptr_t) frames[i];
+#endif
+    atomic_store_explicit(&l->seq, idx + 1, memory_order_release);
+}
+
+void ish_diag_timer_struct_bad(const struct timer *timer, enum ish_diag_timer_call call, uint32_t magic) {
+    ish_diag_add(DIAG_TIMER_STRUCT_BAD, 1);
+    ish_diag_timer_life(DIAG_TL_STRUCT_BAD, NULL, timer, NULL, (int) call, magic);
+}
+
+void ish_diag_timer_stale_skip(const struct posix_timer *slot, const struct timer *firing) {
+    ish_diag_add(DIAG_TIMER_STALE_SKIPPED, 1);
+    ish_diag_timer_life(DIAG_TL_STALE_SKIP, slot, firing, NULL, -1,
+                        __atomic_load_n(&slot->magic, __ATOMIC_RELAXED));
 }
 
 // MARK: - Thread ownership
@@ -289,6 +355,15 @@ void ish_diag_exec(int is_node) {
 
 void ish_diag_group_gone(struct tgroup *group) {
     group_node(group, false);
+    // [INV-261109-03] Called just before reap frees the group: if it still
+    // has timer slots, their threads will fire into freed memory - note the
+    // address, so a fire record's slot can be matched to it.
+    int64_t left = 0;
+    for (int i = 0; i < TIMERS_MAX; i++)
+        if (group->posix_timers[i].timer != NULL)
+            left++;
+    if (left > 0)
+        ish_diag_timer_life(DIAG_TL_GROUP_FREE, NULL, NULL, group, -1, left);
 }
 
 void ish_diag_group_forked(struct tgroup *group) {
@@ -346,6 +421,14 @@ static void c_u64(uint64_t v) {
 }
 static void c_i64(int64_t v) {
     if (v < 0) { c_str("-"); c_u64((uint64_t) 0 - (uint64_t) v); } else c_u64((uint64_t) v);
+}
+static void c_hex(uint64_t v) {
+    char tmp[16];
+    int i = 0;
+    do { tmp[i++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v && i < 16);
+    c_str("0x");
+    while (i > 0 && crash_len < sizeof(crash_buf) - 1)
+        crash_buf[crash_len++] = tmp[--i];
 }
 static void c_flush(int fd) {
     size_t off = 0;
@@ -443,6 +526,44 @@ void ish_diag_write_crash(int fd) {
         c_str(" tgroup_lo="); c_u64(f->tgroup_lo);
         c_str(" tgroup_null="); c_u64(f->tgroup_null);
         c_str(" magic_ok="); c_u64(f->magic == DIAG_TIMER_MAGIC);
+        // [INV-261109-03]
+        c_str(" magic="); c_hex(f->magic);
+        c_str(" slot="); c_hex(f->slot);
+        c_str(" firing="); c_hex(f->firing);
+        c_str(" slot_timer="); c_hex(f->slot_timer);
+        c_str(" owner_ok="); c_u64(f->firing != 0 && f->firing == f->slot_timer);
+        c_str("\n");
+        if (crash_len > sizeof(crash_buf) - 256)
+            c_flush(fd);
+    }
+    c_flush(fd);
+    // [INV-261109-03] The timer lifecycle, oldest first. Addresses are host
+    // addresses (bt: symbolicate against the binary's load address).
+    static const char *const life_names[] = {
+        [DIAG_TL_CREATE] = "create", [DIAG_TL_DELETE] = "delete",
+        [DIAG_TL_GROUP_DEAD] = "group_dead", [DIAG_TL_GROUP_FREE] = "group_free",
+        [DIAG_TL_INHERITED_OP] = "inherited_op", [DIAG_TL_STALE_SKIP] = "stale_skip",
+        [DIAG_TL_STRUCT_BAD] = "struct_bad",
+    };
+    uint64_t lhead = atomic_load_explicit(&life_head, memory_order_acquire);
+    uint64_t lfirst = lhead > LIFE_RING ? lhead - LIFE_RING : 0;
+    for (uint64_t idx = lfirst; idx < lhead; idx++) {
+        struct diag_life *l = &life_ring[idx % LIFE_RING];
+        if (atomic_load_explicit(&l->seq, memory_order_acquire) != idx + 1)
+            continue;
+        c_str("[ish-diag] timer_life "); c_u64(l->ms); c_str("ms ");
+        c_str(l->kind < sizeof(life_names) / sizeof(life_names[0]) && life_names[l->kind] ? life_names[l->kind] : "?");
+        c_str(" pid="); c_i64(l->pid);
+        c_str(" id="); c_i64(l->id);
+        c_str(" slot="); c_hex(l->slot);
+        c_str(" timer="); c_hex(l->timer);
+        c_str(" group="); c_hex(l->group);
+        c_str(" x="); c_i64(l->x);
+        c_str(" bt=");
+        for (int i = 0; i < l->frames && i < LIFE_BT; i++) {
+            if (i) c_str(",");
+            c_hex(l->bt[i]);
+        }
         c_str("\n");
         if (crash_len > sizeof(crash_buf) - 256)
             c_flush(fd);

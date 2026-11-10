@@ -181,6 +181,11 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
         unlock(&group->tty->lock);
     }
     group->itimer = NULL;
+    // [INV-261109-03] The copied slots still name the parent's timers, which
+    // never fire into this copy: mark them so a fire that lands here (the
+    // parent's group freed, this block reused) is dropped, not delivered.
+    for (int i = 0; i < TIMERS_MAX; i++)
+        __atomic_store_n(&group->posix_timers[i].magic, 0, __ATOMIC_RELAXED);
     group->doing_group_exit = false;
     group->children_rusage = (struct rusage_) {};
     {

@@ -394,6 +394,18 @@ static void posix_timer_callback(struct posix_timer *timer) {
     // [FIX-261031-04] Record the fire (and a fire on a slot whose timer is
     // gone) before anything else reads the slot. Observation only.
     ish_diag_timer_fire(timer);
+    // [INV-261109-03] The slot lives inside its group, and the group is freed
+    // at reap while this timer's thread keeps running (timers are not freed
+    // when their group dies). After that the slot is freed memory, often a
+    // new group's copy of its parent's slots: firing anyway sent the
+    // parent's signal to the parent (tests/regress stale). Use the slot only
+    // while it is still this timer's live slot; the compares read, never
+    // follow, what is there.
+    if (__atomic_load_n(&timer->magic, __ATOMIC_RELAXED) != DIAG_TIMER_MAGIC ||
+            timer->timer != timer_firing()) {
+        ish_diag_timer_stale_skip(timer, timer_firing());
+        return;
+    }
     if (timer->tgroup == NULL)
         return;
     struct siginfo_ info = {
@@ -491,6 +503,7 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
         timer->tgroup = group;
         timer->thread_pid = group->leader->pid;
     }
+    ish_diag_timer_life(DIAG_TL_CREATE, timer, timer->timer, group, (int) timer_id, sigev.method);
     unlock(&group->lock);
     ish_diag_add(DIAG_TIMER_CREATE, 1);
     return 0;
@@ -500,6 +513,17 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
 // (empty) names a slot with no timer: recorded, and the caller says EINVAL.
 static void timer_id_refused(dword_t timer_id, enum ish_diag_timer_call call, bool empty) {
     ish_diag_event(DIAG_EV_TIMER_OOB, (int32_t) timer_id, call + (empty ? DIAG_TIMER_SLOT_EMPTY : 0));
+}
+
+// [INV-261109-03] fork copies posix_timers[] with the parent's struct timer
+// pointers in it, so a child's call on such a slot acts on the parent's
+// timer (timer_delete frees it under the parent). Recorded only; the call
+// goes on as before. Call with the group locked and pt->timer set.
+static void timer_note_inherited(struct posix_timer *pt, enum ish_diag_timer_call call) {
+    if (pt->timer->data == pt)
+        return;
+    ish_diag_add(DIAG_TIMER_INHERITED_OPS, 1);
+    ish_diag_timer_life(DIAG_TL_INHERITED_OP, pt, pt->timer, current->group, pt->timer_id, call);
 }
 
 int_t sys_timer_settime(dword_t timer_id, int_t flags, addr_t new_value_addr, addr_t old_value_addr) {
@@ -522,6 +546,7 @@ int_t sys_timer_settime(dword_t timer_id, int_t flags, addr_t new_value_addr, ad
         timer_id_refused(timer_id, DIAG_TIMER_CALL_SETTIME, true);
         return _EINVAL;
     }
+    timer_note_inherited(timer, DIAG_TIMER_CALL_SETTIME);
     struct timer_spec spec = timer_spec_to_real(value);
     struct timer_spec old_spec;
     if (flags & TIMER_ABSTIME_) {
@@ -554,6 +579,7 @@ int_t sys_timer_gettime(dword_t timer_id, addr_t curr_value_addr) {
         unlock(&current->group->lock);
         return _EINVAL;
     }
+    timer_note_inherited(pt, DIAG_TIMER_CALL_GETTIME);
 
     struct timer_spec spec;
     spec.interval = pt->timer->interval;
@@ -587,6 +613,7 @@ int_t sys_timer_getoverrun(dword_t timer_id) {
         unlock(&current->group->lock);
         return _EINVAL;
     }
+    timer_note_inherited(pt, DIAG_TIMER_CALL_GETOVERRUN);
     unlock(&current->group->lock);
     return 0;
 }
@@ -608,6 +635,8 @@ int_t sys_timer_delete(dword_t timer_id) {
         timer_id_refused(timer_id, DIAG_TIMER_CALL_DELETE, true);
         return _EINVAL;
     }
+    timer_note_inherited(timer, DIAG_TIMER_CALL_DELETE);
+    ish_diag_timer_life(DIAG_TL_DELETE, timer, timer->timer, current->group, (int) timer_id, 0);
     __atomic_store_n(&timer->magic, 0, __ATOMIC_RELAXED);
     timer_free(timer->timer);
     timer->timer = NULL;
