@@ -64,7 +64,14 @@ struct timer {
     lock_t lock;
 
     bool dead; // set by timer_free, the thread will free the timer if this is set when it finishes
+    // [INV-261109-03] TIMER_LIVE_MAGIC from timer_new until it is freed; the
+    // block is then poisoned (TIMER_DEAD_MAGIC, 0xDE fill), so a later
+    // timer_free / timer_set through a stale pointer is caught and skipped
+    // instead of locking and freeing memory someone else may own.
+    uint32_t magic;
 };
+#define TIMER_LIVE_MAGIC 0x4c524d54u    // "TMRL"
+#define TIMER_DEAD_MAGIC 0xdeadf7eeu
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data);
 void timer_free(struct timer *timer);
@@ -77,5 +84,8 @@ struct timer_spec {
     struct timespec interval;
 };
 int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *oldspec);
+// [INV-261109-03] The timer whose callback this thread is running (NULL
+// outside a callback), so a callback can check its data still belongs to it.
+struct timer *timer_firing(void);
 
 #endif

@@ -1,9 +1,25 @@
 #include <stdlib.h>
+#include <string.h>
 #include <signal.h>
 #include <time.h>
 #include "util/timer.h"
 #include "misc.h"
 #include "kernel/diag.h"
+#include "kernel/errno.h"
+
+// [INV-261109-03] Set by timer_thread around the callback.
+static __thread struct timer *firing;
+struct timer *timer_firing(void) {
+    return firing;
+}
+
+// Fill the block before it goes back to malloc: a stale user then reads
+// TIMER_DEAD_MAGIC (or whatever reused the block), never a live-looking timer.
+static void timer_poison_free(struct timer *timer) {
+    memset(timer, 0xde, sizeof(*timer));
+    timer->magic = TIMER_DEAD_MAGIC;
+    free(timer);
+}
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data) {
 //    assert(clockid == CLOCK_MONOTONIC || clockid == CLOCK_REALTIME);
@@ -15,10 +31,18 @@ struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data
     timer->thread_running = false;
     lock_init(&timer->lock);
     timer->dead = false;
+    timer->magic = TIMER_LIVE_MAGIC;
     return timer;
 }
 
 void timer_free(struct timer *timer) {
+    // [INV-261109-03] A freed (poisoned) or reused block: do not lock or free
+    // it a second time, record who tried.
+    uint32_t magic = __atomic_load_n(&timer->magic, __ATOMIC_RELAXED);
+    if (magic != TIMER_LIVE_MAGIC) {
+        ish_diag_timer_struct_bad(timer, DIAG_TIMER_CALL_DELETE, magic);
+        return;
+    }
     lock(&timer->lock);
     timer->active = false;
     if (timer->thread_running) {
@@ -27,7 +51,7 @@ void timer_free(struct timer *timer) {
         unlock(&timer->lock);
     } else {
         unlock(&timer->lock);
-        free(timer);
+        timer_poison_free(timer);
     }
 }
 
@@ -48,8 +72,11 @@ static void *timer_thread(void *param) {
             lock(&timer->lock);
             remaining = timespec_subtract(timer->end, timespec_now(timer->clockid));
         }
-        if (timer->active)
+        if (timer->active) {
+            firing = timer;
             timer->callback(timer->data);
+            firing = NULL;
+        }
         if (timer->active && timespec_positive(timer->interval)) {
             timer->start = timer->end;
             timer->end = timespec_add(timer->start, timer->interval);
@@ -60,13 +87,18 @@ static void *timer_thread(void *param) {
     timer->thread_running = false;
     ish_diag_add(DIAG_TIMER_THREADS_LIVE, (uint64_t) -1);   // [FIX-261031-04]
     if (timer->dead)
-        free(timer);
+        timer_poison_free(timer);
     else
         unlock(&timer->lock);
     return NULL;
 }
 
 int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *oldspec) {
+    uint32_t magic = __atomic_load_n(&timer->magic, __ATOMIC_RELAXED);
+    if (magic != TIMER_LIVE_MAGIC) {   // [INV-261109-03] see timer_free
+        ish_diag_timer_struct_bad(timer, DIAG_TIMER_CALL_SETTIME, magic);
+        return _EINVAL;
+    }
     lock(&timer->lock);
     struct timespec now = timespec_now(timer->clockid);
     if (oldspec != NULL) {

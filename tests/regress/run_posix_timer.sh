@@ -90,15 +90,19 @@ else
     echo "  SKIP  host checks: no libish.a next to $ISH"
 fi
 
-for c in signo ids normal thread_id diag leak; do
+for c in signo ids normal thread_id diag leak stale; do
     echo
     echo "########## posix timer: $c ##########"
     if [ "$HAS_DIAG" -eq 0 ] && { [ "$c" = diag ] || [ "$c" = leak ]; }; then
         echo "  SKIP  $c: reads /proc/ish/diag"
         continue
     fi
-    "$TIMEOUT" 20 "$ISH" -r "$ROOTFS" /tmp/regress_posix_timer_bounds "$c"
+    out=$("$TIMEOUT" 20 "$ISH" -r "$ROOTFS" /tmp/regress_posix_timer_bounds "$c")
     rc=$?
+    printf '%s\n' "$out"
+    # iSH does not pass the guest's exit status on, so a failed check would
+    # otherwise read as a pass: go by what the case printed.
+    case "$out" in *"  FAIL  "*) status=1 ;; esac
     case "$rc" in
         0) ;;
         124) echo "  FAIL  $c: hung (no exit within 20 s)"; status=1 ;;

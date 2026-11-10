@@ -13,6 +13,8 @@
 #include "kernel/task.h"
 #include "kernel/signal.h"
 #include "kernel/diag.h"
+#include "kernel/errno.h"
+#include "util/timer.h"
 
 static int failures;
 static void check(int ok, const char *what) {
@@ -107,10 +109,34 @@ int main(void) {
           "event: send_signal_oob a=sig b=target pid");
     check(strstr(dump, "timer_leak_exit") && strstr(dump, " a=3 b=1\n"), "event: timer_leak_exit a=3 b=1 (one inherited)");
     check(strstr(dump, "timer_stale") && strstr(dump, " a=1082214400 b=0\n"), "event: timer_stale for the gone timer");
-    check(strstr(dump, "timer_fire pid=77 thread=\"timer\" a=14 b=3 seq=9 tgroup_lo=4660 tgroup_null=0 magic_ok=1\n") != NULL,
+    check(strstr(dump, "timer_fire pid=77 thread=\"timer\" a=14 b=3 seq=9 tgroup_lo=4660 tgroup_null=0 magic_ok=1 magic=0x54494d52 slot=") != NULL,
           "fire: the live timer");
-    check(strstr(dump, "timer_fire pid=12 thread=\"timer\" a=1082214400 b=5 seq=4 tgroup_lo=0 tgroup_null=1 magic_ok=0\n") != NULL,
+    check(strstr(dump, "timer_fire pid=12 thread=\"timer\" a=1082214400 b=5 seq=4 tgroup_lo=0 tgroup_null=1 magic_ok=0 magic=0x0 slot=") != NULL,
           "fire: the gone timer");
+    // [INV-261109-03] Outside a timer thread nothing is firing.
+    check(strstr(dump, " firing=0x0 slot_timer=0x0 owner_ok=0\n") != NULL, "fire: firing timer and slot timer recorded");
+    // The three leaked slots and their group, each with a backtrace.
+    int dead = 0;
+    for (const char *p = dump; (p = strstr(p, "ms group_dead ")) != NULL; p++)
+        dead++;
+    check(dead == 3, "timer_life: group_dead for each leaked slot");
+    check(strstr(dump, " group_dead pid=-1 id=1 slot=") && strstr(dump, " x=1 bt=0x"),
+          "timer_life: the inherited one says so, with a backtrace");
+
+    puts("a struct timer that is no longer live is not touched");   // [INV-261109-03]
+    before = counter(DIAG_TIMER_STRUCT_BAD);
+    struct timer *t = timer_new(CLOCK_MONOTONIC, NULL, NULL);
+    check(t->magic == TIMER_LIVE_MAGIC, "timer_new: live magic");
+    t->magic = TIMER_DEAD_MAGIC;
+    struct timer_spec in_1s = { .value = { 1, 0 } };
+    check(timer_set(t, in_1s, NULL) == _EINVAL && !t->thread_running, "timer_set on a dead timer: EINVAL, no thread");
+    timer_free(t);   // dead: refused, not freed
+    check(counter(DIAG_TIMER_STRUCT_BAD) - before == 2, "timer_struct_bad +2");
+    t->magic = TIMER_LIVE_MAGIC;
+    timer_free(t);
+    crash_dump();
+    check(strstr(dump, " struct_bad pid=-1 id=2 slot=0x0 timer=0x") && strstr(dump, " x=3735943150 bt="),
+          "timer_life: struct_bad names the timer, the call and the magic");
 
     puts("fire ring keeps its own 16");
     for (int i = 0; i < 40; i++)

@@ -306,6 +306,49 @@ static void case_leak(void) {
           "timer_leaked_at_exit +2");
 }
 
+// [INV-261109-03] A process exits with a POSIX timer armed. Its group is
+// freed at reap, but the timer thread still fires into the slot inside it.
+// The next fork usually gets the same block back, and the new group's slot
+// is a copy of ours: the stale fire then reads our pid and SIGALRM out of it
+// and signals us, a process that has no timer at all (on Linux the dead
+// process's timers die with it). Fixed: the fire sees the slot is no longer
+// a live timer and does nothing.
+static void case_stale(void) {
+    puts("a timer of a process that exited never fires into another process");
+    catch_alrm();
+    // Leave this slot 0 holding our pid and SIGALRM, with no timer in it.
+    struct ksigevent sev = { .signo = SIGALRM, .notify = SIGEV_SIGNAL_ };
+    int id = -1;
+    k_timer_create(CLOCK_MONOTONIC, &sev, &id);
+    k_timer_delete(id);
+    int fired = 0;
+    for (int round = 0; round < 5 && !fired; round++) {
+        pid_t a = fork();
+        if (a == 0) {
+            // Takes slot 0 (it is free), arms 200 ms, exits at once.
+            int cid = -1;
+            k_timer_create(CLOCK_MONOTONIC, &sev, &cid);
+            struct itimerspec in_200ms = { .it_value = { 0, 200 * 1000 * 1000 } };
+            k_timer_settime(cid, 0, &in_200ms, NULL);
+            _exit(0);
+        }
+        int status;
+        waitpid(a, &status, 0);
+        // Reaped: a's group is freed. b is the next fork: its group is
+        // likely a's block, its slot 0 a copy of ours.
+        pid_t b = fork();
+        if (b == 0) {
+            usleep(600 * 1000);
+            _exit(0);
+        }
+        for (int i = 0; i < 60 && !got_sig; i++)
+            usleep(10 * 1000);
+        fired = got_sig != 0;
+        waitpid(b, &status, 0);
+    }
+    check(!fired, "no SIGALRM reached a process without a timer");
+}
+
 int main(int argc, char **argv) {
     const char *which = argc > 1 ? argv[1] : "";
     if (!strcmp(which, "signo")) case_signo();
@@ -314,8 +357,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "thread_id")) case_thread_id();
     else if (!strcmp(which, "diag")) case_diag();
     else if (!strcmp(which, "leak")) case_leak();
+    else if (!strcmp(which, "stale")) case_stale();
     else {
-        fprintf(stderr, "usage: %s signo|ids|normal|thread_id|diag|leak\n", argv[0]);
+        fprintf(stderr, "usage: %s signo|ids|normal|thread_id|diag|leak|stale\n", argv[0]);
         return 2;
     }
     printf("%s: %d failure(s)\n", which, failures);
