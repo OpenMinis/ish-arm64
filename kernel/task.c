@@ -8,6 +8,8 @@
 #include "kernel/calls.h"
 #include "kernel/pmu.h"
 #include "kernel/task.h"
+#include "kernel/diag.h"
+#include "kernel/retire.h"
 #include "kernel/memory.h"
 #include "emu/tlb.h"
 #include "kernel/hvf.h"
@@ -168,6 +170,34 @@ void task_destroy(struct task *task) {
         // Overflow — free immediately (rare, only with 64+ concurrent exits)
         free(task);
     }
+}
+
+// [FIX-261114-33] Reaped thread groups, kept allocated for a while.
+//
+// Field crash (Minis 1.16 (25), iOS 16.0.3, 2026-11-14): SIGABRT in
+// free(task->group) under wait4 - free_small -> small_free_list_remove_ptr ->
+// free_list_checksum_botch. The group being freed was fine; the free block
+// next to it had been written to after its own free. struct task has been
+// zeroed and freed late since the leaked-thread fixes, for exactly this
+// reason; struct tgroup was freed at once, and a thread that outlives its
+// group (the exit safety valve leaves such threads running) reaches it
+// through current->group and takes its lock - a write.
+//
+// The group is left as it is, not poisoned: a late user then finds valid
+// locks and fields, as it did while the block happened to be unreused, and
+// carries on to its own exit. What changes is that the block is still ours.
+// A write that arrives while it is retired is counted and logged with its
+// offsets, which names the field and so the writer.
+static struct retire_ring retired_groups;
+
+void tgroup_retire(struct tgroup *group, pid_t_ pid) {
+    struct retire_report report;
+    retire_push(&retired_groups, group, sizeof(struct tgroup), (int) pid, &report);
+    if (!report.changed)
+        return;
+    ish_diag_add(DIAG_GROUP_LATE_WRITE, 1);
+    printk("GROUP_LATE_WRITE pid=%d group=%p size=%zu changed=%zu bytes off=%zu..%zu\n",
+           report.tag, report.ptr, report.size, report.bytes, report.first, report.last);
 }
 
 static void task_run_tlb_cleanup(void *arg) {
