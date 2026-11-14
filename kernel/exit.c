@@ -621,7 +621,9 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
     task_leave_session(task);
     list_remove(&task->group->pgroup);
     ish_diag_group_gone(task->group);   // [FEAT-261027-15]
-    free(task->group);
+    // [FIX-261114-33] Not freed here: see tgroup_retire. Read the pid before
+    // task_destroy zeroes the task.
+    tgroup_retire(task->group, task->pid);
     atomic_fetch_sub_explicit(&ish_live_guest_procs, 1, memory_order_relaxed);   // [T-ish-freeze-watch]
 
     task_destroy(task);

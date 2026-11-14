@@ -176,6 +176,10 @@ static inline void task_set_mm(struct task *task, struct mm *mm) {
 struct task *task_create_(struct task *parent);
 // Removes the process from the process table and frees it. Must be called with pids_lock.
 void task_destroy(struct task *task);
+// [FIX-261114-33] Give up a reaped thread group. It is freed later (kernel/retire.h),
+// so a thread that still holds it does not write into freed memory.
+// pids_lock must be held.
+void tgroup_retire(struct tgroup *group, pid_t_ pid);
 
 // misc
 void vfork_notify(struct task *task);

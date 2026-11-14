@@ -60,6 +60,8 @@ enum ish_diag_counter {
     DIAG_TIMER_STALE_SKIPPED,   // fires dropped: the slot is no longer this timer's (its group died)
     DIAG_TIMER_STRUCT_BAD,      // timer_free / timer_set on a freed or reused struct timer, skipped
     DIAG_TIMER_INHERITED_OPS,   // timer syscalls on a slot copied by fork (the timer is the parent's)
+    // [FIX-261114-33] (appended)
+    DIAG_GROUP_LATE_WRITE,      // reaped thread groups found written to while retired
     DIAG_COUNTER_COUNT
 };
 

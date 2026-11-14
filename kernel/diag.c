@@ -64,6 +64,7 @@ static const char *const counter_names[DIAG_COUNTER_COUNT] = {
     [DIAG_TIMER_STALE_SKIPPED] = "timer_stale_skipped",
     [DIAG_TIMER_STRUCT_BAD] = "timer_struct_bad",
     [DIAG_TIMER_INHERITED_OPS] = "timer_inherited_ops",
+    [DIAG_GROUP_LATE_WRITE] = "group_late_write",
 };
 
 static const char *const event_names[] = {
@@ -409,7 +410,7 @@ static bool counter_always_shown(int i) {
     case DIAG_VALVE_LEAKED: case DIAG_DEFERRED_RELEASED: case DIAG_EXIT_GROUPS:
     case DIAG_TIMER_CREATE: case DIAG_TIMER_DELETE: case DIAG_TIMER_LEAKED_AT_EXIT:
     case DIAG_TIMER_THREADS_LIVE: case DIAG_TIMER_STALE_SKIPPED: case DIAG_TIMER_STRUCT_BAD:
-    case DIAG_TIMER_INHERITED_OPS:
+    case DIAG_TIMER_INHERITED_OPS: case DIAG_GROUP_LATE_WRITE:
         return true;
     default:
         return false;
