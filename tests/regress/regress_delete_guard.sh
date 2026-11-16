@@ -286,5 +286,30 @@ check "$(orphans)|$(sqlite3 "$R/meta.db" 'pragma integrity_check;')" "0|ok" "res
 out=$(g - - "ISH_TEST_TRASH_RESTAT=/mnt/b/f2=100600:0:0" -- /bin/sh -c 'stat -c "%a %u" /mnt/b/f2; cat /mnt/b/f2')
 check "$(echo $out)" "600 0 two" "restore stat on a path that already has a row updates it"
 
+# ---- a trash on another volume: the file is COPIED during the commit hook, then deleted by fakefs
+trash_world; refc=$(g - - -- /bin/sh -c 'rm /mnt/b/f1; echo "rm=$?"; rm -r /mnt/b/dir; echo "rmr=$?"; ls /mnt/b'); refc_host=$(tree "$H"); refc_rows=$(rows)
+trash_world; out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=copy -- /bin/sh -c 'rm /mnt/b/f1; echo "rm=$?"; rm -r /mnt/b/dir; echo "rmr=$?"; ls /mnt/b')
+check "$out" "$refc" "copy: the guest sees exactly what it sees for a real delete"
+check "$(tree "$H")|$(rows)|$(orphans)" "$refc_host|$refc_rows|0" "copy: host tree and meta.db rows are the ones a real delete leaves, no orphan"
+check "$(cat "$T/1")|$(ls "$T" | wc -l | tr -d ' ')|$(ls "$T" | grep -c partial)" "one|3|0" "copy: every deleted file has a complete copy in the trash (f1, dir/f3, dir/sub/f4), no partial left"
+trash_world
+out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=copy:1500 -- /bin/sh -c 'rm /mnt/b/f1 & p=$!; sleep 0.4; ls /mnt/b/f1 >/dev/null 2>&1 && echo "still-there"; echo new > /mnt/b/n1; cat /mnt/b/f2; mv /mnt/b/n1 /mnt/b/n2; ls /mnt/b | tr "\n" " "; echo; echo "others-done"; wait $p; echo "rm=$?"; ls /mnt/b/f1 2>&1 | grep -c "No such"')
+check "$(echo "$out" | tr '\n' '|')" "still-there|two|dir empty f1 f2 n2 |others-done|rm=0|1|" "copy: while a slow copy runs the original is still there and other tasks create, read, rename and list in the same directory (no fakefs lock is held)"
+check "$(cat "$T/1")|$(orphans)|$(sqlite3 "$R/meta.db" 'pragma integrity_check;')" "one|0|ok" "copy: ...and the copy is complete, meta.db sound"
+trash_world
+out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=copyfail:200 -- /bin/sh -c 'rm /mnt/b/f1 2>&1; echo "rc=$?"; cat /mnt/b/f1; rm -r /mnt/b/dir 2>/dev/null; echo "rmr=$?"; cat /mnt/b/dir/sub/f4')
+check "$(echo "$out" | tail -4 | tr '\n' '|')|$(cat "$H/f1")|$(ls "$T" | wc -l | tr -d ' ')" "rc=1|one|rmr=1|four||one|0" "copy fails: EPERM, the original whole and readable, nothing (no partial) in the trash"
+check "$(echo "$out" | head -1 | grep -c 'Operation not permitted')|$(orphans)" "1|0" "copy fails: the guest is told 'Operation not permitted', no orphan"
+out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=copy -- /bin/sh -c 'rm /mnt/b/f1; echo "rc=$?"')
+check "$out|$([ -e "$H/f1" ] && echo kept || echo gone)|$(cat "$T/1")" "rc=0|gone|one" "copy fails: ...and the file is not stuck - the next attempt deletes it and keeps a copy"
+trash_world
+start=$(date +%s)
+out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=copy:30000 -- /bin/sh -c 'rm /mnt/b/f1 & p=$!; sleep 0.5; kill -9 $p; wait $p; echo "status=$?"; cat /mnt/b/f1')
+check "$(echo "$out" | grep -v '^Killed' | tr '\n' '|')|$(cat "$H/f1")|$(ls "$T" | wc -l | tr -d ' ')|$([ $(( $(date +%s) - start )) -lt 8 ] && echo quick)" "status=137|one||one|0|quick" "copy: a task killed in the middle of a copy leaves at once; the original is whole and no partial is left"
+check "$(orphans)|$(sqlite3 "$R/meta.db" 'pragma integrity_check;')" "0|ok" "copy: ...meta.db sound after the kill"
+trash_world
+out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=copy:600 -- /bin/sh -c 'rm /mnt/b/f1 2>/dev/null & a=$!; rm /mnt/b/f1 2>/dev/null & b=$!; wait $a; ra=$?; wait $b; rb=$?; echo "$((ra+rb))"; ls /mnt/b/f1 2>&1 | grep -c "No such"')
+check "$(echo $out)|$([ -e "$H/f1" ] && echo kept || echo gone)" "1 1|gone" "copy: two tasks deleting the same file at once - exactly one succeeds, the file is gone once"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

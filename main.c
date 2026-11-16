@@ -526,15 +526,67 @@ static pthread_mutex_t test_guard_log_lock = PTHREAD_MUTEX_INITIALIZER;
 //       <host dir>/manifest
 //   ISH_TEST_TRASH_MODE=move (default) | delete (answer "delete as usual")
 //       | deny | lie (answer "removed" without moving anything)
+//       | copy[:<ms>] (a trash on another volume: COPY the file to
+//         <host dir>/<n> via "<n>.partial", taking <ms>, then answer "delete";
+//         killed meanwhile -> the partial is removed, "interrupted")
+//       | copyfail[:<ms>] (the copy fails after <ms>: partial removed, deny)
 //   ISH_TEST_TRASH_RESTAT=/guest/path=<mode octal>:<uid>:<gid>  at start, set
 //       that path's guest stat (fakefs_guest_stat_restore)
 static char test_trash_dir[1024];
 static char test_trash_mode[32];
 static int test_trash_seq;
 
+// A slow copy for the "another volume" modes. 0 = copied, -1 = failed,
+// -2 = the task is being killed (nothing is left in either case but 0).
+static int test_copy_slowly(const char *from, const char *dest, int ms, bool fail) {
+    char partial[1200];
+    snprintf(partial, sizeof(partial), "%s.partial", dest);
+    FILE *in = fopen(from, "rb"), *out = fopen(partial, "wb");
+    if (in == NULL || out == NULL) {
+        if (in) fclose(in);
+        if (out) { fclose(out); unlink(partial); }
+        return -1;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+        fwrite(buf, 1, n, out);
+    fclose(in);
+    fclose(out);
+    for (int waited = 0; waited < ms; waited += 20) {
+        if (fakefs_guard_should_abort()) {
+            unlink(partial);
+            return -2;
+        }
+        usleep(20000);
+    }
+    if (fail || rename(partial, dest) < 0) {
+        unlink(partial);
+        return -1;
+    }
+    return 0;
+}
+
 static int test_commit_hook(const struct fakefs_guard_request *req) {
     if (strcmp(test_trash_mode, "delete") == 0)
         return FAKEFS_COMMIT_DELETE;
+    if (strncmp(test_trash_mode, "copy", 4) == 0) {
+        bool fail = strncmp(test_trash_mode, "copyfail", 8) == 0;
+        const char *colon = strchr(test_trash_mode, ':');
+        int ms = colon != NULL ? atoi(colon + 1) : 0;
+        if (req->op == FAKEFS_GUARD_OP_RMDIR || req->is_dir)
+            return FAKEFS_COMMIT_DELETE;
+        pthread_mutex_lock(&test_guard_log_lock);
+        int n = ++test_trash_seq;
+        pthread_mutex_unlock(&test_guard_log_lock);
+        char dest[1100];
+        snprintf(dest, sizeof(dest), "%s/%d", test_trash_dir, n);
+        int r = test_copy_slowly(req->host_path, dest, ms, fail);
+        if (r == -2)
+            return FAKEFS_GUARD_INTERRUPTED;
+        // Copied: the kernel deletes the original. Not copied: it stays.
+        return r == 0 ? FAKEFS_COMMIT_DELETE : FAKEFS_GUARD_DENY;
+    }
     if (strcmp(test_trash_mode, "deny") == 0)
         return FAKEFS_GUARD_DENY;
     if (strcmp(test_trash_mode, "lie") == 0)
