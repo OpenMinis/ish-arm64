@@ -510,11 +510,15 @@ static void test_path_hook_install(const char *spec) {
 //   ISH_TEST_GUARD_REBIND=/guest=/host   while waiting, point that bind mount
 //       at another host directory (the user changing mounts under a question)
 //   ISH_TEST_GUARD_UNBIND=/guest         while waiting, remove that bind mount
+//   ISH_TEST_GUARD_PLAIN=/guest/prefix   a plain-rootfs prefix guarded too
+//   ISH_TEST_GUARD_RELINK=/host/link=/host/target   while waiting, re-point
+//       that host symbolic link (the app switching the session a link shows)
 static char test_guard_mode[64];
 static char test_guard_only[1024];
 static char test_guard_log[1024];
 static char test_guard_rebind[2048];
 static char test_guard_unbind[1024];
+static char test_guard_relink[2048];
 static pthread_mutex_t test_guard_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void test_bind_install(const char *spec) {
@@ -591,6 +595,17 @@ static int test_guard_hook(const struct fakefs_guard_request *req) {
         }
         if (test_guard_unbind[0] != '\0')
             fakefs_bind_unmount(test_guard_unbind);
+        if (test_guard_relink[0] != '\0') {
+            char buf[2048];
+            snprintf(buf, sizeof(buf), "%s", test_guard_relink);
+            char *eq = strchr(buf, '=');
+            if (eq != NULL) {
+                *eq = '\0';
+                unlink(buf);
+                if (symlink(eq + 1, buf) < 0)
+                    fprintf(stderr, "ISH_TEST_GUARD_RELINK: %s\n", strerror(errno));
+            }
+        }
         if (!test_guard_sleep(ms - ms / 2))
             return FAKEFS_GUARD_INTERRUPTED;
         if (verdict != NULL && strcmp(verdict, ":deny") == 0)
@@ -610,6 +625,14 @@ static void test_guard_install(void) {
     if ((v = getenv("ISH_TEST_GUARD_LOG")) != NULL) snprintf(test_guard_log, sizeof(test_guard_log), "%s", v);
     if ((v = getenv("ISH_TEST_GUARD_REBIND")) != NULL) snprintf(test_guard_rebind, sizeof(test_guard_rebind), "%s", v);
     if ((v = getenv("ISH_TEST_GUARD_UNBIND")) != NULL) snprintf(test_guard_unbind, sizeof(test_guard_unbind), "%s", v);
+    if ((v = getenv("ISH_TEST_GUARD_RELINK")) != NULL) snprintf(test_guard_relink, sizeof(test_guard_relink), "%s", v);
+    // ISH_TEST_GUARD_PLAIN=/guest/prefix: a plain-rootfs prefix that is guarded too.
+    if ((v = getenv("ISH_TEST_GUARD_PLAIN")) != NULL) {
+        static char plain[256];
+        snprintf(plain, sizeof(plain), "%s", v);
+        const char *list[1] = {plain};
+        fakefs_set_guard_plain_prefixes(list, 1);
+    }
     unsigned scope = FAKEFS_GUARD_SCOPE_BIND | FAKEFS_GUARD_SCOPE_ROUTED;
     if ((v = getenv("ISH_TEST_GUARD_SCOPE")) != NULL) scope = (unsigned) strtoul(v, NULL, 10);
     fakefs_set_guard_hook(test_guard_hook);

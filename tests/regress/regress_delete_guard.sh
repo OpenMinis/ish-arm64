@@ -196,5 +196,52 @@ fresh
 out=$(g deny - -- /bin/sh -c 'ln /mnt/r/f1 /mnt/r/link 2>/dev/null && mv /mnt/r/f1 /mnt/r/link; echo "rc=$?"')
 check "$out|$(calls)" "rc=0|0" "a rename onto a hard link of itself is not a removal"
 
+# ---- a plain-rootfs prefix: a directory reached through a link in the rootfs
+# (how a task with no fs_context reaches the app's /var/minis/workspace)
+plain_world() {
+    fresh
+    "$ISH" -f "$R" /bin/mkdir -p /mnt/w 2>/dev/null
+    # Its own directory: $A is also the target of the path hook, and a cwd
+    # inside it would read back as /mnt/r.
+    # The files are made from the guest, through the link: a plain path is
+    # only visible to the guest once meta.db has a row for it.
+    PW=$D/plain; mkdir -p "$PW"
+    rm -rf "$R/data/mnt/w"; ln -s "$PW" "$R/data/mnt/w"
+    # Absolute paths throughout: the CLI has no reverse mapping for a cwd
+    # that lies outside the rootfs.
+    "$ISH" -f "$R" /bin/sh -c 'mkdir /mnt/w/dir /mnt/w/empty && echo one > /mnt/w/f1 && echo two > /mnt/w/f2 && echo three > /mnt/w/dir/f3' 2>/dev/null
+    mkdir -p "$D/other/dir"; echo one > "$D/other/f1"; echo two > "$D/other/f2"; echo three > "$D/other/dir/f3"
+}
+PL='rm /mnt/w/f1 2>&1; echo "rm=$?"; rmdir /mnt/w/empty 2>&1; echo "rmdir=$?"; mv /mnt/w/f2 /mnt/w/dir/f3 2>&1; echo "mv=$?"; mv /mnt/w/dir/f3 /mnt/w/dir/new; echo "move=$?"; cat /mnt/w/dir/new'
+plain_world; ref=$(g - - -- /bin/sh -c "$PL"); ref_tree=$(tree "$PW")
+check "$(echo $ref)" "rm=0 rmdir=0 mv=0 move=0 two" "plain prefix: reference run without a guard"
+plain_world; out=$(g deny - -- /bin/sh -c "$PL")
+check "$out|$(tree "$PW")|$(calls)" "$ref|$ref_tree|0" "plain prefix not registered: nothing is asked, same result"
+plain_world; out=$(g deny 1 ISH_TEST_GUARD_PLAIN=/mnt/w -- /bin/sh -c "$PL")
+check "$out|$(tree "$PW")|$(calls)" "$ref|$ref_tree|0" "plain prefix registered but the routed scope bit clear: nothing is asked"
+plain_world; out=$(g allow - ISH_TEST_GUARD_PLAIN=/mnt/w -- /bin/sh -c "$PL")
+check "$out|$(tree "$PW")" "$ref|$ref_tree" "plain prefix, allow: same result as without a guard"
+check "$(calls)|$(awk -F'\t' '$1==3' "$L" | wc -l | tr -d ' ')" "3|1" "plain prefix, allow: unlink, rmdir and the one rename onto an existing file are asked about; the move onto a free name is not"
+check "$(awk -F'\t' '$1==1 {print $2 "|" $3}' "$L")" "/mnt/w/f1|$(cd "$R/data" && pwd -P)/mnt/w/f1" "plain prefix: the host path is the one under the rootfs data directory, link not resolved"
+plain_world; before=$(tree "$PW"); out=$(g deny - ISH_TEST_GUARD_PLAIN=/mnt/w -- /bin/sh -c "$PL")
+check "$(echo "$out" | grep -c 'Operation not permitted')|$(tree "$PW")" "3|$(echo "$before" | sed 's|dir/f3 three|dir/new three|')" "plain prefix, deny: three refusals, not one file gone (the move onto a free name still happens)"
+check "$(orphans)|$(sqlite3 "$R/meta.db" 'pragma integrity_check;')" "0|ok" "plain prefix, deny: no orphan inode, meta.db integrity"
+check "$(g - - -- /bin/sh -c 'rm /mnt/w/f1 && echo gone')" gone "plain prefix: with the guard off again the refused file deletes normally"
+plain_world; out=$(g deny - ISH_TEST_GUARD_PLAIN=/mnt/w -- /bin/sh -c 'echo x > /mnt/wx; rm /mnt/wx; echo "sibling=$?"; rm -rf /mnt/w/dir; echo "sub=$?"; echo a > /tmp/a; rm /tmp/a; echo "tmp=$?"')
+check "$(echo $out | sed 's/rm: [^=]*permitted //g')" "sibling=0 sub=1 tmp=0" "plain prefix: only paths below it are asked about, not a sibling with the same beginning nor the rest of the rootfs"
+plain_world
+out=$(g wait:400:allow - ISH_TEST_GUARD_PLAIN=/mnt/w "ISH_TEST_GUARD_RELINK=$R/data/mnt/w=$D/other" -- /bin/sh -c 'rm /mnt/w/f1 2>&1; echo "rc=$?"')
+check "$(echo "$out" | tail -1)|$(echo "$out" | grep -ci 'i/o error')|$(cat "$PW/f1")|$(cat "$D/other/f1")" "rc=1|1|one|one" "plain prefix, link re-pointed during the wait: EIO, and the file is still there in the old directory and in the new one"
+plain_world
+out=$(g wait:400:allow - ISH_TEST_GUARD_PLAIN=/mnt/w "ISH_TEST_GUARD_RELINK=$R/data/mnt/w=$D/other" -- /bin/sh -c 'mv /mnt/w/f2 /mnt/w/dir/f3 2>&1; echo "rc=$?"')
+check "$(echo "$out" | tail -1)|$(cat "$PW/f2")|$(cat "$PW/dir/f3")|$(cat "$D/other/f2")|$(cat "$D/other/dir/f3")" "rc=1|two|three|two|three" "plain prefix, link re-pointed during the wait: a rename touches neither directory"
+plain_world
+out=$(g wait:300:allow - ISH_TEST_GUARD_PLAIN=/mnt/w -- /bin/sh -c 'rm /mnt/w/f1; echo "rc=$?"')
+check "$out|$([ -e "$PW/f1" ] && echo kept || echo gone)" "rc=0|gone" "plain prefix, allowed after a wait with the link unchanged: the delete happens"
+plain_world
+start=$(date +%s)
+out=$(g hang - ISH_TEST_GUARD_PLAIN=/mnt/w -- /bin/sh -c 'rm /mnt/w/f1 & p=$!; sleep 1; kill -9 $p; wait $p; echo "status=$?"')
+check "$(echo "$out" | tail -1)|$(cat "$PW/f1")|$([ $(( $(date +%s) - start )) -lt 8 ] && echo quick)" "status=137|one|quick" "plain prefix: a task blocked in the hook is killed at once and deletes nothing"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

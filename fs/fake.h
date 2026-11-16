@@ -187,6 +187,18 @@ void fakefs_set_guard_hook(fakefs_guard_hook_t hook);
 void fakefs_set_guard_scope(unsigned scope);
 unsigned fakefs_guard_scope(void);
 
+/* Guest path prefixes of the PLAIN rootfs that are sent to the hook as well
+ * (at most 4, each at most 255 bytes, no trailing slash), while the ROUTED
+ * scope bit is set. For a directory that some tasks reach through the
+ * translate hook and others - tasks with no fs_context - through a symbolic
+ * link in the rootfs: the app's /var/minis/workspace. Only paths strictly
+ * below a prefix are sent; `host_path` is then the path under the rootfs
+ * data directory, link not resolved (the hook resolves it). After a wait
+ * the directory the path leads to is resolved again and the call fails with
+ * EIO if the link now points elsewhere. Call it before setting the scope;
+ * NULL / 0 clears the list. */
+void fakefs_set_guard_plain_prefixes(const char *const *prefixes, int count);
+
 /* For the hook, on the thread it was called on: true once the calling task
  * has a fatal signal pending or is being torn down - stop waiting. */
 bool fakefs_guard_should_abort(void);

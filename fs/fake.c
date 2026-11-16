@@ -612,6 +612,68 @@ int fakefs_guard_ancestry(int *tgids, int max) {
     return n;
 }
 
+/* Plain-rootfs prefixes that are guarded too (see fs/fake.h). Written only
+ * by fakefs_set_guard_plain_prefixes, which publishes the count last. */
+#define FAKEFS_GUARD_PLAIN_MAX 4
+static char g_guard_plain[FAKEFS_GUARD_PLAIN_MAX][256];
+static int g_guard_plain_len[FAKEFS_GUARD_PLAIN_MAX];
+static _Atomic int g_guard_plain_count = 0;
+
+void fakefs_set_guard_plain_prefixes(const char *const *prefixes, int count) {
+    atomic_store_explicit(&g_guard_plain_count, 0, memory_order_release);
+    if (prefixes == NULL || count <= 0)
+        return;
+    int n = 0;
+    for (int i = 0; i < count && n < FAKEFS_GUARD_PLAIN_MAX; i++) {
+        const char *p = prefixes[i];
+        size_t len = p != NULL ? strlen(p) : 0;
+        while (len > 1 && p[len - 1] == '/') len--;
+        if (len == 0 || len >= sizeof(g_guard_plain[0]) || p[0] != '/')
+            continue;
+        memcpy(g_guard_plain[n], p, len);
+        g_guard_plain[n][len] = '\0';
+        g_guard_plain_len[n] = (int) len;
+        n++;
+    }
+    atomic_store_explicit(&g_guard_plain_count, n, memory_order_release);
+}
+
+/* For a path of the plain rootfs: is it strictly below a guarded prefix? If
+ * so, writes the host path it has under the rootfs data directory (links
+ * not resolved) and returns true. Costs one atomic load when no prefix is
+ * registered or the ROUTED scope bit is clear. */
+static bool guard_plain_path(struct mount *mount, const char *path, char *out, size_t out_size) {
+    int count = atomic_load_explicit(&g_guard_plain_count, memory_order_acquire);
+    if (count == 0)
+        return false;
+    if ((atomic_load_explicit(&g_guard_scope, memory_order_acquire) & FAKEFS_GUARD_SCOPE_ROUTED) == 0)
+        return false;
+    const char *rel = path[0] == '/' ? path + 1 : path;   /* without the leading slash */
+    bool hit = false;
+    for (int i = 0; i < count && !hit; i++) {
+        int len = g_guard_plain_len[i] - 1;                /* prefix without its slash */
+        if (strncmp(g_guard_plain[i] + 1, rel, len) == 0 && rel[len] == '/' && rel[len + 1] != '\0')
+            hit = true;
+    }
+    if (!hit)
+        return false;
+    char root[PATH_MAX];
+    if (fcntl(mount->root_fd, F_GETPATH, root) < 0)
+        return false;
+    return snprintf(out, out_size, "%s/%s", root, rel) < (int) out_size;
+}
+
+/* The directory a plain host path really leads to (every link resolved). */
+static bool guard_plain_dir(const char *host_path, char *out) {
+    char parent[PATH_MAX];
+    snprintf(parent, sizeof(parent), "%s", host_path);
+    char *slash = strrchr(parent, '/');
+    if (slash == NULL || slash == parent)
+        return false;
+    *slash = '\0';
+    return realpath(parent, out) != NULL;
+}
+
 /* True when a delete under this kind of path has to be shown to the guard
  * hook. The whole cost of the guard while it is off: one atomic load. */
 static inline bool guard_wanted(bool routed) {
@@ -684,6 +746,23 @@ static int guard_same_place(const char *path, const char *host_before, bool rout
     return 0;
 }
 
+/* guard_ask for a plain-rootfs path under a guarded prefix. Returns 0 to go
+ * ahead or a negative errno. The path reaches its directory through a link
+ * in the rootfs that the host may re-point at any time: where it leads is
+ * resolved before the question and, if the hook waited, again after it, and
+ * a different answer fails the call with EIO. */
+static int guard_ask_plain(int op, const char *path, const char *host_path,
+                           const char *host_src, bool is_dir) {
+    char before[PATH_MAX], after[PATH_MAX];
+    bool known = guard_plain_dir(host_path, before);
+    int g = guard_ask(op, path, host_path, host_src, is_dir, false);
+    if (g <= 0)
+        return g;
+    if (!known || !guard_plain_dir(host_path, after) || strcmp(before, after) != 0)
+        return _EIO;
+    return 0;
+}
+
 static int fakefs_unlink(struct mount *mount, const char *path) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
@@ -698,6 +777,10 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
         if (g < 0)
             return g;
         if (g > 0 && (g = guard_same_place(path, host_abs, via_hook)) < 0)
+            return g;
+    } else if (!via_bind && guard_plain_path(mount, path, host_abs, sizeof(host_abs))) {
+        int g = guard_ask_plain(FAKEFS_GUARD_OP_UNLINK, path, host_abs, NULL, false);
+        if (g < 0)
             return g;
     }
     /* Hook-routed paths bypass meta.db entirely (see fakefs_open). */
@@ -749,6 +832,10 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
         if (g < 0)
             return g;
         if (g > 0 && (g = guard_same_place(path, host_abs, via_hook)) < 0)
+            return g;
+    } else if (!via_bind && guard_plain_path(mount, path, host_abs, sizeof(host_abs))) {
+        int g = guard_ask_plain(FAKEFS_GUARD_OP_RMDIR, path, host_abs, NULL, true);
+        if (g < 0)
             return g;
     }
     if (via_hook) {
@@ -807,6 +894,21 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
                 if ((g = guard_same_place(dst, host_dst, dst_hook)) < 0)
                     return g;
             }
+        }
+    }
+    if (!src_bind && guard_plain_path(mount, dst, host_dst, sizeof(host_dst))) {
+        /* The same question for a plain-rootfs destination under a guarded
+         * prefix. The source's host path is the one under the rootfs too. */
+        char root[PATH_MAX];
+        struct stat dst_st, src_st;
+        if (fcntl(mount->root_fd, F_GETPATH, root) == 0 &&
+            snprintf(host_src, sizeof(host_src), "%s/%s", root, src[0] == '/' ? src + 1 : src) < (int) sizeof(host_src) &&
+            lstat(host_dst, &dst_st) == 0 &&
+            !(lstat(host_src, &src_st) == 0 && src_st.st_dev == dst_st.st_dev &&
+              src_st.st_ino == dst_st.st_ino)) {
+            int g = guard_ask_plain(FAKEFS_GUARD_OP_REPLACE, dst, host_dst, host_src, S_ISDIR(dst_st.st_mode));
+            if (g < 0)
+                return g;
         }
     }
     if (src_hook) {
