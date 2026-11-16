@@ -144,20 +144,30 @@ void db_exec_reset(struct fakefs_db *fs, sqlite3_stmt *stmt) {
     db_reset(fs, stmt);
 }
 
+// [FEAT-261116-11] How many meta.db transactions this thread is inside (0 or
+// 1 today). The delete guard may block for minutes and must never be entered
+// with the lock held; it checks this.
+static _Thread_local int db_lock_depth;
+int db_lock_depth_current(void) { return db_lock_depth; }
+
 void db_begin_read(struct fakefs_db *fs) {
     sqlite3_mutex_enter(fs->lock);
+    db_lock_depth++;
     db_exec_reset(fs, fs->stmt.begin_deferred);
 }
 void db_begin_write(struct fakefs_db *fs) {
     sqlite3_mutex_enter(fs->lock);
+    db_lock_depth++;
     db_exec_reset(fs, fs->stmt.begin_immediate);
 }
 void db_commit(struct fakefs_db *fs) {
     db_exec_reset(fs, fs->stmt.commit);
+    db_lock_depth--;
     sqlite3_mutex_leave(fs->lock);
 }
 void db_rollback(struct fakefs_db *fs) {
     db_exec_reset(fs, fs->stmt.rollback);
+    db_lock_depth--;
     sqlite3_mutex_leave(fs->lock);
 }
 

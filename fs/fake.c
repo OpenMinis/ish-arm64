@@ -22,6 +22,8 @@
 #include "debug.h"
 #include "kernel/errno.h"
 #include "kernel/task.h"
+#include "kernel/signal.h"
+#include <assert.h>
 #include "fs/fd.h"
 #include "fs/dev.h"
 #include "fs/inode.h"
@@ -569,6 +571,119 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
     return 0;
 }
 
+/* ===== Delete guard (see fs/fake.h) ===== [FEAT-261116-11] */
+static _Atomic(fakefs_guard_hook_t) g_guard_hook = NULL;
+static _Atomic unsigned g_guard_scope = 0;
+static _Atomic uint64_t g_guard_calls = 0;
+
+void fakefs_set_guard_hook(fakefs_guard_hook_t hook) {
+    atomic_store_explicit(&g_guard_hook, hook, memory_order_release);
+}
+void fakefs_set_guard_scope(unsigned scope) {
+    atomic_store_explicit(&g_guard_scope, scope, memory_order_release);
+}
+unsigned fakefs_guard_scope(void) {
+    return atomic_load_explicit(&g_guard_scope, memory_order_acquire);
+}
+uint64_t fakefs_guard_call_count(void) {
+    return atomic_load_explicit(&g_guard_calls, memory_order_relaxed);
+}
+
+bool fakefs_guard_should_abort(void) {
+    if (current == NULL)
+        return false;
+    // Orphaned first: a thread the exit valve gave up on must not touch its
+    // sighand (task_fatal_signal_pending would).
+    if (task_orphaned(current))
+        return true;
+    return task_fatal_signal_pending(current);
+}
+
+int fakefs_guard_ancestry(int *tgids, int max) {
+    if (current == NULL || tgids == NULL || max <= 0)
+        return 0;
+    int n = 0;
+    lock(&pids_lock);
+    for (struct task *t = current; t != NULL && n < max; t = t->parent) {
+        if (n == 0 || tgids[n - 1] != t->tgid)
+            tgids[n++] = t->tgid;
+    }
+    unlock(&pids_lock);
+    return n;
+}
+
+/* True when a delete under this kind of path has to be shown to the guard
+ * hook. The whole cost of the guard while it is off: one atomic load. */
+static inline bool guard_wanted(bool routed) {
+    unsigned scope = atomic_load_explicit(&g_guard_scope, memory_order_acquire);
+    if (scope == 0)
+        return false;
+    return (scope & (routed ? FAKEFS_GUARD_SCOPE_ROUTED : FAKEFS_GUARD_SCOPE_BIND)) != 0;
+}
+
+/* Ask the guard hook about removing `host_path`. Returns 0 to go ahead, a
+ * negative errno to fail the call, or 1 when the hook blocked before saying
+ * yes - the caller must then translate its path(s) again (guard_same_place)
+ * before touching the host.
+ *
+ * Call it only where nothing has been changed yet and no lock is held. */
+static int guard_ask(int op, const char *path, const char *host_path,
+                     const char *host_src, bool is_dir, bool routed) {
+    fakefs_guard_hook_t hook = atomic_load_explicit(&g_guard_hook, memory_order_acquire);
+    if (hook == NULL)
+        return 0;
+    // The hook may wait for the user for minutes: holding the meta.db lock
+    // across that would stop every other guest file operation. No call site
+    // does; if one ever did, skip the question rather than freeze the kernel.
+    assert(db_lock_depth_current() == 0);
+    if (db_lock_depth_current() != 0)
+        return 0;
+    char guest[MAX_PATH];
+    if (path[0] != '/')
+        snprintf(guest, sizeof(guest), "/%s", path);
+    else
+        snprintf(guest, sizeof(guest), "%s", path);
+    struct fakefs_guard_request req = {
+        .op = op,
+        .guest_path = guest,
+        .host_path = host_path,
+        .host_src = host_src,
+        .is_dir = is_dir,
+        .routed = routed,
+        .fs_context = (current != NULL && current->group != NULL) ? current->group->fs_context : 0,
+        .pid = current != NULL ? current->pid : 0,
+        .tgid = current != NULL ? current->tgid : 0,
+    };
+    atomic_fetch_add_explicit(&g_guard_calls, 1, memory_order_relaxed);
+    int verdict = hook(&req);
+    // However the hook answered: a task that was killed, or given up on by
+    // the exit valve, while it waited does nothing more.
+    if (current != NULL && task_orphaned(current))
+        return _EINTR;
+    switch (verdict) {
+        case FAKEFS_GUARD_PROCEED: return 0;
+        case FAKEFS_GUARD_PROCEED_WAITED: return 1;
+        case FAKEFS_GUARD_INTERRUPTED: return _EINTR;
+        default: return _EPERM;
+    }
+}
+
+/* After a wait: does `path` still lead to the host path the guard was asked
+ * about, the same way, and is it still writable? The user may have removed
+ * the mount, or made it read-only, while the question was up. 0 when
+ * unchanged; otherwise the errno to fail with - never act on the new place. */
+static int guard_same_place(const char *path, const char *host_before, bool routed_before) {
+    if (is_under_readonly_bind_mount(path))
+        return _EROFS;
+    char host_now[PATH_MAX];
+    bool routed_now = false;
+    if (!bind_mount_translate_path_ex(path, host_now, sizeof(host_now), &routed_now))
+        return _EIO;
+    if (routed_now != routed_before || strcmp(host_now, host_before) != 0)
+        return _EIO;
+    return 0;
+}
+
 static int fakefs_unlink(struct mount *mount, const char *path) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
@@ -576,6 +691,15 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
     char host_abs[PATH_MAX];
     bool via_hook = false;
     bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    /* [FEAT-261116-11] Delete guard: before the host call, before meta.db
+     * (bind_mount_ensure_inode below takes its lock), nothing changed yet. */
+    if (via_bind && guard_wanted(via_hook)) {
+        int g = guard_ask(FAKEFS_GUARD_OP_UNLINK, path, host_abs, NULL, false, via_hook);
+        if (g < 0)
+            return g;
+        if (g > 0 && (g = guard_same_place(path, host_abs, via_hook)) < 0)
+            return g;
+    }
     /* Hook-routed paths bypass meta.db entirely (see fakefs_open). */
     if (via_hook) {
         if (unlink(host_abs) < 0)
@@ -619,6 +743,14 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
     char host_abs[PATH_MAX];
     bool via_hook = false;
     bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    /* [FEAT-261116-11] Delete guard, as in fakefs_unlink. */
+    if (via_bind && guard_wanted(via_hook)) {
+        int g = guard_ask(FAKEFS_GUARD_OP_RMDIR, path, host_abs, NULL, true, via_hook);
+        if (g < 0)
+            return g;
+        if (g > 0 && (g = guard_same_place(path, host_abs, via_hook)) < 0)
+            return g;
+    }
     if (via_hook) {
         if (rmdir(host_abs) < 0)
             return errno_map();
@@ -656,6 +788,27 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
     bool dst_bind = bind_mount_translate_path_ex(dst, host_dst, sizeof(host_dst), &dst_hook);
     if (src_bind != dst_bind || src_hook != dst_hook)
         return _EXDEV;
+    /* [FEAT-261116-11] Delete guard: a rename destroys something only when
+     * its destination exists and is another file than the source (onto a
+     * hard link of itself it is a no-op). Moving a file - destination free -
+     * is never asked about. As in fakefs_unlink, nothing has changed yet. */
+    if (src_bind && guard_wanted(src_hook)) {
+        struct stat dst_st, src_st;
+        if (lstat(host_dst, &dst_st) == 0 &&
+            !(lstat(host_src, &src_st) == 0 && src_st.st_dev == dst_st.st_dev &&
+              src_st.st_ino == dst_st.st_ino)) {
+            int g = guard_ask(FAKEFS_GUARD_OP_REPLACE, dst, host_dst, host_src,
+                              S_ISDIR(dst_st.st_mode), dst_hook);
+            if (g < 0)
+                return g;
+            if (g > 0) {
+                if ((g = guard_same_place(src, host_src, src_hook)) < 0)
+                    return g;
+                if ((g = guard_same_place(dst, host_dst, dst_hook)) < 0)
+                    return g;
+            }
+        }
+    }
     if (src_hook) {
         if (rename(host_src, host_dst) < 0)
             return errno_map();

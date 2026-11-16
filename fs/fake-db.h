@@ -34,6 +34,8 @@ int fake_db_deinit(struct fakefs_db *fs);
 
 void db_begin_read(struct fakefs_db *fs);
 void db_begin_write(struct fakefs_db *fs);
+// Number of meta.db transactions the calling thread is inside.
+int db_lock_depth_current(void);
 void db_commit(struct fakefs_db *fs);
 void db_rollback(struct fakefs_db *fs);
 

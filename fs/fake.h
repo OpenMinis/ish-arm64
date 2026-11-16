@@ -129,6 +129,76 @@ typedef bool (*fakefs_path_reverse_hook_t)(
 
 void fakefs_set_path_reverse_hook(fakefs_path_reverse_hook_t hook);
 
+/* ===== Delete guard =====
+ *
+ * [FEAT-261116-11] Optional host-provided check that runs before fakefs
+ * removes something on a bind mount or a hook-routed path: unlink, rmdir, and
+ * a rename whose destination exists (the destination is what is lost). The
+ * hook may BLOCK - the host asks the user - so, unlike the translate hooks:
+ *
+ *   - it is called on the guest task's own thread, before any host change and
+ *     before any meta.db change, with no fakefs lock and no pids_lock held;
+ *     a refusal therefore leaves host and meta.db exactly as they were;
+ *   - while it waits it must poll fakefs_guard_should_abort() (a few times a
+ *     second) and return FAKEFS_GUARD_INTERRUPTED once that is true, or the
+ *     task cannot be killed;
+ *   - it must not change anything on the host itself.
+ *
+ * Paths of the plain rootfs (neither bind nor hook-routed) never reach it.
+ * With no hook set, or with the scope bit of the path's kind cleared, the
+ * delete path is unchanged: one atomic load and nothing else.
+ *
+ * Return value: FAKEFS_GUARD_PROCEED, FAKEFS_GUARD_PROCEED_WAITED (the hook
+ * blocked first: fakefs translates the path again and fails the call with
+ * EIO if it no longer leads to the same host path, instead of acting on the
+ * new place), FAKEFS_GUARD_DENY (the call fails with EPERM),
+ * FAKEFS_GUARD_INTERRUPTED (EINTR). Any other value is treated as DENY.
+ */
+#define FAKEFS_GUARD_OP_UNLINK  1
+#define FAKEFS_GUARD_OP_RMDIR   2
+#define FAKEFS_GUARD_OP_REPLACE 3   /* rename onto an existing destination */
+
+#define FAKEFS_GUARD_PROCEED        0
+#define FAKEFS_GUARD_PROCEED_WAITED 1
+#define FAKEFS_GUARD_DENY          (-1)
+#define FAKEFS_GUARD_INTERRUPTED   (-2)
+
+/* Which kinds of path are sent to the hook. */
+#define FAKEFS_GUARD_SCOPE_BIND   1u  /* static bind mounts (g_bind_mounts[]) */
+#define FAKEFS_GUARD_SCOPE_ROUTED 2u  /* paths routed by the translate hook */
+
+struct fakefs_guard_request {
+    int op;                  /* FAKEFS_GUARD_OP_* */
+    const char *guest_path;  /* what is removed, with a leading slash */
+    const char *host_path;   /* its host path, exactly what fakefs will act on */
+    const char *host_src;    /* REPLACE: host path of the rename's source, else NULL */
+    bool is_dir;             /* REPLACE: the destination is a directory */
+    bool routed;             /* translated by the path-translate hook */
+    uint64_t fs_context;     /* current->group->fs_context */
+    int pid;                 /* calling task */
+    int tgid;                /* its process */
+};
+
+typedef int (*fakefs_guard_hook_t)(const struct fakefs_guard_request *request);
+
+/* NULL removes the hook. */
+void fakefs_set_guard_hook(fakefs_guard_hook_t hook);
+/* Bit set of FAKEFS_GUARD_SCOPE_*; 0 (the default) sends nothing. */
+void fakefs_set_guard_scope(unsigned scope);
+unsigned fakefs_guard_scope(void);
+
+/* For the hook, on the thread it was called on: true once the calling task
+ * has a fatal signal pending or is being torn down - stop waiting. */
+bool fakefs_guard_should_abort(void);
+
+/* For the hook, on the thread it was called on: the process ids from the
+ * caller's process up through its ancestors (caller first), at most `max`.
+ * Returns how many were written. Takes pids_lock briefly; never blocks. */
+int fakefs_guard_ancestry(int *tgids, int max);
+
+/* How many times the hook has been called since boot (diagnostics, tests). */
+uint64_t fakefs_guard_call_count(void);
+
 /* Register the absolute host path of the fakefs `data/` directory (the
  * host filesystem location backing fakefs `root_fd`). Used by
  * fakefs_bind_mount_resolve_path() to suppress "self-containing" bind

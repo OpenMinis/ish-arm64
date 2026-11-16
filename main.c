@@ -494,6 +494,128 @@ static void test_path_hook_install(const char *spec) {
     fakefs_set_path_reverse_hook(test_hook_reverse);
 }
 
+// ---- Delete guard and static bind mounts, for tests (fs/fake.h) ----
+// [FEAT-261116-11]
+//   ISH_TEST_BIND=/guest=/host[,/guest2=/host2...]  static bind mounts, the
+//       way the app binds /var/minis/shared and the external folders
+//   ISH_TEST_GUARD=<verdict>   installs a guard hook:
+//       allow | deny             answer at once
+//       wait:<ms>:allow|deny     block first (polling for a kill), then answer
+//       hang                     block until the task is killed (60 s cap, then deny)
+//       badvalue                 answer with a value fakefs does not know
+//   ISH_TEST_GUARD_SCOPE=<n>   FAKEFS_GUARD_SCOPE_* bits (default 3)
+//   ISH_TEST_GUARD_ONLY=<str>  the verdict applies to host paths containing
+//       <str>; every other path is allowed at once
+//   ISH_TEST_GUARD_LOG=<file>  one line per call: op, guest, host, routed, tgid, ancestors
+//   ISH_TEST_GUARD_REBIND=/guest=/host   while waiting, point that bind mount
+//       at another host directory (the user changing mounts under a question)
+//   ISH_TEST_GUARD_UNBIND=/guest         while waiting, remove that bind mount
+static char test_guard_mode[64];
+static char test_guard_only[1024];
+static char test_guard_log[1024];
+static char test_guard_rebind[2048];
+static char test_guard_unbind[1024];
+static pthread_mutex_t test_guard_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void test_bind_install(const char *spec) {
+    if (spec == NULL)
+        return;
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (char *item = strtok(buf, ","); item != NULL; item = strtok(NULL, ",")) {
+        char *eq = strchr(item, '=');
+        if (eq == NULL || item[0] != '/') {
+            fprintf(stderr, "ISH_TEST_BIND: expected /guest=/host, got %s\n", item);
+            continue;
+        }
+        *eq = '\0';
+        int err = fakefs_bind_mount(item, eq + 1, false);
+        if (err < 0)
+            fprintf(stderr, "ISH_TEST_BIND: %s -> %s failed (%d)\n", item, eq + 1, err);
+    }
+}
+
+// Sleeps `ms` in short slices; false as soon as the task is to die.
+static bool test_guard_sleep(long ms) {
+    for (long waited = 0; waited < ms; waited += 20) {
+        if (fakefs_guard_should_abort())
+            return false;
+        struct timespec ts = {0, 20 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    return !fakefs_guard_should_abort();
+}
+
+static int test_guard_hook(const struct fakefs_guard_request *req) {
+    if (test_guard_log[0] != '\0') {
+        int anc[16];
+        int n = fakefs_guard_ancestry(anc, 16);
+        char line[4096];
+        int len = snprintf(line, sizeof(line), "%d\t%s\t%s\t%d\t%d\t",
+                           req->op, req->guest_path, req->host_path, req->routed ? 1 : 0, req->tgid);
+        for (int i = 0; i < n && len < (int) sizeof(line) - 16; i++)
+            len += snprintf(line + len, sizeof(line) - len, i ? ",%d" : "%d", anc[i]);
+        len += snprintf(line + len, sizeof(line) - len, "\n");
+        pthread_mutex_lock(&test_guard_log_lock);
+        FILE *f = fopen(test_guard_log, "a");
+        if (f != NULL) {
+            fwrite(line, 1, len, f);
+            fclose(f);
+        }
+        pthread_mutex_unlock(&test_guard_log_lock);
+    }
+    if (test_guard_only[0] != '\0' && strstr(req->host_path, test_guard_only) == NULL)
+        return FAKEFS_GUARD_PROCEED;
+    const char *mode = test_guard_mode;
+    if (strcmp(mode, "allow") == 0)
+        return FAKEFS_GUARD_PROCEED;
+    if (strcmp(mode, "deny") == 0)
+        return FAKEFS_GUARD_DENY;
+    if (strcmp(mode, "badvalue") == 0)
+        return 77;
+    if (strcmp(mode, "hang") == 0)
+        return test_guard_sleep(60000) ? FAKEFS_GUARD_DENY : FAKEFS_GUARD_INTERRUPTED;
+    if (strncmp(mode, "wait:", 5) == 0) {
+        long ms = strtol(mode + 5, NULL, 10);
+        const char *verdict = strchr(mode + 5, ':');
+        if (!test_guard_sleep(ms / 2))
+            return FAKEFS_GUARD_INTERRUPTED;
+        if (test_guard_rebind[0] != '\0') {
+            char buf[2048];
+            snprintf(buf, sizeof(buf), "%s", test_guard_rebind);
+            char *eq = strchr(buf, '=');
+            if (eq != NULL) {
+                *eq = '\0';
+                fakefs_bind_mount(buf, eq + 1, false);
+            }
+        }
+        if (test_guard_unbind[0] != '\0')
+            fakefs_bind_unmount(test_guard_unbind);
+        if (!test_guard_sleep(ms - ms / 2))
+            return FAKEFS_GUARD_INTERRUPTED;
+        if (verdict != NULL && strcmp(verdict, ":deny") == 0)
+            return FAKEFS_GUARD_DENY;
+        return FAKEFS_GUARD_PROCEED_WAITED;
+    }
+    return FAKEFS_GUARD_DENY;
+}
+
+static void test_guard_install(void) {
+    const char *mode = getenv("ISH_TEST_GUARD");
+    if (mode == NULL)
+        return;
+    snprintf(test_guard_mode, sizeof(test_guard_mode), "%s", mode);
+    const char *v;
+    if ((v = getenv("ISH_TEST_GUARD_ONLY")) != NULL) snprintf(test_guard_only, sizeof(test_guard_only), "%s", v);
+    if ((v = getenv("ISH_TEST_GUARD_LOG")) != NULL) snprintf(test_guard_log, sizeof(test_guard_log), "%s", v);
+    if ((v = getenv("ISH_TEST_GUARD_REBIND")) != NULL) snprintf(test_guard_rebind, sizeof(test_guard_rebind), "%s", v);
+    if ((v = getenv("ISH_TEST_GUARD_UNBIND")) != NULL) snprintf(test_guard_unbind, sizeof(test_guard_unbind), "%s", v);
+    unsigned scope = FAKEFS_GUARD_SCOPE_BIND | FAKEFS_GUARD_SCOPE_ROUTED;
+    if ((v = getenv("ISH_TEST_GUARD_SCOPE")) != NULL) scope = (unsigned) strtoul(v, NULL, 10);
+    fakefs_set_guard_hook(test_guard_hook);
+    fakefs_set_guard_scope(scope);
+}
+
 int main(int argc, char *const argv[]) {
     ish_signpost_init();
     atexit(dump_pc_hist);
@@ -621,5 +743,9 @@ int main(int argc, char *const argv[]) {
     }
     do_mount(&procfs, "proc", "/proc", "", 0);
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
+    // Static bind mounts and the delete guard, for tests: both need the
+    // fakefs root that xX_main_Xx just mounted.
+    test_bind_install(getenv("ISH_TEST_BIND"));
+    test_guard_install();
     task_run_current();
 }
