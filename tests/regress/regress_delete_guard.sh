@@ -243,5 +243,48 @@ start=$(date +%s)
 out=$(g hang - ISH_TEST_GUARD_PLAIN=/mnt/w -- /bin/sh -c 'rm /mnt/w/f1 & p=$!; sleep 1; kill -9 $p; wait $p; echo "status=$?"')
 check "$(echo "$out" | tail -1)|$(cat "$PW/f1")|$([ $(( $(date +%s) - start )) -lt 8 ] && echo quick)" "status=137|one|quick" "plain prefix: a task blocked in the hook is killed at once and deletes nothing"
 
+# ---- the host takes the file away itself (a trash): the commit hook
+trash_world() { fresh; T=$D/trash; mkdir -p "$T"; }
+TR='chown 1000:1000 /mnt/b/f1; chmod 640 /mnt/b/f1; ln -s f2 /mnt/b/lnk; rm /mnt/b/f1; echo "rm=$?"; ls /mnt/b/f1 2>&1 | grep -c "No such"; rm /mnt/b/lnk; echo "rmlnk=$?"; mv /mnt/b/f2 /mnt/b/dir/f3; echo "mv=$?"; cat /mnt/b/dir/f3; rm -r /mnt/b/dir; echo "rmr=$?"; rmdir /mnt/b/empty; echo "rmdir=$?"; rm /mnt/r/f1; echo "r_rm=$?"; mv /mnt/r/f2 /mnt/r/dir/f3; echo "r_mv=$?"; cat /mnt/r/dir/f3'
+trash_world; ref=$(g - - -- /bin/sh -c "$TR"); ref_host=$(tree "$H"); ref_sess=$(tree "$A"); ref_rows=$(rows)
+trash_world; out=$(g allow - "ISH_TEST_TRASH=$T" -- /bin/sh -c "$TR")
+check "$out" "$ref" "trash: the guest sees exactly what it sees for a real delete (exit codes, output)"
+check "$(tree "$H")|$(tree "$A")" "$ref_host|$ref_sess" "trash: the guest-visible host tree is the one a real delete leaves"
+check "$(rows)|$(orphans)" "$ref_rows|0" "trash: meta.db rows are the ones a real delete leaves, no orphan inode"
+check "$(sqlite3 "$R/meta.db" 'pragma integrity_check;')" ok "trash: meta.db integrity"
+# moved: f1, lnk, dir/f3 (replaced by f2), dir/f3 again (was f2, by rm -r), sub/f4; routed f1, dir/f3 (replaced)
+check "$(ls "$T" | grep -v manifest | wc -l | tr -d ' ')" 7 "trash: every removed or replaced file is in the trash directory"
+check "$(cat "$T/1")|$(cat "$T/3")|$(cat "$T/4")" "one|three|two" "trash: with its content - the deleted file, the replaced destination, then the file that replaced it"
+check "$(awk -F'\t' '$3=="/mnt/b/f1" {print $4 ":" $5 ":" $6 ":" $7}' "$T/manifest")" "1:100640:1000:1000" "trash: the commit hook is told the guest's mode and owner of a bind-mount file"
+check "$(awk -F'\t' '$3=="/mnt/b/lnk" {print substr($5,1,2)}' "$T/manifest")" "12" "trash: a guest symlink on a bind mount is reported as a symlink (S_IFLNK), and its host file moved"
+check "$(awk -F'\t' '$3=="/mnt/r/f1" {print $4}' "$T/manifest")" "0" "trash: a routed path has no guest stat (its host mode is the guest's)"
+check "$(awk -F'\t' '$2==2' "$T/manifest" | wc -l | tr -d ' ')" 3 "trash: removed directories are recorded (dir/sub, dir, empty), not moved"
+trash_world; out=$(g wait:300:allow - "ISH_TEST_TRASH=$T" -- /bin/sh -c 'rm /mnt/b/f1; echo "rc=$?"')
+check "$out|$(cat "$T/1")|$([ -e "$H/f1" ] && echo there || echo gone)" "rc=0|one|gone" "trash after a wait: moved"
+trash_world; out=$(g wait:400:allow - "ISH_TEST_TRASH=$T" "ISH_TEST_GUARD_REBIND=/mnt/b=$H2" -- /bin/sh -c 'rm /mnt/b/f1 2>/dev/null; echo "rc=$?"')
+check "$out|$(cat "$H/f1")|$(cat "$H2/f1")|$(ls "$T" | wc -l | tr -d ' ')" "rc=1|one|one|0" "trash, mount re-pointed during the wait: nothing is moved from either place (the commit hook is not even called)"
+trash_world; before=$(tree "$H")
+g - - -- /bin/sh -c 'ls -R /mnt/b >/dev/null' >/dev/null; before_rows=$(rows)
+out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=deny -- /bin/sh -c 'rm /mnt/b/f1 2>&1; echo "rc=$?"; mv /mnt/b/f2 /mnt/b/dir/f3 2>/dev/null; echo "mv=$?"')
+check "$(echo "$out" | grep -c "not permitted")|$(echo "$out" | grep -E "^(rc|mv)=" | tr '\n' ' ')|$(tree "$H")|$(rows)|$(orphans)" "1|rc=1 mv=1 |$before|$before_rows|0" "trash refused at commit: EPERM, host files and meta.db rows untouched"
+trash_world; out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=delete -- /bin/sh -c 'rm /mnt/b/f1; echo "rc=$?"')
+check "$out|$([ -e "$H/f1" ] && echo there || echo gone)|$(ls "$T" | wc -l | tr -d ' ')|$(orphans)" "rc=0|gone|0|0" "trash declined (cannot take it): the file is deleted the usual way"
+trash_world; before=$(tree "$H")
+out=$(g allow - "ISH_TEST_TRASH=$T" ISH_TEST_TRASH_MODE=lie -- /bin/sh -c 'rm /mnt/b/f1 2>&1; echo "rc=$?"; rm /mnt/r/f1 2>/dev/null; echo "r=$?"')
+check "$(echo "$out" | grep -ci "i/o error")|$(echo "$out" | grep -E "^(rc|r)=" | tr '\n' ' ')|$(tree "$H")|$(cat "$A/f1")|$(orphans)" "1|rc=1 r=1 |$before|one|0" "the hook claims it removed a file that is still there: EIO, the file is NOT deleted, no row is dropped"
+check "$(g - - -- /bin/sh -c 'rm /mnt/b/f1 && echo gone')" gone "...and it deletes normally afterwards"
+plain_world; T=$D/trash; mkdir -p "$T"
+out=$(g allow - ISH_TEST_GUARD_PLAIN=/mnt/w "ISH_TEST_TRASH=$T" -- /bin/sh -c 'rm /mnt/w/f1; echo "rm=$?"; mv /mnt/w/f2 /mnt/w/dir/f3; echo "mv=$?"; cat /mnt/w/dir/f3')
+check "$(echo $out)|$(cat "$T/1")|$(cat "$T/2")|$(orphans)" "rm=0 mv=0 two|one|three|0" "trash on a plain-prefix path: moved, the guest sees a delete, no orphan"
+# putting a file back: the host renames it into place and tells fakefs the mode and owner
+trash_world
+g allow - "ISH_TEST_TRASH=$T" -- /bin/sh -c 'chown 1000:1000 /mnt/b/f1; chmod 640 /mnt/b/f1; rm /mnt/b/f1' >/dev/null
+mv "$T/1" "$H/f1"
+out=$(g - - "ISH_TEST_TRASH_RESTAT=/mnt/b/f1=100640:1000:1000" -- /bin/sh -c 'stat -c "%a %u %g %F" /mnt/b/f1; cat /mnt/b/f1')
+check "$(echo $out)" "640 1000 1000 regular file one" "restore: a file put back on the host gets its guest mode and owner again (fakefs_guest_stat_restore)"
+check "$(orphans)|$(sqlite3 "$R/meta.db" 'pragma integrity_check;')" "0|ok" "restore: no orphan, meta.db integrity"
+out=$(g - - "ISH_TEST_TRASH_RESTAT=/mnt/b/f2=100600:0:0" -- /bin/sh -c 'stat -c "%a %u" /mnt/b/f2; cat /mnt/b/f2')
+check "$(echo $out)" "600 0 two" "restore stat on a path that already has a row updates it"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

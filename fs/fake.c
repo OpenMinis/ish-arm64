@@ -573,11 +573,15 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
 
 /* ===== Delete guard (see fs/fake.h) ===== [FEAT-261116-11] */
 static _Atomic(fakefs_guard_hook_t) g_guard_hook = NULL;
+static _Atomic(fakefs_guard_hook_t) g_guard_commit_hook = NULL;
 static _Atomic unsigned g_guard_scope = 0;
 static _Atomic uint64_t g_guard_calls = 0;
 
 void fakefs_set_guard_hook(fakefs_guard_hook_t hook) {
     atomic_store_explicit(&g_guard_hook, hook, memory_order_release);
+}
+void fakefs_set_guard_commit_hook(fakefs_guard_hook_t hook) {
+    atomic_store_explicit(&g_guard_commit_hook, hook, memory_order_release);
 }
 void fakefs_set_guard_scope(unsigned scope) {
     atomic_store_explicit(&g_guard_scope, scope, memory_order_release);
@@ -683,10 +687,13 @@ static inline bool guard_wanted(bool routed) {
     return (scope & (routed ? FAKEFS_GUARD_SCOPE_ROUTED : FAKEFS_GUARD_SCOPE_BIND)) != 0;
 }
 
-/* Ask the guard hook about removing `host_path`. Returns 0 to go ahead, a
- * negative errno to fail the call, or 1 when the hook blocked before saying
- * yes - the caller must then translate its path(s) again (guard_same_place)
- * before touching the host.
+#define GUARD_WAITED 1   /* the hook blocked first: check the path(s) again */
+#define GUARD_TRASH  2   /* the host wants to take it away itself: guard_commit */
+
+/* Ask the guard hook about removing `host_path`. Returns a negative errno to
+ * fail the call, or a set of GUARD_* flags (0 = just go ahead). With
+ * GUARD_WAITED the caller must translate its path(s) again (guard_same_place)
+ * before touching the host; with GUARD_TRASH it then calls guard_commit.
  *
  * Call it only where nothing has been changed yet and no lock is held. */
 static int guard_ask(int op, const char *path, const char *host_path,
@@ -724,10 +731,91 @@ static int guard_ask(int op, const char *path, const char *host_path,
         return _EINTR;
     switch (verdict) {
         case FAKEFS_GUARD_PROCEED: return 0;
-        case FAKEFS_GUARD_PROCEED_WAITED: return 1;
+        case FAKEFS_GUARD_PROCEED_WAITED: return GUARD_WAITED;
+        case FAKEFS_GUARD_PROCEED | FAKEFS_GUARD_TRASH: return GUARD_TRASH;
+        case FAKEFS_GUARD_PROCEED_WAITED | FAKEFS_GUARD_TRASH: return GUARD_WAITED | GUARD_TRASH;
         case FAKEFS_GUARD_INTERRUPTED: return _EINTR;
         default: return _EPERM;
     }
+}
+
+/* The second half of a delete the host wants to take away itself: call the
+ * commit hook. Returns 1 when the hook removed `host_path` (verified - a
+ * path that is still there after "removed" fails the call with EIO rather
+ * than being deleted without having been kept), 0 when fakefs is to delete as
+ * usual, or a negative errno. `fs` and `path` give the guest's view of the
+ * path from meta.db; NULL `fs` for hook-routed paths. */
+static int guard_commit(struct fakefs_db *fs, int op, const char *path, const char *host_path,
+                        const char *host_src, bool is_dir, bool routed) {
+    fakefs_guard_hook_t hook = atomic_load_explicit(&g_guard_commit_hook, memory_order_acquire);
+    if (hook == NULL)
+        return 0;
+    assert(db_lock_depth_current() == 0);
+    if (db_lock_depth_current() != 0)
+        return 0;
+    char guest[MAX_PATH];
+    if (path[0] != '/')
+        snprintf(guest, sizeof(guest), "/%s", path);
+    else
+        snprintf(guest, sizeof(guest), "%s", path);
+    struct fakefs_guard_request req = {
+        .op = op,
+        .guest_path = guest,
+        .host_path = host_path,
+        .host_src = host_src,
+        .is_dir = is_dir,
+        .routed = routed,
+        .fs_context = (current != NULL && current->group != NULL) ? current->group->fs_context : 0,
+        .pid = current != NULL ? current->pid : 0,
+        .tgid = current != NULL ? current->tgid : 0,
+    };
+    if (fs != NULL) {
+        struct ish_stat st;
+        db_begin_read(fs);
+        bool found = path_read_stat(fs, path, &st, NULL);
+        db_commit(fs);
+        if (found) {
+            req.has_guest_stat = true;
+            req.guest_mode = st.mode;
+            req.guest_uid = st.uid;
+            req.guest_gid = st.gid;
+        }
+    }
+    int verdict = hook(&req);
+    if (current != NULL && task_orphaned(current))
+        return _EINTR;
+    if (verdict == FAKEFS_COMMIT_DELETE)
+        return 0;
+    if (verdict == FAKEFS_GUARD_INTERRUPTED)
+        return _EINTR;
+    if (verdict != FAKEFS_COMMIT_REMOVED)
+        return _EPERM;
+    struct stat still;
+    if (lstat(host_path, &still) == 0)
+        return _EIO;
+    return 1;
+}
+
+int fakefs_guest_stat_restore(const char *guest_path, uint32_t mode, uint32_t uid, uint32_t gid) {
+    if (g_fakefs_mount == NULL)
+        return _ENODEV;
+    if (guest_path == NULL || guest_path[0] != '/')
+        return _EINVAL;
+    struct fakefs_db *fs = &g_fakefs_mount->fakefs;
+    struct ish_stat st;
+    uint64_t inode = 0;
+    db_begin_write(fs);
+    if (path_read_stat(fs, guest_path, &st, &inode)) {
+        st.mode = mode;
+        st.uid = uid;
+        st.gid = gid;
+        inode_write_stat(fs, inode, &st);
+    } else {
+        st = (struct ish_stat) {.mode = mode, .uid = uid, .gid = gid, .rdev = 0};
+        path_create(fs, guest_path, &st);
+    }
+    db_commit(fs);
+    return 0;
 }
 
 /* After a wait: does `path` still lead to the host path the guard was asked
@@ -746,8 +834,8 @@ static int guard_same_place(const char *path, const char *host_before, bool rout
     return 0;
 }
 
-/* guard_ask for a plain-rootfs path under a guarded prefix. Returns 0 to go
- * ahead or a negative errno. The path reaches its directory through a link
+/* guard_ask for a plain-rootfs path under a guarded prefix. Returns GUARD_*
+ * flags or a negative errno (the re-check after a wait is done here). The path reaches its directory through a link
  * in the rootfs that the host may re-point at any time: where it leads is
  * resolved before the question and, if the hook waited, again after it, and
  * a different answer fails the call with EIO. */
@@ -756,11 +844,11 @@ static int guard_ask_plain(int op, const char *path, const char *host_path,
     char before[PATH_MAX], after[PATH_MAX];
     bool known = guard_plain_dir(host_path, before);
     int g = guard_ask(op, path, host_path, host_src, is_dir, false);
-    if (g <= 0)
+    if (g < 0 || !(g & GUARD_WAITED))
         return g;
     if (!known || !guard_plain_dir(host_path, after) || strcmp(before, after) != 0)
         return _EIO;
-    return 0;
+    return g;
 }
 
 static int fakefs_unlink(struct mount *mount, const char *path) {
@@ -772,20 +860,36 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
     bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
     /* [FEAT-261116-11] Delete guard: before the host call, before meta.db
      * (bind_mount_ensure_inode below takes its lock), nothing changed yet. */
+    /* True once the host has taken the file away itself (its trash): the host
+     * removal below is skipped, everything else is the delete it always was. */
+    bool removed = false;
     if (via_bind && guard_wanted(via_hook)) {
         int g = guard_ask(FAKEFS_GUARD_OP_UNLINK, path, host_abs, NULL, false, via_hook);
         if (g < 0)
             return g;
-        if (g > 0 && (g = guard_same_place(path, host_abs, via_hook)) < 0)
-            return g;
+        int e;
+        if ((g & GUARD_WAITED) && (e = guard_same_place(path, host_abs, via_hook)) < 0)
+            return e;
+        if (g & GUARD_TRASH) {
+            int c = guard_commit(via_hook ? NULL : fs, FAKEFS_GUARD_OP_UNLINK, path, host_abs, NULL, false, via_hook);
+            if (c < 0)
+                return c;
+            removed = c > 0;
+        }
     } else if (!via_bind && guard_plain_path(mount, path, host_abs, sizeof(host_abs))) {
         int g = guard_ask_plain(FAKEFS_GUARD_OP_UNLINK, path, host_abs, NULL, false);
         if (g < 0)
             return g;
+        if (g & GUARD_TRASH) {
+            int c = guard_commit(fs, FAKEFS_GUARD_OP_UNLINK, path, host_abs, NULL, false, false);
+            if (c < 0)
+                return c;
+            removed = c > 0;
+        }
     }
     /* Hook-routed paths bypass meta.db entirely (see fakefs_open). */
     if (via_hook) {
-        if (unlink(host_abs) < 0)
+        if (!removed && unlink(host_abs) < 0)
             return errno_map();
         fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
         return 0;
@@ -801,10 +905,10 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
      * blocked task could not be killed. The metadata update follows in its
      * own short transaction; bind-mount rows are re-created on demand
      * (bind_mount_ensure_inode), so the brief gap between the two is benign. */
-    if (via_bind && unlink(host_abs) < 0)
+    if (via_bind && !removed && unlink(host_abs) < 0)
         return errno_map();
     db_begin_write(fs);
-    if (!via_bind) {
+    if (!via_bind && !removed) {
         int err = realfs.unlink(mount, path);
         if (err < 0) {
             db_rollback(fs);
@@ -831,12 +935,21 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
         int g = guard_ask(FAKEFS_GUARD_OP_RMDIR, path, host_abs, NULL, true, via_hook);
         if (g < 0)
             return g;
-        if (g > 0 && (g = guard_same_place(path, host_abs, via_hook)) < 0)
-            return g;
+        int e;
+        if ((g & GUARD_WAITED) && (e = guard_same_place(path, host_abs, via_hook)) < 0)
+            return e;
+        /* A directory is not taken away (it is empty); the host only learns
+         * of it, to rebuild it on a restore. */
+        if ((g & GUARD_TRASH) &&
+            (e = guard_commit(via_hook ? NULL : fs, FAKEFS_GUARD_OP_RMDIR, path, host_abs, NULL, true, via_hook)) < 0)
+            return e;
     } else if (!via_bind && guard_plain_path(mount, path, host_abs, sizeof(host_abs))) {
         int g = guard_ask_plain(FAKEFS_GUARD_OP_RMDIR, path, host_abs, NULL, true);
         if (g < 0)
             return g;
+        int e;
+        if ((g & GUARD_TRASH) && (e = guard_commit(fs, FAKEFS_GUARD_OP_RMDIR, path, host_abs, NULL, true, false)) < 0)
+            return e;
     }
     if (via_hook) {
         if (rmdir(host_abs) < 0)
@@ -888,11 +1001,20 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
                               S_ISDIR(dst_st.st_mode), dst_hook);
             if (g < 0)
                 return g;
-            if (g > 0) {
-                if ((g = guard_same_place(src, host_src, src_hook)) < 0)
-                    return g;
-                if ((g = guard_same_place(dst, host_dst, dst_hook)) < 0)
-                    return g;
+            if (g & GUARD_WAITED) {
+                int e;
+                if ((e = guard_same_place(src, host_src, src_hook)) < 0)
+                    return e;
+                if ((e = guard_same_place(dst, host_dst, dst_hook)) < 0)
+                    return e;
+            }
+            /* The file about to be replaced goes to the host first; the rename
+             * below then lands on a free name (or replaces, if not taken). */
+            if (g & GUARD_TRASH) {
+                int c = guard_commit(dst_hook ? NULL : fs, FAKEFS_GUARD_OP_REPLACE, dst, host_dst, host_src,
+                                     S_ISDIR(dst_st.st_mode), dst_hook);
+                if (c < 0)
+                    return c;
             }
         }
     }
@@ -909,6 +1031,11 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
             int g = guard_ask_plain(FAKEFS_GUARD_OP_REPLACE, dst, host_dst, host_src, S_ISDIR(dst_st.st_mode));
             if (g < 0)
                 return g;
+            if (g & GUARD_TRASH) {
+                int c = guard_commit(fs, FAKEFS_GUARD_OP_REPLACE, dst, host_dst, host_src, S_ISDIR(dst_st.st_mode), false);
+                if (c < 0)
+                    return c;
+            }
         }
     }
     if (src_hook) {

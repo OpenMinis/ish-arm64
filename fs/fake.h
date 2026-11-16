@@ -162,6 +162,21 @@ void fakefs_set_path_reverse_hook(fakefs_path_reverse_hook_t hook);
 #define FAKEFS_GUARD_PROCEED_WAITED 1
 #define FAKEFS_GUARD_DENY          (-1)
 #define FAKEFS_GUARD_INTERRUPTED   (-2)
+/* Or'ed into PROCEED / PROCEED_WAITED: the host wants to take the thing away
+ * itself (a trash) instead of having it deleted. fakefs then calls the commit
+ * hook - after the path has been checked again, right where it would have
+ * deleted - and acts on its answer. */
+#define FAKEFS_GUARD_TRASH          0x10
+
+/* Answers of the commit hook. */
+#define FAKEFS_COMMIT_DELETE  0   /* not taken: fakefs deletes as usual */
+#define FAKEFS_COMMIT_REMOVED 1   /* the hook moved it away: fakefs skips the host
+                                   * removal and updates meta.db as for a delete.
+                                   * For RMDIR and REPLACE of a directory the hook
+                                   * never removes; for REPLACE fakefs then renames
+                                   * onto the now free name. If the path is still
+                                   * there after REMOVED the call fails with EIO. */
+/* FAKEFS_GUARD_DENY / FAKEFS_GUARD_INTERRUPTED as above; anything else: DENY. */
 
 /* Which kinds of path are sent to the hook. */
 #define FAKEFS_GUARD_SCOPE_BIND   1u  /* static bind mounts (g_bind_mounts[]) */
@@ -177,12 +192,31 @@ struct fakefs_guard_request {
     uint64_t fs_context;     /* current->group->fs_context */
     int pid;                 /* calling task */
     int tgid;                /* its process */
+    /* Commit hook only: what meta.db says the guest sees for this path (mode
+     * with the file type, owner). False for hook-routed paths, which have no
+     * meta.db row - their host mode is the guest's. */
+    bool has_guest_stat;
+    uint32_t guest_mode;
+    uint32_t guest_uid;
+    uint32_t guest_gid;
 };
 
 typedef int (*fakefs_guard_hook_t)(const struct fakefs_guard_request *request);
 
 /* NULL removes the hook. */
 void fakefs_set_guard_hook(fakefs_guard_hook_t hook);
+/* The commit hook (see FAKEFS_GUARD_TRASH). Same calling conditions as the
+ * guard hook: the guest task's own thread, nothing changed yet, no lock
+ * held; it may block and must then poll fakefs_guard_should_abort(). It may
+ * move `host_path` away (rename it elsewhere) and nothing else. */
+void fakefs_set_guard_commit_hook(fakefs_guard_hook_t hook);
+
+/* Give a guest path of a bind mount or of the plain rootfs the mode and owner
+ * the guest should see (creating its meta.db row if it has none) - for a file
+ * the host has put back, e.g. restored from a trash. `mode` includes the file
+ * type bits. Returns 0, or a negative errno (-ENODEV before fakefs is
+ * mounted). Not for hook-routed paths. */
+int fakefs_guest_stat_restore(const char *guest_path, uint32_t mode, uint32_t uid, uint32_t gid);
 /* Bit set of FAKEFS_GUARD_SCOPE_*; 0 (the default) sends nothing. */
 void fakefs_set_guard_scope(unsigned scope);
 unsigned fakefs_guard_scope(void);

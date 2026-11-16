@@ -520,6 +520,45 @@ static char test_guard_rebind[2048];
 static char test_guard_unbind[1024];
 static char test_guard_relink[2048];
 static pthread_mutex_t test_guard_log_lock = PTHREAD_MUTEX_INITIALIZER;
+//   ISH_TEST_TRASH=<host dir>   every allowed removal is offered to a commit
+//       hook that moves the file into <host dir> (named <n>) and appends
+//       "<n>\t<op>\t<guest>\t<has stat>\t<mode, octal>\t<uid>\t<gid>" to
+//       <host dir>/manifest
+//   ISH_TEST_TRASH_MODE=move (default) | delete (answer "delete as usual")
+//       | deny | lie (answer "removed" without moving anything)
+//   ISH_TEST_TRASH_RESTAT=/guest/path=<mode octal>:<uid>:<gid>  at start, set
+//       that path's guest stat (fakefs_guest_stat_restore)
+static char test_trash_dir[1024];
+static char test_trash_mode[32];
+static int test_trash_seq;
+
+static int test_commit_hook(const struct fakefs_guard_request *req) {
+    if (strcmp(test_trash_mode, "delete") == 0)
+        return FAKEFS_COMMIT_DELETE;
+    if (strcmp(test_trash_mode, "deny") == 0)
+        return FAKEFS_GUARD_DENY;
+    if (strcmp(test_trash_mode, "lie") == 0)
+        return FAKEFS_COMMIT_REMOVED;
+    pthread_mutex_lock(&test_guard_log_lock);
+    int n = ++test_trash_seq;
+    char line[4096], manifest[1100], dest[1100];
+    snprintf(manifest, sizeof(manifest), "%s/manifest", test_trash_dir);
+    snprintf(dest, sizeof(dest), "%s/%d", test_trash_dir, n);
+    int len = snprintf(line, sizeof(line), "%d\t%d\t%s\t%d\t%o\t%u\t%u\n", n, req->op, req->guest_path,
+                       req->has_guest_stat ? 1 : 0, req->guest_mode, req->guest_uid, req->guest_gid);
+    FILE *f = fopen(manifest, "a");
+    if (f != NULL) {
+        fwrite(line, 1, len, f);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&test_guard_log_lock);
+    // A directory is only recorded; fakefs removes it itself.
+    if (req->op == FAKEFS_GUARD_OP_RMDIR || req->is_dir)
+        return FAKEFS_COMMIT_DELETE;
+    if (rename(req->host_path, dest) < 0)
+        return FAKEFS_COMMIT_DELETE;
+    return FAKEFS_COMMIT_REMOVED;
+}
 
 static void test_bind_install(const char *spec) {
     if (spec == NULL)
@@ -571,8 +610,9 @@ static int test_guard_hook(const struct fakefs_guard_request *req) {
     if (test_guard_only[0] != '\0' && strstr(req->host_path, test_guard_only) == NULL)
         return FAKEFS_GUARD_PROCEED;
     const char *mode = test_guard_mode;
+    int trash = test_trash_dir[0] != '\0' ? FAKEFS_GUARD_TRASH : 0;
     if (strcmp(mode, "allow") == 0)
-        return FAKEFS_GUARD_PROCEED;
+        return FAKEFS_GUARD_PROCEED | trash;
     if (strcmp(mode, "deny") == 0)
         return FAKEFS_GUARD_DENY;
     if (strcmp(mode, "badvalue") == 0)
@@ -610,9 +650,24 @@ static int test_guard_hook(const struct fakefs_guard_request *req) {
             return FAKEFS_GUARD_INTERRUPTED;
         if (verdict != NULL && strcmp(verdict, ":deny") == 0)
             return FAKEFS_GUARD_DENY;
-        return FAKEFS_GUARD_PROCEED_WAITED;
+        return FAKEFS_GUARD_PROCEED_WAITED | trash;
     }
     return FAKEFS_GUARD_DENY;
+}
+
+static void test_restat_install(void) {
+    const char *v = getenv("ISH_TEST_TRASH_RESTAT");
+    if (v == NULL)
+        return;
+    char buf[1200];
+    snprintf(buf, sizeof(buf), "%s", v);
+    char *eq = strchr(buf, '=');
+    unsigned m = 0, u = 0, gid = 0;
+    if (eq != NULL && sscanf(eq + 1, "%o:%u:%u", &m, &u, &gid) == 3) {
+        *eq = '\0';
+        int err = fakefs_guest_stat_restore(buf, m, u, gid);
+        if (err < 0) fprintf(stderr, "ISH_TEST_TRASH_RESTAT: %d\n", err);
+    }
 }
 
 static void test_guard_install(void) {
@@ -632,6 +687,11 @@ static void test_guard_install(void) {
         snprintf(plain, sizeof(plain), "%s", v);
         const char *list[1] = {plain};
         fakefs_set_guard_plain_prefixes(list, 1);
+    }
+    if ((v = getenv("ISH_TEST_TRASH")) != NULL) {
+        snprintf(test_trash_dir, sizeof(test_trash_dir), "%s", v);
+        if ((v = getenv("ISH_TEST_TRASH_MODE")) != NULL) snprintf(test_trash_mode, sizeof(test_trash_mode), "%s", v);
+        fakefs_set_guard_commit_hook(test_commit_hook);
     }
     unsigned scope = FAKEFS_GUARD_SCOPE_BIND | FAKEFS_GUARD_SCOPE_ROUTED;
     if ((v = getenv("ISH_TEST_GUARD_SCOPE")) != NULL) scope = (unsigned) strtoul(v, NULL, 10);
@@ -770,5 +830,6 @@ int main(int argc, char *const argv[]) {
     // fakefs root that xX_main_Xx just mounted.
     test_bind_install(getenv("ISH_TEST_BIND"));
     test_guard_install();
+    test_restat_install();
     task_run_current();
 }
