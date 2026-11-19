@@ -74,20 +74,28 @@ static int compute_relative_path(const char *link_dir, const char *abs_target,
     if (ld_len > 0 && link_dir[ld_len - 1] != '/')
         ups++;
 
+    /* [FIX-261119-LP-W] strlcpy / strlcat return the length they wanted:
+     * one at or past out_size means the target was cut - an error, since a
+     * cut link target points somewhere else. */
+    size_t want = 0;
     out[0] = '\0';
     for (int i = 0; i < ups; i++) {
         if (i == 0)
-            strlcpy(out, "..", out_size);
+            want = strlcpy(out, "..", out_size);
         else
-            strlcat(out, "/..", out_size);
+            want = strlcat(out, "/..", out_size);
+        if (want >= out_size)
+            return -1;
     }
 
     /* Append the remainder of abs_target after common prefix */
     const char *suffix = abs_target + common;
     if (*suffix == '/') suffix++; /* skip leading slash */
     if (*suffix) {
-        if (ups > 0) strlcat(out, "/", out_size);
-        strlcat(out, suffix, out_size);
+        if (ups > 0 && strlcat(out, "/", out_size) >= out_size)
+            return -1;
+        if (strlcat(out, suffix, out_size) >= out_size)
+            return -1;
     }
 
     if (out[0] == '\0') {
@@ -117,6 +125,30 @@ static bool bind_debug(void) {
     return on;
 }
 #define BIND_LOG(...) do { if (bind_debug()) fprintf(stderr, __VA_ARGS__); } while (0)
+
+/* [FIX-261119-LP-W] Every host path here is built in char[PATH_MAX]; on
+ * Windows that was 260 (see compat.h) and paths were cut. Elsewhere the
+ * system's own PATH_MAX (1024 on Darwin) is the host's limit anyway; there
+ * and here, a path that does not fit is refused (fits_snprintf). */
+#ifdef _WIN32
+_Static_assert(PATH_MAX >= 4096, "fakefs host path buffers need PATH_MAX >= 4096");
+#endif
+
+/* [FIX-261119-LP-W] snprintf that says whether it fit. A path that does not
+ * fit is never used cut: a cut host path names another file. */
+static bool fits_snprintf(char *out, size_t size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static bool fits_snprintf(char *out, size_t size, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out, size, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t) n >= size) {
+        if (size > 0)
+            out[0] = '\0';
+        return false;
+    }
+    return true;
+}
 struct mount *g_fakefs_mount = NULL;
 
 /* Optional host-provided override hooks for guest↔host path translation.
@@ -253,9 +285,9 @@ bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t
         /* Try matching as-is first */
         if (host_path_ncmp(resolved, g_bind_mounts[i].host_path, hlen) == 0 &&
             (resolved[hlen] == '/' || resolved[hlen] == '\0')) {
-            snprintf(out_path, out_size, "%s%s",
-                     g_bind_mounts[i].path, resolved + hlen);
-            return true;
+            /* [FIX-261119-LP-W] No guest path that fits: not mapped. */
+            return fits_snprintf(out_path, out_size, "%s%s",
+                                 g_bind_mounts[i].path, resolved + hlen);
         }
         /* F_GETPATH resolves /var -> /private/var on iOS.
          * If host_path starts with /var/ but resolved starts with /private/var/,
@@ -265,9 +297,8 @@ bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t
             const char *resolved_no_private = resolved + 8; /* skip "/private" */
             if (strncmp(resolved_no_private, g_bind_mounts[i].host_path, hlen) == 0 &&
                 (resolved_no_private[hlen] == '/' || resolved_no_private[hlen] == '\0')) {
-                snprintf(out_path, out_size, "%s%s",
-                         g_bind_mounts[i].path, resolved_no_private + hlen);
-                return true;
+                return fits_snprintf(out_path, out_size, "%s%s",
+                                     g_bind_mounts[i].path, resolved_no_private + hlen);
             }
         }
     }
@@ -292,15 +323,19 @@ bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t o
  * meta.db need to know — hook-routed paths must NOT be stored in meta.db,
  * since the `paths` table is keyed by guest path globally, while the hook
  * can map the same guest path to different host files per fs_context. */
-static bool bind_mount_translate_path_ex(const char *path, char *out_path,
-                                         size_t out_size, bool *out_via_hook) {
+/* [FIX-261119-LP-W] 1: under a bind, `out_path` is the host path; 0: not
+ * under a bind; _ENAMETOOLONG: under a bind, but the host path does not
+ * fit `out_size` - callers fail the call with it, never use a cut path. */
+static int bind_translate(const char *path, char *out_path,
+                          size_t out_size, bool *out_via_hook) {
     if (out_via_hook != NULL) *out_via_hook = false;
     /* Normalize: if path lacks leading /, prepend it for comparison.
      * Bind mount table always stores paths with leading /. */
     char normalized[MAX_PATH];
     const char *cmp_path = path;
     if (path[0] != '/') {
-        snprintf(normalized, sizeof(normalized), "/%s", path);
+        if (!fits_snprintf(normalized, sizeof(normalized), "/%s", path))
+            return _ENAMETOOLONG;
         cmp_path = normalized;
     }
     /* Host-provided hook wins over the static table. The hook sees the
@@ -313,7 +348,7 @@ static bool bind_mount_translate_path_ex(const char *path, char *out_path,
             ctx = current->group->fs_context;
         if (hook(cmp_path, ctx, out_path, out_size)) {
             if (out_via_hook != NULL) *out_via_hook = true;
-            return true;
+            return 1;
         }
     }
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
@@ -322,16 +357,16 @@ static bool bind_mount_translate_path_ex(const char *path, char *out_path,
         int len = g_bind_mounts[i].path_len;
         if (strncmp(g_bind_mounts[i].path, cmp_path, len) == 0 &&
             (cmp_path[len] == '/' || cmp_path[len] == '\0')) {
-            snprintf(out_path, out_size, "%s%s",
-                     g_bind_mounts[i].host_path, cmp_path + len);
-            return true;
+            if (!fits_snprintf(out_path, out_size, "%s%s",
+                               g_bind_mounts[i].host_path, cmp_path + len)) {
+                BIND_LOG("fakefs: \"%s\" under bind slot[%d] is longer than %zu bytes on the host\n",
+                         cmp_path, i, out_size - 1);
+                return _ENAMETOOLONG;
+            }
+            return 1;
         }
     }
-    return false;
-}
-
-static bool bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
-    return bind_mount_translate_path_ex(path, out_path, out_size, NULL);
+    return 0;
 }
 
 /* Check if a path is at or under a bind mount prefix.
@@ -340,7 +375,9 @@ static bool is_under_bind_mount(const char *path) {
     char normalized[MAX_PATH];
     const char *cmp_path = path;
     if (path[0] != '/') {
-        snprintf(normalized, sizeof(normalized), "/%s", path);
+        /* [FIX-261119-LP-W] A cut copy could match another prefix. */
+        if (!fits_snprintf(normalized, sizeof(normalized), "/%s", path))
+            return false;
         cmp_path = normalized;
     }
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
@@ -368,7 +405,10 @@ static bool is_under_readonly_bind_mount(const char *path) {
     char normalized[MAX_PATH];
     const char *cmp_path = path;
     if (path[0] != '/') {
-        snprintf(normalized, sizeof(normalized), "/%s", path);
+        /* [FIX-261119-LP-W] Too long to compare: treated as read-only, so a
+         * write is refused rather than let through. */
+        if (!fits_snprintf(normalized, sizeof(normalized), "/%s", path))
+            return true;
         cmp_path = normalized;
     }
     fakefs_path_readonly_hook_t hook = atomic_load_explicit(&g_path_readonly_hook, memory_order_acquire);
@@ -399,7 +439,11 @@ static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount
     /* Check if it exists on host — use direct path for bind mounts */
     struct stat host_stat;
     char host_abs[PATH_MAX];
-    if (bind_mount_translate_path(path, host_abs, sizeof(host_abs))) {
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(path, host_abs, sizeof(host_abs), NULL);
+    if (tr < 0)
+        return 0;
+    if (tr > 0) {
         if (stat(host_abs, &host_stat) < 0)
             return 0;
     } else if (fstatat(mount->root_fd, fix_path(path), &host_stat, AT_SYMLINK_NOFOLLOW) < 0) {
@@ -481,7 +525,11 @@ static struct fd *fakefs_open_(struct mount *mount, const char *path, int flags,
     char host_abs[PATH_MAX];
     struct fd *fd;
     bool via_hook = false;
-    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(path, host_abs, sizeof(host_abs), &via_hook);
+    if (tr < 0)
+        return ERR_PTR(tr);
+    bool via_bind = tr > 0;
     if (via_bind) {
         int real_flags = 0;
         if (flags & O_RDONLY_) real_flags |= O_RDONLY;
@@ -641,8 +689,14 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
      * sides returns EXDEV, matching cross-fs link semantics. */
     char host_src[PATH_MAX], host_dst[PATH_MAX];
     bool src_hook = false, dst_hook = false;
-    bool src_bind = bind_mount_translate_path_ex(src, host_src, sizeof(host_src), &src_hook);
-    bool dst_bind = bind_mount_translate_path_ex(dst, host_dst, sizeof(host_dst), &dst_hook);
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int src_tr = bind_translate(src, host_src, sizeof(host_src), &src_hook);
+    int dst_tr = bind_translate(dst, host_dst, sizeof(host_dst), &dst_hook);
+    if (src_tr < 0)
+        return src_tr;
+    if (dst_tr < 0)
+        return dst_tr;
+    bool src_bind = src_tr > 0, dst_bind = dst_tr > 0;
     if (src_hook != dst_hook)
         return _EXDEV;
     if (src_hook) {
@@ -691,7 +745,11 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
         return _EROFS;
     char host_abs[PATH_MAX];
     bool via_hook = false;
-    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(path, host_abs, sizeof(host_abs), &via_hook);
+    if (tr < 0)
+        return tr;
+    bool via_bind = tr > 0;
     /* Hook-routed paths bypass meta.db entirely (see fakefs_open). */
     if (via_hook) {
         if (unlink(host_abs) < 0)
@@ -750,7 +808,11 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
         return _EROFS;
     char host_abs[PATH_MAX];
     bool via_hook = false;
-    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(path, host_abs, sizeof(host_abs), &via_hook);
+    if (tr < 0)
+        return tr;
+    bool via_bind = tr > 0;
     if (via_hook) {
         if (rmdir(host_abs) < 0)
             return errno_map();
@@ -800,8 +862,14 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
         return _EROFS;
     char host_src[PATH_MAX], host_dst[PATH_MAX];
     bool src_hook = false, dst_hook = false;
-    bool src_bind = bind_mount_translate_path_ex(src, host_src, sizeof(host_src), &src_hook);
-    bool dst_bind = bind_mount_translate_path_ex(dst, host_dst, sizeof(host_dst), &dst_hook);
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int src_tr = bind_translate(src, host_src, sizeof(host_src), &src_hook);
+    int dst_tr = bind_translate(dst, host_dst, sizeof(host_dst), &dst_hook);
+    if (src_tr < 0)
+        return src_tr;
+    if (dst_tr < 0)
+        return dst_tr;
+    bool src_bind = src_tr > 0, dst_bind = dst_tr > 0;
     if (src_bind != dst_bind || src_hook != dst_hook)
         return _EXDEV;
     if (src_hook) {
@@ -851,7 +919,11 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
      * recognize as a symlink. */
     char host_chk[PATH_MAX];
     bool _vh = false;
-    if (bind_mount_translate_path_ex(link, host_chk, sizeof(host_chk), &_vh) && _vh)
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(link, host_chk, sizeof(host_chk), &_vh);
+    if (tr < 0)
+        return tr;
+    if (tr > 0 && _vh)
         return _EPERM;
     db_begin_write(fs);
     // create a file containing the target
@@ -915,7 +987,13 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
      * against the host file; synthesize mode bits from host's. */
     char host_abs[PATH_MAX];
     bool via_hook = false;
-    if (bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook) && via_hook) {
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(path, host_abs, sizeof(host_abs), &via_hook);
+    if (tr < 0) {
+        ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
+        return tr;
+    }
+    if (tr > 0 && via_hook) {
         struct stat host_stat;
         if (stat(host_abs, &host_stat) < 0) {
             ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
@@ -972,7 +1050,8 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     }
     int err;
     char host_stat_path[PATH_MAX];
-    if (bind_mount_translate_path(path, host_stat_path, sizeof(host_stat_path))) {
+    /* [FIX-261119-LP-W] Same path as above: it fit there, it fits here. */
+    if (bind_translate(path, host_stat_path, sizeof(host_stat_path), NULL) > 0) {
         /* For bind-mounted paths, stat the host path directly to avoid
          * AT_SYMLINK_NOFOLLOW returning symlink stats instead of dir stats.
          * [T-ish-bind-host-op-unlocked] The meta.db row is already read;
@@ -1041,7 +1120,7 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
         if (realfs_getpath(fd, fd_path) == 0) {
             char host_chk[PATH_MAX];
             bool via_hook = false;
-            if (bind_mount_translate_path_ex(fd_path, host_chk, sizeof(host_chk), &via_hook) && via_hook) {
+            if (bind_translate(fd_path, host_chk, sizeof(host_chk), &via_hook) > 0 && via_hook) {
                 mode_t_ type = fake_stat->mode & S_IFMT;
                 fake_stat->mode = type | (S_ISDIR(fake_stat->mode) ? 0755 : 0644);
                 fake_stat->uid = 0;
@@ -1087,7 +1166,11 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
      * effect (or a real EPERM) rather than silent no-op or a meta.db die. */
     char host_abs_chk[PATH_MAX];
     bool _via_hook = false;
-    if (bind_mount_translate_path_ex(path, host_abs_chk, sizeof(host_abs_chk), &_via_hook) && _via_hook) {
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(path, host_abs_chk, sizeof(host_abs_chk), &_via_hook);
+    if (tr < 0)
+        return tr;
+    if (tr > 0 && _via_hook) {
         int err = 0;
         switch (attr.type) {
             case attr_size:
@@ -1172,7 +1255,11 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
         return _EROFS;
     char host_abs[PATH_MAX];
     bool via_hook = false;
-    bool via_bind = bind_mount_translate_path_ex(path, host_abs, sizeof(host_abs), &via_hook);
+    /* [FIX-261119-LP-W] A host path that does not fit is an error, never a cut path. */
+    int tr = bind_translate(path, host_abs, sizeof(host_abs), &via_hook);
+    if (tr < 0)
+        return tr;
+    bool via_bind = tr > 0;
     if (via_hook) {
         if (mkdir(host_abs, 0777) < 0)
             return errno_map();
@@ -1302,7 +1389,10 @@ retry:
      * host directory, so it's stable for the duration of the open fd). */
     char host_check[PATH_MAX];
     bool entry_via_hook = false;
-    bind_mount_translate_path_ex(entry_path, host_check, sizeof(host_check), &entry_via_hook);
+    /* [FIX-261119-LP-W] An entry whose host path does not fit cannot be
+     * looked at: skipped, as an entry with no inode is below. */
+    if (bind_translate(entry_path, host_check, sizeof(host_check), &entry_via_hook) < 0)
+        goto retry;
     if (entry_via_hook) {
         return res;
     }
@@ -1356,14 +1446,21 @@ static int create_relative_symlink(int root_fd, const char *host_link,
 
     /* Build the absolute path of the symlink's parent directory */
     char link_abs[PATH_MAX];
-    snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link);
+    /* [FIX-261119-LP-W] A cut parent would make the wrong relative target. */
+    if (!fits_snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     /* Strip the last component to get the parent dir */
     char *last_slash = strrchr(link_abs, '/');
     if (last_slash) *last_slash = '\0';
 
     /* Compute relative path from link parent dir to host_path */
     char rel_target[PATH_MAX];
-    compute_relative_path(link_abs, host_real, rel_target, sizeof(rel_target));
+    if (compute_relative_path(link_abs, host_real, rel_target, sizeof(rel_target)) < 0) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
     BIND_LOG("create_relative_symlink: \"%s\" -> \"%s\" (relative: \"%s\")\n",
             host_link, host_path, rel_target);
@@ -1405,7 +1502,8 @@ static bool bind_link_matches(int root_fd, const char *host_link, const char *ho
     char root_abs[PATH_MAX], link_abs[PATH_MAX], a[PATH_MAX], b[PATH_MAX];
     if (fcntl(root_fd, F_GETPATH, root_abs) != 0)
         return false;
-    snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link);
+    if (!fits_snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link))
+        return false;
     if (realpath(link_abs, a) == NULL || realpath(host_path, b) == NULL)
         return false;
     /* [FIX-261119-W] NTFS names are case-insensitive, and the two ends of
@@ -1479,6 +1577,16 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
     char resolved_host[PATH_MAX];
     if (realpath(host_path, resolved_host) != NULL)
         host_path = resolved_host;
+
+    /* [FIX-261119-LP-W] The table holds both paths in char[PATH_MAX]; one
+     * that does not fit is refused, not stored cut (a cut host path is
+     * another folder). The FAIL line is what Minis shows for the mount. */
+    if (strlen(linux_path) >= sizeof(g_bind_mounts[0].path) ||
+        strlen(host_path) >= sizeof(g_bind_mounts[0].host_path)) {
+        fprintf(stderr, "fakefs_bind_mount: FAIL path too long (host %zu, guest %zu characters; at most %zu)\n",
+                strlen(host_path), strlen(linux_path), sizeof(g_bind_mounts[0].host_path) - 1);
+        return _ENAMETOOLONG;
+    }
 
     /* Compute the meta.db mode for the top-level mount point based on whether
      * the mount is read-only and whether it's a file or directory. */
@@ -1642,7 +1750,10 @@ int fakefs_bind_unmount(const char *linux_path) {
 
 static int fakefs_mount(struct mount *mount) {
     char db_path[PATH_MAX];
-    strcpy(db_path, mount->source);
+    /* [FIX-261119-LP-W] Bounded: "<root>/data" becomes "<root>/meta.db". */
+    if (!fits_snprintf(db_path, sizeof(db_path), "%s", mount->source) ||
+        strlen(mount->source) + strlen("meta.db") - strlen("data") >= sizeof(db_path))
+        return _ENAMETOOLONG;
     char *basename = strrchr(db_path, '/') + 1;
     assert(strcmp(basename, "data") == 0);
     strcpy(basename, "meta.db");
@@ -1709,7 +1820,9 @@ const struct fs_ops fakefs = {
 };
 
 bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
-    return bind_mount_translate_path(path, out_path, out_size);
+    /* [FIX-261119-LP-W] Too long for `out_path`: no host path (out_path is
+     * left empty), so a caller cannot use a cut one. */
+    return bind_translate(path, out_path, out_size, NULL) > 0;
 }
 
 /* ===== Bind-mount file change notifications =====

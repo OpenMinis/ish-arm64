@@ -9,6 +9,20 @@
 // first, so they do so consistently.
 #ifndef PLATFORM_WINDOWS_COMPAT_H
 #define PLATFORM_WINDOWS_COMPAT_H
+
+// [FIX-261119-LP-W] PATH_MAX is 4096 in every C file, the px
+// implementation (PX_IMPL) included. mingw's <limits.h> defines it as 260,
+// and the `#ifndef PATH_MAX` below never fired because the headers above it
+// had already pulled <limits.h> in: fakefs then built bind host paths in
+// char[260] with snprintf and silently cut them - a write under a mount
+// past 259 host characters landed on (and overwrote) a file with the cut
+// name (INV-261119-LP). <limits.h> is read here first, so its include
+// guard keeps any later #include <limits.h> from setting it back.
+#if !defined(__ASSEMBLER__)
+#include <limits.h>
+#undef PATH_MAX
+#define PATH_MAX 4096
+#endif
 // Not for assembly, nor for the px implementation itself (built with
 // -DPX_IMPL against the real Windows headers).
 #if !defined(__ASSEMBLER__) && !defined(PX_IMPL)

@@ -119,8 +119,14 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
         perror(root);
         exit(1);
     }
-    if (fs == &fakefs)
+    if (fs == &fakefs) {
+        // [FIX-261119-LP-W] Bounded: a rootfs path this long cannot be used.
+        if (strlen(root_realpath) + strlen("/data") >= sizeof(root_realpath)) {
+            fprintf(stderr, "%s: rootfs path too long\n", root);
+            exit(1);
+        }
         strcat(root_realpath, "/data");
+    }
     int err = mount_root(fs, root_realpath);
     if (err < 0)
         return err;
