@@ -134,6 +134,26 @@ void fakefs_set_path_reverse_hook(fakefs_path_reverse_hook_t hook) {
     atomic_store_explicit(&g_path_reverse_hook, hook, memory_order_release);
 }
 
+/* [FIX-261119-W2] Host paths compare as the host's file system does: on
+ * Windows NTFS names are case-insensitive (the paths here all come from
+ * px_realpath / F_GETPATH, so they already use '/' and the same drive and
+ * UNC forms). One helper for every host-path comparison in this file - the
+ * rootfs guard, the reverse mapping and bind_link_matches - so they can
+ * never disagree. ASCII case only: px_realpath returns the on-disk case,
+ * which is what makes the two sides the same string in practice. */
+static int host_path_ncmp(const char *a, const char *b, size_t n) {
+#ifdef _WIN32
+    return _strnicmp(a, b, n);
+#else
+    return strncmp(a, b, n);
+#endif
+}
+
+static bool host_path_eq(const char *a, const char *b) {
+    size_t n = strlen(a);
+    return n == strlen(b) && host_path_ncmp(a, b, n) == 0;
+}
+
 /* Absolute host path of the fakefs `data/` directory, registered by the
  * host via fakefs_set_rootfs_data_path() at boot. Used to detect
  * "self-containing" bind mounts in fakefs_bind_mount_resolve_path() —
@@ -165,9 +185,18 @@ void fakefs_set_rootfs_data_path(const char *abs_host_path) {
     }
     memcpy(g_rootfs_data_path, abs_host_path, n);
     g_rootfs_data_path[n] = '\0';
+#ifdef _WIN32
+    /* [FIX-261119-W2] A caller may pass C:\... ; the paths compared with
+     * it use '/'. */
+    for (char *p = g_rootfs_data_path; *p; p++)
+        if (*p == '\\')
+            *p = '/';
+#endif
     g_rootfs_data_path_len = (int)n;
-    fprintf(stderr, "fakefs: rootfs_data_path registered \"%s\" (len=%d)\n",
-            g_rootfs_data_path, g_rootfs_data_path_len);
+    /* [FIX-261119-W2] ish.exe registers it on every start now (xX_main_Xx.h);
+     * an unconditional line would open every terminal and command output. */
+    BIND_LOG("fakefs: rootfs_data_path registered \"%s\" (len=%d)\n",
+             g_rootfs_data_path, g_rootfs_data_path_len);
 }
 
 /* True if `host_path` is an ancestor of (or equal to) the registered
@@ -178,7 +207,7 @@ static bool fakefs_host_path_contains_rootfs(const char *host_path, int host_pat
         return false;
     if (host_path_len > g_rootfs_data_path_len)
         return false;
-    if (strncmp(host_path, g_rootfs_data_path, host_path_len) != 0)
+    if (host_path_ncmp(host_path, g_rootfs_data_path, host_path_len) != 0)
         return false;
     /* Either exact match, or g_rootfs_data_path has a '/' immediately
      * after the host_path prefix (proper ancestor). Anything else is a
@@ -222,7 +251,7 @@ bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t
             continue;
         }
         /* Try matching as-is first */
-        if (strncmp(resolved, g_bind_mounts[i].host_path, hlen) == 0 &&
+        if (host_path_ncmp(resolved, g_bind_mounts[i].host_path, hlen) == 0 &&
             (resolved[hlen] == '/' || resolved[hlen] == '\0')) {
             snprintf(out_path, out_size, "%s%s",
                      g_bind_mounts[i].path, resolved + hlen);
@@ -1379,16 +1408,12 @@ static bool bind_link_matches(int root_fd, const char *host_link, const char *ho
     snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link);
     if (realpath(link_abs, a) == NULL || realpath(host_path, b) == NULL)
         return false;
-#ifdef _WIN32
     /* [FIX-261119-W] NTFS names are case-insensitive, and the two ends of
      * a junction can come back cased differently (C:/Users/Name vs
      * c:/users/name); a case-only difference is the same folder. Treated
      * as different, ish replaces the junction with its own symlink, which
      * needs Developer Mode, and the mount fails. */
-    return _stricmp(a, b) == 0;
-#else
-    return strcmp(a, b) == 0;
-#endif
+    return host_path_eq(a, b);
 }
 
 /* Replace whatever is at host_link with a link to host_path. Several ish

@@ -23,6 +23,7 @@
 
 void real_tty_reset_term(void);
 int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_only);
+void fakefs_set_rootfs_data_path(const char *abs_host_path);
 
 // -b GUEST=HOST[:ro]: show host directory (or file) HOST at GUEST, read-only
 // with :ro. Needs -f; the mount point is replaced by a link to HOST in the
@@ -123,6 +124,16 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     int err = mount_root(fs, root_realpath);
     if (err < 0)
         return err;
+    // [FIX-261119-W2] The rootfs guard (ed3c8189, what iOS turns on from
+    // ISHKernel.m): a -b bind whose host folder holds this data folder - a
+    // whole user folder on Windows, where the rootfs is under
+    // %LOCALAPPDATA% - is skipped when an fd's host path is mapped back to
+    // a guest path; without it every rootfs file mapped into that bind and
+    // every exec failed with EACCES. Registered here, before any bind, with
+    // the very string the rootfs is mounted from (realpath + "/data"), so
+    // it has the form the binds' realpath'd host paths and F_GETPATH use.
+    if (fs == &fakefs)
+        fakefs_set_rootfs_data_path(root_realpath);
 #ifdef _WIN32
     px_boot_mark("root mounted");
 #endif
