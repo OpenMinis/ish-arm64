@@ -499,6 +499,28 @@ static void test_path_hook_install(const char *spec) {
     fakefs_set_path_reverse_hook(test_hook_reverse);
 }
 
+// ---- Static bind mounts, for tests (fs/fake.h) ----
+//   ISH_TEST_BIND=/guest=/host[,/guest2=/host2...]  static bind mounts, the
+//       way the app binds /var/minis/shared and the external folders
+//   ISH_TEST_BIND_RO=...   the same, mounted read-only
+static void test_bind_install(const char *spec, bool readonly) {
+    if (spec == NULL)
+        return;
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (char *item = strtok(buf, ","); item != NULL; item = strtok(NULL, ",")) {
+        char *eq = strchr(item, '=');
+        if (eq == NULL || item[0] != '/') {
+            fprintf(stderr, "ISH_TEST_BIND: expected /guest=/host, got %s\n", item);
+            continue;
+        }
+        *eq = '\0';
+        int err = fakefs_bind_mount(item, eq + 1, readonly);
+        if (err < 0)
+            fprintf(stderr, "ISH_TEST_BIND: %s -> %s failed (%d)\n", item, eq + 1, err);
+    }
+}
+
 int main(int argc, char *const argv[]) {
     ish_signpost_init();
     atexit(dump_pc_hist);
@@ -629,5 +651,9 @@ int main(int argc, char *const argv[]) {
     }
     do_mount(&procfs, "proc", "/proc", "", 0);
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
+    // Static bind mounts, for tests: they need the fakefs root that
+    // xX_main_Xx just mounted.
+    test_bind_install(getenv("ISH_TEST_BIND"), false);
+    test_bind_install(getenv("ISH_TEST_BIND_RO"), true);
     task_run_current();
 }
