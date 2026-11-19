@@ -1220,6 +1220,13 @@ static ssize_t fakefs_readlink(struct mount *mount, const char *path, char *buf,
     return err;
 }
 
+/* [FIX-261119-W] The guest paths fakefs builds are kernel paths: MAX_PATH
+ * is kernel/fs.h's 4096, which realfs_getpath fills up to. Windows' own
+ * MAX_PATH is 260; should a header ever bring it in first, a path under a
+ * mounted user folder (AppData\Local\Packages\...) would overrun the
+ * buffer below - fail the build instead. */
+_Static_assert(MAX_PATH >= 4096, "fakefs path buffers need the kernel's MAX_PATH (4096), not Windows' 260");
+
 static int fakefs_readdir(struct fd *fd, struct dir_entry *entry) {
     assert(fd->ops == &fakefs_fdops);
     int res;
@@ -1230,7 +1237,9 @@ retry:
 
     // this is annoying
     char entry_path[MAX_PATH + 1];
-    realfs_getpath(fd, entry_path);
+    if (realfs_getpath(fd, entry_path) < 0)
+        entry_path[0] = '\0';
+    entry_path[MAX_PATH] = '\0';
 
     /* [T-ios-log-verbose-tier] Per-ENTRY trace, gated on the app's Verbose
      * level. Unconditional it produced 1.68 M lines / 183 MB in one day from
@@ -1242,13 +1251,21 @@ retry:
         fprintf(stderr, "fakefs_readdir: getpath=\"%s\" entry=\"%s\"\n", entry_path, entry->name);
 
     if (strcmp(entry->name, "..") == 0) {
-        if (strcmp(entry_path, "") != 0) {
-            *strrchr(entry_path, '/') = '\0';
-        }
+        char *slash = strrchr(entry_path, '/');
+        if (slash != NULL)
+            *slash = '\0';
     } else if (strcmp(entry->name, ".") != 0) {
-        // god I don't know what to do if this would overflow
-        strcat(entry_path, "/");
-        strcat(entry_path, entry->name);
+        /* [FIX-261119-W] Bounded: an entry whose full path does not fit has
+         * no meta.db row to look up (no path that long can be opened
+         * either), so it is skipped, as an entry with no inode is below. */
+        size_t len = strlen(entry_path), name_len = strlen(entry->name);
+        if (len + 1 + name_len >= sizeof(entry_path)) {
+            if (ish_verbose_trace_enabled)
+                fprintf(stderr, "fakefs_readdir: skipped \"%s\" (path longer than %d bytes)\n", entry->name, MAX_PATH);
+            goto retry;
+        }
+        entry_path[len] = '/';
+        memcpy(entry_path + len + 1, entry->name, name_len + 1);
     }
 
     /* Hook-routed entries are not in meta.db by design (see fakefs_open).
@@ -1360,7 +1377,18 @@ static bool bind_link_matches(int root_fd, const char *host_link, const char *ho
     if (fcntl(root_fd, F_GETPATH, root_abs) != 0)
         return false;
     snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link);
-    return realpath(link_abs, a) != NULL && realpath(host_path, b) != NULL && strcmp(a, b) == 0;
+    if (realpath(link_abs, a) == NULL || realpath(host_path, b) == NULL)
+        return false;
+#ifdef _WIN32
+    /* [FIX-261119-W] NTFS names are case-insensitive, and the two ends of
+     * a junction can come back cased differently (C:/Users/Name vs
+     * c:/users/name); a case-only difference is the same folder. Treated
+     * as different, ish replaces the junction with its own symlink, which
+     * needs Developer Mode, and the mount fails. */
+    return _stricmp(a, b) == 0;
+#else
+    return strcmp(a, b) == 0;
+#endif
 }
 
 /* Replace whatever is at host_link with a link to host_path. Several ish
