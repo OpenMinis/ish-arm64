@@ -85,3 +85,18 @@ also checks CPU time inside timed waits. `/proc/ish/poll_spin` switches the four
 guards (`regfile`, `hupedge`, `deadline`, `backoff`) off one by one, e.g.
 `echo hupedge 0 > /proc/ish/poll_spin`; with all four off the test must fail
 (5 of 7 cases hang), which proves it catches the bug.
+
+## FUTEX_WAIT_BITSET deadline clock (2026-11-19, FIX-261119-11)
+
+| Fix | What broke before it | Covered by |
+| --- | --- | --- |
+| absolute futex deadline read on the caller's clock | `sys_futex` converted FUTEX_WAIT_BITSET's absolute deadline against CLOCK_REALTIME whether or not FUTEX_CLOCK_REALTIME was set. Without the flag the deadline is on CLOCK_MONOTONIC (seconds since boot), which against the wall clock is decades in the past: the wait returned ETIMEDOUT at once, and a caller waiting until a deadline (Rust std `park_timeout` / `recv_timeout`) waited again at once - a busy loop holding one core (23,385 futex calls in 2 s; codex's `OpenTelemetry.M` thread on a device). | `regress_futex_abs_clock.c` |
+
+`tests/regress/run_futex_clock.sh [-i build-native/ish]` runs it under a 60 s
+host timeout: a monotonic deadline blocks until it passes (private and shared),
+a FUTEX_CLOCK_REALTIME deadline is still wall-clock time (and a monotonic
+reading passed with that flag is long past), a past deadline on either clock
+returns at once, FUTEX_WAIT's relative timeout is unchanged, a wait-until loop
+over 1 s makes one futex call, a wake ends a deadline wait with 0, and a
+changed word is EAGAIN. Against an unfixed `ish` the two monotonic-deadline
+cases, the loop (100,000 calls in 144 ms) and the wake case fail.
