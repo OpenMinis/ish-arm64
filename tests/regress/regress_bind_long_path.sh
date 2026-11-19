@@ -4,6 +4,13 @@
 # Listing and walking such a tree must work and must never overrun fakefs's
 # path buffers (fakefs_readdir appended entry names with unchecked strcat).
 #
+# KNOWN FAILING on Windows at 25976c35 (and before it, at 0ceff128): under a
+# bind, a path stops working once the guest path passes about 260 characters
+# (the host path about 280) - mkdir / create answer "File exists", cat "Is a
+# directory" - while the same depth in the rootfs works past 700. The cause is
+# in the bind code path and not found yet (FIX-261119-W report); this test is
+# what a fix has to make pass.
+#
 # Run inside the guest, with a host folder bound at $1 (default /mnt/longpath):
 #   ish.exe -f <rootfs> -b /mnt/longpath=<empty host folder> /bin/sh /tmp/regress_bind_long_path.sh
 set -u
