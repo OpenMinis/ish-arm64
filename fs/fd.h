@@ -138,6 +138,10 @@ struct fd {
     // hook: fake_inode is then the HOST inode number, which means nothing in
     // meta.db and must never be looked up there.
     bool fake_via_hook;
+    // [T-ish-bind-host-mode] fakefs opened this fd under a static bind mount
+    // (a user-mounted host folder): fstat and fchmod then follow the bind
+    // mount mode rule (see bind_mount_report_mode in fake.c).
+    bool fake_via_bind;
     // [T-ish-exec-fewer-meta-txns] fakefs_open reads the stat row inside the
     // transaction it already holds for the path lookup and parks it here; the
     // first fstat after open (generic_openat's own) consumes it instead of

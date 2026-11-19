@@ -340,10 +340,63 @@ static bool is_under_readonly_bind_mount(const char *path) {
     return false;
 }
 
+/* [T-ish-bind-host-mode] What a regular file or directory under a static
+ * bind mount reports as its mode.
+ *
+ * Its meta.db row is created the first time the path is seen, with a fixed
+ * 0644 (file) / 0755 (directory) - the host file's own bits were thrown
+ * away, so a 0600 private key in a mounted folder read as 0644 and ssh
+ * refused it ("UNPROTECTED PRIVATE KEY FILE"), and a 0755 script was not
+ * executable. Now:
+ *
+ *   - the guest set the mode itself (chmod, or created the file with other
+ *     bits): the row's mode, as before. Such a row either carries
+ *     FAKEFS_BIND_MODE_SET in rdev (written by chmod from here on) or holds
+ *     bits other than the fixed default (a chmod made before this existed);
+ *   - otherwise: the host file's permission bits, from the host stat the
+ *     caller has already done. No extra host call, no meta.db write, and a
+ *     host-side chmod shows at the next stat.
+ *
+ * chmod is still not written through to the host. The owner stays what the
+ * row says (root unless the guest chowned it): a host uid has no account in
+ * the guest. rdev is unused for regular files and directories, so it can
+ * hold the mark; it is reported as 0. Other file types are left alone. */
+#define FAKEFS_BIND_MODE_SET 0x65646f6du /* "mode" */
+
+static bool bind_mount_mode_rule_applies(uint32_t row_mode) {
+    return S_ISREG(row_mode) || S_ISDIR(row_mode);
+}
+
+static void bind_mount_report_mode(struct statbuf *out, uint32_t row_mode, uint32_t row_rdev,
+                                   uint32_t host_mode) {
+    if (!bind_mount_mode_rule_applies(row_mode)) {
+        out->mode = row_mode;
+        out->rdev = row_rdev;
+        return;
+    }
+    uint32_t legacy_default = S_ISDIR(row_mode) ? 0755 : 0644;
+    bool guest_set = row_rdev == FAKEFS_BIND_MODE_SET || (row_mode & 07777) != legacy_default;
+    out->mode = guest_set ? row_mode : ((row_mode & S_IFMT) | (host_mode & 07777));
+    out->rdev = 0;
+}
+
 /* Auto-create a meta.db entry for a path under a bind mount.
  * Probes the host filesystem to determine if it's a file or directory. */
+static inode_t bind_mount_ensure_inode_mode(struct fakefs_db *fs, struct mount *mount,
+                                            const char *path, uint32_t *host_mode_out);
+
 static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount,
                                        const char *path) {
+    return bind_mount_ensure_inode_mode(fs, mount, path, NULL);
+}
+
+/* [T-ish-bind-host-mode] `host_mode_out`, when given, receives the st_mode of
+ * the host stat done here (0 when the row already existed and nothing was
+ * stat'ed), so a first stat of a path needs no second host call. */
+static inode_t bind_mount_ensure_inode_mode(struct fakefs_db *fs, struct mount *mount,
+                                            const char *path, uint32_t *host_mode_out) {
+    if (host_mode_out != NULL)
+        *host_mode_out = 0;
     db_begin_read(fs);
     inode_t ino = path_get_inode(fs, path);
     db_commit(fs);
@@ -361,6 +414,8 @@ static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount
             return 0;
     }
 
+    if (host_mode_out != NULL)
+        *host_mode_out = host_stat.st_mode;
     uint32_t mode;
     if (S_ISDIR(host_stat.st_mode))
         mode = S_IFDIR | 0755;
@@ -427,6 +482,7 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         fd = fd_create(&realfs_fdops);
         fd->real_fd = fd_no;
         fd->dir = NULL;
+        fd->fake_via_bind = !via_hook;
     } else {
         fd = realfs.open(mount, path, flags, 0666);
         if (IS_ERR(fd))
@@ -1188,7 +1244,8 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         db_rollback(fs);
         /* Auto-create for bind-mounted paths */
         if (is_under_bind_mount(path)) {
-            inode = bind_mount_ensure_inode(fs, mount, path);
+            uint32_t seen_host_mode = 0;
+            inode = bind_mount_ensure_inode_mode(fs, mount, path, &seen_host_mode);
             if (inode != 0) {
                 db_begin_read(fs);
                 path_read_stat(fs, path, &ishstat, &inode);
@@ -1197,10 +1254,14 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
                 if (err < 0)
                     return err;
                 fake_stat->inode = inode;
-                fake_stat->mode = ishstat.mode;
+                // [T-ish-bind-host-mode] The mode ensure_inode just read from
+                // the host: it follows a symbolic link, as every later stat of
+                // this path does, where realfs.stat above reports the link
+                // itself. (0: another task made the row first; realfs's will do.)
+                bind_mount_report_mode(fake_stat, ishstat.mode, ishstat.rdev,
+                                       seen_host_mode != 0 ? seen_host_mode : fake_stat->mode);
                 fake_stat->uid = ishstat.uid;
                 fake_stat->gid = ishstat.gid;
-                fake_stat->rdev = ishstat.rdev;
                 return 0;
             }
         }
@@ -1208,6 +1269,8 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     }
     int err;
     char host_stat_path[PATH_MAX];
+    bool under_bind = false;
+    uint32_t host_mode = 0;
     if (bind_mount_translate_path(path, host_stat_path, sizeof(host_stat_path))) {
         /* For bind-mounted paths, stat the host path directly to avoid
          * AT_SYMLINK_NOFOLLOW returning symlink stats instead of dir stats.
@@ -1223,6 +1286,9 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         fake_stat->atime = real_stat.st_atimespec.tv_sec;
         fake_stat->mtime = real_stat.st_mtimespec.tv_sec;
         fake_stat->ctime = real_stat.st_ctimespec.tv_sec;
+        // [T-ish-bind-host-mode] The mode of the host file this stat just read.
+        under_bind = true;
+        host_mode = real_stat.st_mode;
         err = 0;
     } else {
         err = realfs.stat(mount, path, fake_stat);
@@ -1231,10 +1297,14 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     if (err < 0)
         return err;
     fake_stat->inode = inode;
-    fake_stat->mode = ishstat.mode;
+    if (under_bind) {
+        bind_mount_report_mode(fake_stat, ishstat.mode, ishstat.rdev, host_mode);
+    } else {
+        fake_stat->mode = ishstat.mode;
+        fake_stat->rdev = ishstat.rdev;
+    }
     fake_stat->uid = ishstat.uid;
     fake_stat->gid = ishstat.gid;
-    fake_stat->rdev = ishstat.rdev;
     ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
     return 0;
 }
@@ -1261,10 +1331,15 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     if (fd->fake_open_stat.valid) {
         fd->fake_open_stat.valid = false;
         fake_stat->inode = fd->fake_inode;
-        fake_stat->mode = fd->fake_open_stat.mode;
+        // [T-ish-bind-host-mode] fake_stat->mode is the host's (realfs.fstat above).
+        if (fd->fake_via_bind) {
+            bind_mount_report_mode(fake_stat, fd->fake_open_stat.mode, fd->fake_open_stat.rdev, fake_stat->mode);
+        } else {
+            fake_stat->mode = fd->fake_open_stat.mode;
+            fake_stat->rdev = fd->fake_open_stat.rdev;
+        }
         fake_stat->uid = fd->fake_open_stat.uid;
         fake_stat->gid = fd->fake_open_stat.gid;
-        fake_stat->rdev = fd->fake_open_stat.rdev;
         return 0;
     }
     db_begin_read(fs);
@@ -1292,11 +1367,22 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     }
     db_commit(fs);
     fake_stat->inode = fd->fake_inode;
-    fake_stat->mode = ishstat.mode;
+    if (fd->fake_via_bind) {
+        bind_mount_report_mode(fake_stat, ishstat.mode, ishstat.rdev, fake_stat->mode);
+    } else {
+        fake_stat->mode = ishstat.mode;
+        fake_stat->rdev = ishstat.rdev;
+    }
     fake_stat->uid = ishstat.uid;
     fake_stat->gid = ishstat.gid;
-    fake_stat->rdev = ishstat.rdev;
     return 0;
+}
+
+/* [T-ish-bind-host-mode] The guest chose this mode: from now on the row,
+ * not the host file, says what it is (see bind_mount_report_mode). */
+static void bind_mount_mark_mode_set(struct ish_stat *ishstat, struct attr attr) {
+    if (attr.type == attr_mode && bind_mount_mode_rule_applies(ishstat->mode))
+        ishstat->rdev = FAKEFS_BIND_MODE_SET;
 }
 
 static void fake_stat_setattr(struct ish_stat *ishstat, struct attr attr) {
@@ -1360,6 +1446,7 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
                 db_begin_read(fs);
                 path_read_stat(fs, path, &ishstat, &inode);
                 fake_stat_setattr(&ishstat, attr);
+                bind_mount_mark_mode_set(&ishstat, attr);
                 inode_write_stat(fs, inode, &ishstat);
                 db_commit(fs);
                 return 0;
@@ -1368,6 +1455,8 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
         return _ENOENT;
     }
     fake_stat_setattr(&ishstat, attr);
+    if (is_under_bind_mount(path))
+        bind_mount_mark_mode_set(&ishstat, attr);
     inode_write_stat(fs, inode, &ishstat);
     db_commit(fs);
     return 0;
@@ -1404,6 +1493,8 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
     }
     db_begin_write(fs);
     fake_stat_setattr(&ishstat, attr);
+    if (fd->fake_via_bind)
+        bind_mount_mark_mode_set(&ishstat, attr);
     inode_write_stat(fs, fd->fake_inode, &ishstat);
     db_commit(fs);
     return 0;

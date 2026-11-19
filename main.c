@@ -498,6 +498,7 @@ static void test_path_hook_install(const char *spec) {
 // [FEAT-261116-11]
 //   ISH_TEST_BIND=/guest=/host[,/guest2=/host2...]  static bind mounts, the
 //       way the app binds /var/minis/shared and the external folders
+//   ISH_TEST_BIND_RO=...   the same, mounted read-only
 //   ISH_TEST_GUARD=<verdict>   installs a guard hook:
 //       allow | deny             answer at once
 //       wait:<ms>:allow|deny     block first (polling for a kill), then answer
@@ -612,7 +613,7 @@ static int test_commit_hook(const struct fakefs_guard_request *req) {
     return FAKEFS_COMMIT_REMOVED;
 }
 
-static void test_bind_install(const char *spec) {
+static void test_bind_install(const char *spec, bool readonly) {
     if (spec == NULL)
         return;
     char buf[8192];
@@ -624,7 +625,7 @@ static void test_bind_install(const char *spec) {
             continue;
         }
         *eq = '\0';
-        int err = fakefs_bind_mount(item, eq + 1, false);
+        int err = fakefs_bind_mount(item, eq + 1, readonly);
         if (err < 0)
             fprintf(stderr, "ISH_TEST_BIND: %s -> %s failed (%d)\n", item, eq + 1, err);
     }
@@ -880,7 +881,8 @@ int main(int argc, char *const argv[]) {
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
     // Static bind mounts and the delete guard, for tests: both need the
     // fakefs root that xX_main_Xx just mounted.
-    test_bind_install(getenv("ISH_TEST_BIND"));
+    test_bind_install(getenv("ISH_TEST_BIND"), false);
+    test_bind_install(getenv("ISH_TEST_BIND_RO"), true);
     test_guard_install();
     test_restat_install();
     task_run_current();
