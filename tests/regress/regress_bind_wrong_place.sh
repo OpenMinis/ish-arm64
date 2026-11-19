@@ -58,8 +58,9 @@ before=$(ls "$d" | wc -l | tr -d ' ')
 name=$(printf "%0150d" 7)
 touch "$d/$name" 2>/tmp/lp_err; rc=$?
 check "$rc" 1 "a create past 4095 host characters fails"
-check "$(sed 's/.*: //' /tmp/lp_err)" "File name too long" "with ENAMETOOLONG"
-mkdir "$d/$name" 2>/tmp/lp_err; check "$(sed 's/.*: //' /tmp/lp_err)" "File name too long" "mkdir past 4095: ENAMETOOLONG"
+too_long() { sed 's/.*: //' /tmp/lp_err | sed 's/^Filename too long$/File name too long/'; }   # busybox / libc wording
+check "$(too_long)" "File name too long" "with ENAMETOOLONG"
+mkdir "$d/$name" 2>/tmp/lp_err; check "$(too_long)" "File name too long" "mkdir past 4095: ENAMETOOLONG"
 check "$(ls "$d" | wc -l | tr -d ' ')" "$before" "nothing new appeared in the folder"
 
 rm -rf "$D"; check "$( [ -e "$D" ] && echo left || echo gone )" gone "rm -rf removes the whole tree"

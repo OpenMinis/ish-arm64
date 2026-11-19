@@ -980,6 +980,31 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     return 0;
 }
 
+/* [FIX-261119-LP-W] A meta.db row that says "folder" where the host has a
+ * file, or "file" where it has a folder, is wrong wherever it is: fakefs
+ * keeps folders and regular files as the same kind on the host (only
+ * symlinks, devices and fifos differ, and are left alone). Builds that cut
+ * long bind host paths (INV-261119-LP) left such rows behind - a cut write
+ * that hit a folder recorded the long name as a folder - and kept those
+ * names unusable after the fix. The host's kind wins, and the row is
+ * rewritten once. `host_mode` is the host's mode (0: not known). Called
+ * where the host was asked anyway: no extra system call. */
+static void heal_row_kind(struct fakefs_db *fs, inode_t inode, struct ish_stat *row, mode_t_ host_mode) {
+    mode_t_ want;
+    if (S_ISDIR(row->mode) && S_ISREG(host_mode))
+        want = S_IFREG | 0644;
+    else if (S_ISREG(row->mode) && S_ISDIR(host_mode))
+        want = S_IFDIR | 0755;
+    else
+        return;
+    BIND_LOG("fakefs: inode %llu was 0%o in meta.db and 0%o on the host - row repaired\n",
+             (unsigned long long) inode, row->mode, want);
+    row->mode = want;
+    db_begin_write(fs);
+    inode_write_stat(fs, inode, row);
+    db_commit(fs);
+}
+
 static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
     ISH_SIGNPOST_SCOPE_BEGIN(fs, "fakefs_stat", _fs_spid);
     struct fakefs_db *fs = &mount->fakefs;
@@ -1049,6 +1074,7 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         return _ENOENT;
     }
     int err;
+    mode_t_ host_mode = 0;
     char host_stat_path[PATH_MAX];
     /* [FIX-261119-LP-W] Same path as above: it fit there, it fits here. */
     if (bind_translate(path, host_stat_path, sizeof(host_stat_path), NULL) > 0) {
@@ -1060,6 +1086,7 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         struct stat real_stat;
         if (stat(host_stat_path, &real_stat) < 0)
             return errno_map();
+        host_mode = S_ISDIR(real_stat.st_mode) ? S_IFDIR : S_ISREG(real_stat.st_mode) ? S_IFREG : 0;
         /* Everything realfs.stat would fill in (inode, mode and owner come
          * from meta.db below). dev above all: it must be what fstat reports
          * for the same file, or coreutils' same-inode check on a file it
@@ -1079,9 +1106,11 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     } else {
         err = realfs.stat(mount, path, fake_stat);
         db_commit(fs);
+        host_mode = fake_stat->mode;
     }
     if (err < 0)
         return err;
+    heal_row_kind(fs, inode, &ishstat, host_mode);
     fake_stat->inode = inode;
     fake_stat->mode = ishstat.mode;
     fake_stat->uid = ishstat.uid;
@@ -1100,6 +1129,14 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     // consumed once (see struct fd).
     if (fd->fake_open_stat.valid) {
         fd->fake_open_stat.valid = false;
+        if ((S_ISDIR(fd->fake_open_stat.mode) && S_ISREG(fake_stat->mode)) ||
+            (S_ISREG(fd->fake_open_stat.mode) && S_ISDIR(fake_stat->mode))) {
+            /* [FIX-261119-LP-W] A wrong kind: the full row, repaired. */
+            struct ish_stat row = {.mode = fd->fake_open_stat.mode, .uid = fd->fake_open_stat.uid,
+                                   .gid = fd->fake_open_stat.gid, .rdev = fd->fake_open_stat.rdev};
+            heal_row_kind(fs, fd->fake_inode, &row, fake_stat->mode);
+            fd->fake_open_stat.mode = row.mode;
+        }
         fake_stat->inode = fd->fake_inode;
         fake_stat->mode = fd->fake_open_stat.mode;
         fake_stat->uid = fd->fake_open_stat.uid;
@@ -1132,6 +1169,7 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
         return _ENOENT;
     }
     db_commit(fs);
+    heal_row_kind(fs, fd->fake_inode, &ishstat, fake_stat->mode);
     fake_stat->inode = fd->fake_inode;
     fake_stat->mode = ishstat.mode;
     fake_stat->uid = ishstat.uid;
