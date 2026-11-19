@@ -534,10 +534,16 @@ dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2,
         if (user_get(timeout_or_val2, timeout_))
             return _EFAULT;
         if (cmd == FUTEX_WAIT_BITSET_) {
-            // FUTEX_WAIT_BITSET uses absolute CLOCK_REALTIME timeout;
-            // convert to relative for our futex_wait implementation.
+            // FUTEX_WAIT_BITSET takes an absolute deadline; convert it to
+            // relative for our futex_wait implementation. As on Linux the
+            // deadline is on CLOCK_MONOTONIC unless FUTEX_CLOCK_REALTIME is
+            // set. Reading it against the wall clock always made a monotonic
+            // deadline (seconds since boot) look decades in the past, so the
+            // wait returned ETIMEDOUT at once and the caller, seeing its
+            // deadline had not passed, waited again: a busy loop. The guest's
+            // CLOCK_MONOTONIC is the host's (clockid_to_real in time.c).
             struct timespec now;
-            clock_gettime(CLOCK_REALTIME, &now);
+            clock_gettime((op & FUTEX_CLOCK_REALTIME_) ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now);
             timeout.tv_sec = timeout_.sec - now.tv_sec;
             timeout.tv_nsec = timeout_.nsec - now.tv_nsec;
             if (timeout.tv_nsec < 0) {
