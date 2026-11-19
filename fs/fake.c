@@ -43,7 +43,8 @@
 /* Compute a relative symlink target from link_dir to abs_target.
  * link_dir is the absolute path of the directory containing the symlink.
  * abs_target is the absolute path the symlink should point to.
- * Result is written to out (must be PATH_MAX). Returns 0 on success. */
+ * Result is written to out (must be PATH_MAX). Returns 0 on success, -1 when
+ * the result does not fit. */
 static int compute_relative_path(const char *link_dir, const char *abs_target,
                                   char *out, size_t out_size) {
     /* Find common prefix (up to the last shared '/') */
@@ -77,19 +78,26 @@ static int compute_relative_path(const char *link_dir, const char *abs_target,
         ups++;
 
     out[0] = '\0';
+    // [T-ish-bind-path-overflow] strlcat reports the length it wanted; a
+    // result that did not fit is an error, not a shorter target.
+    size_t want = 0;
     for (int i = 0; i < ups; i++) {
         if (i == 0)
-            strlcpy(out, "..", out_size);
+            want = strlcpy(out, "..", out_size);
         else
-            strlcat(out, "/..", out_size);
+            want = strlcat(out, "/..", out_size);
+        if (want >= out_size)
+            return -1;
     }
 
     /* Append the remainder of abs_target after common prefix */
     const char *suffix = abs_target + common;
     if (*suffix == '/') suffix++; /* skip leading slash */
     if (*suffix) {
-        if (ups > 0) strlcat(out, "/", out_size);
-        strlcat(out, suffix, out_size);
+        if (ups > 0 && strlcat(out, "/", out_size) >= out_size)
+            return -1;
+        if (strlcat(out, suffix, out_size) >= out_size)
+            return -1;
     }
 
     if (out[0] == '\0') {
@@ -177,6 +185,52 @@ static bool fakefs_host_path_contains_rootfs(const char *host_path, int host_pat
      * sibling-prefix false positive (e.g. /Users/x vs /Users/xyz). */
     char next = g_rootfs_data_path[host_path_len];
     return next == '/' || next == '\0';
+}
+
+/* [T-ish-bind-path-overflow] A guest path under a bind mount becomes
+ * "<mount's host folder><rest of the guest path>" in a PATH_MAX buffer. The
+ * guest may use paths up to MAX_PATH (4096); a host path stops at PATH_MAX
+ * (1024 on Darwin). The join used to be a bare snprintf: a result that did
+ * not fit was cut off and used anyway, so a write to .../dir/victimEXTRA
+ * whose host path was five characters too long went to .../dir/victim -
+ * reported as a success, over whatever file had that name.
+ *
+ * A join that does not fit now yields this path instead. Its one component
+ * is longer than NAME_MAX, so every host call made with it - open, stat,
+ * mkdir, unlink, rename, chmod, truncate, opendir - fails in the host
+ * kernel with ENAMETOOLONG before it can touch anything, which errno_map
+ * hands to the guest as is. The translate functions keep returning true for
+ * such a path: "false" means "not under a mount" to their callers, which
+ * would send the operation on to the rootfs. No call site changes, and no
+ * work is added where a path fits: one comparison of snprintf's result. */
+#define BIND_PATH_TOO_LONG_HEAD "/ish-path-too-long-"
+#define BIND_PATH_TOO_LONG_LEN (NAME_MAX + 2 + sizeof(BIND_PATH_TOO_LONG_HEAD))
+
+static void bind_mount_path_too_long(char *out, size_t out_size) {
+    if (out_size == 0)
+        return;
+    if (out_size <= BIND_PATH_TOO_LONG_LEN) {
+        // No room for the marker either. An empty path fails every host
+        // call too (ENOENT); no caller passes a buffer this small.
+        out[0] = '\0';
+        return;
+    }
+    size_t head = sizeof(BIND_PATH_TOO_LONG_HEAD) - 1;
+    memcpy(out, BIND_PATH_TOO_LONG_HEAD, head);
+    memset(out + head, 'x', BIND_PATH_TOO_LONG_LEN - 1 - head);
+    out[BIND_PATH_TOO_LONG_LEN - 1] = '\0';
+}
+
+static bool bind_mount_is_path_too_long(const char *host_path) {
+    return host_path != NULL &&
+        strncmp(host_path, BIND_PATH_TOO_LONG_HEAD, sizeof(BIND_PATH_TOO_LONG_HEAD) - 1) == 0;
+}
+
+/* out = a + b, or the too-long marker when that does not fit. */
+static void bind_mount_join(char *out, size_t out_size, const char *a, const char *b) {
+    int n = snprintf(out, out_size, "%s%s", a, b);
+    if (n < 0 || (size_t) n >= out_size)
+        bind_mount_path_too_long(out, out_size);
 }
 
 /* Translate a resolved host path back to a Linux path for bind mounts.
@@ -285,8 +339,8 @@ static bool bind_mount_translate_path_ex(const char *path, char *out_path,
         int len = g_bind_mounts[i].path_len;
         if (strncmp(g_bind_mounts[i].path, cmp_path, len) == 0 &&
             (cmp_path[len] == '/' || cmp_path[len] == '\0')) {
-            snprintf(out_path, out_size, "%s%s",
-                     g_bind_mounts[i].host_path, cmp_path + len);
+            // [T-ish-bind-path-overflow] Never a cut-off path.
+            bind_mount_join(out_path, out_size, g_bind_mounts[i].host_path, cmp_path + len);
             return true;
         }
     }
@@ -607,6 +661,10 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
     bool src_hook = false, dst_hook = false;
     bool src_bind = bind_mount_translate_path_ex(src, host_src, sizeof(host_src), &src_hook);
     bool dst_bind = bind_mount_translate_path_ex(dst, host_dst, sizeof(host_dst), &dst_hook);
+    // [T-ish-bind-path-overflow] As for symlink.
+    if ((src_bind && bind_mount_is_path_too_long(host_src)) ||
+        (dst_bind && bind_mount_is_path_too_long(host_dst)))
+        return _ENAMETOOLONG;
     if (src_hook != dst_hook)
         return _EXDEV;
     if (src_hook) {
@@ -754,6 +812,10 @@ static inline bool guard_wanted(bool routed) {
  * Call it only where nothing has been changed yet and no lock is held. */
 static int guard_ask(int op, const char *path, const char *host_path,
                      const char *host_src, bool is_dir, bool routed) {
+    // [T-ish-bind-path-overflow] Nothing to ask about: the operation cannot
+    // reach any host file.
+    if (bind_mount_is_path_too_long(host_path) || bind_mount_is_path_too_long(host_src))
+        return _ENAMETOOLONG;
     fakefs_guard_hook_t hook = atomic_load_explicit(&g_guard_hook, memory_order_acquire);
     if (hook == NULL)
         return 0;
@@ -803,6 +865,8 @@ static int guard_ask(int op, const char *path, const char *host_path,
  * path from meta.db; NULL `fs` for hook-routed paths. */
 static int guard_commit(struct fakefs_db *fs, int op, const char *path, const char *host_path,
                         const char *host_src, bool is_dir, bool routed) {
+    if (bind_mount_is_path_too_long(host_path) || bind_mount_is_path_too_long(host_src))
+        return _ENAMETOOLONG;
     fakefs_guard_hook_t hook = atomic_load_explicit(&g_guard_commit_hook, memory_order_acquire);
     if (hook == NULL)
         return 0;
@@ -1141,8 +1205,14 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
      * recognize as a symlink. */
     char host_chk[PATH_MAX];
     bool _vh = false;
-    if (bind_mount_translate_path_ex(link, host_chk, sizeof(host_chk), &_vh) && _vh)
+    bool link_bind = bind_mount_translate_path_ex(link, host_chk, sizeof(host_chk), &_vh);
+    if (link_bind && _vh)
         return _EPERM;
+    // [T-ish-bind-path-overflow] The file below is made through the rootfs
+    // link to the mount, which has no such limit: it would get its full
+    // name, one that no later open or stat of it could reach.
+    if (link_bind && bind_mount_is_path_too_long(host_chk))
+        return _ENAMETOOLONG;
     db_begin_write(fs);
     // create a file containing the target
     int fd = openat(mount->root_fd, fix_path(link), O_WRONLY | O_CREAT | O_EXCL, 0666);
@@ -1175,6 +1245,10 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
         return _EROFS;
+    // [T-ish-bind-path-overflow] As for symlink.
+    char host_chk[PATH_MAX];
+    if (bind_mount_translate_path(path, host_chk, sizeof(host_chk)) && bind_mount_is_path_too_long(host_chk))
+        return _ENAMETOOLONG;
     mode_t_ real_mode = 0666;
     if (S_ISBLK(mode) || S_ISCHR(mode) || S_ISSOCK(mode))
         real_mode |= S_IFREG;
@@ -1264,6 +1338,12 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
                 fake_stat->gid = ishstat.gid;
                 return 0;
             }
+            // [T-ish-bind-path-overflow] Not "no such file": a path whose
+            // host form does not fit. Only on this failure path.
+            char too_long_chk[PATH_MAX];
+            if (bind_mount_translate_path(path, too_long_chk, sizeof(too_long_chk)) &&
+                bind_mount_is_path_too_long(too_long_chk))
+                return _ENAMETOOLONG;
         }
         return _ENOENT;
     }
@@ -1593,7 +1673,11 @@ retry:
             *strrchr(entry_path, '/') = '\0';
         }
     } else if (strcmp(entry->name, ".") != 0) {
-        // god I don't know what to do if this would overflow
+        // [T-ish-bind-path-overflow] A name that does not fit behind its
+        // directory's path has no path the guest could use: leave it out
+        // rather than write past the buffer.
+        if (strlen(entry_path) + 1 + strlen(entry->name) >= sizeof(entry_path))
+            goto retry;
         strcat(entry_path, "/");
         strcat(entry_path, entry->name);
     }
@@ -1676,14 +1760,22 @@ static int create_relative_symlink(int root_fd, const char *host_link,
 
     /* Build the absolute path of the symlink's parent directory */
     char link_abs[PATH_MAX];
-    snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link);
+    // [T-ish-bind-path-overflow] A cut-off parent would give a link that
+    // points somewhere else.
+    if (snprintf(link_abs, sizeof(link_abs), "%s/%s", root_abs, host_link) >= (int) sizeof(link_abs)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     /* Strip the last component to get the parent dir */
     char *last_slash = strrchr(link_abs, '/');
     if (last_slash) *last_slash = '\0';
 
     /* Compute relative path from link parent dir to host_path */
     char rel_target[PATH_MAX];
-    compute_relative_path(link_abs, host_real, rel_target, sizeof(rel_target));
+    if (compute_relative_path(link_abs, host_real, rel_target, sizeof(rel_target)) < 0) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
     fprintf(stderr, "create_relative_symlink: \"%s\" -> \"%s\" (relative: \"%s\")\n",
             host_link, host_path, rel_target);
@@ -1762,6 +1854,16 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
     char resolved_host[PATH_MAX];
     if (realpath(host_path, resolved_host) != NULL)
         host_path = resolved_host;
+
+    // [T-ish-bind-path-overflow] The table holds both paths in PATH_MAX
+    // buffers; one that does not fit was stored cut off, with the length of
+    // the whole. Refuse the mount instead.
+    if (strlen(host_path) >= sizeof(g_bind_mounts[0].host_path) ||
+        strlen(linux_path) >= sizeof(g_bind_mounts[0].path)) {
+        fprintf(stderr, "fakefs_bind_mount: FAIL path too long (host %zu, guest %zu, max %zu)\n",
+                strlen(host_path), strlen(linux_path), sizeof(g_bind_mounts[0].host_path) - 1);
+        return _ENAMETOOLONG;
+    }
 
     /* Compute the meta.db mode for the top-level mount point based on whether
      * the mount is read-only and whether it's a file or directory. */

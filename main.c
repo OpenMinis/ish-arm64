@@ -463,7 +463,14 @@ static bool test_hook_translate(const char *guest_path, uint64_t fs_context,
     const char *tail;
     if (!test_hook_prefix_match(guest_path, test_hook_guest, &tail))
         return false;
-    snprintf(out, out_size, "%s%s", test_hook_host, tail);
+    // A hook answers for the whole path or not at all: one that does not fit
+    // is given an over-long name, which no host call accepts (ENAMETOOLONG),
+    // never a cut-off path. The app's hook (ISHKernel.m) does the same.
+    if (snprintf(out, out_size, "%s%s", test_hook_host, tail) >= (int) out_size && out_size > NAME_MAX + 3) {
+        out[0] = '/';
+        memset(out + 1, 'x', NAME_MAX + 1);
+        out[NAME_MAX + 2] = '\0';
+    }
     return true;
 }
 
