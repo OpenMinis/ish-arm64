@@ -221,9 +221,19 @@ static void bind_mount_path_too_long(char *out, size_t out_size) {
     out[BIND_PATH_TOO_LONG_LEN - 1] = '\0';
 }
 
+/* True for the marker above, and for the one a translate hook hands back
+ * for a routed path that does not fit (the app's hook and the CLI's test
+ * hook write "/" and a name longer than NAME_MAX): any absolute path whose
+ * first component no file system accepts. */
 static bool bind_mount_is_path_too_long(const char *host_path) {
-    return host_path != NULL &&
-        strncmp(host_path, BIND_PATH_TOO_LONG_HEAD, sizeof(BIND_PATH_TOO_LONG_HEAD) - 1) == 0;
+    if (host_path == NULL || host_path[0] != '/')
+        return false;
+    size_t n = 0;
+    while (host_path[1 + n] != '\0' && host_path[1 + n] != '/') {
+        if (++n > NAME_MAX)
+            return true;
+    }
+    return false;
 }
 
 /* out = a + b, or the too-long marker when that does not fit. */

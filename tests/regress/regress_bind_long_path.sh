@@ -152,6 +152,10 @@ out=$(ISH_TEST_BIND="/mnt/b=$H" ISH_TEST_GUARD=allow ISH_TEST_GUARD_LOG="$L" "$I
 check "$out|$(wc -l < "$L" | tr -d ' ')" "rc=1
 rc=1|0" "the delete guard is not asked about a path that cannot exist"
 check "$(state)" "$CLEAN" "with a guard that allows everything: still nothing changed"
+: > "$L"
+out=$(ISH_TEST_PATH_HOOK="/mnt/r=$H" ISH_TEST_GUARD=allow ISH_TEST_GUARD_LOG="$L" "$ISH" -f "$R" /bin/sh -c "cd '/mnt/r/$REL'; rm victimEXTRA 2>/dev/null; echo \"rc=\$?\"; mv other victimEXTRA 2>/dev/null; echo \"rc=\$?\"" 2>&1 | filt)
+check "$out|$(wc -l < "$L" | tr -d ' ')|$(state)" "rc=1
+rc=1|0|$CLEAN" "the same for a hook-routed path"
 
 # ---- a path the host already has beyond the limit ----
 fresh
