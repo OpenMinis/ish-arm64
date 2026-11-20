@@ -167,6 +167,13 @@ struct sighand {
 struct sighand *sighand_new(void);
 struct sighand *sighand_copy(struct sighand *sighand);
 void sighand_release(struct sighand *sighand);
+// [FIX-261120-04] task->sighand read or cleared from a thread that does not
+// hold pids_lock. retain: the slot's sighand with one more reference (release
+// it), or NULL. detach: empties the slot and hands back what was in it,
+// reference included.
+struct task;
+struct sighand *task_sighand_retain(struct task *task);
+struct sighand *task_sighand_detach(struct task *task);
 
 dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_addr, dword_t sigset_size);
 dword_t sys_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_addr);

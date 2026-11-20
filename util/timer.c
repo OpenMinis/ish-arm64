@@ -30,6 +30,16 @@ void timer_free(struct timer *timer) {
     }
 }
 
+void timer_retarget(struct timer *timer, void *from, void *to) {
+    // Windows line: no TIMER_LIVE_MAGIC here (that came with the iOS line's
+    // cd69f042, not ported). The only caller is exit_tgroup, under
+    // pids_lock, while group->itimer is still allocated.
+    lock(&timer->lock);
+    if (timer->data == from)
+        timer->data = to;
+    unlock(&timer->lock);
+}
+
 static void *timer_thread(void *param) {
     struct timer *timer = param;
     lock(&timer->lock);
