@@ -129,3 +129,14 @@ returns at once, FUTEX_WAIT's relative timeout is unchanged, a wait-until loop
 over 1 s makes one futex call, a wake ends a deadline wait with 0, and a
 changed word is EAGAIN. Against an unfixed `ish` the two monotonic-deadline
 cases, the loop (100,000 calls in 144 ms) and the wake case fail.
+
+## Interval timer firing into an exiting process (2026-11-20, FIX-261120-04)
+
+| Fix | What broke before it | Covered by |
+| --- | --- | --- |
+| a signal sender keeps its own reference to the target's sighand; the exiting task empties its signal queue under that lock; the itimer moves to a remaining thread when the thread that armed it exits | `send_signal` locked `task->sighand` and `deliver_signal_unlocked` read the pointer again after `do_exit` had cleared it (only senders holding `pids_lock` were safe; a timer thread is not): SIGSEGV at `deliver_signal_unlocked <- send_signal <- itimer_notify <- timer_thread`, twice in four minutes on one device (crash point BMSbJxXTmk3lJ83-5fdtjL). The timer's target was also the thread that called `setitimer`, left dangling when that thread exited before its process. | `regress_itimer_exit.c` |
+
+`tests/regress/run_itimer_exit.sh [-i build-native/ish]`: children arm a 100 us
+interval timer and exit (an unfixed `ish` crashes within seconds), then
+children whose helper thread arms the timer and exits must still receive
+SIGALRM on the main thread.

@@ -55,6 +55,15 @@ void timer_free(struct timer *timer) {
     }
 }
 
+void timer_retarget(struct timer *timer, void *from, void *to) {
+    if (__atomic_load_n(&timer->magic, __ATOMIC_RELAXED) != TIMER_LIVE_MAGIC)
+        return;
+    lock(&timer->lock);
+    if (timer->data == from)
+        timer->data = to;
+    unlock(&timer->lock);
+}
+
 static void *timer_thread(void *param) {
     struct timer *timer = param;
     // Rearming and freeing a timer interrupt its nanosleep with SIGUSR1,
