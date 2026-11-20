@@ -46,6 +46,17 @@ static bool exit_tgroup(struct task *task) {
         // because fish tries to set the pgid to that of an exited but not reaped
         // task.
         // https://github.com/Microsoft/WSL/issues/2786
+    } else if (group->itimer != NULL) {
+        // [FIX-261120-04] The interval timer signals the thread that called
+        // setitimer. That thread going first, with the process living on,
+        // left the timer firing into this task after it was freed. Hand it
+        // to a thread that stays (SIGALRM is a process signal: any will do).
+        struct task *heir = NULL, *other;
+        list_for_each_entry(&group->threads, other, group_links) {
+            if (heir == NULL || (heir->exiting && !other->exiting))
+                heir = other;
+        }
+        timer_retarget(group->itimer, task, heir);
     }
     return group_dead;
 }
@@ -171,15 +182,27 @@ noreturn void do_exit(int status) {
     current->exiting = true;
     // release the sighand (may already be NULL if another thread in the group
     // exited concurrently and released it, e.g. after safety-valve SIGUSR1)
-    if (current->sighand != NULL) {
-        sighand_release(current->sighand);
-        current->sighand = NULL;
-    }
+    // [FIX-261120-04] A sender without pids_lock (a timer thread) may be
+    // adding to the queue under the sighand's lock right now: empty the slot
+    // first, so a later sender sees it gone, then empty the queue under that
+    // lock. pids_lock -> sighand->lock is the order kill and /proc already
+    // use. An exit that starts while this very thread holds the lock (the
+    // owner field is only ever set to the locking thread) does not wait for
+    // itself; it frees as it always did.
+    struct sighand *exit_sighand = task_sighand_detach(current);
+    bool exit_sighand_locked = exit_sighand != NULL &&
+        !pthread_equal(exit_sighand->lock.owner, pthread_self());
+    if (exit_sighand_locked)
+        lock(&exit_sighand->lock);
     struct sigqueue *sigqueue, *sigqueue_tmp;
     list_for_each_entry_safe(&current->queue, sigqueue, sigqueue_tmp, queue) {
         list_remove(&sigqueue->queue);
         free(sigqueue);
     }
+    if (exit_sighand_locked)
+        unlock(&exit_sighand->lock);
+    if (exit_sighand != NULL)
+        sighand_release(exit_sighand);
     struct task *leader = current->group->leader;
 
     // reparent children
@@ -422,10 +445,9 @@ noreturn void do_exit_group(int status) {
                     task->exiting = true;
                     list_remove(&task->group_links);
                     // Release resources so pipes get EOF and memory is freed.
-                    if (task->sighand != NULL) {
-                        sighand_release(task->sighand);
-                        task->sighand = NULL;
-                    }
+                    struct sighand *stuck_sighand = task_sighand_detach(task);
+                    if (stuck_sighand != NULL)
+                        sighand_release(stuck_sighand);
                     // [T-ish-mem-uaf-user-write / T-ish-mm-leak-refcount-handoff]
                     // DO NOT mm_release() a stuck thread's mm HERE. This thread
                     // is, by definition, still running inside an uninterruptible

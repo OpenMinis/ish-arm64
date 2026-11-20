@@ -67,7 +67,36 @@ static int signal_action(struct sighand *sighand, int sig) {
 // JSC's thread resume path uses RT signals (RTMIN/RT_1/RT_2); dropping a
 // duplicate as "already pending" loses a resume and wedges the GC handshake.
 #define SIGRTMIN_ 32
-static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ info) {
+// [FIX-261120-04] task->sighand is cleared by the task's own do_exit (and by
+// the stuck-thread cleanup) under pids_lock. Senders that hold pids_lock
+// (kill, /proc) are safe; a timer thread is not one of them, and an interval
+// ITIMER_REAL firing while its process exited read the pointer, locked it,
+// and then found it NULL (SIGSEGV in deliver_signal_unlocked, crash point
+// BMSbJxXTmk3lJ83-5fdtjL) or freed. This lock makes "read the slot and take a
+// reference" atomic against "clear the slot". It is a leaf: nothing else is
+// locked while it is held.
+static lock_t sighand_slot_lock = LOCK_INITIALIZER;
+
+struct sighand *task_sighand_retain(struct task *task) {
+    lock(&sighand_slot_lock);
+    struct sighand *sighand = task->sighand;
+    if (sighand != NULL)
+        sighand->refcount++;
+    unlock(&sighand_slot_lock);
+    return sighand;
+}
+
+struct sighand *task_sighand_detach(struct task *task) {
+    lock(&sighand_slot_lock);
+    struct sighand *sighand = task->sighand;
+    task->sighand = NULL;
+    unlock(&sighand_slot_lock);
+    return sighand;
+}
+
+// `sighand` is the caller's locked, referenced task->sighand. The task's slot
+// may be cleared while the lock is dropped below, so it is never read again.
+static void deliver_signal_unlocked(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info) {
     if (sig < SIGRTMIN_ && sigset_has(task->pending, sig))
         return;
 
@@ -90,13 +119,13 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
         // program handles itself does not interrupt stat/open/getdents, which
         // the kernel would not restart (design §2-②, Q11).
         bool netfs_cancel = atomic_load_explicit(&task->netfs_call, memory_order_acquire) != 0 &&
-            (sig == SIGKILL_ || signal_action(task->sighand, sig) == SIGNAL_KILL);
+            (sig == SIGKILL_ || signal_action(sighand, sig) == SIGNAL_KILL);
         pthread_kill(task->thread, SIGUSR1);
 
         // wake up any pthread condition waiters
         // actual madness, I hope to god it's correct
         // must release the sighand lock while going insane, to avoid a deadlock
-        unlock(&task->sighand->lock);
+        unlock(&sighand->lock);
         if (netfs_cancel)
             netfs_cancel_task_call(task);
         // Wake up the target thread's condvar wait.
@@ -109,7 +138,7 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
         if (task->waiting_cond != NULL)
             notify(task->waiting_cond);
         unlock(&task->waiting_cond_lock);
-        lock(&task->sighand->lock);
+        lock(&sighand->lock);
     }
 }
 
@@ -133,11 +162,15 @@ bool task_fatal_signal_pending(struct task *task) {
 }
 
 void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
-    if (task->sighand == NULL)
+    struct sighand *sighand = task_sighand_retain(task);
+    if (sighand == NULL)
         return;
-    lock(&task->sighand->lock);
-    deliver_signal_unlocked(task, sig, info);
-    unlock(&task->sighand->lock);
+    lock(&sighand->lock);
+    // Detached since: the task is past the point of taking signals.
+    if (task->sighand == sighand)
+        deliver_signal_unlocked(task, sighand, sig, info);
+    unlock(&sighand->lock);
+    sighand_release(sighand);
     cpu_poke(&task->cpu);
 #if ISH_HVF
     hvf_kick(task);
@@ -171,12 +204,19 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
     if (native_offload_forward_signal(task, sig))
         return;
 
-    struct sighand *sighand = task->sighand;
+    struct sighand *sighand = task_sighand_retain(task);
     if (sighand == NULL)
         return;
     lock(&sighand->lock);
+    // [FIX-261120-04] Detached since the reference was taken: the task is in
+    // do_exit and its signal queue is being, or has been, emptied.
+    if (task->sighand != sighand) {
+        unlock(&sighand->lock);
+        sighand_release(sighand);
+        return;
+    }
     if (signal_action(sighand, sig) != SIGNAL_IGNORE) {
-        deliver_signal_unlocked(task, sig, info);
+        deliver_signal_unlocked(task, sighand, sig, info);
         // Poke the target CPU so it exits the JIT loop at the next gadget
         // boundary instead of waiting for INT_TIMER (up to 1024 cycles).
         // This reduces signal delivery latency from ~1024 to ~1 gadget.
@@ -186,6 +226,7 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
 #endif
     }
     unlock(&sighand->lock);
+    sighand_release(sighand);
 
     if (sig == SIGCONT_ || sig == SIGKILL_) {
         lock(&task->group->lock);
@@ -203,7 +244,7 @@ bool try_self_signal(int sig) {
     bool can_send = signal_action(sighand, sig) != SIGNAL_IGNORE &&
         !sigset_has(current->blocked, sig);
     if (can_send)
-        deliver_signal_unlocked(current, sig, SIGINFO_NIL);
+        deliver_signal_unlocked(current, sighand, sig, SIGINFO_NIL);
     unlock(&sighand->lock);
     return can_send;
 }

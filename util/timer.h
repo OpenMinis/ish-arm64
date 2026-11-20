@@ -75,6 +75,9 @@ struct timer {
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data);
 void timer_free(struct timer *timer);
+// [FIX-261120-04] If the timer's callback data is `from`, make it `to`. Waits
+// for a callback that is running, so on return no fire uses `from` any more.
+void timer_retarget(struct timer *timer, void *from, void *to);
 // value is how long to wait until the next fire
 // interval is how long after that to wait until the next fire (if non-zero)
 // bizarre interface is based off setitimer, because this is going to be used
