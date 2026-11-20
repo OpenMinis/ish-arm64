@@ -8,4 +8,6 @@ import hashlib, os
 d = os.urandom(1 << 20)
 for a in ('sha3_256', 'blake2b', 'sha224', 'sha384'): hashlib.new(a, d).digest()
 "
+# the openssl command line: primitives, keys and signatures, TLS 1.2 / 1.3 suites and groups
+sh openssl_train.sh
 echo tls-train-ok

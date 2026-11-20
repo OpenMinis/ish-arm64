@@ -43,4 +43,4 @@ if grep -n -E 'FAIL|Traceback|unrecognized option|^Usage:|skipped|: not found|No
     exit 1
 fi
 rm -f "$log.bad"
-python3 "$(dirname "$0")/gen.py" "$rec" "$ish" "$rootfs" "$out" --name "$name"
+python3 "$(dirname "$0")/gen.py" "$rec" "$ish" "$rootfs" "$out" --name "$name" --module "$module"

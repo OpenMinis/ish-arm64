@@ -242,6 +242,8 @@ def main():
     ap.add_argument('--family', help='fnmatch() pattern of the file names this image also serves (other '
                     'versions of the module, matched block by block); default from the file name, '
                     '"" for none')
+    ap.add_argument('--module', help='when the recording holds several modules (the recorded substring '
+                    'matched more than one file), keep the one whose path ends with this')
     ap.add_argument('--abi', help='abi of the ish that recorded, for a recording made before the header had it '
                     '(the "abi" of /proc/ish/jit in that same build)')
     ap.add_argument('--no-links', action='store_true', help='no static links between translations: a block '
@@ -261,6 +263,14 @@ def main():
         sys.exit(f"❌ {args.recording}: the JIT code region filled up while recording, so the translations of "
                  "what ran after that are missing; record a smaller workload")
     mods = {t['mod'] for t in trans}
+    if len(mods) > 1 and args.module:
+        # ISH_JIT_RECORD_MOD is a substring: /usr/bin/ssh also records ssh-keygen, ssh-agent, ...
+        # when the workload runs them. Links name a translation by its position in the recording,
+        # so the others stay in the list and are left out below, like translations --keep drops.
+        exact = [m for m in mods if m.endswith(args.module)]
+        if len(exact) == 1:
+            print(f"✂️  keeping {exact[0]}, dropping {', '.join(sorted(mods - set(exact)))}")
+            mods = set(exact)
     if len(mods) != 1:
         sys.exit(f"❌ expected one module in the recording, got {sorted(mods)}")
     mod = mods.pop()
@@ -270,10 +280,10 @@ def main():
     syms = host_symbols(args.ish)
     print(f"📼 {len(trans)} translations of {mod}, prologue {header['prologue_words']} words")
 
-    kept = range(len(trans))
+    kept = [i for i, t in enumerate(trans) if t['mod'] == mod]
     if args.keep:
         hot = {int(x, 0) for x in open(args.keep).read().split()}
-        kept = [i for i, t in enumerate(trans) if hot & set(segment_offsets(t))]
+        kept = [i for i in kept if hot & set(segment_offsets(trans[i]))]
         print(f"✂️  keeping {len(kept)} of {len(trans)} translations ({len(hot)} hot offsets)")
     # Stable order: by file offset (the loader binary-searches it), then key.
     order = sorted(kept, key=lambda i: (trans[i]['off'], trans[i]['key']))

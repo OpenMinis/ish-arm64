@@ -28,7 +28,8 @@ benchmark/aojit/           images, workloads and tests (host scripts at the top)
     │                      and the generators of their inputs (gen_*); busybox charts doc gh net node pil
     │                      py pyext rg shell ssh zlib
     ├── verify/            the checks of verify.sh (check.sh, threeway.sh, futex_stress.py)
-    └── measure/           workloads for profile.sh (ssh, curl, py, py_local, py_tls, rg, git, zlib)
+    └── measure/           workloads for profile.sh (ssh, curl, py, py_local, py_tls, rg, git, zlib);
+                           ssh_matrix.sh: ssh / scp / TLS step by step, to compare two image sets
 ```
 
 Inputs (JSON, logs, images, certificates, the 10 MB scp file) are generated in the guest by
@@ -259,6 +260,17 @@ benchmark/aojit/compat.sh build-arm64-aot/ish                                   
 `verify.sh` and the ssh cases need an sshd in a second ish on a fakefs rootfs:
 `build-arm64-jit/ish -f <fakefs> /bin/sh /tmp/aojit/ssh/server.sh 2222 < <client public keys>`
 (`guest/ssh/keys.sh` prints them). Without `AOJIT_SSH` the ssh part is skipped.
+The server's rootfs needs `openssh-server openssh-sftp-server openssh-keygen openssh-client-common`.
+
+The ssh, scp and crypto recordings need the same sshd: `ssh/ssh_train_full.sh` runs every common
+host key, user key, KEX, cipher and MAC against it (server.sh turns on the ones sshd leaves out),
+and `net/crypto_train.sh` is `tls_train.sh` plus that script, because ssh's cryptography runs in
+libcrypto. Record these three one after the other (`JOBS=1`): they share the server's files and
+a forwarded port. `tls_train.sh` needs the `openssl` command (`net/openssl_train.sh`); on a rootfs
+whose libcrypto must not be upgraded, copy only `/usr/bin/openssl` out of the package (`apk fetch`).
+`ISH_JIT_RECORD_MOD=/usr/bin/ssh` also matches ssh-keygen, ssh-agent, ssh-add and ssh-keyscan,
+which that workload runs; `record.sh` passes the substring to `gen.py --module`, which keeps the
+module whose path ends with it.
 
 On the phone: `sh /tmp/phone.sh <host> <repo dir on host>` (see `phone.sh`). Add `OLDLIB=<dir>`
 for the family cases.
